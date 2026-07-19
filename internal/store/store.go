@@ -72,44 +72,7 @@ func Open(ctx context.Context, path string) (*Store, error) {
 func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) migrate(ctx context.Context) error {
-	const schema = `
-CREATE TABLE IF NOT EXISTS events (
-  id INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL CHECK (kind IN ('screen', 'audio')),
-  captured_at TEXT NOT NULL,
-  text TEXT NOT NULL DEFAULT '',
-  app TEXT NOT NULL DEFAULT '',
-  window TEXT NOT NULL DEFAULT '',
-  media_path TEXT NOT NULL,
-  duration_ms INTEGER NOT NULL DEFAULT 0,
-  metadata_json TEXT NOT NULL DEFAULT '{}',
-  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-);
-CREATE INDEX IF NOT EXISTS events_captured_at_idx ON events(captured_at DESC);
-CREATE INDEX IF NOT EXISTS events_kind_captured_at_idx ON events(kind, captured_at DESC);
-CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
-  text, app, window,
-  content='events', content_rowid='id',
-  tokenize='unicode61 remove_diacritics 2'
-);
-CREATE TRIGGER IF NOT EXISTS events_ai AFTER INSERT ON events BEGIN
-  INSERT INTO events_fts(rowid, text, app, window)
-  VALUES (new.id, new.text, new.app, new.window);
-END;
-CREATE TRIGGER IF NOT EXISTS events_ad AFTER DELETE ON events BEGIN
-  INSERT INTO events_fts(events_fts, rowid, text, app, window)
-  VALUES ('delete', old.id, old.text, old.app, old.window);
-END;
-CREATE TRIGGER IF NOT EXISTS events_au AFTER UPDATE ON events BEGIN
-  INSERT INTO events_fts(events_fts, rowid, text, app, window)
-  VALUES ('delete', old.id, old.text, old.app, old.window);
-  INSERT INTO events_fts(rowid, text, app, window)
-  VALUES (new.id, new.text, new.app, new.window);
-END;`
-	if _, err := s.db.ExecContext(ctx, schema); err != nil {
-		return fmt.Errorf("migrate database (SQLite must include FTS5): %w", err)
-	}
-	return nil
+	return s.runMigrations(ctx)
 }
 
 func (s *Store) Insert(ctx context.Context, event *Event) error {
