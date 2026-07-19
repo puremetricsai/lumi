@@ -41,10 +41,12 @@ Data flows one way: `internal/cli` wires concrete processors into a `capture.Rec
 
 - **Never lose captured media.** If OCR or transcription fails after a file was written, the event is still inserted with `{"processor_error": ...}` in `metadata_json` (`processorMetadata`). Don't convert processor failures into early returns that drop the file.
 - **Deduplicate screen frames by SHA-256 of the JPEG bytes.** Identical consecutive frames are deleted and not indexed.
-- **FTS input must go through `ftsQuery`.** It quotes each word and joins with `AND`, which is what keeps raw user text from being interpreted as FTS5 syntax.
+- **FTS input must go through `ftsExpression`** (`internal/store/query.go`). It quotes each term and joins with `AND` or `OR` depending on `SearchOptions.Match`; the quoting is what keeps raw user text from being interpreted as FTS5 syntax, and it applies to both joiners. `MatchAll` is the zero value, so `lumi search` keeps its conjunctive semantics without opting in. Terms with no letters or digits are dropped, and an expression that comes back empty means "run no FTS query at all" — an empty MATCH is a syntax error, not a zero-result search.
+- **`ask` stages its retrieval: all-terms → any-term → recency.** `retrieveContext` (`internal/cli/retrieve.go`) strips stopwords from the question first. Feeding a raw question to an `AND` query matches nothing, which is what previously made `ask` recency-based in practice. Only `MatchAny` uses `bm25(events_fts, 1.0, 0.4, 0.4)` — without the column weights a one-word `app`/`window` hit outranks a page of relevant OCR.
+- **A degraded retrieval is never silent.** Any stage past `all-terms` prints a note to stderr, so a recency-shaped answer is never mistaken for a retrieved one.
 - **`lumi ask` sends text and metadata only** — screenshots and WAVs are never uploaded. Keep it that way.
-- **`ask` falls back to recent events** when the FTS query matches nothing, so an answer is still grounded in real activity.
+- **The activity context is byte-budgeted in `contextFor`** (`internal/cli/context.go`): `maxEventChars` per event, `--max-context-chars` overall, always at least one event. The store never truncates `Event.Text` — that would corrupt `lumi search --json`, which is a data-export path.
 
 ## External dependencies
 
-`screencapture` (system), `tesseract`, `ffmpeg`, `whisper-cli` + a model via `LUMI_WHISPER_MODEL`, and `CEREBRAS_API_KEY` for `ask` only. Frontmost app/window comes from `osascript` and degrades to empty strings on failure.
+`screencapture` (system), `tesseract`, `ffmpeg`, `whisper-cli` + a model via `LUMI_WHISPER_MODEL`, and `CEREBRAS_API_KEY` for `ask` only. The Cerebras model resolves as `--model` → `LUMI_CEREBRAS_MODEL` → `config.DefaultCerebrasModel`. Frontmost app/window comes from `osascript` and degrades to empty strings on failure.
