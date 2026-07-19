@@ -1,0 +1,121 @@
+version: '3'
+
+dotenv: ['.env']
+
+vars:
+  BINARY: lumi
+  PKG: ./cmd/lumi
+
+tasks:
+  default:
+    desc: List available tasks
+    cmds:
+      - task --list
+    silent: true
+
+  build:
+    desc: Build the lumi binary
+    sources:
+      - '**/*.go'
+      - go.mod
+      - go.sum
+    generates:
+      - '{{.BINARY}}'
+    cmds:
+      - go build -o {{.BINARY}} {{.PKG}}
+
+  test:
+    desc: Run all tests
+    cmds:
+      - go test ./... {{.CLI_ARGS}}
+
+  test:v:
+    desc: Run all tests with verbose output
+    cmds:
+      - go test -v ./... {{.CLI_ARGS}}
+
+  test:one:
+    desc: 'Run a single test (e.g. task test:one -- -run TestSearch ./internal/store)'
+    cmds:
+      - go test -v {{.CLI_ARGS}}
+
+  cover:
+    desc: Run tests with a coverage report
+    cmds:
+      - go test -coverprofile=coverage.out ./...
+      - go tool cover -func=coverage.out
+
+  cover:html:
+    desc: Open the HTML coverage report
+    deps: [cover]
+    cmds:
+      - go tool cover -html=coverage.out
+
+  vet:
+    desc: Run go vet
+    cmds:
+      - go vet ./...
+
+  fmt:
+    desc: Format all Go source
+    cmds:
+      - go fmt ./...
+
+  tidy:
+    desc: Tidy go.mod and go.sum
+    cmds:
+      - go mod tidy
+
+  check:
+    desc: Format, vet, and test
+    cmds:
+      - task: fmt
+      - task: vet
+      - task: test
+
+  clean:
+    desc: Remove build artifacts and coverage output
+    cmds:
+      - rm -f {{.BINARY}} coverage.out
+
+  doctor:
+    desc: Report which external binaries, models, and API keys are available
+    deps: [build]
+    cmds:
+      - ./{{.BINARY}} doctor
+
+  record:
+    desc: 'Capture screen + audio (e.g. task record -- --no-audio --duration 10s)'
+    platforms: [darwin]
+    deps: [build]
+    interactive: true
+    cmds:
+      - ./{{.BINARY}} record {{.CLI_ARGS}}
+
+  smoke:
+    desc: Bounded 10s screen-only capture smoke test
+    platforms: [darwin]
+    deps: [build]
+    cmds:
+      - ./{{.BINARY}} record --no-audio --duration 10s
+
+  search:
+    desc: 'Search captured events (e.g. task search -- "invoice")'
+    deps: [build]
+    cmds:
+      - ./{{.BINARY}} search {{.CLI_ARGS}}
+
+  ask:
+    desc: 'Ask a question over captured events (e.g. task ask -- "what did I work on?")'
+    deps: [build]
+    preconditions:
+      - sh: test -n "$CEREBRAS_API_KEY"
+        msg: 'CEREBRAS_API_KEY is not set (add it to .env)'
+    cmds:
+      - ./{{.BINARY}} ask {{.CLI_ARGS}}
+
+  version:
+    desc: Print the Lumi version
+    deps: [build]
+    cmds:
+      - ./{{.BINARY}} version

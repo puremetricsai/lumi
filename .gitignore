@@ -37,3 +37,10 @@ go.work.sum
 *.db-shm
 *.db-wal
 .DS_Store
+
+# AI
+.claude/
+docs/superpowers/
+
+# Taskfile
+.task/
