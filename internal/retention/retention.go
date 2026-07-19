@@ -39,10 +39,14 @@ func Prune(ctx context.Context, s *store.Store, opts Options) (Result, error) {
 		return result, errors.New("prune requires --older-than or --max-bytes")
 	}
 
+	agePruned := make(map[int64]bool)
 	if opts.Before != nil {
 		expired, err := s.Expired(ctx, *opts.Before, 0)
 		if err != nil {
 			return result, err
+		}
+		for _, e := range expired {
+			agePruned[e.ID] = true
 		}
 		partial, err := remove(ctx, s, expired, opts.DryRun)
 		result.add(partial)
@@ -59,6 +63,18 @@ func Prune(ctx context.Context, s *store.Store, opts Options) (Result, error) {
 		if err != nil {
 			return result, err
 		}
+		// On a real run the age pass already deleted its rows, so `all` holds
+		// only survivors. On a dry run nothing was deleted, so drop the
+		// age-pruned rows here to see exactly the set a real run's size stage sees.
+		if opts.DryRun && len(agePruned) > 0 {
+			kept := all[:0]
+			for _, event := range all {
+				if !agePruned[event.ID] {
+					kept = append(kept, event)
+				}
+			}
+			all = kept
+		}
 		var total int64
 		sizes := make([]int64, len(all))
 		for i, event := range all {
@@ -66,11 +82,6 @@ func Prune(ctx context.Context, s *store.Store, opts Options) (Result, error) {
 			total += sizes[i]
 		}
 		overBy := total - opts.MaxBytes
-		if opts.DryRun {
-			// A dry run has not actually freed the age-pruned bytes yet, so
-			// discount them here to report the same outcome a real run gives.
-			overBy -= result.Bytes
-		}
 		if overBy > 0 {
 			cutoff := 0
 			var freed int64

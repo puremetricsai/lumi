@@ -145,6 +145,43 @@ func TestPruneToleratesMissingMediaFiles(t *testing.T) {
 	}
 }
 
+// A dry run that combines an age policy and a size policy must report exactly
+// what a real run would delete — no double-counting of the age-expired events
+// that the size stage re-sees only because dry run never deleted them.
+func TestPruneDryRunCombinedAgeAndSize(t *testing.T) {
+	ctx := context.Background()
+	s, dir := newStore(t, ctx)
+	now := time.Now().UTC()
+
+	oldPath := seed(t, ctx, s, dir, "old.jpg", now.Add(-48*time.Hour), 10)
+	freshPath := seed(t, ctx, s, dir, "fresh.jpg", now, 100)
+
+	cutoff := now.Add(-24 * time.Hour)
+	// Age prunes old (10B). Size cap 50 then forces fresh (100B) out too.
+	// A real run deletes 2 events / 110 bytes; the dry run must report the same.
+	result, err := Prune(ctx, s, Options{Before: &cutoff, MaxBytes: 50, DryRun: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Events != 2 || result.Bytes != 110 {
+		t.Fatalf("dry run must report what a real run would delete, got %#v", result)
+	}
+	// Dry run must not have deleted anything.
+	if _, err := os.Stat(oldPath); err != nil {
+		t.Fatalf("dry run must not delete files: %v", err)
+	}
+	if _, err := os.Stat(freshPath); err != nil {
+		t.Fatalf("dry run must not delete files: %v", err)
+	}
+	remaining, err := s.Search(ctx, store.SearchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remaining) != 2 {
+		t.Fatalf("dry run must not delete rows, got %d", len(remaining))
+	}
+}
+
 func TestPruneWithNoPolicyIsAnError(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newStore(t, ctx)
