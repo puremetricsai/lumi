@@ -151,7 +151,7 @@ func (a *app) recordCommand() *cobra.Command {
 }
 
 func (a *app) searchCommand() *cobra.Command {
-	var kind, since, until string
+	var kind, since, until, app, window string
 	var limit int
 	var asJSON bool
 	cmd := &cobra.Command{
@@ -163,7 +163,7 @@ func (a *app) searchCommand() *cobra.Command {
 			if len(args) == 1 {
 				query = args[0]
 			}
-			opts, err := searchOptions(query, kind, since, until, limit)
+			opts, err := searchOptions(query, kind, since, until, app, window, limit)
 			if err != nil {
 				return err
 			}
@@ -189,13 +189,15 @@ func (a *app) searchCommand() *cobra.Command {
 	flags.StringVar(&kind, "type", "all", "content type: all, screen, or audio")
 	flags.StringVar(&since, "since", "", "earliest time (RFC3339 or duration such as 8h)")
 	flags.StringVar(&until, "until", "", "latest time (RFC3339)")
+	flags.StringVar(&app, "app", "", "only events captured from this application (exact, case-insensitive)")
+	flags.StringVar(&window, "window", "", "only events whose window title contains this text")
 	flags.IntVar(&limit, "limit", 20, "maximum results")
 	flags.BoolVar(&asJSON, "json", false, "emit JSON")
 	return cmd
 }
 
 func (a *app) askCommand() *cobra.Command {
-	var since, model string
+	var since, model, app, window string
 	var limit, maxContextChars int
 	cmd := &cobra.Command{
 		Use:   "ask <question>",
@@ -207,7 +209,7 @@ func (a *app) askCommand() *cobra.Command {
 				return err
 			}
 			defer s.Close()
-			opts, err := searchOptions("", "all", since, "", limit)
+			opts, err := searchOptions("", "all", since, "", app, window, limit)
 			if err != nil {
 				return err
 			}
@@ -234,6 +236,8 @@ func (a *app) askCommand() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&since, "since", "24h", "activity window (RFC3339 or duration)")
+	cmd.Flags().StringVar(&app, "app", "", "restrict activity to this application")
+	cmd.Flags().StringVar(&window, "window", "", "restrict activity to windows whose title contains this text")
 	cmd.Flags().IntVar(&limit, "limit", 50, "maximum activity records sent to Cerebras")
 	cmd.Flags().StringVar(&model, "model", defaultCerebrasModel(), "Cerebras model; set $LUMI_CEREBRAS_MODEL to change the default")
 	cmd.Flags().IntVar(&maxContextChars, "max-context-chars", defaultContextChars, "character budget for the activity context sent to Cerebras")
@@ -294,8 +298,8 @@ func defaultCerebrasModel() string {
 	return config.DefaultCerebrasModel
 }
 
-func searchOptions(query, kind, since, until string, limit int) (store.SearchOptions, error) {
-	opts := store.SearchOptions{Query: query, Limit: limit}
+func searchOptions(query, kind, since, until, app, window string, limit int) (store.SearchOptions, error) {
+	opts := store.SearchOptions{Query: query, App: app, Window: window, Limit: limit}
 	switch kind {
 	case "", "all":
 	case "screen":

@@ -55,6 +55,12 @@ CREATE TRIGGER IF NOT EXISTS events_au AFTER UPDATE ON events BEGIN
   VALUES (new.id, new.text, new.app, new.window);
 END;`,
 	},
+	{
+		Version: 2,
+		SQL: `
+CREATE INDEX IF NOT EXISTS events_app_captured_at_idx
+  ON events(app COLLATE NOCASE, captured_at DESC);`,
+	},
 }
 
 // runMigrations applies every migration whose version exceeds the database's

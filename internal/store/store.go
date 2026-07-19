@@ -33,12 +33,14 @@ type Event struct {
 }
 
 type SearchOptions struct {
-	Query string
-	Match MatchMode
-	Kind  Kind
-	Since *time.Time
-	Until *time.Time
-	Limit int
+	Query  string
+	Match  MatchMode
+	Kind   Kind
+	App    string // exact, case-insensitive
+	Window string // substring, case-insensitive
+	Since  *time.Time
+	Until  *time.Time
+	Limit  int
 }
 
 type Store struct {
@@ -70,6 +72,13 @@ func Open(ctx context.Context, path string) (*Store, error) {
 }
 
 func (s *Store) Close() error { return s.db.Close() }
+
+// likeEscape neutralises LIKE wildcards so a filter value is matched literally.
+// Pair it with an ESCAPE '\' clause.
+func likeEscape(input string) string {
+	replacer := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return replacer.Replace(input)
+}
 
 func (s *Store) migrate(ctx context.Context) error {
 	return s.runMigrations(ctx)
@@ -134,6 +143,14 @@ func (s *Store) Search(ctx context.Context, opts SearchOptions) ([]Event, error)
 	if opts.Kind != "" {
 		where = append(where, "e.kind = ?")
 		args = append(args, opts.Kind)
+	}
+	if app := strings.TrimSpace(opts.App); app != "" {
+		where = append(where, "e.app = ? COLLATE NOCASE")
+		args = append(args, app)
+	}
+	if window := strings.TrimSpace(opts.Window); window != "" {
+		where = append(where, `e.window LIKE ? ESCAPE '\' COLLATE NOCASE`)
+		args = append(args, "%"+likeEscape(window)+"%")
 	}
 	if opts.Since != nil {
 		where = append(where, "e.captured_at >= ?")
