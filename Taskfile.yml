@@ -25,6 +25,27 @@ tasks:
     cmds:
       - go build -o {{.BINARY}} {{.PKG}}
 
+  install:
+    desc: Install the lumi binary system-wide into the Go bin directory
+    vars:
+      GOBIN:
+        sh: go env GOBIN || true
+      GOPATH:
+        sh: go env GOPATH
+    cmds:
+      - go install {{.PKG}}
+      - 'echo "installed lumi to {{if .GOBIN}}{{.GOBIN}}{{else}}{{.GOPATH}}/bin{{end}}"'
+
+  uninstall:
+    desc: Remove the installed lumi binary from the Go bin directory
+    vars:
+      GOBIN:
+        sh: go env GOBIN || true
+      GOPATH:
+        sh: go env GOPATH
+    cmds:
+      - rm -f {{if .GOBIN}}{{.GOBIN}}{{else}}{{.GOPATH}}/bin{{end}}/{{.BINARY}}
+
   test:
     desc: Run all tests
     cmds:
