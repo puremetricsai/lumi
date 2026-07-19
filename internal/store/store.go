@@ -234,26 +234,41 @@ FROM events WHERE captured_at < ? ORDER BY captured_at ASC`
 	return events, nil
 }
 
+// deleteBatchSize bounds the IN (?, …) list well under SQLite's
+// SQLITE_MAX_VARIABLE_NUMBER (32766) so a large prune does not exceed it.
+const deleteBatchSize = 900
+
 // DeleteByIDs removes events and, via the events_ad trigger, their FTS rows.
-// It does not touch media files; callers own that.
+// It deletes in batches to stay under SQLite's bound-parameter limit, so a
+// prune of an arbitrarily large expired set never trips "too many SQL
+// variables". It does not touch media files; callers own that.
 func (s *Store) DeleteByIDs(ctx context.Context, ids []int64) (int64, error) {
 	if len(ids) == 0 {
 		return 0, nil
 	}
-	placeholders := make([]string, len(ids))
-	args := make([]any, len(ids))
-	for i, id := range ids {
-		placeholders[i] = "?"
-		args[i] = id
+	var total int64
+	for start := 0; start < len(ids); start += deleteBatchSize {
+		end := start + deleteBatchSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		batch := ids[start:end]
+		placeholders := make([]string, len(batch))
+		args := make([]any, len(batch))
+		for i, id := range batch {
+			placeholders[i] = "?"
+			args[i] = id
+		}
+		result, err := s.db.ExecContext(ctx,
+			"DELETE FROM events WHERE id IN ("+strings.Join(placeholders, ",")+")", args...)
+		if err != nil {
+			return total, fmt.Errorf("delete events: %w", err)
+		}
+		deleted, err := result.RowsAffected()
+		if err != nil {
+			return total, fmt.Errorf("count deleted events: %w", err)
+		}
+		total += deleted
 	}
-	result, err := s.db.ExecContext(ctx,
-		"DELETE FROM events WHERE id IN ("+strings.Join(placeholders, ",")+")", args...)
-	if err != nil {
-		return 0, fmt.Errorf("delete events: %w", err)
-	}
-	deleted, err := result.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("count deleted events: %w", err)
-	}
-	return deleted, nil
+	return total, nil
 }

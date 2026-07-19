@@ -252,3 +252,45 @@ func TestSearchWindowFilterEscapesWildcards(t *testing.T) {
 		t.Fatalf("%% must be literal, not a wildcard, got %#v", got)
 	}
 }
+
+func TestDeleteByIDsBatchesLargeIDSets(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// Three real rows to delete.
+	var realIDs []int64
+	for i := 0; i < 3; i++ {
+		e := Event{Kind: KindScreen, Text: "row", MediaPath: "x.jpg"}
+		if err := s.Insert(ctx, &e); err != nil {
+			t.Fatal(err)
+		}
+		realIDs = append(realIDs, e.ID)
+	}
+
+	// Far more than SQLite's SQLITE_MAX_VARIABLE_NUMBER (32766) ids in one call.
+	// An unbatched IN (?, ...) fails with "too many SQL variables"; batching must
+	// tolerate it and delete exactly the real rows.
+	ids := append([]int64{}, realIDs...)
+	for id := int64(1_000_000); len(ids) < 40000; id++ {
+		ids = append(ids, id)
+	}
+
+	deleted, err := s.DeleteByIDs(ctx, ids)
+	if err != nil {
+		t.Fatalf("DeleteByIDs must batch to stay under the variable limit: %v", err)
+	}
+	if deleted != int64(len(realIDs)) {
+		t.Fatalf("DeleteByIDs = %d, want %d", deleted, len(realIDs))
+	}
+	got, err := s.Search(ctx, SearchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("all real rows should be deleted, got %d remaining", len(got))
+	}
+}
