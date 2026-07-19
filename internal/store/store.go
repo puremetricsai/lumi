@@ -34,6 +34,7 @@ type Event struct {
 
 type SearchOptions struct {
 	Query string
+	Match MatchMode
 	Kind  Kind
 	Since *time.Time
 	Until *time.Time
@@ -149,11 +150,23 @@ func (s *Store) Search(ctx context.Context, opts SearchOptions) ([]Event, error)
 	args := make([]any, 0, 5)
 	from := "events e"
 	rank := "0.0"
-	if strings.TrimSpace(opts.Query) != "" {
+	// Guard on the built expression, not the raw query: a query of pure
+	// punctuation survives TrimSpace but tokenizes to nothing.
+	match := ftsExpression(opts.Query, opts.Match)
+	if match != "" {
 		from = "events_fts JOIN events e ON e.id = events_fts.rowid"
 		where = append(where, "events_fts MATCH ?")
-		args = append(args, ftsQuery(opts.Query))
-		rank = "bm25(events_fts)"
+		args = append(args, match)
+		// bm25 length-normalizes per column, so a hit in the one-word app or
+		// window column scores far higher than the same term buried in a page
+		// of OCR. Under MatchAll that rarely mattered; under MatchAny it would
+		// let stray window titles outrank substantive content. Weights are
+		// applied only here so `search` ranking is unchanged.
+		if opts.Match == MatchAny {
+			rank = "bm25(events_fts, 1.0, 0.4, 0.4)"
+		} else {
+			rank = "bm25(events_fts)"
+		}
 	}
 	if opts.Kind != "" {
 		where = append(where, "e.kind = ?")
@@ -172,7 +185,7 @@ e.media_path, e.duration_ms, e.metadata_json, ` + rank + ` AS rank FROM ` + from
 	if len(where) > 0 {
 		query += " WHERE " + strings.Join(where, " AND ")
 	}
-	if strings.TrimSpace(opts.Query) != "" {
+	if match != "" {
 		query += " ORDER BY rank, e.captured_at DESC"
 	} else {
 		query += " ORDER BY e.captured_at DESC"
@@ -203,14 +216,4 @@ e.media_path, e.duration_ms, e.metadata_json, ` + rank + ` AS rank FROM ` + from
 		return nil, fmt.Errorf("iterate search results: %w", err)
 	}
 	return events, nil
-}
-
-func ftsQuery(input string) string {
-	words := strings.Fields(input)
-	quoted := make([]string, 0, len(words))
-	for _, word := range words {
-		word = strings.ReplaceAll(word, `"`, `""`)
-		quoted = append(quoted, `"`+word+`"`)
-	}
-	return strings.Join(quoted, " AND ")
 }

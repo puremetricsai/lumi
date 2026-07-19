@@ -25,8 +25,24 @@ import (
 
 const version = "0.1.0-dev"
 
+// answerer is the inference backend used by `ask`. It exists so tests can
+// exercise the command without a network call; production always uses
+// cerebras.Client.
+type answerer interface {
+	Answer(ctx context.Context, question, activityContext string) (string, error)
+}
+
 type app struct {
 	dataDir string
+	// newAnswerer is overridden in tests. Nil means the real Cerebras client.
+	newAnswerer func(model string) answerer
+}
+
+func (a *app) answerer(model string) answerer {
+	if a.newAnswerer != nil {
+		return a.newAnswerer(model)
+	}
+	return cerebras.Client{APIKey: os.Getenv("CEREBRAS_API_KEY"), Model: model}
 }
 
 func Execute() error {
@@ -180,7 +196,7 @@ func (a *app) searchCommand() *cobra.Command {
 
 func (a *app) askCommand() *cobra.Command {
 	var since, model string
-	var limit int
+	var limit, maxContextChars int
 	cmd := &cobra.Command{
 		Use:   "ask <question>",
 		Short: "Answer a question from local activity using Cerebras",
@@ -191,36 +207,36 @@ func (a *app) askCommand() *cobra.Command {
 				return err
 			}
 			defer s.Close()
-			opts, err := searchOptions(args[0], "all", since, "", limit)
+			opts, err := searchOptions("", "all", since, "", limit)
 			if err != nil {
 				return err
 			}
-			events, err := s.Search(cmd.Context(), opts)
+			events, stage, err := retrieveContext(cmd.Context(), s, args[0], opts)
 			if err != nil {
 				return err
-			}
-			if len(events) == 0 {
-				opts.Query = ""
-				events, err = s.Search(cmd.Context(), opts)
-				if err != nil {
-					return err
-				}
 			}
 			if len(events) == 0 {
 				return errors.New("no local activity has been indexed yet")
 			}
-			answer, err := (cerebras.Client{APIKey: os.Getenv("CEREBRAS_API_KEY"), Model: model}).Answer(
-				cmd.Context(), args[0], contextFor(events))
+			// Never answer from a degraded retrieval silently.
+			switch stage {
+			case stageAnyTerm:
+				fmt.Fprintln(cmd.ErrOrStderr(), "note: no events matched every term; ranked by best partial match")
+			case stageRecent:
+				fmt.Fprintf(cmd.ErrOrStderr(), "note: the question had no searchable terms; using the %d most recent events\n", len(events))
+			}
+			answer, err := a.answerer(model).Answer(cmd.Context(), args[0], contextFor(events, maxContextChars))
 			if err != nil {
 				return err
 			}
-			fmt.Fprintln(os.Stdout, answer)
+			fmt.Fprintln(cmd.OutOrStdout(), answer)
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&since, "since", "24h", "activity window (RFC3339 or duration)")
 	cmd.Flags().IntVar(&limit, "limit", 50, "maximum activity records sent to Cerebras")
-	cmd.Flags().StringVar(&model, "model", config.DefaultCerebrasModel, "Cerebras model")
+	cmd.Flags().StringVar(&model, "model", defaultCerebrasModel(), "Cerebras model; set $LUMI_CEREBRAS_MODEL to change the default")
+	cmd.Flags().IntVar(&maxContextChars, "max-context-chars", defaultContextChars, "character budget for the activity context sent to Cerebras")
 	return cmd
 }
 
@@ -258,6 +274,7 @@ func (a *app) doctorCommand() *cobra.Command {
 			} else {
 				fmt.Fprintln(os.Stdout, "Cerebras API key\tok\tconfigured")
 			}
+			fmt.Fprintf(os.Stdout, "Cerebras model\tok\t%s\n", defaultCerebrasModel())
 			fmt.Fprintf(os.Stdout, "data directory\tok\t%s\n", paths.Root)
 			if missing {
 				return errors.New("one or more recording requirements are missing")
@@ -265,6 +282,16 @@ func (a *app) doctorCommand() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+// defaultCerebrasModel resolves the model the same way --whisper-model
+// resolves LUMI_WHISPER_MODEL: an explicit flag beats the environment, which
+// beats the built-in default.
+func defaultCerebrasModel() string {
+	if model := strings.TrimSpace(os.Getenv("LUMI_CEREBRAS_MODEL")); model != "" {
+		return model
+	}
+	return config.DefaultCerebrasModel
 }
 
 func searchOptions(query, kind, since, until string, limit int) (store.SearchOptions, error) {
@@ -311,20 +338,8 @@ func printEvents(events []store.Event) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 	defer w.Flush()
 	for _, event := range events {
-		text := strings.Join(strings.Fields(event.Text), " ")
-		if len(text) > 180 {
-			text = text[:177] + "..."
-		}
+		text := truncateRunes(strings.Join(strings.Fields(event.Text), " "), 180)
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", event.CapturedAt.Local().Format("2006-01-02 15:04:05"), event.Kind, event.App, text)
 		fmt.Fprintf(w, "\tmedia\t%s\t\n", event.MediaPath)
 	}
-}
-
-func contextFor(events []store.Event) string {
-	var builder strings.Builder
-	for _, event := range events {
-		fmt.Fprintf(&builder, "[%s] kind=%s app=%q window=%q media=%q\n%s\n\n",
-			event.CapturedAt.Format(time.RFC3339), event.Kind, event.App, event.Window, event.MediaPath, event.Text)
-	}
-	return builder.String()
 }
