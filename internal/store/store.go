@@ -33,12 +33,14 @@ type Event struct {
 }
 
 type SearchOptions struct {
-	Query string
-	Match MatchMode
-	Kind  Kind
-	Since *time.Time
-	Until *time.Time
-	Limit int
+	Query  string
+	Match  MatchMode
+	Kind   Kind
+	App    string // exact, case-insensitive
+	Window string // substring, case-insensitive
+	Since  *time.Time
+	Until  *time.Time
+	Limit  int
 }
 
 type Store struct {
@@ -71,45 +73,15 @@ func Open(ctx context.Context, path string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+// likeEscape neutralises LIKE wildcards so a filter value is matched literally.
+// Pair it with an ESCAPE '\' clause.
+func likeEscape(input string) string {
+	replacer := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return replacer.Replace(input)
+}
+
 func (s *Store) migrate(ctx context.Context) error {
-	const schema = `
-CREATE TABLE IF NOT EXISTS events (
-  id INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL CHECK (kind IN ('screen', 'audio')),
-  captured_at TEXT NOT NULL,
-  text TEXT NOT NULL DEFAULT '',
-  app TEXT NOT NULL DEFAULT '',
-  window TEXT NOT NULL DEFAULT '',
-  media_path TEXT NOT NULL,
-  duration_ms INTEGER NOT NULL DEFAULT 0,
-  metadata_json TEXT NOT NULL DEFAULT '{}',
-  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-);
-CREATE INDEX IF NOT EXISTS events_captured_at_idx ON events(captured_at DESC);
-CREATE INDEX IF NOT EXISTS events_kind_captured_at_idx ON events(kind, captured_at DESC);
-CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
-  text, app, window,
-  content='events', content_rowid='id',
-  tokenize='unicode61 remove_diacritics 2'
-);
-CREATE TRIGGER IF NOT EXISTS events_ai AFTER INSERT ON events BEGIN
-  INSERT INTO events_fts(rowid, text, app, window)
-  VALUES (new.id, new.text, new.app, new.window);
-END;
-CREATE TRIGGER IF NOT EXISTS events_ad AFTER DELETE ON events BEGIN
-  INSERT INTO events_fts(events_fts, rowid, text, app, window)
-  VALUES ('delete', old.id, old.text, old.app, old.window);
-END;
-CREATE TRIGGER IF NOT EXISTS events_au AFTER UPDATE ON events BEGIN
-  INSERT INTO events_fts(events_fts, rowid, text, app, window)
-  VALUES ('delete', old.id, old.text, old.app, old.window);
-  INSERT INTO events_fts(rowid, text, app, window)
-  VALUES (new.id, new.text, new.app, new.window);
-END;`
-	if _, err := s.db.ExecContext(ctx, schema); err != nil {
-		return fmt.Errorf("migrate database (SQLite must include FTS5): %w", err)
-	}
-	return nil
+	return s.runMigrations(ctx)
 }
 
 func (s *Store) Insert(ctx context.Context, event *Event) error {
@@ -172,6 +144,14 @@ func (s *Store) Search(ctx context.Context, opts SearchOptions) ([]Event, error)
 		where = append(where, "e.kind = ?")
 		args = append(args, opts.Kind)
 	}
+	if app := strings.TrimSpace(opts.App); app != "" {
+		where = append(where, "e.app = ? COLLATE NOCASE")
+		args = append(args, app)
+	}
+	if window := strings.TrimSpace(opts.Window); window != "" {
+		where = append(where, `e.window LIKE ? ESCAPE '\' COLLATE NOCASE`)
+		args = append(args, "%"+likeEscape(window)+"%")
+	}
 	if opts.Since != nil {
 		where = append(where, "e.captured_at >= ?")
 		args = append(args, opts.Since.UTC().Format(time.RFC3339Nano))
@@ -216,4 +196,79 @@ e.media_path, e.duration_ms, e.metadata_json, ` + rank + ` AS rank FROM ` + from
 		return nil, fmt.Errorf("iterate search results: %w", err)
 	}
 	return events, nil
+}
+
+// Expired returns events captured strictly before the cutoff, oldest first.
+// A limit of zero or less means no limit.
+func (s *Store) Expired(ctx context.Context, before time.Time, limit int) ([]Event, error) {
+	query := `SELECT id, kind, captured_at, text, app, window, media_path, duration_ms, metadata_json
+FROM events WHERE captured_at < ? ORDER BY captured_at ASC`
+	args := []any{before.UTC().Format(time.RFC3339Nano)}
+	if limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, limit)
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("select expired events: %w", err)
+	}
+	defer rows.Close()
+	events := make([]Event, 0)
+	for rows.Next() {
+		var event Event
+		var capturedAt, metadata string
+		if err := rows.Scan(&event.ID, &event.Kind, &capturedAt, &event.Text, &event.App,
+			&event.Window, &event.MediaPath, &event.DurationMS, &metadata); err != nil {
+			return nil, fmt.Errorf("scan expired event: %w", err)
+		}
+		event.CapturedAt, err = time.Parse(time.RFC3339Nano, capturedAt)
+		if err != nil {
+			return nil, fmt.Errorf("parse event timestamp %q: %w", capturedAt, err)
+		}
+		event.Metadata = json.RawMessage(metadata)
+		events = append(events, event)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate expired events: %w", err)
+	}
+	return events, nil
+}
+
+// deleteBatchSize bounds the IN (?, …) list well under SQLite's
+// SQLITE_MAX_VARIABLE_NUMBER (32766) so a large prune does not exceed it.
+const deleteBatchSize = 900
+
+// DeleteByIDs removes events and, via the events_ad trigger, their FTS rows.
+// It deletes in batches to stay under SQLite's bound-parameter limit, so a
+// prune of an arbitrarily large expired set never trips "too many SQL
+// variables". It does not touch media files; callers own that.
+func (s *Store) DeleteByIDs(ctx context.Context, ids []int64) (int64, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	var total int64
+	for start := 0; start < len(ids); start += deleteBatchSize {
+		end := start + deleteBatchSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		batch := ids[start:end]
+		placeholders := make([]string, len(batch))
+		args := make([]any, len(batch))
+		for i, id := range batch {
+			placeholders[i] = "?"
+			args[i] = id
+		}
+		result, err := s.db.ExecContext(ctx,
+			"DELETE FROM events WHERE id IN ("+strings.Join(placeholders, ",")+")", args...)
+		if err != nil {
+			return total, fmt.Errorf("delete events: %w", err)
+		}
+		deleted, err := result.RowsAffected()
+		if err != nil {
+			return total, fmt.Errorf("count deleted events: %w", err)
+		}
+		total += deleted
+	}
+	return total, nil
 }

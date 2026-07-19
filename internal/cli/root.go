@@ -19,6 +19,7 @@ import (
 	"github.com/puremetricsai/lumi/internal/cerebras"
 	"github.com/puremetricsai/lumi/internal/config"
 	"github.com/puremetricsai/lumi/internal/platform"
+	"github.com/puremetricsai/lumi/internal/retention"
 	"github.com/puremetricsai/lumi/internal/store"
 	"github.com/spf13/cobra"
 )
@@ -63,7 +64,7 @@ func newRootCommand() *cobra.Command {
 		},
 	}
 	cmd.PersistentFlags().StringVar(&a.dataDir, "data-dir", "", "data directory (default: $LUMI_HOME or ~/Library/Application Support/Lumi)")
-	cmd.AddCommand(a.recordCommand(), a.searchCommand(), a.askCommand(), a.doctorCommand())
+	cmd.AddCommand(a.recordCommand(), a.searchCommand(), a.askCommand(), a.pruneCommand(), a.doctorCommand())
 	cmd.AddCommand(&cobra.Command{Use: "version", Short: "Print the Lumi version", Run: func(*cobra.Command, []string) {
 		fmt.Fprintln(os.Stdout, version)
 	}})
@@ -151,7 +152,7 @@ func (a *app) recordCommand() *cobra.Command {
 }
 
 func (a *app) searchCommand() *cobra.Command {
-	var kind, since, until string
+	var kind, since, until, app, window string
 	var limit int
 	var asJSON bool
 	cmd := &cobra.Command{
@@ -163,7 +164,7 @@ func (a *app) searchCommand() *cobra.Command {
 			if len(args) == 1 {
 				query = args[0]
 			}
-			opts, err := searchOptions(query, kind, since, until, limit)
+			opts, err := searchOptions(query, kind, since, until, app, window, limit)
 			if err != nil {
 				return err
 			}
@@ -189,13 +190,15 @@ func (a *app) searchCommand() *cobra.Command {
 	flags.StringVar(&kind, "type", "all", "content type: all, screen, or audio")
 	flags.StringVar(&since, "since", "", "earliest time (RFC3339 or duration such as 8h)")
 	flags.StringVar(&until, "until", "", "latest time (RFC3339)")
+	flags.StringVar(&app, "app", "", "only events captured from this application (exact, case-insensitive)")
+	flags.StringVar(&window, "window", "", "only events whose window title contains this text")
 	flags.IntVar(&limit, "limit", 20, "maximum results")
 	flags.BoolVar(&asJSON, "json", false, "emit JSON")
 	return cmd
 }
 
 func (a *app) askCommand() *cobra.Command {
-	var since, model string
+	var since, model, app, window string
 	var limit, maxContextChars int
 	cmd := &cobra.Command{
 		Use:   "ask <question>",
@@ -207,7 +210,7 @@ func (a *app) askCommand() *cobra.Command {
 				return err
 			}
 			defer s.Close()
-			opts, err := searchOptions("", "all", since, "", limit)
+			opts, err := searchOptions("", "all", since, "", app, window, limit)
 			if err != nil {
 				return err
 			}
@@ -234,9 +237,63 @@ func (a *app) askCommand() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&since, "since", "24h", "activity window (RFC3339 or duration)")
+	cmd.Flags().StringVar(&app, "app", "", "restrict activity to this application")
+	cmd.Flags().StringVar(&window, "window", "", "restrict activity to windows whose title contains this text")
 	cmd.Flags().IntVar(&limit, "limit", 50, "maximum activity records sent to Cerebras")
 	cmd.Flags().StringVar(&model, "model", defaultCerebrasModel(), "Cerebras model; set $LUMI_CEREBRAS_MODEL to change the default")
 	cmd.Flags().IntVar(&maxContextChars, "max-context-chars", defaultContextChars, "character budget for the activity context sent to Cerebras")
+	return cmd
+}
+
+func (a *app) pruneCommand() *cobra.Command {
+	var olderThan string
+	var maxBytes int64
+	var dryRun, asJSON bool
+	cmd := &cobra.Command{
+		Use:   "prune",
+		Short: "Delete old events and their media files",
+		Long: "Delete indexed events and the screenshots or audio they point at.\n" +
+			"--older-than takes a Go duration (720h) or an RFC3339 timestamp; Go durations have no 'd' unit.",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			opts := retention.Options{MaxBytes: maxBytes, DryRun: dryRun}
+			if olderThan != "" {
+				before, err := parseTime(olderThan, true)
+				if err != nil {
+					return fmt.Errorf("parse --older-than: %w", err)
+				}
+				opts.Before = before
+			}
+			s, _, err := a.openStore(cmd.Context())
+			if err != nil {
+				return err
+			}
+			defer s.Close()
+			result, err := retention.Prune(cmd.Context(), s, opts)
+			if err != nil {
+				return err
+			}
+			if asJSON {
+				encoder := json.NewEncoder(os.Stdout)
+				encoder.SetIndent("", "  ")
+				return encoder.Encode(result)
+			}
+			verb := "deleted"
+			if dryRun {
+				verb = "would delete"
+			}
+			fmt.Fprintf(os.Stdout, "%s %d events, %.1f MiB of media\n",
+				verb, result.Events, float64(result.Bytes)/(1024*1024))
+			if result.MissingFiles > 0 {
+				fmt.Fprintf(os.Stdout, "%d events referenced media that was already gone\n", result.MissingFiles)
+			}
+			return nil
+		},
+	}
+	flags := cmd.Flags()
+	flags.StringVar(&olderThan, "older-than", "", "delete events older than this duration (e.g. 720h) or RFC3339 time")
+	flags.Int64Var(&maxBytes, "max-bytes", 0, "cap total media size in bytes, deleting oldest first (zero disables)")
+	flags.BoolVar(&dryRun, "dry-run", false, "report what would be deleted without deleting")
+	flags.BoolVar(&asJSON, "json", false, "emit JSON")
 	return cmd
 }
 
@@ -294,8 +351,8 @@ func defaultCerebrasModel() string {
 	return config.DefaultCerebrasModel
 }
 
-func searchOptions(query, kind, since, until string, limit int) (store.SearchOptions, error) {
-	opts := store.SearchOptions{Query: query, Limit: limit}
+func searchOptions(query, kind, since, until, app, window string, limit int) (store.SearchOptions, error) {
+	opts := store.SearchOptions{Query: query, App: app, Window: window, Limit: limit}
 	switch kind {
 	case "", "all":
 	case "screen":
