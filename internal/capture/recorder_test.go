@@ -2,9 +2,15 @@ package capture
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"image/color"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -15,32 +21,150 @@ import (
 
 type fakeScreen struct{ count atomic.Int64 }
 
-func (f *fakeScreen) Capture(_ context.Context, path string) error {
+func (f *fakeScreen) Capture(_ context.Context, directory, prefix string) ([]ScreenFrame, error) {
 	value := f.count.Add(1)
-	return os.WriteFile(path, []byte(fmt.Sprintf("fake-jpeg-%d", value)), 0o600)
+	path := filepath.Join(directory, fmt.Sprintf("%s-display-1.jpg", prefix))
+	err := os.WriteFile(path, []byte(fmt.Sprintf("fake-jpeg-%d", value)), 0o600)
+	return []ScreenFrame{{Path: path, DisplayID: 1, Width: 100, Height: 100}}, err
 }
 
-type fakeOCR struct{}
+type repeatedScreen struct{ contents []byte }
 
-func (fakeOCR) Extract(context.Context, string) (string, error) {
+func (s repeatedScreen) Capture(_ context.Context, directory, prefix string) ([]ScreenFrame, error) {
+	path := filepath.Join(directory, prefix+"-display-9.jpg")
+	err := os.WriteFile(path, s.contents, 0o600)
+	return []ScreenFrame{{Path: path, DisplayID: 9, Width: 64, Height: 36}}, err
+}
+
+type flakyScreen struct{ attempts atomic.Int64 }
+
+func (s *flakyScreen) Capture(ctx context.Context, directory, prefix string) ([]ScreenFrame, error) {
+	if s.attempts.Add(1) == 1 {
+		return nil, errors.New("transient ScreenCaptureKit failure")
+	}
+	return (&fakeScreen{}).Capture(ctx, directory, prefix)
+}
+
+type hotplugScreen struct {
+	calls    atomic.Int64
+	contents []byte
+}
+
+func (s *hotplugScreen) Capture(_ context.Context, directory, prefix string) ([]ScreenFrame, error) {
+	var displayIDs []uint32
+	switch s.calls.Add(1) {
+	case 1:
+		displayIDs = []uint32{1}
+	case 2:
+		displayIDs = []uint32{1, 2}
+	default:
+		displayIDs = []uint32{2}
+	}
+	frames := make([]ScreenFrame, 0, len(displayIDs))
+	for _, displayID := range displayIDs {
+		path := filepath.Join(directory, fmt.Sprintf("%s-display-%d.jpg", prefix, displayID))
+		if err := os.WriteFile(path, s.contents, 0o600); err != nil {
+			return nil, err
+		}
+		frames = append(frames, ScreenFrame{Path: path, DisplayID: displayID, Width: 64, Height: 36})
+	}
+	return frames, nil
+}
+
+type fakeVision struct{}
+
+func (fakeVision) Extract(context.Context, string) (string, error) {
 	return "Lumi end to end screen text", nil
+}
+
+type countingText struct{ calls atomic.Int64 }
+
+func (c *countingText) Extract(context.Context, string) (string, error) {
+	c.calls.Add(1)
+	return "Vision fallback", nil
+}
+
+type failingText struct{}
+
+func (failingText) Extract(context.Context, string) (string, error) {
+	return "", errors.New("Vision request failed")
+}
+
+type accessibilityText struct{}
+
+func (accessibilityText) Snapshot(context.Context) (ScreenContext, error) {
+	return ScreenContext{
+		App: "Notes", Window: "Plan", Text: "Accessibility primary text", DisplayID: 1,
+	}, nil
+}
+
+type fakeContext struct{}
+
+func (fakeContext) Snapshot(context.Context) (ScreenContext, error) {
+	return ScreenContext{App: "Test App", Window: "Test Window"}, nil
 }
 
 type fakeAudio struct{}
 
-func (fakeAudio) Record(ctx context.Context, path string, duration time.Duration) error {
+func (fakeAudio) Record(ctx context.Context, directory, prefix string, duration time.Duration) ([]AudioFrame, error) {
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return nil, ctx.Err()
 	case <-time.After(duration):
 	}
-	return os.WriteFile(path, []byte("fake-wave"), 0o600)
+	path := filepath.Join(directory, prefix+"-microphone.wav")
+	err := os.WriteFile(path, []byte("fake-wave"), 0o600)
+	return []AudioFrame{{Path: path, Source: "microphone", DurationMS: duration.Milliseconds()}}, err
+}
+
+type dualAudio struct{}
+
+func (dualAudio) Record(ctx context.Context, directory, prefix string, duration time.Duration) ([]AudioFrame, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(duration):
+	}
+	frames := []AudioFrame{
+		{Path: filepath.Join(directory, prefix+"-system.wav"), Source: "system", DurationMS: duration.Milliseconds()},
+		{Path: filepath.Join(directory, prefix+"-microphone.wav"), Source: "microphone", DurationMS: duration.Milliseconds()},
+	}
+	for _, frame := range frames {
+		if err := os.WriteFile(frame.Path, []byte("fake-wave"), 0o600); err != nil {
+			return nil, err
+		}
+	}
+	return frames, nil
+}
+
+type completionAfterCancelAudio struct{}
+
+func (completionAfterCancelAudio) Record(ctx context.Context, directory, prefix string, duration time.Duration) ([]AudioFrame, error) {
+	<-ctx.Done()
+	path := filepath.Join(directory, prefix+"-system.wav")
+	if err := os.WriteFile(path, []byte("late-native-wave"), 0o600); err != nil {
+		return nil, err
+	}
+	return []AudioFrame{{Path: path, Source: "system", DurationMS: duration.Milliseconds()}}, nil
 }
 
 type fakeTranscriber struct{}
 
 func (fakeTranscriber) Transcribe(context.Context, string) (string, error) {
 	return "Lumi end to end audio transcript", nil
+}
+
+type failingTranscriber struct{}
+
+func (failingTranscriber) Transcribe(context.Context, string) (string, error) {
+	return "", errors.New("whisper failed")
+}
+
+type countingTranscriber struct{ calls atomic.Int64 }
+
+func (t *countingTranscriber) Transcribe(context.Context, string) (string, error) {
+	t.calls.Add(1)
+	return "unexpected", nil
 }
 
 func TestRecorderCaptureProcessStoreSearch(t *testing.T) {
@@ -61,8 +185,8 @@ func TestRecorderCaptureProcessStoreSearch(t *testing.T) {
 	recorder := Recorder{
 		Store: s, Paths: paths, CaptureScreen: true, CaptureAudio: true,
 		ScreenInterval: 8 * time.Millisecond, AudioChunk: 8 * time.Millisecond,
-		Screen: &fakeScreen{}, OCR: fakeOCR{}, Audio: fakeAudio{}, Transcriber: fakeTranscriber{},
-		WindowContext: func(context.Context) (string, string) { return "Test App", "Test Window" },
+		Screen: &fakeScreen{}, Text: fakeVision{}, Context: fakeContext{},
+		Audio: fakeAudio{}, Transcriber: fakeTranscriber{},
 	}
 	recordCtx, cancel := context.WithTimeout(ctx, 35*time.Millisecond)
 	defer cancel()
@@ -77,6 +201,9 @@ func TestRecorderCaptureProcessStoreSearch(t *testing.T) {
 	if len(screen) == 0 || screen[0].App != "Test App" {
 		t.Fatalf("screen pipeline did not produce a searchable event: %#v", screen)
 	}
+	if screen[0].TextSource != "vision" || screen[0].DisplayID != 1 {
+		t.Fatalf("screen provenance was not stored: %#v", screen[0])
+	}
 	if _, err := os.Stat(screen[0].MediaPath); err != nil {
 		t.Fatalf("screen media was not preserved: %v", err)
 	}
@@ -88,7 +215,307 @@ func TestRecorderCaptureProcessStoreSearch(t *testing.T) {
 	if len(audio) == 0 || audio[0].DurationMS != 8 {
 		t.Fatalf("audio pipeline did not produce a searchable event: %#v", audio)
 	}
+	if audio[0].AudioSource != "microphone" {
+		t.Fatalf("audio provenance was not stored: %#v", audio[0])
+	}
 	if filepath.Ext(audio[0].MediaPath) != ".wav" {
 		t.Fatalf("unexpected audio media path: %s", audio[0].MediaPath)
+	}
+}
+
+func TestRecorderPrefersAccessibilityOverVision(t *testing.T) {
+	ctx := context.Background()
+	paths, err := config.FromRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := paths.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(ctx, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	vision := &countingText{}
+	recorder := Recorder{
+		Store: s, Paths: paths, CaptureScreen: true, ScreenInterval: time.Hour,
+		Screen: &fakeScreen{}, Text: vision, Context: accessibilityText{},
+	}
+	recordCtx, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
+	defer cancel()
+	if err := recorder.Run(recordCtx); err != nil {
+		t.Fatal(err)
+	}
+	if got := vision.calls.Load(); got != 0 {
+		t.Fatalf("Vision called %d times despite useful Accessibility text", got)
+	}
+	events, err := s.Search(ctx, store.SearchOptions{Query: "Accessibility primary"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].TextSource != "accessibility" {
+		t.Fatalf("Accessibility text was not primary: %#v", events)
+	}
+}
+
+func TestRecorderDeletesPerceptualDuplicatesFromDiskAndIndex(t *testing.T) {
+	ctx := context.Background()
+	paths, err := config.FromRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := paths.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(ctx, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	sourcePath := filepath.Join(t.TempDir(), "source.jpg")
+	writeSolidJPEG(t, sourcePath, color.RGBA{R: 40, G: 80, B: 120, A: 255})
+	contents, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := Recorder{
+		Store: s, Paths: paths, Screen: repeatedScreen{contents: contents}, Text: fakeVision{},
+		Context: accessibilityText{}, Comparer: &FrameComparer{MaxSilence: time.Hour},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	recorder.captureScreen(ctx)
+	recorder.captureScreen(ctx)
+
+	events, err := s.Search(ctx, store.SearchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("duplicate frame created %d indexed events, want 1", len(events))
+	}
+	files, err := os.ReadDir(paths.Screenshots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("duplicate frame left %d screenshot files, want 1", len(files))
+	}
+}
+
+func TestRecorderRecoversAfterTransientScreenFailure(t *testing.T) {
+	ctx := context.Background()
+	paths, err := config.FromRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(ctx, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	screen := &flakyScreen{}
+	recorder := Recorder{
+		Store: s, Paths: paths, CaptureScreen: true, ScreenInterval: 2 * time.Millisecond,
+		Screen: screen, Text: fakeVision{}, Context: fakeContext{},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	recordCtx, cancel := context.WithTimeout(ctx, 12*time.Millisecond)
+	defer cancel()
+	if err := recorder.Run(recordCtx); err != nil {
+		t.Fatal(err)
+	}
+	if screen.attempts.Load() < 2 {
+		t.Fatal("screen capture was not retried")
+	}
+	events, err := s.Search(ctx, store.SearchOptions{Query: "screen text"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) == 0 {
+		t.Fatal("recorder did not recover after transient screen failure")
+	}
+}
+
+func TestRecorderHandlesDisplayHotplugBetweenCaptures(t *testing.T) {
+	ctx := context.Background()
+	paths, err := config.FromRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := paths.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(ctx, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	sourcePath := filepath.Join(t.TempDir(), "display.jpg")
+	writeSolidJPEG(t, sourcePath, color.RGBA{R: 60, G: 90, B: 120, A: 255})
+	contents, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := Recorder{
+		Store: s, Paths: paths, Screen: &hotplugScreen{contents: contents},
+		Text: fakeVision{}, Context: accessibilityText{}, Comparer: &FrameComparer{MaxSilence: time.Hour},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	recorder.captureScreen(ctx) // display 1
+	recorder.captureScreen(ctx) // displays 1 and 2
+	recorder.captureScreen(ctx) // display 2
+
+	events, err := s.Search(ctx, store.SearchOptions{Limit: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	displays := map[uint32]int{}
+	for _, event := range events {
+		displays[event.DisplayID]++
+	}
+	if displays[1] != 1 || displays[2] != 1 || len(events) != 2 {
+		t.Fatalf("hotplug capture produced unexpected display events: %#v", events)
+	}
+}
+
+func TestRecorderPreservesMediaAfterProcessorFailures(t *testing.T) {
+	ctx := context.Background()
+	paths, err := config.FromRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := paths.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(ctx, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	sourcePath := filepath.Join(t.TempDir(), "source.jpg")
+	writeSolidJPEG(t, sourcePath, color.White)
+	contents, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	screenRecorder := Recorder{
+		Store: s, Paths: paths, Screen: repeatedScreen{contents: contents}, Text: failingText{},
+		Comparer: &FrameComparer{}, Logger: logger,
+	}
+	screenRecorder.captureScreen(ctx)
+
+	audioRecorder := Recorder{
+		Store: s, Paths: paths, CaptureAudio: true, AudioChunk: 2 * time.Millisecond,
+		Audio: fakeAudio{}, Transcriber: failingTranscriber{}, Logger: logger,
+	}
+	recordCtx, cancel := context.WithTimeout(ctx, 7*time.Millisecond)
+	defer cancel()
+	if err := audioRecorder.Run(recordCtx); err != nil {
+		t.Fatal(err)
+	}
+
+	events, err := s.Search(ctx, store.SearchOptions{Limit: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) < 2 {
+		t.Fatalf("processor failures lost events: %#v", events)
+	}
+	seen := map[store.Kind]bool{}
+	for _, event := range events {
+		if _, err := os.Stat(event.MediaPath); err != nil {
+			t.Errorf("processor failure lost %s media: %v", event.Kind, err)
+		}
+		var metadata map[string]any
+		if err := json.Unmarshal(event.Metadata, &metadata); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := metadata["processor_error"]; !ok {
+			t.Errorf("%s event omitted processor error: %s", event.Kind, event.Metadata)
+		}
+		seen[event.Kind] = true
+	}
+	if !seen[store.KindScreen] || !seen[store.KindAudio] {
+		t.Fatalf("expected preserved screen and audio events, got %#v", seen)
+	}
+}
+
+func TestRecorderIndexesSystemAndMicrophoneAudioSeparately(t *testing.T) {
+	ctx := context.Background()
+	paths, err := config.FromRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(ctx, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	recorder := Recorder{
+		Store: s, Paths: paths, CaptureAudio: true, AudioChunk: 5 * time.Millisecond,
+		Audio: dualAudio{}, Transcriber: fakeTranscriber{},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	recordCtx, cancel := context.WithTimeout(ctx, 15*time.Millisecond)
+	defer cancel()
+	if err := recorder.Run(recordCtx); err != nil {
+		t.Fatal(err)
+	}
+	events, err := s.Search(ctx, store.SearchOptions{Query: "audio transcript"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sources := map[string]bool{}
+	for _, event := range events {
+		sources[event.AudioSource] = true
+	}
+	if !sources["system"] || !sources["microphone"] {
+		t.Fatalf("expected separately indexed system and microphone audio, got %#v", events)
+	}
+}
+
+func TestRecorderIndexesNativeAudioCompletedAfterCancellation(t *testing.T) {
+	ctx := context.Background()
+	paths, err := config.FromRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(ctx, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	transcriber := &countingTranscriber{}
+	recorder := Recorder{
+		Store: s, Paths: paths, CaptureAudio: true, AudioChunk: 30 * time.Second,
+		Audio: completionAfterCancelAudio{}, Transcriber: transcriber,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	recordCtx, cancel := context.WithTimeout(ctx, 5*time.Millisecond)
+	defer cancel()
+	if err := recorder.Run(recordCtx); err != nil {
+		t.Fatal(err)
+	}
+	if transcriber.calls.Load() != 0 {
+		t.Fatal("transcriber should be skipped after recording cancellation")
+	}
+	events, err := s.Search(ctx, store.SearchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].AudioSource != "system" {
+		t.Fatalf("late native audio was not indexed: %#v", events)
+	}
+	if _, err := os.Stat(events[0].MediaPath); err != nil {
+		t.Fatalf("late native audio was not preserved: %v", err)
+	}
+	if !strings.Contains(string(events[0].Metadata), "transcription skipped after capture stopped") {
+		t.Fatalf("late native audio omitted cancellation provenance: %s", events[0].Metadata)
 	}
 }

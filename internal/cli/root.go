@@ -18,6 +18,7 @@ import (
 	"github.com/puremetricsai/lumi/internal/capture"
 	"github.com/puremetricsai/lumi/internal/cerebras"
 	"github.com/puremetricsai/lumi/internal/config"
+	"github.com/puremetricsai/lumi/internal/macosnative"
 	"github.com/puremetricsai/lumi/internal/platform"
 	"github.com/puremetricsai/lumi/internal/retention"
 	"github.com/puremetricsai/lumi/internal/store"
@@ -64,7 +65,8 @@ func newRootCommand() *cobra.Command {
 		},
 	}
 	cmd.PersistentFlags().StringVar(&a.dataDir, "data-dir", "", "data directory (default: $LUMI_HOME or ~/Library/Application Support/Lumi)")
-	cmd.AddCommand(a.recordCommand(), a.searchCommand(), a.askCommand(), a.pruneCommand(), a.doctorCommand())
+	cmd.AddCommand(a.recordCommand(), a.searchCommand(), a.askCommand(), a.pruneCommand(),
+		a.doctorCommand(), a.permissionsCommand(), a.nativeSmokeCommand())
 	cmd.AddCommand(&cobra.Command{Use: "version", Short: "Print the Lumi version", Run: func(*cobra.Command, []string) {
 		fmt.Fprintln(os.Stdout, version)
 	}})
@@ -96,9 +98,7 @@ func (a *app) openStore(ctx context.Context) (*store.Store, config.Paths, error)
 func (a *app) recordCommand() *cobra.Command {
 	var interval, audioChunk, duration time.Duration
 	var noScreen, noAudio bool
-	var display int
-	var audioDevice, ocrLanguage, whisperLanguage, whisperModel string
-	var screencaptureBinary, tesseractBinary, ffmpegBinary, whisperBinary string
+	var whisperLanguage, whisperModel, whisperBinary string
 	cmd := &cobra.Command{
 		Use:   "record",
 		Short: "Continuously capture, process, and index screen and audio activity",
@@ -108,6 +108,9 @@ func (a *app) recordCommand() *cobra.Command {
 			}
 			if !noAudio && whisperModel == "" {
 				return errors.New("audio transcription requires --whisper-model or LUMI_WHISPER_MODEL (use --no-audio for screen-only capture)")
+			}
+			if err := requireRecordingPermissions(cmd.Context(), !noScreen, !noAudio); err != nil {
+				return err
 			}
 			s, paths, err := a.openStore(cmd.Context())
 			if err != nil {
@@ -124,9 +127,10 @@ func (a *app) recordCommand() *cobra.Command {
 			recorder := capture.Recorder{
 				Store: s, Paths: paths, ScreenInterval: interval, AudioChunk: audioChunk,
 				CaptureScreen: !noScreen, CaptureAudio: !noAudio, Logger: logger,
-				Screen:      capture.ScreenCapturer{Binary: screencaptureBinary, Display: display},
-				OCR:         capture.OCR{Binary: tesseractBinary, Language: ocrLanguage},
-				Audio:       capture.AudioRecorder{Binary: ffmpegBinary, Device: audioDevice},
+				Screen:      capture.NativeScreens{},
+				Text:        capture.VisionText{},
+				Context:     capture.AccessibilityContext{},
+				Audio:       capture.NativeAudio{},
 				Transcriber: capture.Transcriber{Binary: whisperBinary, ModelPath: whisperModel, Language: whisperLanguage},
 			}
 			logger.Info("recording started", "database", paths.Database, "screen", !noScreen, "audio", !noAudio)
@@ -134,19 +138,13 @@ func (a *app) recordCommand() *cobra.Command {
 		},
 	}
 	flags := cmd.Flags()
-	flags.DurationVar(&interval, "interval", 5*time.Second, "screen capture interval")
+	flags.DurationVar(&interval, "interval", 2*time.Second, "screen capture interval")
 	flags.DurationVar(&audioChunk, "audio-chunk", 30*time.Second, "audio chunk duration")
 	flags.DurationVar(&duration, "duration", 0, "stop after this duration (zero runs until interrupted)")
-	flags.BoolVar(&noScreen, "no-screen", false, "disable screen capture and OCR")
+	flags.BoolVar(&noScreen, "no-screen", false, "disable screen capture and text extraction")
 	flags.BoolVar(&noAudio, "no-audio", false, "disable audio capture and transcription")
-	flags.IntVar(&display, "display", 1, "macOS display number to capture")
-	flags.StringVar(&audioDevice, "audio-device", "0", "FFmpeg AVFoundation audio device index")
-	flags.StringVar(&ocrLanguage, "ocr-language", "eng", "Tesseract language")
 	flags.StringVar(&whisperLanguage, "whisper-language", "en", "Whisper language")
 	flags.StringVar(&whisperModel, "whisper-model", os.Getenv("LUMI_WHISPER_MODEL"), "path to a whisper.cpp model")
-	flags.StringVar(&screencaptureBinary, "screencapture-binary", "/usr/sbin/screencapture", "screencapture executable")
-	flags.StringVar(&tesseractBinary, "tesseract-binary", "tesseract", "Tesseract executable")
-	flags.StringVar(&ffmpegBinary, "ffmpeg-binary", "ffmpeg", "FFmpeg executable")
 	flags.StringVar(&whisperBinary, "whisper-binary", "whisper-cli", "whisper.cpp executable")
 	return cmd
 }
@@ -157,7 +155,7 @@ func (a *app) searchCommand() *cobra.Command {
 	var asJSON bool
 	cmd := &cobra.Command{
 		Use:   "search [text]",
-		Short: "Full-text search OCR and audio transcripts",
+		Short: "Full-text search screen text and audio transcripts",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			query := ""
@@ -308,7 +306,30 @@ func (a *app) doctorCommand() *cobra.Command {
 			}
 			fmt.Fprintf(os.Stdout, "platform\tok\tApple Silicon macOS\n")
 			missing := false
-			for _, binary := range []string{"/usr/sbin/screencapture", "tesseract", "ffmpeg", "whisper-cli"} {
+			permissions, permissionErr := macosnative.PermissionStatus(cmd.Context())
+			if permissionErr != nil {
+				fmt.Fprintf(os.Stdout, "native capture\tmissing\t%v\n", permissionErr)
+				missing = true
+			} else {
+				for _, permission := range []struct{ name, status, settings string }{
+					{"Screen Recording", permissions.ScreenRecording, "Privacy & Security > Screen & System Audio Recording"},
+					{"Accessibility", permissions.Accessibility, "Privacy & Security > Accessibility"},
+					{"Input Monitoring", permissions.InputMonitoring, "optional; only needed by future event-tap capture"},
+					{"Microphone", permissions.Microphone, "Privacy & Security > Microphone"},
+				} {
+					state := "ok"
+					if permission.status != "granted" {
+						state = "missing"
+						if permission.name == "Input Monitoring" {
+							state = "optional"
+						} else {
+							missing = true
+						}
+					}
+					fmt.Fprintf(os.Stdout, "%s permission\t%s\t%s (%s)\n", permission.name, state, permission.status, permission.settings)
+				}
+			}
+			for _, binary := range []string{"whisper-cli"} {
 				resolved, lookupErr := exec.LookPath(binary)
 				if lookupErr != nil {
 					fmt.Fprintf(os.Stdout, "%s\tmissing\t%s\n", filepath.Base(binary), lookupErr)
@@ -334,11 +355,119 @@ func (a *app) doctorCommand() *cobra.Command {
 			fmt.Fprintf(os.Stdout, "Cerebras model\tok\t%s\n", defaultCerebrasModel())
 			fmt.Fprintf(os.Stdout, "data directory\tok\t%s\n", paths.Root)
 			if missing {
-				return errors.New("one or more recording requirements are missing")
+				return errors.New("one or more recording requirements are missing; run `./lumi permissions --request` for macOS capture permissions")
 			}
 			return nil
 		},
 	}
+}
+
+func (a *app) permissionsCommand() *cobra.Command {
+	var request, inputMonitoring bool
+	cmd := &cobra.Command{
+		Use:   "permissions",
+		Short: "Show or request native macOS capture permissions",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			var permissions macosnative.Permissions
+			var err error
+			if request {
+				permissions, err = macosnative.RequestPermissions(cmd.Context(), inputMonitoring)
+			} else {
+				permissions, err = macosnative.PermissionStatus(cmd.Context())
+			}
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "Screen Recording\t%s\n", permissions.ScreenRecording)
+			fmt.Fprintf(cmd.OutOrStdout(), "Accessibility\t%s\n", permissions.Accessibility)
+			fmt.Fprintf(cmd.OutOrStdout(), "Input Monitoring\t%s\n", permissions.InputMonitoring)
+			fmt.Fprintf(cmd.OutOrStdout(), "Microphone\t%s\n", permissions.Microphone)
+			if request && (permissions.ScreenRecording != "granted" ||
+				permissions.Accessibility != "granted" || permissions.Microphone != "granted") {
+				return errors.New("finish approving Lumi in System Settings, then restart the command")
+			}
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&request, "request", false, "open the native macOS permission request flows")
+	cmd.Flags().BoolVar(&inputMonitoring, "input-monitoring", false,
+		"also request optional Input Monitoring permission")
+	return cmd
+}
+
+func (a *app) nativeSmokeCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "native-smoke",
+		Short: "Run a bounded native capture test without indexing media",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := requireRecordingPermissions(cmd.Context(), true, true); err != nil {
+				return err
+			}
+			directory, err := os.MkdirTemp("", "lumi-native-smoke-")
+			if err != nil {
+				return fmt.Errorf("create native smoke directory: %w", err)
+			}
+			defer os.RemoveAll(directory)
+
+			frames, err := macosnative.CaptureScreens(cmd.Context(), directory, "screen")
+			if err != nil {
+				return err
+			}
+			if _, err := macosnative.RecognizeText(cmd.Context(), frames[0].Path); err != nil {
+				return fmt.Errorf("run Vision smoke test: %w", err)
+			}
+			snapshot, err := macosnative.Accessibility(cmd.Context())
+			if err != nil {
+				return fmt.Errorf("run Accessibility smoke test: %w", err)
+			}
+			if snapshot.App == "" {
+				return errors.New("Accessibility smoke test returned no frontmost application")
+			}
+			audio, err := macosnative.RecordAudio(cmd.Context(), directory, "audio", 0.5)
+			if err != nil {
+				return err
+			}
+			sources := make(map[string]bool)
+			for _, frame := range audio {
+				contents, err := os.ReadFile(frame.Path)
+				if err != nil {
+					return fmt.Errorf("read %s audio smoke output: %w", frame.Source, err)
+				}
+				if len(contents) < 12 || string(contents[:4]) != "RIFF" || string(contents[8:12]) != "WAVE" {
+					return fmt.Errorf("%s audio smoke output is not a WAV file", frame.Source)
+				}
+				sources[frame.Source] = true
+			}
+			if !sources["system"] || !sources["microphone"] {
+				return fmt.Errorf("native audio smoke test requires system and microphone outputs, got %v", sources)
+			}
+			fmt.Fprintf(cmd.OutOrStdout(),
+				"native capture ok: %d displays, Accessibility app %q, Vision ok, system audio ok, microphone ok\n",
+				len(frames), snapshot.App)
+			return nil
+		},
+	}
+}
+
+func requireRecordingPermissions(ctx context.Context, screen, audio bool) error {
+	permissions, err := macosnative.PermissionStatus(ctx)
+	if err != nil {
+		return fmt.Errorf("check native macOS permissions: %w", err)
+	}
+	var missing []string
+	if (screen || audio) && permissions.ScreenRecording != "granted" {
+		missing = append(missing, "Screen Recording (System Settings > Privacy & Security > Screen & System Audio Recording)")
+	}
+	if screen && permissions.Accessibility != "granted" {
+		missing = append(missing, "Accessibility (System Settings > Privacy & Security > Accessibility)")
+	}
+	if audio && permissions.Microphone != "granted" {
+		missing = append(missing, "Microphone (System Settings > Privacy & Security > Microphone)")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("grant required macOS permissions to this terminal or the Lumi binary: %s; run `./lumi permissions --request`", strings.Join(missing, "; "))
+	}
+	return nil
 }
 
 // defaultCerebrasModel resolves the model the same way --whisper-model

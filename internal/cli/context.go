@@ -13,14 +13,14 @@ const (
 	// defaultContextChars budgets the activity context sent to Cerebras.
 	// Budgeting in characters rather than tokens avoids a tokenizer
 	// dependency; the ratio assumed here is a pessimistic ~3 chars/token,
-	// because OCR output (garbled words, UI chrome, symbols) tokenizes far
-	// worse than prose. 60000 chars is therefore ~20k tokens, which leaves
+	// because screen text (UI chrome, symbols, and occasional Vision errors)
+	// tokenizes worse than prose. 60000 chars is therefore ~20k tokens, which leaves
 	// room for the 1200-token completion reserve and the prompt scaffold
 	// inside a 32k context. The floor is deliberately conservative: --model
 	// and LUMI_CEREBRAS_MODEL let users point at smaller models, and
 	// --max-context-chars is the escape hatch for larger ones.
 	defaultContextChars = 60000
-	// maxEventChars caps any single event so one full-page OCR dump cannot
+	// maxEventChars caps any single event so one full-page screen-text dump cannot
 	// consume the whole budget.
 	maxEventChars  = 2000
 	ellipsis       = "…"
@@ -54,11 +54,12 @@ func trimToRunes(s string, max int) string {
 	return s[:max]
 }
 
-// compactOCR strips the padding whitespace that dominates OCR output: each
+// compactScreenText strips the padding whitespace that dominates extracted
+// screen text: each
 // line is trimmed and blank lines are dropped. Line structure is preserved on
 // purpose — collapsing all whitespace (strings.Fields) would destroy the
 // layout that makes screen text readable.
-func compactOCR(s string) string {
+func compactScreenText(s string) string {
 	lines := strings.Split(s, "\n")
 	kept := lines[:0]
 	for _, line := range lines {
@@ -79,9 +80,10 @@ func compactOCR(s string) string {
 func contextFor(events []store.Event, budget int) string {
 	var builder strings.Builder
 	for i, event := range events {
-		block := fmt.Sprintf("[%s] kind=%s app=%q window=%q media=%q\n%s\n\n",
+		block := fmt.Sprintf("[%s] kind=%s app=%q window=%q text_source=%q display_id=%d audio_source=%q media=%q\n%s\n\n",
 			event.CapturedAt.Format(time.RFC3339), event.Kind, event.App, event.Window,
-			event.MediaPath, truncateRunes(compactOCR(event.Text), maxEventChars))
+			event.TextSource, event.DisplayID, event.AudioSource, event.MediaPath,
+			truncateRunes(compactScreenText(event.Text), maxEventChars))
 		// The marker is part of the output, so its cost has to be reserved
 		// before the block is admitted — otherwise appending it overshoots.
 		marker := fmt.Sprintf(omissionMarker, len(events)-i)

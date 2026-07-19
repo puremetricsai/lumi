@@ -61,6 +61,17 @@ END;`,
 CREATE INDEX IF NOT EXISTS events_app_captured_at_idx
   ON events(app COLLATE NOCASE, captured_at DESC);`,
 	},
+	{
+		Version: 3,
+		SQL: `
+ALTER TABLE events ADD COLUMN text_source TEXT NOT NULL DEFAULT '';
+ALTER TABLE events ADD COLUMN display_id INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE events ADD COLUMN audio_source TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS events_display_captured_at_idx
+  ON events(display_id, captured_at DESC);
+CREATE INDEX IF NOT EXISTS events_audio_source_captured_at_idx
+  ON events(audio_source, captured_at DESC);`,
+	},
 }
 
 // runMigrations applies every migration whose version exceeds the database's

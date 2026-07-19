@@ -3,73 +3,86 @@ package capture
 import (
 	"context"
 	"fmt"
-	"os/exec"
 	"strings"
+
+	"github.com/puremetricsai/lumi/internal/macosnative"
 )
 
-type ScreenCapturer struct {
-	Binary  string
-	Display int
+// ScreenFrame is a captured image and the stable CoreGraphics display ID that
+// produced it. A source enumerates displays on every capture, so display
+// hotplug does not require restarting the recorder.
+type ScreenFrame struct {
+	Path         string
+	DisplayID    uint32
+	Width        int
+	Height       int
+	CaptureError string
 }
 
-func (c ScreenCapturer) Capture(ctx context.Context, destination string) error {
-	binary := c.Binary
-	if binary == "" {
-		binary = "/usr/sbin/screencapture"
-	}
-	display := c.Display
-	if display <= 0 {
-		display = 1
-	}
-	output, err := exec.CommandContext(ctx, binary, "-x", "-t", "jpg", "-D", fmt.Sprint(display), destination).CombinedOutput()
+type ScreenContext struct {
+	App         string
+	Window      string
+	Text        string
+	DisplayID   uint32
+	InputActive bool
+}
+
+type ScreenSource interface {
+	Capture(context.Context, string, string) ([]ScreenFrame, error)
+}
+
+type TextExtractor interface {
+	Extract(context.Context, string) (string, error)
+}
+
+type ContextExtractor interface {
+	Snapshot(context.Context) (ScreenContext, error)
+}
+
+// NativeScreens captures every currently connected display with
+// ScreenCaptureKit's SCScreenshotManager.
+type NativeScreens struct{}
+
+func (NativeScreens) Capture(ctx context.Context, directory, prefix string) ([]ScreenFrame, error) {
+	frames, err := macosnative.CaptureScreens(ctx, directory, prefix)
 	if err != nil {
-		return commandError("capture screen", err, output)
+		return nil, fmt.Errorf("capture displays with ScreenCaptureKit: %w", err)
 	}
-	return nil
+	result := make([]ScreenFrame, 0, len(frames))
+	for _, frame := range frames {
+		result = append(result, ScreenFrame{
+			Path: frame.Path, DisplayID: frame.DisplayID, Width: frame.Width, Height: frame.Height,
+			CaptureError: frame.CaptureError,
+		})
+	}
+	return result, nil
 }
 
-type OCR struct {
-	Binary   string
-	Language string
-}
+// AccessibilityContext reads the focused application's Accessibility tree.
+// It is the primary screen-text source; Vision is only invoked when the tree
+// is unavailable or contains no useful text.
+type AccessibilityContext struct{}
 
-func (o OCR) Extract(ctx context.Context, imagePath string) (string, error) {
-	binary := o.Binary
-	if binary == "" {
-		binary = "tesseract"
-	}
-	args := []string{imagePath, "stdout", "--psm", "3"}
-	if o.Language != "" {
-		args = append(args, "-l", o.Language)
-	}
-	output, err := exec.CommandContext(ctx, binary, args...).CombinedOutput()
+func (AccessibilityContext) Snapshot(ctx context.Context) (ScreenContext, error) {
+	snapshot, err := macosnative.Accessibility(ctx)
 	if err != nil {
-		return "", commandError("run OCR", err, output)
+		return ScreenContext{}, fmt.Errorf("read macOS Accessibility tree: %w", err)
 	}
-	return strings.TrimSpace(string(output)), nil
+	return ScreenContext{
+		App: snapshot.App, Window: snapshot.Window, Text: snapshot.Text,
+		DisplayID: snapshot.DisplayID, InputActive: snapshot.InputActive,
+	}, nil
 }
 
-func FrontmostWindow(ctx context.Context) (app, window string) {
-	const script = `tell application "System Events"
-set frontProcess to first application process whose frontmost is true
-set appName to name of frontProcess
-try
-set windowName to name of front window of frontProcess
-on error
-set windowName to ""
-end try
-return appName & linefeed & windowName
-end tell`
-	output, err := exec.CommandContext(ctx, "/usr/bin/osascript", "-e", script).Output()
+// VisionText performs on-device Apple Vision text recognition.
+type VisionText struct{}
+
+func (VisionText) Extract(ctx context.Context, imagePath string) (string, error) {
+	text, err := macosnative.RecognizeText(ctx, imagePath)
 	if err != nil {
-		return "", ""
+		return "", fmt.Errorf("recognize text with Apple Vision: %w", err)
 	}
-	parts := strings.SplitN(strings.TrimSpace(string(output)), "\n", 2)
-	app = strings.TrimSpace(parts[0])
-	if len(parts) == 2 {
-		window = strings.TrimSpace(parts[1])
-	}
-	return app, window
+	return strings.TrimSpace(text), nil
 }
 
 func commandError(action string, err error, output []byte) error {

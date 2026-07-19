@@ -91,3 +91,41 @@ func TestMigrateUpgradesLegacyDatabase(t *testing.T) {
 		t.Fatalf("legacy row should be findable exactly once, got %d rows", len(got))
 	}
 }
+
+func TestCaptureProvenanceRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	event := Event{
+		Kind: KindScreen, Text: "native text", MediaPath: "display.jpg",
+		TextSource: "accessibility", DisplayID: 42,
+	}
+	if err := s.Insert(ctx, &event); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Search(ctx, SearchOptions{Query: "native"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].TextSource != "accessibility" || got[0].DisplayID != 42 {
+		t.Fatalf("capture provenance did not round trip: %#v", got)
+	}
+
+	audio := Event{
+		Kind: KindAudio, Text: "meeting", MediaPath: "system.wav", AudioSource: "system",
+	}
+	if err := s.Insert(ctx, &audio); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.Search(ctx, SearchOptions{Query: "meeting"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].AudioSource != "system" {
+		t.Fatalf("audio provenance did not round trip: %#v", got)
+	}
+}

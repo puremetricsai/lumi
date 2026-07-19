@@ -20,16 +20,19 @@ const (
 )
 
 type Event struct {
-	ID         int64           `json:"id"`
-	Kind       Kind            `json:"kind"`
-	CapturedAt time.Time       `json:"captured_at"`
-	Text       string          `json:"text"`
-	App        string          `json:"app,omitempty"`
-	Window     string          `json:"window,omitempty"`
-	MediaPath  string          `json:"media_path"`
-	DurationMS int64           `json:"duration_ms,omitempty"`
-	Metadata   json.RawMessage `json:"metadata,omitempty"`
-	Rank       float64         `json:"rank,omitempty"`
+	ID          int64           `json:"id"`
+	Kind        Kind            `json:"kind"`
+	CapturedAt  time.Time       `json:"captured_at"`
+	Text        string          `json:"text"`
+	App         string          `json:"app,omitempty"`
+	Window      string          `json:"window,omitempty"`
+	MediaPath   string          `json:"media_path"`
+	DurationMS  int64           `json:"duration_ms,omitempty"`
+	TextSource  string          `json:"text_source,omitempty"`
+	DisplayID   uint32          `json:"display_id,omitempty"`
+	AudioSource string          `json:"audio_source,omitempty"`
+	Metadata    json.RawMessage `json:"metadata,omitempty"`
+	Rank        float64         `json:"rank,omitempty"`
 }
 
 type SearchOptions struct {
@@ -98,9 +101,11 @@ func (s *Store) Insert(ctx context.Context, event *Event) error {
 		return errors.New("event metadata is not valid JSON")
 	}
 	result, err := s.db.ExecContext(ctx, `
-INSERT INTO events(kind, captured_at, text, app, window, media_path, duration_ms, metadata_json)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, event.Kind, event.CapturedAt.UTC().Format(time.RFC3339Nano),
-		event.Text, event.App, event.Window, event.MediaPath, event.DurationMS, string(event.Metadata))
+INSERT INTO events(kind, captured_at, text, app, window, media_path, duration_ms,
+                   text_source, display_id, audio_source, metadata_json)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, event.Kind, event.CapturedAt.UTC().Format(time.RFC3339Nano),
+		event.Text, event.App, event.Window, event.MediaPath, event.DurationMS,
+		event.TextSource, event.DisplayID, event.AudioSource, string(event.Metadata))
 	if err != nil {
 		return fmt.Errorf("insert event: %w", err)
 	}
@@ -131,7 +136,7 @@ func (s *Store) Search(ctx context.Context, opts SearchOptions) ([]Event, error)
 		args = append(args, match)
 		// bm25 length-normalizes per column, so a hit in the one-word app or
 		// window column scores far higher than the same term buried in a page
-		// of OCR. Under MatchAll that rarely mattered; under MatchAny it would
+		// of screen text. Under MatchAll that rarely mattered; under MatchAny it would
 		// let stray window titles outrank substantive content. Weights are
 		// applied only here so `search` ranking is unchanged.
 		if opts.Match == MatchAny {
@@ -161,7 +166,8 @@ func (s *Store) Search(ctx context.Context, opts SearchOptions) ([]Event, error)
 		args = append(args, opts.Until.UTC().Format(time.RFC3339Nano))
 	}
 	query := `SELECT e.id, e.kind, e.captured_at, e.text, e.app, e.window,
-e.media_path, e.duration_ms, e.metadata_json, ` + rank + ` AS rank FROM ` + from
+e.media_path, e.duration_ms, e.text_source, e.display_id, e.audio_source, e.metadata_json,
+` + rank + ` AS rank FROM ` + from
 	if len(where) > 0 {
 		query += " WHERE " + strings.Join(where, " AND ")
 	}
@@ -182,7 +188,8 @@ e.media_path, e.duration_ms, e.metadata_json, ` + rank + ` AS rank FROM ` + from
 		var event Event
 		var capturedAt, metadata string
 		if err := rows.Scan(&event.ID, &event.Kind, &capturedAt, &event.Text, &event.App,
-			&event.Window, &event.MediaPath, &event.DurationMS, &metadata, &event.Rank); err != nil {
+			&event.Window, &event.MediaPath, &event.DurationMS, &event.TextSource, &event.DisplayID,
+			&event.AudioSource, &metadata, &event.Rank); err != nil {
 			return nil, fmt.Errorf("scan search result: %w", err)
 		}
 		event.CapturedAt, err = time.Parse(time.RFC3339Nano, capturedAt)
@@ -201,7 +208,8 @@ e.media_path, e.duration_ms, e.metadata_json, ` + rank + ` AS rank FROM ` + from
 // Expired returns events captured strictly before the cutoff, oldest first.
 // A limit of zero or less means no limit.
 func (s *Store) Expired(ctx context.Context, before time.Time, limit int) ([]Event, error) {
-	query := `SELECT id, kind, captured_at, text, app, window, media_path, duration_ms, metadata_json
+	query := `SELECT id, kind, captured_at, text, app, window, media_path, duration_ms,
+text_source, display_id, audio_source, metadata_json
 FROM events WHERE captured_at < ? ORDER BY captured_at ASC`
 	args := []any{before.UTC().Format(time.RFC3339Nano)}
 	if limit > 0 {
@@ -218,7 +226,8 @@ FROM events WHERE captured_at < ? ORDER BY captured_at ASC`
 		var event Event
 		var capturedAt, metadata string
 		if err := rows.Scan(&event.ID, &event.Kind, &capturedAt, &event.Text, &event.App,
-			&event.Window, &event.MediaPath, &event.DurationMS, &metadata); err != nil {
+			&event.Window, &event.MediaPath, &event.DurationMS, &event.TextSource, &event.DisplayID,
+			&event.AudioSource, &metadata); err != nil {
 			return nil, fmt.Errorf("scan expired event: %w", err)
 		}
 		event.CapturedAt, err = time.Parse(time.RFC3339Nano, capturedAt)

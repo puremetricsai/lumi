@@ -10,7 +10,7 @@ import (
 )
 
 // TestContextForRespectsBudget is the regression for the reported defect:
-// contextFor used to concatenate every event's full OCR text with no cap.
+// contextFor used to concatenate every event's full screen text with no cap.
 func TestContextForRespectsBudget(t *testing.T) {
 	events := make([]store.Event, 50)
 	for i := range events {
@@ -117,10 +117,10 @@ func TestContextForEmpty(t *testing.T) {
 	}
 }
 
-func TestCompactOCR(t *testing.T) {
+func TestCompactScreenText(t *testing.T) {
 	in := "  File   Edit  View  \n\n\n   \n  main.go — lumi  \n\n  func main() {  \n"
 	want := "File   Edit  View\nmain.go — lumi\nfunc main() {"
-	if got := compactOCR(in); got != want {
-		t.Fatalf("compactOCR:\n got %q\nwant %q", got, want)
+	if got := compactScreenText(in); got != want {
+		t.Fatalf("compactScreenText:\n got %q\nwant %q", got, want)
 	}
 }
