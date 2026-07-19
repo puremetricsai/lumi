@@ -31,9 +31,9 @@ Data flows one way: `internal/cli` wires concrete processors into a `capture.Rec
 
 **`internal/capture`** — `Recorder` runs independent screen and audio goroutines until the context is cancelled. Every external tool sits behind a small interface (`ScreenSource`, `TextExtractor`, `AudioSource`, `SpeechTranscriber`); the concrete types (`ScreenCapturer`, `OCR`, `AudioRecorder`, `Transcriber`) are thin `exec.CommandContext` wrappers whose binary path is injectable via flags. Add new capture or processing sources by implementing an interface, not by editing the loops.
 
-**`internal/store`** — single-file SQLite via `modernc.org/sqlite` (pure Go, no cgo). `MaxOpenConns(1)` plus WAL; schema is applied idempotently in `migrate` on every `Open` — there is no versioned migration system, so schema changes must stay `CREATE ... IF NOT EXISTS`-safe against existing databases. The `events_fts` external-content FTS5 table is kept in sync by insert/delete/update triggers, so writes go only to `events`. Timestamps are stored as RFC3339Nano UTC strings and compared lexicographically — any new time column must use the same format or range filters break.
+**`internal/store`** — single-file SQLite via `modernc.org/sqlite` (pure Go, no cgo). `MaxOpenConns(1)` plus WAL; schema changes are versioned migrations in `internal/store/migrations.go`, applied on every `Open` and tracked by SQLite's `user_version` pragma (each migration runs in its own transaction). The `events_fts` external-content FTS5 table is kept in sync by insert/delete/update triggers, so writes go only to `events`. Timestamps are stored as RFC3339Nano UTC strings and compared lexicographically — any new time column must use the same format or range filters break.
 
-**`internal/cli`** — Cobra commands (`record`, `search`, `ask`, `doctor`, `version`). All processor binaries, languages, and intervals are flags with sane defaults, so tests and users can substitute tools.
+**`internal/cli`** — Cobra commands (`record`, `search`, `ask`, `prune`, `doctor`, `version`). All processor binaries, languages, and intervals are flags with sane defaults, so tests and users can substitute tools.
 
 **`internal/config`** — resolves `Paths` from `--data-dir`, else `LUMI_HOME`, else `~/Library/Application Support/Lumi`; directories are created 0700.
 
@@ -46,6 +46,8 @@ Data flows one way: `internal/cli` wires concrete processors into a `capture.Rec
 - **A degraded retrieval is never silent.** Any stage past `all-terms` prints a note to stderr, so a recency-shaped answer is never mistaken for a retrieved one.
 - **`lumi ask` sends text and metadata only** — screenshots and WAVs are never uploaded. Keep it that way.
 - **The activity context is byte-budgeted in `contextFor`** (`internal/cli/context.go`): `maxEventChars` per event, `--max-context-chars` overall, always at least one event. The store never truncates `Event.Text` — that would corrupt `lumi search --json`, which is a data-export path.
+- **Schema changes go through `internal/store/migrations.go`.** Append a new `migration` with the next version number; never edit shipped SQL. The applied version lives in SQLite's `user_version` pragma.
+- **Pruning deletes rows before files.** Orphaned files are recoverable; rows pointing at missing media are not. `lumi prune` is the only code path permitted to delete media.
 
 ## External dependencies
 
