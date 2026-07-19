@@ -197,3 +197,63 @@ e.media_path, e.duration_ms, e.metadata_json, ` + rank + ` AS rank FROM ` + from
 	}
 	return events, nil
 }
+
+// Expired returns events captured strictly before the cutoff, oldest first.
+// A limit of zero or less means no limit.
+func (s *Store) Expired(ctx context.Context, before time.Time, limit int) ([]Event, error) {
+	query := `SELECT id, kind, captured_at, text, app, window, media_path, duration_ms, metadata_json
+FROM events WHERE captured_at < ? ORDER BY captured_at ASC`
+	args := []any{before.UTC().Format(time.RFC3339Nano)}
+	if limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, limit)
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("select expired events: %w", err)
+	}
+	defer rows.Close()
+	events := make([]Event, 0)
+	for rows.Next() {
+		var event Event
+		var capturedAt, metadata string
+		if err := rows.Scan(&event.ID, &event.Kind, &capturedAt, &event.Text, &event.App,
+			&event.Window, &event.MediaPath, &event.DurationMS, &metadata); err != nil {
+			return nil, fmt.Errorf("scan expired event: %w", err)
+		}
+		event.CapturedAt, err = time.Parse(time.RFC3339Nano, capturedAt)
+		if err != nil {
+			return nil, fmt.Errorf("parse event timestamp %q: %w", capturedAt, err)
+		}
+		event.Metadata = json.RawMessage(metadata)
+		events = append(events, event)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate expired events: %w", err)
+	}
+	return events, nil
+}
+
+// DeleteByIDs removes events and, via the events_ad trigger, their FTS rows.
+// It does not touch media files; callers own that.
+func (s *Store) DeleteByIDs(ctx context.Context, ids []int64) (int64, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	result, err := s.db.ExecContext(ctx,
+		"DELETE FROM events WHERE id IN ("+strings.Join(placeholders, ",")+")", args...)
+	if err != nil {
+		return 0, fmt.Errorf("delete events: %w", err)
+	}
+	deleted, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("count deleted events: %w", err)
+	}
+	return deleted, nil
+}

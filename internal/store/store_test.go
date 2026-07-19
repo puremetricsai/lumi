@@ -162,6 +162,74 @@ func TestSearchFiltersByWindowSubstring(t *testing.T) {
 	}
 }
 
+func TestExpiredAndDeleteByIDs(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	old := Event{Kind: KindScreen, CapturedAt: now.Add(-48 * time.Hour), Text: "ancient", MediaPath: "old.jpg"}
+	fresh := Event{Kind: KindScreen, CapturedAt: now, Text: "current", MediaPath: "new.jpg"}
+	for _, e := range []*Event{&old, &fresh} {
+		if err := s.Insert(ctx, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	expired, err := s.Expired(ctx, now.Add(-24*time.Hour), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(expired) != 1 || expired[0].ID != old.ID {
+		t.Fatalf("expected only the 48h-old event, got %#v", expired)
+	}
+
+	deleted, err := s.DeleteByIDs(ctx, []int64{old.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 1 {
+		t.Fatalf("DeleteByIDs = %d, want 1", deleted)
+	}
+
+	// The FTS index must have been cleaned by the delete trigger.
+	got, err := s.Search(ctx, SearchOptions{Query: "ancient"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("deleted event must not remain searchable, got %#v", got)
+	}
+
+	remaining, err := s.Search(ctx, SearchOptions{Query: "current"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remaining) != 1 {
+		t.Fatalf("the fresh event must survive, got %#v", remaining)
+	}
+}
+
+func TestDeleteByIDsWithNoIDs(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	deleted, err := s.DeleteByIDs(ctx, nil)
+	if err != nil {
+		t.Fatalf("deleting nothing must not error: %v", err)
+	}
+	if deleted != 0 {
+		t.Fatalf("DeleteByIDs(nil) = %d, want 0", deleted)
+	}
+}
+
 // A window filter containing LIKE wildcards must be treated as literal text.
 func TestSearchWindowFilterEscapesWildcards(t *testing.T) {
 	ctx := context.Background()
