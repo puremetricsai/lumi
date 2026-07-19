@@ -2,13 +2,11 @@ package capture
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
@@ -20,31 +18,16 @@ type Recorder struct {
 	Store          *store.Store
 	Paths          config.Paths
 	Screen         ScreenSource
-	OCR            TextExtractor
+	Text           TextExtractor
+	Context        ContextExtractor
 	Audio          AudioSource
 	Transcriber    SpeechTranscriber
-	WindowContext  func(context.Context) (string, string)
+	Comparer       *FrameComparer
 	ScreenInterval time.Duration
 	AudioChunk     time.Duration
 	CaptureScreen  bool
 	CaptureAudio   bool
 	Logger         *slog.Logger
-
-	lastScreenHash [sha256.Size]byte
-	haveScreenHash bool
-	mu             sync.Mutex
-}
-
-type ScreenSource interface {
-	Capture(context.Context, string) error
-}
-
-type TextExtractor interface {
-	Extract(context.Context, string) (string, error)
-}
-
-type AudioSource interface {
-	Record(context.Context, string, time.Duration) error
 }
 
 type SpeechTranscriber interface {
@@ -58,20 +41,23 @@ func (r *Recorder) Run(ctx context.Context) error {
 	if !r.CaptureScreen && !r.CaptureAudio {
 		return errors.New("at least one of screen or audio capture must be enabled")
 	}
-	if r.CaptureScreen && (r.Screen == nil || r.OCR == nil) {
-		return errors.New("screen source and OCR processor are required")
+	if r.CaptureScreen && (r.Screen == nil || r.Text == nil) {
+		return errors.New("screen source and fallback text extractor are required")
 	}
 	if r.CaptureAudio && (r.Audio == nil || r.Transcriber == nil) {
 		return errors.New("audio source and transcriber are required")
 	}
 	if r.ScreenInterval <= 0 {
-		r.ScreenInterval = 5 * time.Second
+		r.ScreenInterval = 2 * time.Second
 	}
 	if r.AudioChunk <= 0 {
 		r.AudioChunk = 30 * time.Second
 	}
 	if r.Logger == nil {
 		r.Logger = slog.Default()
+	}
+	if r.Comparer == nil {
+		r.Comparer = &FrameComparer{}
 	}
 	if err := r.Paths.Ensure(); err != nil {
 		return err
@@ -112,56 +98,98 @@ func (r *Recorder) screenLoop(ctx context.Context) {
 
 func (r *Recorder) captureScreen(ctx context.Context) {
 	now := time.Now().UTC()
-	path := filepath.Join(r.Paths.Screenshots, fileStamp(now)+".jpg")
-	if err := r.Screen.Capture(ctx, path); err != nil {
+	frames, err := r.Screen.Capture(ctx, r.Paths.Screenshots, fileStamp(now))
+	if err != nil {
 		if ctx.Err() == nil {
 			r.Logger.Error("screen capture failed", "error", err)
 		}
 		return
 	}
-	contents, err := os.ReadFile(path)
-	if err != nil {
-		r.Logger.Error("read screenshot", "error", err)
-		return
-	}
-	hash := sha256.Sum256(contents)
-	r.mu.Lock()
-	duplicate := r.haveScreenHash && hash == r.lastScreenHash
-	if !duplicate {
-		r.lastScreenHash = hash
-		r.haveScreenHash = true
-	}
-	r.mu.Unlock()
-	if duplicate {
-		if err := os.Remove(path); err != nil {
-			r.Logger.Warn("remove duplicate screenshot", "error", err)
+	var screenContext ScreenContext
+	var contextErr error
+	if r.Context != nil {
+		processingCtx, cancel := preservationContext(ctx)
+		screenContext, contextErr = r.Context.Snapshot(processingCtx)
+		cancel()
+		if contextErr != nil {
+			r.Logger.Warn("Accessibility extraction failed; using Vision fallback", "error", contextErr)
 		}
-		return
 	}
-	windowContext := r.WindowContext
-	if windowContext == nil {
-		windowContext = FrontmostWindow
+	for _, frame := range frames {
+		duplicate, similarity, compareErr := r.Comparer.Duplicate(
+			frame.Path, frame.DisplayID, screenContext.InputActive, now)
+		if compareErr != nil {
+			r.Logger.Warn("frame comparison failed; preserving frame", "path", frame.Path, "error", compareErr)
+		}
+		if duplicate {
+			if err := os.Remove(frame.Path); err != nil {
+				r.Logger.Warn("remove duplicate screenshot", "path", frame.Path, "error", err)
+			}
+			continue
+		}
+		text := ""
+		textSource := "accessibility"
+		var processErr error
+		if contextErr == nil && screenContext.Text != "" &&
+			(screenContext.DisplayID == 0 || screenContext.DisplayID == frame.DisplayID) {
+			text = screenContext.Text
+		} else {
+			textSource = "vision"
+			processingCtx, cancel := preservationContext(ctx)
+			text, processErr = r.Text.Extract(processingCtx, frame.Path)
+			cancel()
+		}
+		metadata := screenMetadata(frame, textSource, similarity, processErr, contextErr, compareErr)
+		event := &store.Event{Kind: store.KindScreen, CapturedAt: now, Text: text,
+			App: screenContext.App, Window: screenContext.Window, MediaPath: frame.Path,
+			TextSource: textSource, DisplayID: frame.DisplayID, Metadata: metadata}
+		storeCtx, cancel := preservationContext(ctx)
+		err := r.Store.Insert(storeCtx, event)
+		cancel()
+		if err != nil {
+			r.Logger.Error("store screen event", "path", frame.Path, "error", err)
+			continue
+		}
+		r.Logger.Info("captured screen", "id", event.ID, "display", frame.DisplayID,
+			"app", screenContext.App, "text_source", textSource, "characters", len(text))
+		if processErr != nil {
+			r.Logger.Warn("Vision failed; screenshot was still indexed", "error", processErr)
+		}
 	}
-	app, window := windowContext(ctx)
-	text, processErr := r.OCR.Extract(ctx, path)
-	metadata := processorMetadata(processErr)
-	event := &store.Event{Kind: store.KindScreen, CapturedAt: now, Text: text, App: app,
-		Window: window, MediaPath: path, Metadata: metadata}
-	if err := r.Store.Insert(ctx, event); err != nil {
-		r.Logger.Error("store screen event", "error", err)
-		return
+}
+
+func screenMetadata(frame ScreenFrame, textSource string, similarity float64, processErr, contextErr, compareErr error) json.RawMessage {
+	metadata := map[string]any{
+		"display_id":       frame.DisplayID,
+		"width":            frame.Width,
+		"height":           frame.Height,
+		"text_source":      textSource,
+		"frame_similarity": similarity,
 	}
-	r.Logger.Info("captured screen", "id", event.ID, "app", app, "characters", len(text))
 	if processErr != nil {
-		r.Logger.Warn("OCR failed; screenshot was still indexed", "error", processErr)
+		metadata["processor_error"] = processErr.Error()
 	}
+	if contextErr != nil {
+		metadata["accessibility_error"] = contextErr.Error()
+	}
+	if compareErr != nil {
+		metadata["comparison_error"] = compareErr.Error()
+	}
+	if frame.CaptureError != "" {
+		metadata["capture_error"] = frame.CaptureError
+	}
+	data, err := json.Marshal(metadata)
+	if err != nil {
+		return processorMetadata(err)
+	}
+	return data
 }
 
 func (r *Recorder) audioLoop(ctx context.Context) {
 	for ctx.Err() == nil {
 		now := time.Now().UTC()
-		path := filepath.Join(r.Paths.Audio, fileStamp(now)+".wav")
-		if err := r.Audio.Record(ctx, path, r.AudioChunk); err != nil {
+		frames, err := r.Audio.Record(ctx, r.Paths.Audio, fileStamp(now), r.AudioChunk)
+		if err != nil {
 			if ctx.Err() == nil {
 				r.Logger.Error("audio capture failed", "error", err)
 				select {
@@ -172,21 +200,57 @@ func (r *Recorder) audioLoop(ctx context.Context) {
 			}
 			continue
 		}
-		text, processErr := r.Transcriber.Transcribe(ctx, path)
-		if ctx.Err() != nil {
-			return
-		}
-		event := &store.Event{Kind: store.KindAudio, CapturedAt: now, Text: text, MediaPath: path,
-			DurationMS: r.AudioChunk.Milliseconds(), Metadata: processorMetadata(processErr)}
-		if err := r.Store.Insert(ctx, event); err != nil {
-			r.Logger.Error("store audio event", "error", err)
-			continue
-		}
-		r.Logger.Info("captured audio", "id", event.ID, "characters", len(text))
-		if processErr != nil {
-			r.Logger.Warn("transcription failed; audio was still indexed", "error", processErr)
+		for _, frame := range frames {
+			text := ""
+			var processErr error
+			if ctx.Err() != nil {
+				processErr = fmt.Errorf("transcription skipped after capture stopped: %w", ctx.Err())
+			} else {
+				text, processErr = r.Transcriber.Transcribe(ctx, frame.Path)
+			}
+			event := &store.Event{Kind: store.KindAudio, CapturedAt: now, Text: text, MediaPath: frame.Path,
+				DurationMS: frame.DurationMS, AudioSource: frame.Source,
+				Metadata: audioMetadata(frame.Source, frame.CaptureError, processErr)}
+			storeCtx, cancel := preservationContext(ctx)
+			err := r.Store.Insert(storeCtx, event)
+			cancel()
+			if err != nil {
+				r.Logger.Error("store audio event", "path", frame.Path, "error", err)
+				continue
+			}
+			r.Logger.Info("captured audio", "id", event.ID, "source", frame.Source, "characters", len(text))
+			if processErr != nil {
+				r.Logger.Warn("transcription failed; audio was still indexed", "source", frame.Source, "error", processErr)
+			}
 		}
 	}
+}
+
+// preservationContext gives already-written media a short, cancellation-free
+// window to finish processor diagnostics and its database insert. Native
+// ScreenCaptureKit calls are synchronous at this boundary and can return media
+// just after the recording context is canceled; abandoning that media would
+// create an unindexed orphan.
+func preservationContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx.Err() == nil {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+}
+
+func audioMetadata(source, captureError string, processErr error) json.RawMessage {
+	metadata := map[string]string{"audio_source": source}
+	if captureError != "" {
+		metadata["capture_error"] = captureError
+	}
+	if processErr != nil {
+		metadata["processor_error"] = processErr.Error()
+	}
+	data, err := json.Marshal(metadata)
+	if err != nil {
+		return processorMetadata(err)
+	}
+	return data
 }
 
 func processorMetadata(err error) json.RawMessage {

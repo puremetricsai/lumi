@@ -17,6 +17,7 @@ tasks:
     desc: Build the lumi binary
     sources:
       - '**/*.go'
+      - '**/*.m'
       - go.mod
       - go.sum
     generates:
@@ -33,6 +34,21 @@ tasks:
     desc: Run all tests with verbose output
     cmds:
       - go test -v ./... {{.CLI_ARGS}}
+
+  test:native:
+    desc: Run the permission-gated ScreenCaptureKit, Accessibility, Vision, and audio smoke test
+    platforms: [darwin]
+    preconditions:
+      - sh: test "$(uname -m)" = arm64
+        msg: Native capture requires an Apple Silicon Mac
+    deps: [build]
+    cmds:
+      - ./{{.BINARY}} native-smoke
+
+  bench:capture:
+    desc: Benchmark perceptual frame comparison
+    cmds:
+      - go test ./internal/capture -run '^$' -bench 'Benchmark(SampledHistogram|FrameComparerExactDuplicate)' -benchmem -count=1
 
   test:one:
     desc: 'Run a single test (e.g. task test:one -- -run TestSearch ./internal/store)'
@@ -79,10 +95,18 @@ tasks:
       - rm -f {{.BINARY}} coverage.out
 
   doctor:
-    desc: Report which external binaries, models, and API keys are available
+    desc: Report native permissions, models, binaries, and API configuration
     deps: [build]
     cmds:
       - ./{{.BINARY}} doctor
+
+  permissions:
+    desc: Request native macOS capture permissions for the stable Lumi binary
+    platforms: [darwin]
+    deps: [build]
+    interactive: true
+    cmds:
+      - ./{{.BINARY}} permissions --request {{.CLI_ARGS}}
 
   record:
     desc: 'Capture screen + audio (e.g. task record -- --no-audio --duration 10s)'

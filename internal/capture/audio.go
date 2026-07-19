@@ -8,36 +8,39 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/puremetricsai/lumi/internal/macosnative"
 )
 
-type AudioRecorder struct {
-	Binary string
-	Device string
+type AudioFrame struct {
+	Path         string
+	Source       string
+	DurationMS   int64
+	CaptureError string
 }
 
-func (r AudioRecorder) Record(ctx context.Context, destination string, duration time.Duration) error {
-	binary := r.Binary
-	if binary == "" {
-		binary = "ffmpeg"
-	}
-	device := r.Device
-	if device == "" {
-		device = "0"
-	}
-	args := []string{
-		"-hide_banner", "-loglevel", "error",
-		"-f", "avfoundation", "-i", ":" + device,
-		"-t", fmt.Sprintf("%.3f", duration.Seconds()),
-		"-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-y", destination,
-	}
-	output, err := exec.CommandContext(ctx, binary, args...).CombinedOutput()
+type AudioSource interface {
+	Record(context.Context, string, string, time.Duration) ([]AudioFrame, error)
+}
+
+// NativeAudio records system output and the default microphone concurrently
+// from one ScreenCaptureKit stream. Both sources are emitted as independent
+// mono 16 kHz WAV chunks so transcription and source attribution stay clear.
+type NativeAudio struct{}
+
+func (NativeAudio) Record(ctx context.Context, directory, prefix string, duration time.Duration) ([]AudioFrame, error) {
+	frames, err := macosnative.RecordAudio(ctx, directory, prefix, duration.Seconds())
 	if err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		return commandError("record audio", err, output)
+		return nil, fmt.Errorf("record system and microphone audio with ScreenCaptureKit: %w", err)
 	}
-	return nil
+	result := make([]AudioFrame, 0, len(frames))
+	for _, frame := range frames {
+		result = append(result, AudioFrame{
+			Path: frame.Path, Source: frame.Source, DurationMS: frame.DurationMS,
+			CaptureError: frame.CaptureError,
+		})
+	}
+	return result, nil
 }
 
 type Transcriber struct {

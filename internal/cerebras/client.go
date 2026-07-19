@@ -53,7 +53,7 @@ func (c Client) Answer(ctx context.Context, question, activityContext string) (s
 	request := chatRequest{
 		Model: model,
 		Messages: []message{
-			{Role: "system", Content: "You answer questions using the supplied local work-activity records. Be concise, distinguish screen OCR from audio transcripts, cite event timestamps, and say when the records do not support a claim."},
+			{Role: "system", Content: "You answer questions using the supplied local work-activity records. Be concise, distinguish Accessibility or Vision screen text from system or microphone audio transcripts, cite event timestamps, and say when the records do not support a claim."},
 			{Role: "user", Content: "Work-activity records:\n\n" + activityContext + "\n\nQuestion: " + question},
 		},
 		MaxCompletionTokens: 1200,
