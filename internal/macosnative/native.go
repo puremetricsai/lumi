@@ -4,7 +4,11 @@ package macosnative
 
 /*
 #cgo CFLAGS: -fblocks -fobjc-arc
-#cgo LDFLAGS: -framework AppKit -framework ApplicationServices -framework AudioToolbox -framework AVFoundation -framework CoreGraphics -framework CoreMedia -framework CoreVideo -framework Foundation -framework ImageIO -framework ScreenCaptureKit -framework UniformTypeIdentifiers -framework Vision
+// LDFLAGS spike (Task 1): -L${SRCDIR} -llumispeech -framework Speech linked
+// liblumispeech.a on the first try on this toolchain (macOS 26.5.2, Xcode
+// 26.6, Swift 6.3) — no Swift-runtime fallback flags (-L/usr/lib/swift,
+// -Wl,-rpath,/usr/lib/swift, -lswiftCore -lswift_Concurrency) were needed.
+#cgo LDFLAGS: -framework AppKit -framework ApplicationServices -framework AudioToolbox -framework AVFoundation -framework CoreGraphics -framework CoreMedia -framework CoreVideo -framework Foundation -framework ImageIO -framework ScreenCaptureKit -framework UniformTypeIdentifiers -framework Vision -L${SRCDIR} -llumispeech -framework Speech
 #include <stdlib.h>
 #include <stdbool.h>
 
@@ -15,6 +19,7 @@ char *lumi_permissions_json(char **error_message);
 char *lumi_request_permissions_json(bool input_monitoring, char **error_message);
 char *lumi_record_audio_json(const char *directory, const char *prefix, double duration_seconds, char **error_message);
 void lumi_os_version(int *major, int *minor, int *patch);
+char *lumi_speech_ping(void);
 */
 import "C"
 
@@ -175,6 +180,18 @@ func OSVersion() (major, minor, patch int, err error) {
 	var nativeMajor, nativeMinor, nativePatch C.int
 	C.lumi_os_version(&nativeMajor, &nativeMinor, &nativePatch)
 	return int(nativeMajor), int(nativeMinor), int(nativePatch), nil
+}
+
+// SpeechPing proves the Swift speech bridge is linked and callable. It needs no
+// permissions or assets and exists so a fast, permission-free test can assert
+// the cgo↔Swift boundary works.
+func SpeechPing() string {
+	value := C.lumi_speech_ping()
+	if value == nil {
+		return ""
+	}
+	defer C.free(unsafe.Pointer(value))
+	return C.GoString(value)
 }
 
 func nativeJSON(value, errorMessage *C.char) ([]byte, error) {

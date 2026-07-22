@@ -13,11 +13,23 @@ tasks:
       - task --list
     silent: true
 
+  speech:
+    desc: Compile the Swift SpeechAnalyzer bridge into a static archive
+    platforms: [darwin]
+    sources:
+      - internal/macosnative/speech.swift
+    generates:
+      - internal/macosnative/liblumispeech.a
+    cmds:
+      - swiftc -emit-library -static -O -o internal/macosnative/liblumispeech.a internal/macosnative/speech.swift
+
   build:
     desc: Build the lumi binary
+    deps: [speech]
     sources:
       - '**/*.go'
       - '**/*.m'
+      - internal/macosnative/liblumispeech.a
       - go.mod
       - go.sum
     generates:
@@ -48,6 +60,7 @@ tasks:
 
   test:
     desc: Run all tests
+    deps: [speech]
     cmds:
       - go test ./... {{.CLI_ARGS}}
 

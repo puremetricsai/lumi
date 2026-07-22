@@ -60,3 +60,5 @@ func RecordAudio(context.Context, string, string, float64) ([]AudioFrame, error)
 }
 
 func OSVersion() (int, int, int, error) { return 0, 0, 0, errUnsupported }
+
+func SpeechPing() string { return "" }

@@ -67,6 +67,12 @@ func TestAccessibilitySnapshotWhenPermissionIsGranted(t *testing.T) {
 	}
 }
 
+func TestSpeechBridgeLinks(t *testing.T) {
+	if got := SpeechPing(); got != "pong" {
+		t.Fatalf("Swift speech bridge not linked: got %q, want \"pong\"", got)
+	}
+}
+
 func TestNativeCaptureSmoke(t *testing.T) {
 	if os.Getenv("LUMI_NATIVE_SMOKE") != "1" {
 		t.Skip("set LUMI_NATIVE_SMOKE=1 after granting Lumi permissions")

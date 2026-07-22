@@ -44,3 +44,6 @@ docs/superpowers/
 
 # Taskfile
 .task/
+
+# Swift speech bridge (generated)
+internal/macosnative/liblumispeech.a
