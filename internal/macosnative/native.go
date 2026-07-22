@@ -217,31 +217,31 @@ func SpeechPing() string {
 	return C.GoString(value)
 }
 
-// SpeechStatus reports whether the current OS, authorization state, and
+// SpeechCapability reports whether the current OS, authorization state, and
 // locale asset availability are sufficient for on-device SpeechAnalyzer
 // transcription. AssetsInstalled is a proxy backed by
 // [SFSpeechRecognizer supportedLocales], the only per-locale signal readable
 // from Objective-C; the authoritative asset state comes from Swift's
 // AssetInventory at transcribe time.
-type SpeechStatus struct {
+type SpeechCapability struct {
 	OSSupported     bool   `json:"os_supported"`
 	Locale          string `json:"locale"`
 	AssetsInstalled bool   `json:"assets_installed"`
 	Authorization   string `json:"authorization"`
 }
 
-func GetSpeechStatus(ctx context.Context, locale string) (SpeechStatus, error) {
+func SpeechStatus(ctx context.Context, locale string) (SpeechCapability, error) {
 	if err := ctx.Err(); err != nil {
-		return SpeechStatus{}, err
+		return SpeechCapability{}, err
 	}
 	localeC := C.CString(locale)
 	defer C.free(unsafe.Pointer(localeC))
 	var nativeErr *C.char
 	result, err := nativeJSON(C.lumi_speech_status_json(localeC, &nativeErr), nativeErr)
 	if err != nil {
-		return SpeechStatus{}, err
+		return SpeechCapability{}, err
 	}
-	var status SpeechStatus
+	var status SpeechCapability
 	if err := json.Unmarshal(result, &status); err != nil {
 		return status, fmt.Errorf("decode speech status: %w", err)
 	}
