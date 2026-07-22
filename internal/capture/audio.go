@@ -43,6 +43,25 @@ func (NativeAudio) Record(ctx context.Context, directory, prefix string, duratio
 	return result, nil
 }
 
+// NativeSpeech transcribes WAV chunks with Apple's on-device SpeechAnalyzer via
+// the macosnative bridge. Locale selects the recognition assets; empty defaults
+// to en-US.
+type NativeSpeech struct {
+	Locale string
+}
+
+func (n NativeSpeech) Transcribe(ctx context.Context, audioPath string) (string, error) {
+	locale := n.Locale
+	if locale == "" {
+		locale = "en-US"
+	}
+	text, err := macosnative.TranscribeAudio(ctx, audioPath, locale)
+	if err != nil {
+		return "", fmt.Errorf("transcribe audio with SpeechAnalyzer: %w", err)
+	}
+	return text, nil
+}
+
 type Transcriber struct {
 	Binary    string
 	ModelPath string
