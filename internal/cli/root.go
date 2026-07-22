@@ -98,16 +98,13 @@ func (a *app) openStore(ctx context.Context) (*store.Store, config.Paths, error)
 func (a *app) recordCommand() *cobra.Command {
 	var interval, audioChunk, duration time.Duration
 	var noScreen, noAudio bool
-	var whisperLanguage, whisperModel, whisperBinary string
+	var speechLocale string
 	cmd := &cobra.Command{
 		Use:   "record",
 		Short: "Continuously capture, process, and index screen and audio activity",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if noScreen && noAudio {
 				return errors.New("--no-screen and --no-audio cannot be used together")
-			}
-			if !noAudio && whisperModel == "" {
-				return errors.New("audio transcription requires --whisper-model or LUMI_WHISPER_MODEL (use --no-audio for screen-only capture)")
 			}
 			if err := requireRecordingPermissions(cmd.Context(), !noScreen, !noAudio); err != nil {
 				return err
@@ -131,7 +128,7 @@ func (a *app) recordCommand() *cobra.Command {
 				Text:        capture.VisionText{},
 				Context:     capture.AccessibilityContext{},
 				Audio:       capture.NativeAudio{},
-				Transcriber: capture.Transcriber{Binary: whisperBinary, ModelPath: whisperModel, Language: whisperLanguage},
+				Transcriber: capture.NativeSpeech{Locale: speechLocale},
 			}
 			logger.Info("recording started", "database", paths.Database, "screen", !noScreen, "audio", !noAudio)
 			return recorder.Run(ctx)
@@ -143,9 +140,7 @@ func (a *app) recordCommand() *cobra.Command {
 	flags.DurationVar(&duration, "duration", 0, "stop after this duration (zero runs until interrupted)")
 	flags.BoolVar(&noScreen, "no-screen", false, "disable screen capture and text extraction")
 	flags.BoolVar(&noAudio, "no-audio", false, "disable audio capture and transcription")
-	flags.StringVar(&whisperLanguage, "whisper-language", "en", "Whisper language")
-	flags.StringVar(&whisperModel, "whisper-model", os.Getenv("LUMI_WHISPER_MODEL"), "path to a whisper.cpp model")
-	flags.StringVar(&whisperBinary, "whisper-binary", "whisper-cli", "whisper.cpp executable")
+	flags.StringVar(&speechLocale, "speech-locale", "en-US", "SpeechAnalyzer recognition locale")
 	return cmd
 }
 
@@ -470,9 +465,8 @@ func requireRecordingPermissions(ctx context.Context, screen, audio bool) error 
 	return nil
 }
 
-// defaultCerebrasModel resolves the model the same way --whisper-model
-// resolves LUMI_WHISPER_MODEL: an explicit flag beats the environment, which
-// beats the built-in default.
+// defaultCerebrasModel resolves the model: an explicit flag beats the
+// environment, which beats the built-in default.
 func defaultCerebrasModel() string {
 	if model := strings.TrimSpace(os.Getenv("LUMI_CEREBRAS_MODEL")); model != "" {
 		return model
