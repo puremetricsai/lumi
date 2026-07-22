@@ -84,6 +84,9 @@ func TestTranscribeAudioSmoke(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(audio) == 0 {
+		t.Fatal("RecordAudio returned no frames")
+	}
 	// A short real recording may be silence; we assert the pipeline runs
 	// without error and returns a string (possibly empty text is NOT allowed
 	// to be an error path — an empty successful transcript is valid here only
