@@ -7,9 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -324,23 +322,29 @@ func (a *app) doctorCommand() *cobra.Command {
 					fmt.Fprintf(os.Stdout, "%s permission\t%s\t%s (%s)\n", permission.name, state, permission.status, permission.settings)
 				}
 			}
-			for _, binary := range []string{"whisper-cli"} {
-				resolved, lookupErr := exec.LookPath(binary)
-				if lookupErr != nil {
-					fmt.Fprintf(os.Stdout, "%s\tmissing\t%s\n", filepath.Base(binary), lookupErr)
-					missing = true
-				} else {
-					fmt.Fprintf(os.Stdout, "%s\tok\t%s\n", filepath.Base(binary), resolved)
-				}
-			}
-			if model := os.Getenv("LUMI_WHISPER_MODEL"); model == "" {
-				fmt.Fprintln(os.Stdout, "whisper model\tmissing\tset LUMI_WHISPER_MODEL or pass --whisper-model")
-				missing = true
-			} else if _, statErr := os.Stat(model); statErr != nil {
-				fmt.Fprintf(os.Stdout, "whisper model\tmissing\t%v\n", statErr)
+			speech, speechErr := macosnative.SpeechStatus(cmd.Context(), "en-US")
+			if speechErr != nil {
+				fmt.Fprintf(os.Stdout, "speech transcription\tmissing\t%v\n", speechErr)
 				missing = true
 			} else {
-				fmt.Fprintf(os.Stdout, "whisper model\tok\t%s\n", model)
+				if speech.OSSupported {
+					fmt.Fprintf(os.Stdout, "speech OS support\tok\tmacOS 26+ (SpeechAnalyzer)\n")
+				} else {
+					fmt.Fprintf(os.Stdout, "speech OS support\tmissing\tSpeechAnalyzer requires macOS 26\n")
+					missing = true
+				}
+				authState := "ok"
+				if speech.Authorization != "granted" {
+					authState = "missing"
+					missing = true
+				}
+				fmt.Fprintf(os.Stdout, "Speech Recognition permission\t%s\t%s (Privacy & Security > Speech Recognition)\n", authState, speech.Authorization)
+				if speech.AssetsInstalled {
+					fmt.Fprintf(os.Stdout, "speech assets (%s)\tok\tinstalled\n", speech.Locale)
+				} else {
+					fmt.Fprintf(os.Stdout, "speech assets (%s)\tmissing\tlocale assets not installed; run `./lumi record` once to fetch\n", speech.Locale)
+					missing = true
+				}
 			}
 			if os.Getenv("CEREBRAS_API_KEY") == "" {
 				fmt.Fprintln(os.Stdout, "Cerebras API key\toptional\tset CEREBRAS_API_KEY to use lumi ask")
@@ -377,8 +381,10 @@ func (a *app) permissionsCommand() *cobra.Command {
 			fmt.Fprintf(cmd.OutOrStdout(), "Accessibility\t%s\n", permissions.Accessibility)
 			fmt.Fprintf(cmd.OutOrStdout(), "Input Monitoring\t%s\n", permissions.InputMonitoring)
 			fmt.Fprintf(cmd.OutOrStdout(), "Microphone\t%s\n", permissions.Microphone)
+			fmt.Fprintf(cmd.OutOrStdout(), "Speech Recognition\t%s\n", permissions.SpeechRecognition)
 			if request && (permissions.ScreenRecording != "granted" ||
-				permissions.Accessibility != "granted" || permissions.Microphone != "granted") {
+				permissions.Accessibility != "granted" || permissions.Microphone != "granted" ||
+				permissions.SpeechRecognition != "granted") {
 				return errors.New("finish approving Lumi in System Settings, then restart the command")
 			}
 			return nil
