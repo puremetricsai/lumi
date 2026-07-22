@@ -13,6 +13,7 @@ go build -o lumi ./cmd/lumi
 go test ./...
 go vet ./...
 go test ./internal/store -run TestSearch -v   # single test
+task test:native                            # permission-gated native smoke test
 ```
 
 `internal/capture/recorder_test.go` runs the whole capture→store→search pipeline with fake `ScreenSource`/`ContextExtractor`/`TextExtractor`/`AudioSource`/`SpeechTranscriber` implementations, so it needs no permissions or external binaries. Prefer extending it over invoking real frameworks. `task test:native` builds the stable `./lumi` binary and runs the explicit, permission-gated integration smoke test.
@@ -35,7 +36,9 @@ Data flows one way: `internal/cli` wires concrete processors into a `capture.Rec
 
 **`internal/store`** — single-file SQLite via `modernc.org/sqlite` (pure Go, no cgo). `MaxOpenConns(1)` plus WAL; schema changes are versioned migrations in `internal/store/migrations.go`, applied on every `Open` and tracked by SQLite's `user_version` pragma (each migration runs in its own transaction). The `events_fts` external-content FTS5 table is kept in sync by insert/delete/update triggers, so writes go only to `events`. Timestamps are stored as RFC3339Nano UTC strings and compared lexicographically — any new time column must use the same format or range filters break.
 
-**`internal/cli`** — Cobra commands (`record`, `search`, `ask`, `prune`, `doctor`, `permissions`, `native-smoke`, `version`). Capture and audio-chunk intervals and whisper settings are flags; native framework implementations are production defaults. `permissions --request` invokes native TCC request flows; never add `tccutil reset` as an automatic side effect.
+**`internal/retention`** — explicit age- and size-based pruning used by `lumi prune`. Age pruning runs before size pruning; size enforcement walks indexed events oldest-first. There is no background scheduler or default retention policy. Rows are deleted in bounded batches before media files are unlinked.
+
+**`internal/cli`** — Cobra commands (`record`, `search`, `ask`, `prune`, `doctor`, `permissions`, `native-smoke`, `version`). Capture and audio-chunk intervals and whisper settings are flags; native framework implementations are production defaults. `search` and `ask` expose exact case-insensitive app filtering and case-insensitive window-substring filtering. `permissions --request` invokes native TCC request flows; never add `tccutil reset` as an automatic side effect.
 
 **`internal/config`** — resolves `Paths` from `--data-dir`, else `LUMI_HOME`, else `~/Library/Application Support/Lumi`; directories are created 0700.
 
@@ -50,7 +53,8 @@ Data flows one way: `internal/cli` wires concrete processors into a `capture.Rec
 - **`lumi ask` sends text and metadata only** — screenshots and WAVs are never uploaded. Keep it that way.
 - **The activity context is byte-budgeted in `contextFor`** (`internal/cli/context.go`): `maxEventChars` per event, `--max-context-chars` overall, always at least one event. The store never truncates `Event.Text` — that would corrupt `lumi search --json`, which is a data-export path.
 - **Schema changes go through `internal/store/migrations.go`.** Append a new `migration` with the next version number; never edit shipped SQL. The applied version lives in SQLite's `user_version` pragma.
-- **Pruning deletes rows before files.** Orphaned files are recoverable; rows pointing at missing media are not. `lumi prune` is the only code path permitted to delete media.
+- **Pruning deletes rows before files.** Orphaned files are recoverable; rows pointing at missing media are not. `lumi prune` is the only code path permitted to delete media. Keep dry-run accounting equivalent to a real combined age-then-size run, and keep large deletes batched below SQLite's variable limit.
+- **Capture retries without discarding completed work.** Screen failures naturally retry on the next interval; audio failures retry after a one-second delay. Media returned during cancellation gets a short cancellation-free preservation window for diagnostics and insertion.
 
 ## External dependencies
 

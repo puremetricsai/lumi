@@ -1,10 +1,14 @@
 # Lumi vs. screenpipe: architectural differences
 
-**Date:** 2026-07-19
-**Lumi commit at time of writing:** `e688ad9`
+**Updated:** 2026-07-22
+
+**Lumi commit reviewed:** `8074e6a`
+
+**Lumi changes reviewed:** `e688ad9..8074e6a`
+
 **screenpipe reference:** [mediar-ai/screenpipe](https://github.com/mediar-ai/screenpipe) (`screenpipe/screenpipe` redirects there)
 
-Findings from a side-by-side review of Lumi's Go implementation against screenpipe's Rust workspace. Scoped to *architectural* differences — the GUI gap is assumed and not discussed.
+Findings from a side-by-side review of Lumi's current Go implementation against screenpipe's Rust workspace. This update incorporates Lumi's versioned migrations, filtered search, retention command, and native macOS capture subsystem. It remains scoped to *architectural* differences; the GUI gap is assumed and not discussed.
 
 ---
 
@@ -21,97 +25,109 @@ Two facts that change how this comparison should be used:
 
 | Dimension | Lumi | screenpipe |
 |---|---|---|
-| Media storage | One JPEG per frame | HEVC/libx265 mp4 chunks, fragmented MP4 |
-| Primary text source | Screenshot → Tesseract OCR | macOS Accessibility tree; OCR as fallback |
-| OCR engine (macOS) | Tesseract | Apple Vision |
-| Frame dedup | SHA-256 of JPEG bytes, single-slot | Downscaled histogram compare, adaptive threshold |
-| Capture rate | 5s interval (configurable) | 1.0 fps default, 0.5 on macOS; adaptive mode |
-| Monitors | One, via `--display` | All monitors concurrently, hotplug-aware |
-| Audio input | One device via ffmpeg | Input + system/output audio via ScreenCaptureKit |
-| Audio processing | whisper-cli on every 30s chunk | Silero VAD → Pyannote diarization → GPU whisper |
-| Retention | None — unbounded growth | 10 GB cache cap, 7-day frame retention, hourly sweep |
-| Schema evolution | Idempotent `CREATE IF NOT EXISTS`, no version | `sqlx::migrate!`, versioned, checksum recovery |
-| Query filters | kind, time range | app, window, browser_url, speaker, length, focus, + time |
+| Media storage | One JPEG per retained frame; separate WAV chunks | HEVC/libx265 fragmented MP4 chunks plus audio chunks |
+| Primary text source | Focused-window macOS Accessibility tree; Apple Vision fallback | macOS Accessibility tree; OCR fallback |
+| OCR engine (macOS) | Apple Vision | Apple Vision |
+| Frame dedup | Per-display SHA-256 fast path + sampled RGB histogram; input-aware threshold and 10s maximum silence | Image-hash fast path + downscaled histogram; adaptive threshold and maximum skip interval |
+| Capture rate | Every 2s by default, configurable | 1.0 fps default, 0.5 on macOS; adaptive mode |
+| Monitors | All displays concurrently, re-enumerated for hotplug | All monitors concurrently, hotplug-aware |
+| Audio input | Simultaneous system/output + default microphone via ScreenCaptureKit | Input + system/output audio via ScreenCaptureKit |
+| Audio processing | whisper-cli on each source's 30s WAV chunk | Silero VAD → Pyannote diarization → GPU whisper |
+| Retention | Explicit `prune` by age and/or byte cap; no automatic policy | 10 GB cache cap, 7-day frame retention, hourly sweep |
+| Schema evolution | Append-only migrations tracked by SQLite `user_version` | `sqlx::migrate!`, versioned, checksum recovery |
+| Query filters | Kind, time, exact app, window substring | App, window, browser URL, speaker, length, focus, content type, and time |
 | Interface | CLI only | CLI + Axum HTTP API, SSE, WebSocket, MCP, JS SDK |
-| Process model | Foreground process | Tauri app + sidecar server, PID watchdog, recovery loops |
-| Text retrieval | FTS5 / BM25 | FTS5 / BM25 (vector search is vestigial — see below) |
+| Process model | Foreground process with loop-level retries | Tauri app + sidecar server, PID watchdog, recovery loops |
+| Text retrieval | FTS5/BM25 with staged all-term → any-term → recent retrieval for `ask` | FTS5/BM25 (vector search is vestigial — see below) |
 
 ---
 
-## 1. Storage format — the largest single difference
+## 1. Storage format — still the largest structural difference
 
-Lumi writes one JPEG per captured frame (`internal/capture/recorder.go:99-158`). At the default 5s interval that is roughly **17,000 files per day**, forever.
+Lumi writes one JPEG per retained display frame (`internal/capture/recorder.go`). At the default two-second interval there are up to **43,200 capture opportunities per display per day**, although perceptual deduplication removes redundant frames before indexing. System and microphone audio are written as separate mono 16 kHz WAV chunks.
 
-screenpipe pipes raw frames into ffmpeg and encodes **HEVC (libx265) mp4 chunks**. CRF and preset derive from a quality setting; **B-frames are disabled** so every frame seeks independently. The container uses fragmented MP4 (`frag_keyframe+empty_moov+default_base_moof`) so frames can be extracted from a recording that is still being written. The `frames` table stores `video_chunk_id` + `offset_index` rather than a file path; single-frame display goes through `ffmpeg -ss <offset> -vframes 1` → mjpeg → base64, behind a `FrameImageCache`.
+screenpipe pipes raw frames into ffmpeg and encodes **HEVC (libx265) MP4 chunks**. CRF and preset derive from a quality setting; **B-frames are disabled** so every frame seeks independently. The container uses fragmented MP4 (`frag_keyframe+empty_moov+default_base_moof`) so frames can be extracted from a recording that is still being written. The `frames` table stores `video_chunk_id` + `offset_index` rather than a file path; single-frame display goes through `ffmpeg -ss <offset> -vframes 1` → MJPEG → base64, behind a `FrameImageCache`.
 
-This is an order-of-magnitude disk difference and the reason screenpipe can quote ~15–30 GB/month while retaining video at all.
+Lumi now has an explicit pruning path, so growth need not be unbounded, but JPEG-per-frame storage still creates many files and gives up video compression across adjacent frames. This remains the main reason screenpipe can retain denser visual history for a given disk budget.
 
-## 2. Text extraction: accessibility tree vs. OCR
+## 2. Text extraction — the high-level gap is closed; event depth is not
 
-Lumi's only text source is Tesseract over a screenshot.
+Lumi now uses the same high-level macOS strategy as screenpipe: **Accessibility first, Apple Vision second**. It reads the frontmost application's focused window, recursively collects title/description/value attributes while excluding secure text fields, and associates that snapshot with the display containing the focused window. Vision handles that display when Accessibility is unavailable or empty and handles the other displays. `text_source` and `display_id` are stored as first-class event fields.
 
-screenpipe's README now describes capture as **"accessibility tree extraction with OCR fallback"** — the AX path is primary. `screenpipe-accessibility` uses macOS AX APIs directly (`cidre::ax`, `cidre::cg::event::access`) to capture clicks, aggregated text input, keystrokes, app switches, window focus changes, clipboard operations and content, and focused-element context (role/name/value; text fields read via `ax::attr::value()`). This lands in a `ui_events` table with its own FTS index, plus an `accessibility` table for AX-derived screen content.
+screenpipe's Accessibility subsystem goes further. `screenpipe-accessibility` captures clicks, aggregated text input, keystrokes, application switches, window-focus changes, clipboard operations and focused-element context into a dedicated `ui_events` stream and FTS index, in addition to AX-derived screen content.
 
-Where screenpipe *does* OCR, it uses the platform native engine — **Apple Vision** on macOS, Windows.Media.Ocr on Windows, Tesseract only as the Linux/cross-platform fallback.
+The remaining difference is therefore not OCR quality. Lumi takes a periodic focused-window text snapshot; screenpipe also models user interaction as a separate event stream. That lets screenpipe answer questions about actions and state transitions that cannot reliably be reconstructed from periodic snapshots.
 
-This is the difference that most changes what the tool can *know*. AX text is cleaner than OCR, cheaper to produce, and captures interaction events that no screenshot contains.
+## 3. Deduplication — now broadly comparable
 
-## 3. Dedup quality
+Lumi's `FrameComparer` (`internal/capture/compare.go`) maintains independent state for each display. It uses SHA-256 of the JPEG bytes as an exact fast path, then compares sampled RGB histograms for visually similar frames. The default similarity threshold is 0.985 while idle and 0.995 during recent input, retaining subtler changes while the user is active. A ten-second maximum-silence rule forces a periodic retained frame.
 
-Lumi hashes the full JPEG bytes with SHA-256 and compares against the immediately previous frame only (`recorder.go:127-134`). This catches **pixel-identical frames and nothing else** — a blinking cursor, a clock tick, or antialiasing jitter defeats it entirely, so near-duplicates are OCR'd and indexed indefinitely.
+screenpipe follows the same broad design: image-hash early exit, a downscaled histogram comparison, an adaptive threshold driven by Accessibility input activity, and a maximum skip interval. The implementations differ in sampling and tuning, but near-duplicate handling is no longer a meaningful architectural gap.
 
-screenpipe's `FrameComparer`: image-hash early exit → downscale ~4x to 640x360 → **histogram comparison** (they explicitly dropped SSIM for speed) → adaptive threshold driven by AX input activity when `adaptive-fps` is on → a safety valve capping skips at ~10s so the pipeline never goes silent.
+Lumi's measured 1920×1080 baseline was about 22 µs for the exact-hash path and 5.7 ms when histogram decoding was needed; see `docs/benchmarks/2026-07-19-native-capture.md`.
 
-## 4. Audio depth
+## 4. Audio — source coverage is closed; processing depth remains different
 
-Lumi records one AVFoundation input device and runs whisper-cli on each 30s chunk.
+Lumi now records **system/output audio and the default microphone simultaneously** from one ScreenCaptureKit stream. It excludes its own process audio and emits each source as a separately attributed mono 16 kHz WAV file. This removes the old AVFoundation-device/loopback requirement and makes meeting audio capture practical.
 
-screenpipe adds, in order of impact:
-- **System/output audio** on macOS via ScreenCaptureKit (falls back to the default output device via cpal) — this is what makes meeting capture actually work.
-- **VAD** (Silero v5/v6 ONNX default, WebRTC alternative) behind a `VadEngine` trait, so silence never reaches whisper.
-- **Speaker diarization** via Pyannote ONNX (segmentation + embedding models), producing a `speaker_id` on transcription rows.
-- **GPU whisper** — Metal on macOS, Vulkan on Windows, via `whisper-rs`.
-- **Smart mode**: an `IdleDetector` defers transcription above ~70% CPU so video calls aren't degraded — but audio is still written to disk in realtime, so nothing is lost.
+Lumi still sends every source chunk directly to `whisper-cli`, with no speech gate or speaker model. screenpipe adds:
 
-## 5. Retention
+- **VAD** (Silero v5/v6 ONNX by default, WebRTC alternative), so silence does not reach whisper.
+- **Speaker diarization** via Pyannote ONNX, producing a `speaker_id` on transcription rows.
+- **In-process GPU whisper** through `whisper-rs` rather than a `whisper-cli` subprocess per chunk.
+- **Smart mode**, where an `IdleDetector` defers transcription above roughly 70% CPU while audio continues to be written.
 
-Lumi has **zero `DELETE` statements**. The only file ever removed is a duplicate screenshot and a whisper temp transcript. Screenshots, WAVs, and rows accumulate without bound.
+The main gap is now post-capture efficiency and speaker attribution, not the ability to capture both sides of a call.
 
-screenpipe runs an hourly `run_cache_manager` against a `FrameDiskCache` with `max_cache_size_gb` (default 10) and `frame_retention_days` (default 7), pruning by both age cutoff and total size.
+## 5. Retention — available in Lumi, but operator-driven
 
-## 6. Schema evolution
+Lumi's `prune` command can delete events older than a duration/RFC3339 cutoff, reduce total indexed media below `--max-bytes` by deleting oldest events first, combine both policies, and preview the result with `--dry-run`. It deletes database rows before files so an interruption leaves recoverable orphaned media rather than rows pointing at missing files. Large row deletions are batched below SQLite's parameter limit.
 
-Lumi applies one idempotent `CREATE ... IF NOT EXISTS` blob on every `Open` (`internal/store/store.go:73-112`). There is no `schema_version`, so any future schema change has no upgrade path from databases already in the field.
+There is still **no default retention policy or scheduler**. An operator must invoke `lumi prune` periodically, for example from launchd.
 
-screenpipe uses `sqlx::migrate!` against versioned migration files, with explicit handling for checksum mismatches (update stored checksum, retry) and foreign keys disabled during migration.
+screenpipe runs an hourly `run_cache_manager` against a `FrameDiskCache` with `max_cache_size_gb` (default 10) and `frame_retention_days` (default 7), pruning by both age cutoff and total size. Its architectural advantage is automatic enforcement, not the absence of equivalent pruning primitives in Lumi.
 
-## 7. Query surface
+## 6. Schema evolution — the gap is closed
 
-Lumi's `SearchOptions` (`internal/store/store.go:35-41`) supports **kind and time range only**. `app` and `window` are captured and indexed into FTS but are unreachable as filters — they can only be hit accidentally, as unweighted free-text tokens.
+Lumi now applies ordered, append-only migrations from `internal/store/migrations.go`. Each pending migration runs in its own transaction and the applied version is recorded in SQLite's `user_version` pragma. The current schema is version 3, including indexes for app, display, and audio-source access plus first-class `text_source`, `display_id`, and `audio_source` columns. External-content FTS5 remains synchronized by insert/delete/update triggers.
 
-screenpipe's `GET /search` filters on `content_type`, `app_name`, `window_name`, `browser_url`, `min_length`/`max_length`, `speaker_ids`, `speaker_name`, `focused`, plus time range, with `offset` pagination and a Moka LRU cache keyed on the full parameter hash. A second `GET /search/keyword` endpoint adds fuzzy matching, explicit ordering (`timestamp_asc|timestamp_desc|relevance`), and result grouping. `browser_url` is captured atomically with the screenshot specifically to avoid timing mismatch.
+screenpipe uses `sqlx::migrate!` against versioned migration files, with explicit checksum-mismatch recovery and foreign keys disabled during migration. The mechanisms differ, but both projects now have a forward upgrade path for databases already in the field.
 
-## 8. Process model and operations
+## 7. Query surface — Lumi added the highest-value filters
 
-Lumi's `record` is a foreground process the user babysits. No launchd plist, no PID file, no health check, no `start/stop/status`.
+Lumi's `SearchOptions` now supports content kind, time range, **exact case-insensitive application**, and **case-insensitive window-title substring** filters. The CLI exposes these on both `search` and `ask`. FTS terms are safely quoted and use conjunctive BM25 search by default; `ask` strips question stopwords and degrades explicitly through all-term, weighted any-term, then recent-event retrieval.
 
-screenpipe runs two processes: the Tauri app spawns `screenpipe-server` as a sidecar in a dedicated thread with its own Tokio runtime (to avoid CPU contention with the UI). The server watches its parent PID and self-terminates if the app dies. Capture tasks sit in recovery loops that restart after a 5s sleep. `/health` detects stalls by querying the most recent frame and audio timestamps; the tray polls it every 30s.
+screenpipe's `GET /search` additionally filters on `browser_url`, text length, speaker IDs/name, and focus state, with offset pagination and a Moka LRU cache keyed on the full parameter hash. A second `GET /search/keyword` endpoint adds fuzzy matching, explicit ordering (`timestamp_asc|timestamp_desc|relevance`), and result grouping. `browser_url` is captured atomically with the screenshot to avoid timing mismatch.
 
-macOS permissions are handled explicitly: preflight checks for screen recording, microphone, accessibility, and input monitoring; a background monitor polls every 10s and emits `permission-lost` after two consecutive failures; `reset_and_request_permission` shells out to `tccutil`.
+Lumi has closed the app/window usability gap, but it does not capture the browser, speaker, and focus metadata needed for screenpipe's remaining filters, nor does it expose pagination, grouping, or fuzzy-order controls.
+
+## 8. Process model, recovery, and permissions
+
+Lumi's native subsystem now preflights Screen Recording, Accessibility, Input Monitoring, and Microphone permissions. `lumi permissions --request` invokes Apple's native request flows, `doctor` reports actionable status, and `native-smoke` provides a bounded integration check. Input Monitoring is optional because Lumi detects recent input from CoreGraphics session state rather than installing an event tap.
+
+Recording is still a foreground CLI process. A failed screen capture is retried on the next interval, and the audio loop waits one second and retries after a capture failure. Already-written media is preserved and indexed with processor diagnostics when Accessibility, Vision, comparison, transcription, or shutdown finalization fails.
+
+screenpipe runs two supervised processes: the Tauri app spawns `screenpipe-server` as a sidecar in a dedicated thread with its own Tokio runtime. The server watches its parent PID and self-terminates if the app dies. Capture tasks run recovery loops, `/health` detects stalls from recent frame/audio timestamps, and the tray polls it every 30 seconds. A permission monitor polls every ten seconds and reports permission loss after two consecutive failures.
+
+Lumi now handles native permissions and transient loop failures, but still has no launchd service, PID/status commands, health endpoint, stall detector, continuous permission-loss monitor, or process supervisor.
 
 ## 9. Interfaces beyond the CLI
 
-Lumi is a CLI and nothing else — no server, socket, or streaming.
+Lumi remains a CLI with no server, socket, or streaming interface.
 
-screenpipe exposes an Axum server on `localhost:3030` with `/search`, `/frames/:id`, `/tags/*`, `/raw_sql`, `/ui-events`, SSE frame streaming at `/stream/frames`, and a health WebSocket. On top of that: `@screenpipe/js` and `@screenpipe/browser` SDKs, and an MCP server (`npx -y screenpipe-mcp`) exposing `search-content`, `search-ui-events`, `get-ui-event-stats`, and `export-video`.
+screenpipe exposes an Axum server on `localhost:3030` with `/search`, `/frames/:id`, `/tags/*`, `/raw_sql`, `/ui-events`, SSE frame streaming at `/stream/frames`, and a health WebSocket. On top of that are the `@screenpipe/js` and `@screenpipe/browser` SDKs and an MCP server (`npx -y screenpipe-mcp`) exposing `search-content`, `search-ui-events`, `get-ui-event-stats`, and `export-video`.
+
+This is an intentional scope distinction in Lumi rather than unfinished capture or indexing work.
 
 ---
 
 ## What is *not* a gap
 
-**Semantic / vector search.** `sqlite_vec` is imported in `screenpipe-db` but there is no text-embedding table and no vector query path. The only real embeddings are Pyannote *audio* embeddings for speaker identity. screenpipe's advertised "semantic search using embeddings" is, in the code, an LLM writing FTS5 keyword queries. Lumi's FTS5/BM25-only retrieval matches screenpipe's actual behavior — building an embedding pipeline would be leapfrogging, not catching up.
+**Semantic/vector search.** `sqlite_vec` is imported in `screenpipe-db`, but there is no text-embedding table or vector query path. The only real embeddings are Pyannote *audio* embeddings for speaker identity. screenpipe's advertised "semantic search using embeddings" is, in the code, an LLM writing FTS5 keyword queries. Lumi's FTS5/BM25-only retrieval matches screenpipe's actual behavior; building a text-embedding pipeline would be leapfrogging, not catching up.
 
-**Provider abstraction.** screenpipe supports OpenAI, Anthropic, Ollama, custom OpenAI-compatible endpoints, and its own gateway, with everything routed through an external agent process (`@mariozechner/pi-coding-agent`) over JSON-RPC. Lumi's single-backend Cerebras decision is a deliberate scope choice, not an oversight.
+**Provider abstraction.** screenpipe supports OpenAI, Anthropic, Ollama, custom OpenAI-compatible endpoints, and its own gateway, with requests routed through an external agent process (`@mariozechner/pi-coding-agent`) over JSON-RPC. Lumi's single-backend Cerebras decision is a deliberate scope choice, not an oversight.
+
+**Basic macOS capture coverage.** Both projects capture all displays, handle display hotplug, prefer Accessibility text with Apple Vision fallback, record system and microphone audio, and suppress near-duplicate frames. Differences remain in storage density, Accessibility event richness, and audio processing, but the basic source matrix is now aligned.
 
 ---
 
@@ -119,8 +135,11 @@ screenpipe exposes an Axum server on `localhost:3030` with `/search`, `/frames/:
 
 Worth recording because the numbers are quoted inconsistently across screenpipe's own docs: README says 5–10% CPU, 0.5–3 GB RAM, ~20 GB storage/month; internal docs say 10% CPU and ~15 GB/month; another says ~5–10 GB/month; DeepWiki's storage page says ~30 GB/month at 1 fps. Treat storage as **roughly 5–30 GB/month** depending on fps and quality settings.
 
+Lumi's bounded native sample on an Apple M5 Max used about 104 MiB peak RSS and 6.5 MiB for 12 seconds with one display and five-second audio chunks. That sample validates the pipeline but is too short and workload-specific to extrapolate into a credible monthly figure.
+
 ---
 
 ## Related
 
-Prioritized remediation is tracked in `docs/superpowers/plans/2026-07-19-tier1-retention-filters-migrations.md`, which covers the three cheapest high-impact items: versioned migrations (§6), app/window search filters (§7), and retention (§5).
+- `docs/plans/2026-07-19-tier1-retention-filters-migrations.md` documents the now-landed migration, filter, and retention work.
+- `docs/benchmarks/2026-07-19-native-capture.md` records automated benchmarks, permission-gated native smoke results, and a bounded resource sample for the native capture subsystem.
