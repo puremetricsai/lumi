@@ -49,6 +49,8 @@ func Accessibility(context.Context) (AccessibilitySnapshot, error) {
 
 func RecognizeText(context.Context, string) (string, error) { return "", errUnsupported }
 
+func TranscribeAudio(context.Context, string, string) (string, error) { return "", errUnsupported }
+
 func PermissionStatus(context.Context) (Permissions, error) { return Permissions{}, errUnsupported }
 
 func RequestPermissions(context.Context, bool) (Permissions, error) {

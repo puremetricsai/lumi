@@ -20,6 +20,7 @@ char *lumi_request_permissions_json(bool input_monitoring, char **error_message)
 char *lumi_record_audio_json(const char *directory, const char *prefix, double duration_seconds, char **error_message);
 void lumi_os_version(int *major, int *minor, int *patch);
 char *lumi_speech_ping(void);
+char *lumi_transcribe_audio_string(const char *audio_path, const char *locale, char **error_message);
 */
 import "C"
 
@@ -111,6 +112,26 @@ func RecognizeText(ctx context.Context, imagePath string) (string, error) {
 	defer C.free(unsafe.Pointer(pathC))
 	var nativeErr *C.char
 	result, err := nativeString(C.lumi_vision_recognize(pathC, &nativeErr), nativeErr)
+	if err != nil {
+		return "", err
+	}
+	return result, nil
+}
+
+// TranscribeAudio transcribes a WAV file with on-device SpeechAnalyzer. It
+// mirrors RecognizeText: a nil native return with a populated error message
+// becomes a Go error. An empty string with no error is a valid (silent)
+// transcript. An empty locale defaults to en-US in the native layer.
+func TranscribeAudio(ctx context.Context, audioPath, locale string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	pathC := C.CString(audioPath)
+	localeC := C.CString(locale)
+	defer C.free(unsafe.Pointer(pathC))
+	defer C.free(unsafe.Pointer(localeC))
+	var nativeErr *C.char
+	result, err := nativeString(C.lumi_transcribe_audio_string(pathC, localeC, &nativeErr), nativeErr)
 	if err != nil {
 		return "", err
 	}
