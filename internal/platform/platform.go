@@ -15,8 +15,8 @@ func Validate() error {
 	if err != nil {
 		return fmt.Errorf("inspect macOS version: %w", err)
 	}
-	if major < 15 {
-		return fmt.Errorf("lumi native capture requires macOS 15 or newer (running %d.%d.%d)", major, minor, patch)
+	if major < 26 {
+		return fmt.Errorf("lumi native capture requires macOS 26 or newer (running %d.%d.%d)", major, minor, patch)
 	}
 	return nil
 }
