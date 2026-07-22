@@ -1,36 +1,25 @@
 # Lumi
 
-Lumi is an open-source, local-first work memory for Apple Silicon Macs. It continuously captures every display plus system and microphone audio, extracts screen text from macOS Accessibility with Apple Vision fallback, transcribes speech locally, stores the media on disk, indexes the text in SQLite FTS5, and lets you search and manage it from a Go CLI. An optional `lumi ask` command sends only the retrieved text context to Cerebras for an answer.
+Lumi is an open-source, local-first work memory for Apple Silicon Macs. It continuously captures every display plus system and microphone audio, extracts screen text from macOS Accessibility with Apple Vision fallback, transcribes speech on-device with Apple SpeechAnalyzer, stores the media on disk, indexes the text in SQLite FTS5, and lets you search and manage it from a Go CLI. An optional `lumi ask` command sends only the retrieved text context to Cerebras for an answer.
 
 Lumi is an early v1 implementation inspired by [screenpipe](https://github.com/mediar-ai/screenpipe). It intentionally targets a smaller surface: capture → process → store → query, with no GUI, server, plugins, provider abstraction, or non-Cerebras inference backend.
 
 ## Requirements
 
-- Apple Silicon Mac running macOS 15 or newer (`darwin/arm64`)
+- Apple Silicon Mac running macOS 26 or newer (`darwin/arm64`)
 - Go 1.24 or newer (to build)
-- Xcode Command Line Tools (the binary links native macOS frameworks through cgo)
-- Screen Recording, Accessibility, and Microphone permissions for your terminal or the Lumi binary
-- [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (`whisper-cli`) and a local model for transcription
+- Xcode Command Line Tools and a Swift toolchain (`swiftc` compiles the SpeechAnalyzer bridge into a static archive that cgo links)
+- Screen Recording, Accessibility, Microphone, and Speech Recognition permissions for your terminal or the Lumi binary
 - A Cerebras API key only for `lumi ask`
 
-Homebrew can install the only required command-line processor:
-
-```sh
-brew install whisper-cpp
-```
-
-Download a whisper.cpp model, then set its path:
-
-```sh
-export LUMI_WHISPER_MODEL="$PWD/models/ggml-base.en.bin"
-```
+Transcription runs entirely on-device through Apple SpeechAnalyzer — no external processor or model file to install. The recognition assets for your locale (default `en-US`) download automatically on first use; override the locale with `record --speech-locale`.
 
 ScreenCaptureKit captures system output and the default microphone directly; no loopback audio device is required. Lumi excludes its own process audio from system capture.
 
 ## Build and run
 
 ```sh
-go build -o lumi ./cmd/lumi
+task build # compiles the Swift SpeechAnalyzer bridge (task speech), then go build
 ./lumi permissions --request # or: task permissions
 ./lumi doctor
 ./lumi record
@@ -123,7 +112,7 @@ Lumi does not schedule retention automatically. Run `prune` periodically yoursel
 ```text
 ScreenCaptureKit displays ─→ Accessibility ─┐
                          └─→ Vision fallback ├─→ events + FTS5 ─→ search ─→ Cerebras ask
-ScreenCaptureKit system + microphone ─→ WAV ─→ whisper.cpp ─┘
+ScreenCaptureKit system + microphone ─→ WAV ─→ SpeechAnalyzer (in-process) ─┘
 ```
 
 - `internal/macosnative`: cgo bridge to ScreenCaptureKit, Accessibility, Vision, and permission APIs
@@ -135,12 +124,13 @@ ScreenCaptureKit system + microphone ─→ WAV ─→ whisper.cpp ─┘
 
 Frames use a hash fast path plus a sampled color-histogram comparison with independent state per display; recent user input makes the threshold more sensitive, and a ten-second safety interval prevents capture from going silent. Accessibility text is used for the focused display, while Vision handles fallback and other displays. If Accessibility, Vision, comparison, or transcription fails after media was captured, Lumi preserves and indexes the event with processor diagnostics instead of silently losing the original data.
 
-`lumi permissions --request` invokes Apple's native Screen Recording, Accessibility, and Microphone request flows. `lumi doctor` reports their current state with the matching System Settings location. Input Monitoring is informational and is only requested when `--input-monitoring` is explicitly passed; capture does not require an event tap.
+`lumi permissions --request` invokes Apple's native Screen Recording, Accessibility, Microphone, and Speech Recognition request flows. `lumi doctor` reports their current state with the matching System Settings location. Input Monitoring is informational and is only requested when `--input-monitoring` is explicitly passed; capture does not require an event tap.
 
 ## Development
 
 ```sh
-go test ./...
+task build   # compiles the Swift bridge, then go build
+task test    # full suite (raw go build/go test will not link without the Swift archive)
 go vet ./...
 ```
 
