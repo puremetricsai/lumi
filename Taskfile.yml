@@ -66,6 +66,7 @@ tasks:
 
   test:v:
     desc: Run all tests with verbose output
+    deps: [speech]
     cmds:
       - go test -v ./... {{.CLI_ARGS}}
 
@@ -81,16 +82,19 @@ tasks:
 
   bench:capture:
     desc: Benchmark perceptual frame comparison
+    deps: [speech]
     cmds:
       - go test ./internal/capture -run '^$' -bench 'Benchmark(SampledHistogram|FrameComparerExactDuplicate)' -benchmem -count=1
 
   test:one:
     desc: 'Run a single test (e.g. task test:one -- -run TestSearch ./internal/store)'
+    deps: [speech]
     cmds:
       - go test -v {{.CLI_ARGS}}
 
   cover:
     desc: Run tests with a coverage report
+    deps: [speech]
     cmds:
       - go test -coverprofile=coverage.out ./...
       - go tool cover -func=coverage.out
