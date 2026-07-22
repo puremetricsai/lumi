@@ -9,10 +9,10 @@ A local-first work-memory CLI for Apple Silicon Macs: continuously capture all d
 ## Commands
 
 ```sh
-go build -o lumi ./cmd/lumi
-go test ./...
+task build                                  # compiles the Swift bridge (task speech), then go build
+task test                                   # full suite
 go vet ./...
-go test ./internal/store -run TestSearch -v   # single test
+task speech && go test ./internal/store -run TestSearch -v   # single test (needs the Swift archive)
 task test:native                            # permission-gated native smoke test
 ```
 
