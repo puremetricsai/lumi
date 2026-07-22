@@ -21,6 +21,7 @@ char *lumi_record_audio_json(const char *directory, const char *prefix, double d
 void lumi_os_version(int *major, int *minor, int *patch);
 char *lumi_speech_ping(void);
 char *lumi_transcribe_audio_string(const char *audio_path, const char *locale, char **error_message);
+char *lumi_speech_status_json(const char *locale, char **error_message);
 */
 import "C"
 
@@ -52,10 +53,11 @@ type AccessibilitySnapshot struct {
 }
 
 type Permissions struct {
-	ScreenRecording string `json:"screen_recording"`
-	Accessibility   string `json:"accessibility"`
-	InputMonitoring string `json:"input_monitoring"`
-	Microphone      string `json:"microphone"`
+	ScreenRecording   string `json:"screen_recording"`
+	Accessibility     string `json:"accessibility"`
+	InputMonitoring   string `json:"input_monitoring"`
+	Microphone        string `json:"microphone"`
+	SpeechRecognition string `json:"speech_recognition"`
 }
 
 type AudioFrame struct {
@@ -213,6 +215,37 @@ func SpeechPing() string {
 	}
 	defer C.free(unsafe.Pointer(value))
 	return C.GoString(value)
+}
+
+// SpeechStatus reports whether the current OS, authorization state, and
+// locale asset availability are sufficient for on-device SpeechAnalyzer
+// transcription. AssetsInstalled is a proxy backed by
+// [SFSpeechRecognizer supportedLocales], the only per-locale signal readable
+// from Objective-C; the authoritative asset state comes from Swift's
+// AssetInventory at transcribe time.
+type SpeechStatus struct {
+	OSSupported     bool   `json:"os_supported"`
+	Locale          string `json:"locale"`
+	AssetsInstalled bool   `json:"assets_installed"`
+	Authorization   string `json:"authorization"`
+}
+
+func GetSpeechStatus(ctx context.Context, locale string) (SpeechStatus, error) {
+	if err := ctx.Err(); err != nil {
+		return SpeechStatus{}, err
+	}
+	localeC := C.CString(locale)
+	defer C.free(unsafe.Pointer(localeC))
+	var nativeErr *C.char
+	result, err := nativeJSON(C.lumi_speech_status_json(localeC, &nativeErr), nativeErr)
+	if err != nil {
+		return SpeechStatus{}, err
+	}
+	var status SpeechStatus
+	if err := json.Unmarshal(result, &status); err != nil {
+		return status, fmt.Errorf("decode speech status: %w", err)
+	}
+	return status, nil
 }
 
 func nativeJSON(value, errorMessage *C.char) ([]byte, error) {

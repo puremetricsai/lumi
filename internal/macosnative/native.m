@@ -5,6 +5,7 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <ImageIO/ImageIO.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
+#import <Speech/Speech.h>
 #import <Vision/Vision.h>
 
 #include <stdlib.h>
@@ -325,6 +326,16 @@ static NSString *LumiAuthorizationName(AVAuthorizationStatus status) {
     return @"unknown";
 }
 
+static NSString *LumiSpeechAuthorizationName(SFSpeechRecognizerAuthorizationStatus status) {
+    switch (status) {
+        case SFSpeechRecognizerAuthorizationStatusAuthorized: return @"granted";
+        case SFSpeechRecognizerAuthorizationStatusDenied: return @"denied";
+        case SFSpeechRecognizerAuthorizationStatusRestricted: return @"restricted";
+        case SFSpeechRecognizerAuthorizationStatusNotDetermined: return @"not_determined";
+    }
+    return @"unknown";
+}
+
 char *lumi_permissions_json(char **error_message) {
     @autoreleasepool {
         NSDictionary *permissions = @{
@@ -332,6 +343,7 @@ char *lumi_permissions_json(char **error_message) {
             @"accessibility": AXIsProcessTrusted() ? @"granted" : @"denied_or_not_determined",
             @"input_monitoring": CGPreflightListenEventAccess() ? @"granted" : @"denied_or_not_determined",
             @"microphone": LumiAuthorizationName([AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio]),
+            @"speech_recognition": LumiSpeechAuthorizationName([SFSpeechRecognizer authorizationStatus]),
         };
         NSError *jsonError = nil;
         NSString *json = LumiJSONString(permissions, &jsonError);
@@ -360,7 +372,43 @@ char *lumi_request_permissions_json(bool input_monitoring, char **error_message)
             }];
             dispatch_semaphore_wait(microphoneReady, DISPATCH_TIME_FOREVER);
         }
+        if ([SFSpeechRecognizer authorizationStatus] == SFSpeechRecognizerAuthorizationStatusNotDetermined) {
+            dispatch_semaphore_t speechReady = dispatch_semaphore_create(0);
+            [SFSpeechRecognizer requestAuthorization:^(SFSpeechRecognizerAuthorizationStatus status) {
+                dispatch_semaphore_signal(speechReady);
+            }];
+            dispatch_semaphore_wait(speechReady, DISPATCH_TIME_FOREVER);
+        }
         return lumi_permissions_json(error_message);
+    }
+}
+
+char *lumi_speech_status_json(const char *locale, char **error_message) {
+    @autoreleasepool {
+        NSString *localeID = locale != NULL ? [NSString stringWithUTF8String:locale] : @"en-US";
+        NSOperatingSystemVersion os = [[NSProcessInfo processInfo] operatingSystemVersion];
+        BOOL osSupported = os.majorVersion >= 26;
+        NSLocale *target = [NSLocale localeWithLocaleIdentifier:localeID];
+        BOOL installed = NO;
+        for (NSLocale *supported in [SFSpeechRecognizer supportedLocales]) {
+            if ([supported.localeIdentifier isEqualToString:target.localeIdentifier]) {
+                installed = YES;
+                break;
+            }
+        }
+        NSDictionary *status = @{
+            @"os_supported": @(osSupported),
+            @"locale": localeID,
+            @"assets_installed": @(installed),
+            @"authorization": LumiSpeechAuthorizationName([SFSpeechRecognizer authorizationStatus]),
+        };
+        NSError *jsonError = nil;
+        NSString *json = LumiJSONString(status, &jsonError);
+        if (json == nil) {
+            if (error_message != NULL) *error_message = LumiCopyError(jsonError);
+            return NULL;
+        }
+        return LumiCopyUTF8(json);
     }
 }
 

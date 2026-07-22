@@ -26,10 +26,21 @@ type AccessibilitySnapshot struct {
 }
 
 type Permissions struct {
-	ScreenRecording string `json:"screen_recording"`
-	Accessibility   string `json:"accessibility"`
-	InputMonitoring string `json:"input_monitoring"`
-	Microphone      string `json:"microphone"`
+	ScreenRecording   string `json:"screen_recording"`
+	Accessibility     string `json:"accessibility"`
+	InputMonitoring   string `json:"input_monitoring"`
+	Microphone        string `json:"microphone"`
+	SpeechRecognition string `json:"speech_recognition"`
+}
+
+// SpeechStatus reports whether the current OS, authorization state, and
+// locale asset availability are sufficient for on-device SpeechAnalyzer
+// transcription.
+type SpeechStatus struct {
+	OSSupported     bool   `json:"os_supported"`
+	Locale          string `json:"locale"`
+	AssetsInstalled bool   `json:"assets_installed"`
+	Authorization   string `json:"authorization"`
 }
 
 type AudioFrame struct {
@@ -64,3 +75,7 @@ func RecordAudio(context.Context, string, string, float64) ([]AudioFrame, error)
 func OSVersion() (int, int, int, error) { return 0, 0, 0, errUnsupported }
 
 func SpeechPing() string { return "" }
+
+func GetSpeechStatus(context.Context, string) (SpeechStatus, error) {
+	return SpeechStatus{}, errUnsupported
+}

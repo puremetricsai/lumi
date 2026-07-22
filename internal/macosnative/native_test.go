@@ -19,10 +19,11 @@ func TestPermissionStatusUsesKnownStates(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, status := range map[string]string{
-		"screen recording": permissions.ScreenRecording,
-		"accessibility":    permissions.Accessibility,
-		"input monitoring": permissions.InputMonitoring,
-		"microphone":       permissions.Microphone,
+		"screen recording":   permissions.ScreenRecording,
+		"accessibility":      permissions.Accessibility,
+		"input monitoring":   permissions.InputMonitoring,
+		"microphone":         permissions.Microphone,
+		"speech recognition": permissions.SpeechRecognition,
 	} {
 		if status == "" || status == "unknown" {
 			t.Errorf("%s permission has invalid status %q", name, status)
