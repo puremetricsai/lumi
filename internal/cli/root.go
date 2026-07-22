@@ -119,6 +119,15 @@ func (a *app) recordCommand() *cobra.Command {
 				defer cancel()
 			}
 			logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+			if !noAudio {
+				// Download the recognition assets up front so a first-run download
+				// never stalls transcription mid-recording. Failure is fatal here:
+				// audio was requested and cannot work without assets.
+				logger.Info("ensuring speech recognition assets", "locale", speechLocale)
+				if err := macosnative.EnsureSpeechAssets(ctx, speechLocale); err != nil {
+					return fmt.Errorf("ensure speech recognition assets for %s: %w", speechLocale, err)
+				}
+			}
 			recorder := capture.Recorder{
 				Store: s, Paths: paths, ScreenInterval: interval, AudioChunk: audioChunk,
 				CaptureScreen: !noScreen, CaptureAudio: !noAudio, Logger: logger,
@@ -289,7 +298,8 @@ func (a *app) pruneCommand() *cobra.Command {
 }
 
 func (a *app) doctorCommand() *cobra.Command {
-	return &cobra.Command{
+	var speechLocale string
+	cmd := &cobra.Command{
 		Use:   "doctor",
 		Short: "Check platform, capture tools, models, and API configuration",
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -322,7 +332,7 @@ func (a *app) doctorCommand() *cobra.Command {
 					fmt.Fprintf(os.Stdout, "%s permission\t%s\t%s (%s)\n", permission.name, state, permission.status, permission.settings)
 				}
 			}
-			speech, speechErr := macosnative.SpeechStatus(cmd.Context(), "en-US")
+			speech, speechErr := macosnative.SpeechStatus(cmd.Context(), speechLocale)
 			if speechErr != nil {
 				fmt.Fprintf(os.Stdout, "speech transcription\tmissing\t%v\n", speechErr)
 				missing = true
@@ -342,7 +352,7 @@ func (a *app) doctorCommand() *cobra.Command {
 				if speech.AssetsInstalled {
 					fmt.Fprintf(os.Stdout, "speech assets (%s)\tok\tinstalled\n", speech.Locale)
 				} else {
-					fmt.Fprintf(os.Stdout, "speech assets (%s)\tmissing\tlocale assets not installed; run `./lumi record` once to fetch\n", speech.Locale)
+					fmt.Fprintf(os.Stdout, "speech assets (%s)\tmissing\tlocale assets not installed; `./lumi record` downloads them at startup\n", speech.Locale)
 					missing = true
 				}
 			}
@@ -359,6 +369,8 @@ func (a *app) doctorCommand() *cobra.Command {
 			return nil
 		},
 	}
+	cmd.Flags().StringVar(&speechLocale, "speech-locale", "en-US", "SpeechAnalyzer recognition locale")
+	return cmd
 }
 
 func (a *app) permissionsCommand() *cobra.Command {

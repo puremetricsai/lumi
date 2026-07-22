@@ -20,7 +20,8 @@ char *lumi_request_permissions_json(bool input_monitoring, char **error_message)
 char *lumi_record_audio_json(const char *directory, const char *prefix, double duration_seconds, char **error_message);
 void lumi_os_version(int *major, int *minor, int *patch);
 char *lumi_speech_ping(void);
-char *lumi_transcribe_audio_string(const char *audio_path, const char *locale, char **error_message);
+char *lumi_transcribe_audio_string(const char *audio_path, const char *locale, double timeout_seconds, char **error_message);
+char *lumi_speech_ensure_assets(const char *locale, double timeout_seconds, char **error_message);
 char *lumi_speech_status_json(const char *locale, char **error_message);
 */
 import "C"
@@ -30,6 +31,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 	"unsafe"
 )
 
@@ -124,20 +126,86 @@ func RecognizeText(ctx context.Context, imagePath string) (string, error) {
 // mirrors RecognizeText: a nil native return with a populated error message
 // becomes a Go error. An empty string with no error is a valid (silent)
 // transcript. An empty locale defaults to en-US in the native layer.
+//
+// The native call blocks its OS thread until the SpeechAnalyzer pipeline
+// finishes or the native timeout fires, so it runs on its own goroutine and the
+// caller returns promptly on ctx cancellation. The blocked thread unblocks when
+// the Swift-side timeout elapses, so the native timeout is derived from the ctx
+// deadline (falling back to two minutes) to keep it bounded.
 func TranscribeAudio(ctx context.Context, audioPath, locale string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	pathC := C.CString(audioPath)
-	localeC := C.CString(locale)
-	defer C.free(unsafe.Pointer(pathC))
-	defer C.free(unsafe.Pointer(localeC))
-	var nativeErr *C.char
-	result, err := nativeString(C.lumi_transcribe_audio_string(pathC, localeC, &nativeErr), nativeErr)
-	if err != nil {
-		return "", err
+	timeout := nativeTimeout(ctx, 2*time.Minute)
+	type transcription struct {
+		text string
+		err  error
 	}
-	return result, nil
+	done := make(chan transcription, 1)
+	go func() {
+		// The C strings must outlive the native call. Because TranscribeAudio can
+		// return early on cancellation while the call is still running, the
+		// goroutine that made the call owns and frees them — never a defer that
+		// would run at early return.
+		pathC := C.CString(audioPath)
+		localeC := C.CString(locale)
+		var nativeErr *C.char
+		result, err := nativeString(
+			C.lumi_transcribe_audio_string(pathC, localeC, C.double(timeout.Seconds()), &nativeErr), nativeErr)
+		C.free(unsafe.Pointer(pathC))
+		C.free(unsafe.Pointer(localeC))
+		done <- transcription{text: result, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case r := <-done:
+		return r.text, r.err
+	}
+}
+
+// EnsureSpeechAssets downloads and installs the on-device SpeechAnalyzer assets
+// for a locale so a first transcription mid-recording never triggers an
+// unbounded network download. It honors ctx cancellation the same way
+// TranscribeAudio does: the native call runs on its own goroutine and the
+// blocked OS thread unblocks when the Swift-side timeout fires. Asset downloads
+// can be large, so the native timeout is derived from the ctx deadline, falling
+// back to a generous ten minutes.
+func EnsureSpeechAssets(ctx context.Context, locale string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	timeout := nativeTimeout(ctx, 10*time.Minute)
+	done := make(chan error, 1)
+	go func() {
+		localeC := C.CString(locale)
+		var nativeErr *C.char
+		_, err := nativeString(
+			C.lumi_speech_ensure_assets(localeC, C.double(timeout.Seconds()), &nativeErr), nativeErr)
+		C.free(unsafe.Pointer(localeC))
+		done <- err
+	}()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-done:
+		return err
+	}
+}
+
+// nativeTimeout bounds a blocking native call: the time remaining until the
+// ctx deadline when that is shorter than the fallback, else the fallback. The
+// ctx deadline only ever tightens the bound — a long-running caller like
+// `record --duration 8h` must not stretch a per-operation timeout to hours.
+// The native timeout is what unblocks the OS thread after the Go caller has
+// already returned on ctx cancellation, so it must always be finite.
+func nativeTimeout(ctx context.Context, fallback time.Duration) time.Duration {
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining > 0 && remaining < fallback {
+			return remaining
+		}
+	}
+	return fallback
 }
 
 func PermissionStatus(ctx context.Context) (Permissions, error) {
@@ -219,10 +287,11 @@ func SpeechPing() string {
 
 // SpeechCapability reports whether the current OS, authorization state, and
 // locale asset availability are sufficient for on-device SpeechAnalyzer
-// transcription. AssetsInstalled is a proxy backed by
-// [SFSpeechRecognizer supportedLocales], the only per-locale signal readable
-// from Objective-C; the authoritative asset state comes from Swift's
-// AssetInventory at transcribe time.
+// transcription. AssetsInstalled is authoritative: lumi_speech_status_json
+// delegates to Swift's SpeechTranscriber.installedLocales (lumi_speech_assets_installed
+// in speech.swift), which lists the locales whose on-device assets are actually
+// present — unlike assetInstallationRequest nil-ness, which stays non-nil for an
+// already-installed locale and would report a permanent false "missing".
 type SpeechCapability struct {
 	OSSupported     bool   `json:"os_supported"`
 	Locale          string `json:"locale"`

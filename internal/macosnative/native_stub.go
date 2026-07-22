@@ -62,6 +62,8 @@ func RecognizeText(context.Context, string) (string, error) { return "", errUnsu
 
 func TranscribeAudio(context.Context, string, string) (string, error) { return "", errUnsupported }
 
+func EnsureSpeechAssets(context.Context, string) error { return errUnsupported }
+
 func PermissionStatus(context.Context) (Permissions, error) { return Permissions{}, errUnsupported }
 
 func RequestPermissions(context.Context, bool) (Permissions, error) {

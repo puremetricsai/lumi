@@ -39,6 +39,7 @@ tasks:
 
   install:
     desc: Install the lumi binary system-wide into the Go bin directory
+    deps: [speech]
     vars:
       GOBIN:
         sh: go env GOBIN || true
