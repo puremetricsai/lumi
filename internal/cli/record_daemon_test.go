@@ -2,9 +2,11 @@ package cli
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -79,6 +81,27 @@ func TestProcessAlive(t *testing.T) {
 	_ = sleeper.Wait()
 	if processAlive(pid) {
 		t.Fatalf("processAlive(%d) = true after kill+wait", pid)
+	}
+}
+
+func TestStartDetachedProcessPreservesPID(t *testing.T) {
+	child := exec.Command("sleep", "30")
+	pid, err := startDetachedProcess(child)
+	if err != nil {
+		t.Fatalf("startDetachedProcess: %v", err)
+	}
+	if pid <= 0 {
+		t.Fatalf("startDetachedProcess returned pid %d, want a positive pid", pid)
+	}
+	if !processAlive(pid) {
+		t.Fatalf("processAlive(%d) = false after detach, want true", pid)
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		t.Fatalf("FindProcess(%d): %v", pid, err)
+	}
+	if err := proc.Signal(syscall.SIGTERM); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("stop detached process %d: %v", pid, err)
 	}
 }
 

@@ -16,7 +16,7 @@ import (
 // stopTimeout bounds how long `record stop` waits for the recorder to exit
 // gracefully after SIGTERM. It must exceed the recorder's 5s media-
 // preservation window so in-flight media finishes indexing.
-const stopTimeout = 10 * time.Second
+const stopTimeout = 20 * time.Second
 
 // recordState is the on-disk record of a background recorder. It lives at
 // Paths.RecordState so `status`/`stop` can find the process from any terminal.
@@ -186,12 +186,24 @@ func (a *app) spawnRecorder(paths config.Paths, f recordFlags) (int, error) {
 	child.Stdout = logFile
 	child.Stderr = logFile
 	child.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := child.Start(); err != nil {
+	pid, err := startDetachedProcess(child)
+	if err != nil {
 		return 0, fmt.Errorf("start background recorder: %w", err)
 	}
-	// Detach: never Wait, so the child is not reaped when this process exits.
+	return pid, nil
+}
+
+// startDetachedProcess starts child and releases its process handle without
+// losing the PID needed for state tracking. On Unix, Process.Release mutates
+// Process.Pid to -1, so the PID must be captured first.
+func startDetachedProcess(child *exec.Cmd) (int, error) {
+	if err := child.Start(); err != nil {
+		return 0, err
+	}
+	pid := child.Process.Pid
+	// Detach: never Wait, so the child is reaped after this process exits.
 	_ = child.Process.Release()
-	return child.Process.Pid, nil
+	return pid, nil
 }
 
 // confirmAlive polls liveness over the window and returns false only if the
