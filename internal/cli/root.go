@@ -93,59 +93,77 @@ func (a *app) openStore(ctx context.Context) (*store.Store, config.Paths, error)
 	return s, paths, nil
 }
 
+// recordCommand is a parent that only holds the start/status/stop
+// subcommands; with no RunE, cobra prints its help when invoked bare.
 func (a *app) recordCommand() *cobra.Command {
-	var interval, audioChunk, duration time.Duration
-	var noScreen, noAudio bool
-	var speechLocale string
 	cmd := &cobra.Command{
 		Use:   "record",
-		Short: "Continuously capture, process, and index screen and audio activity",
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			if noScreen && noAudio {
-				return errors.New("--no-screen and --no-audio cannot be used together")
-			}
-			if err := requireRecordingPermissions(cmd.Context(), !noScreen, !noAudio, !noAudio); err != nil {
-				return err
-			}
-			s, paths, err := a.openStore(cmd.Context())
-			if err != nil {
-				return err
-			}
-			defer s.Close()
-			ctx := cmd.Context()
-			logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-			if !noAudio {
-				logger.Info("ensuring speech recognition assets", "locale", speechLocale)
-				if err := macosnative.EnsureSpeechAssets(ctx, speechLocale); err != nil {
-					return fmt.Errorf("ensure speech recognition assets for %s: %w", speechLocale, err)
-				}
-			}
-			if duration > 0 {
-				var cancel context.CancelFunc
-				ctx, cancel = context.WithTimeout(ctx, duration)
-				defer cancel()
-			}
-			recorder := capture.Recorder{
-				Store: s, Paths: paths, ScreenInterval: interval, AudioChunk: audioChunk,
-				CaptureScreen: !noScreen, CaptureAudio: !noAudio, Logger: logger,
-				Screen:      capture.NativeScreens{},
-				Text:        capture.VisionText{},
-				Context:     capture.AccessibilityContext{},
-				Audio:       capture.NativeAudio{},
-				Transcriber: capture.NativeSpeech{Locale: speechLocale},
-			}
-			logger.Info("recording started", "database", paths.Database, "screen", !noScreen, "audio", !noAudio)
-			return recorder.Run(ctx)
-		},
+		Short: "Control the background recorder (start, status, stop)",
+		Long: "Manage the background recorder that captures, processes, and indexes screen\n" +
+			"and audio activity. `record start` launches it in the background; `record\n" +
+			"status` reports its state; `record stop` shuts it down gracefully.",
 	}
-	flags := cmd.Flags()
-	flags.DurationVar(&interval, "interval", 2*time.Second, "screen capture interval")
-	flags.DurationVar(&audioChunk, "audio-chunk", 30*time.Second, "audio chunk duration")
-	flags.DurationVar(&duration, "duration", 0, "stop after this duration (zero runs until interrupted)")
-	flags.BoolVar(&noScreen, "no-screen", false, "disable screen capture and text extraction")
-	flags.BoolVar(&noAudio, "no-audio", false, "disable audio capture and transcription")
-	flags.StringVar(&speechLocale, "speech-locale", "en-US", "SpeechAnalyzer recognition locale")
+	cmd.AddCommand(a.recordStartCommand(), a.recordStatusCommand(), a.recordStopCommand())
 	return cmd
+}
+
+// recordFlags holds the capture flags shared by `record start`. In background
+// mode they are forwarded verbatim to the detached `--foreground` child.
+type recordFlags struct {
+	interval, audioChunk, duration time.Duration
+	noScreen, noAudio              bool
+	speechLocale                   string
+}
+
+func (f *recordFlags) bind(cmd *cobra.Command) {
+	flags := cmd.Flags()
+	flags.DurationVar(&f.interval, "interval", 2*time.Second, "screen capture interval")
+	flags.DurationVar(&f.audioChunk, "audio-chunk", 30*time.Second, "audio chunk duration")
+	flags.DurationVar(&f.duration, "duration", 0, "stop after this duration (zero runs until interrupted)")
+	flags.BoolVar(&f.noScreen, "no-screen", false, "disable screen capture and text extraction")
+	flags.BoolVar(&f.noAudio, "no-audio", false, "disable audio capture and transcription")
+	flags.StringVar(&f.speechLocale, "speech-locale", "en-US", "SpeechAnalyzer recognition locale")
+}
+
+// runForeground runs the capture pipeline in the current process until the
+// context is cancelled (signal or --duration). This is the worker that the
+// detached child executes.
+func (a *app) runForeground(cmd *cobra.Command, f recordFlags) error {
+	if f.noScreen && f.noAudio {
+		return errors.New("--no-screen and --no-audio cannot be used together")
+	}
+	if err := requireRecordingPermissions(cmd.Context(), !f.noScreen, !f.noAudio, !f.noAudio); err != nil {
+		return err
+	}
+	s, paths, err := a.openStore(cmd.Context())
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	ctx := cmd.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	if !f.noAudio {
+		logger.Info("ensuring speech recognition assets", "locale", f.speechLocale)
+		if err := macosnative.EnsureSpeechAssets(ctx, f.speechLocale); err != nil {
+			return fmt.Errorf("ensure speech recognition assets for %s: %w", f.speechLocale, err)
+		}
+	}
+	if f.duration > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, f.duration)
+		defer cancel()
+	}
+	recorder := capture.Recorder{
+		Store: s, Paths: paths, ScreenInterval: f.interval, AudioChunk: f.audioChunk,
+		CaptureScreen: !f.noScreen, CaptureAudio: !f.noAudio, Logger: logger,
+		Screen:      capture.NativeScreens{},
+		Text:        capture.VisionText{},
+		Context:     capture.AccessibilityContext{},
+		Audio:       capture.NativeAudio{},
+		Transcriber: capture.NativeSpeech{Locale: f.speechLocale},
+	}
+	logger.Info("recording started", "database", paths.Database, "screen", !f.noScreen, "audio", !f.noAudio)
+	return recorder.Run(ctx)
 }
 
 func (a *app) searchCommand() *cobra.Command {

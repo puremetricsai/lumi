@@ -18,7 +18,7 @@ task test:native                            # permission-gated native smoke test
 
 `internal/capture/recorder_test.go` runs the whole capture→store→search pipeline with fake `ScreenSource`/`ContextExtractor`/`TextExtractor`/`AudioSource`/`SpeechTranscriber` implementations, so it needs no permissions or external binaries. Prefer extending it over invoking real frameworks. `task test:native` builds the stable `./lumi` binary and runs the explicit, permission-gated integration smoke test.
 
-The CLI itself refuses to run on anything but `darwin/arm64` (`platform.Validate` in `PersistentPreRunE`), and native microphone capture requires macOS 26+. `./lumi doctor` reports native permission state, and API configuration. For a bounded manual smoke test: `./lumi record --no-audio --duration 10s`.
+The CLI itself refuses to run on anything but `darwin/arm64` (`platform.Validate` in `PersistentPreRunE`), and native microphone capture requires macOS 26+. `./lumi doctor` reports native permission state, and API configuration. For a bounded manual smoke test: `./lumi record start --foreground --no-audio --duration 10s`.
 
 `task build` compiles the Swift SpeechAnalyzer bridge (`task speech`) before `go build`; run `task build`/`task test` rather than raw `go build`/`go test`, which will not link without `liblumispeech.a`.
 
@@ -40,7 +40,7 @@ Data flows one way: `internal/cli` wires concrete processors into a `capture.Rec
 
 **`internal/retention`** — explicit age- and size-based pruning used by `lumi prune`. Age pruning runs before size pruning; size enforcement walks indexed events oldest-first. There is no background scheduler or default retention policy. Rows are deleted in bounded batches before media files are unlinked.
 
-**`internal/cli`** — Cobra commands (`record`, `search`, `ask`, `prune`, `doctor`, `permissions`, `native-smoke`, `version`). Capture and audio-chunk intervals and transcription settings are flags; native framework implementations are production defaults. `search` and `ask` expose exact case-insensitive app filtering and case-insensitive window-substring filtering. `permissions --request` invokes native TCC request flows; never add `tccutil reset` as an automatic side effect.
+**`internal/cli`** — Cobra commands (`record start`/`status`/`stop`, `search`, `ask`, `prune`, `doctor`, `permissions`, `native-smoke`, `version`). `record` is a parent command: `record start` runs the capture pipeline, detaching to the background by default (`--foreground` keeps it in the terminal); the background worker is a re-exec of `record start --foreground` tracked by a JSON state file and log under the data dir (`internal/cli/record_daemon.go`). `record stop` sends SIGTERM and waits for the graceful-shutdown path. Capture and audio-chunk intervals and transcription settings are flags; native framework implementations are production defaults. `search` and `ask` expose exact case-insensitive app filtering and case-insensitive window-substring filtering. `permissions --request` invokes native TCC request flows; never add `tccutil reset` as an automatic side effect.
 
 **`internal/config`** — resolves `Paths` from `--data-dir`, else `LUMI_HOME`, else `~/Library/Application Support/Lumi`; directories are created 0700.
 

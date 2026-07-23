@@ -16,6 +16,11 @@ type Paths struct {
 	Database    string
 	Screenshots string
 	Audio       string
+	// RecordState is the JSON file that tracks a background recorder (pid,
+	// start time, what it captures). RecordLog collects the background
+	// recorder's stdout/stderr. Both live directly under Root.
+	RecordState string
+	RecordLog   string
 }
 
 func DefaultPaths() (Paths, error) {
@@ -44,6 +49,8 @@ func FromRoot(root string) (Paths, error) {
 		Database:    filepath.Join(root, "lumi.db"),
 		Screenshots: filepath.Join(root, "screenshots"),
 		Audio:       filepath.Join(root, "audio"),
+		RecordState: filepath.Join(root, "record.json"),
+		RecordLog:   filepath.Join(root, "record.log"),
 	}, nil
 }
 
