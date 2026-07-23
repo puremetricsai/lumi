@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -127,19 +128,33 @@ func (r *Recorder) captureScreen(ctx context.Context) {
 			}
 			continue
 		}
-		text := ""
-		textSource := "accessibility"
-		var processErr error
-		if contextErr == nil && screenContext.Text != "" &&
+		// Full-display Vision OCR is the primary screen-text source: the
+		// screenshot already contains the entire display, so OCR captures every
+		// visible window rather than only the focused window's Accessibility text.
+		// The Accessibility tree still supplies App/Window/InputActive attribution,
+		// and its focused-window text is preserved in metadata when substantive so
+		// no information is lost.
+		textSource := "vision"
+		processingCtx, cancel := preservationContext(ctx)
+		text, processErr := r.Text.Extract(processingCtx, frame.Path)
+		cancel()
+
+		axText := ""
+		if contextErr == nil && substantiveAXText(screenContext) &&
 			(screenContext.DisplayID == 0 || screenContext.DisplayID == frame.DisplayID) {
-			text = screenContext.Text
-		} else {
-			textSource = "vision"
-			processingCtx, cancel := preservationContext(ctx)
-			text, processErr = r.Text.Extract(processingCtx, frame.Path)
-			cancel()
+			axText = screenContext.Text
 		}
-		metadata := screenMetadata(frame, textSource, similarity, processErr, contextErr, compareErr)
+		// If Vision produced no usable text, fall back to indexing the substantive
+		// Accessibility text so the event stays searchable: events_fts and ask read
+		// Event.Text, not metadata. Otherwise keep the AX text as supplementary
+		// provenance in metadata alongside the full-screen OCR body.
+		axMetadata := axText
+		if strings.TrimSpace(text) == "" && axText != "" {
+			text = axText
+			textSource = "accessibility"
+			axMetadata = ""
+		}
+		metadata := screenMetadata(frame, textSource, axMetadata, similarity, processErr, contextErr, compareErr)
 		event := &store.Event{Kind: store.KindScreen, CapturedAt: now, Text: text,
 			App: screenContext.App, Window: screenContext.Window, MediaPath: frame.Path,
 			TextSource: textSource, DisplayID: frame.DisplayID, Metadata: metadata}
@@ -158,13 +173,25 @@ func (r *Recorder) captureScreen(ctx context.Context) {
 	}
 }
 
-func screenMetadata(frame ScreenFrame, textSource string, similarity float64, processErr, contextErr, compareErr error) json.RawMessage {
+// substantiveAXText reports whether the Accessibility snapshot carries more than
+// the window title. It mirrors the render-time heuristic in
+// internal/cli/context.go (screenEvidence) so "useful screen text" means the same
+// thing at capture and at query time.
+func substantiveAXText(c ScreenContext) bool {
+	text := strings.TrimSpace(c.Text)
+	return text != "" && text != strings.TrimSpace(c.Window)
+}
+
+func screenMetadata(frame ScreenFrame, textSource, axText string, similarity float64, processErr, contextErr, compareErr error) json.RawMessage {
 	metadata := map[string]any{
 		"display_id":       frame.DisplayID,
 		"width":            frame.Width,
 		"height":           frame.Height,
 		"text_source":      textSource,
 		"frame_similarity": similarity,
+	}
+	if axText != "" {
+		metadata["accessibility_text"] = axText
 	}
 	if processErr != nil {
 		metadata["processor_error"] = processErr.Error()

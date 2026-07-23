@@ -59,8 +59,9 @@ func (NativeScreens) Capture(ctx context.Context, directory, prefix string) ([]S
 }
 
 // AccessibilityContext reads the focused application's Accessibility tree.
-// It is the primary screen-text source; Vision is only invoked when the tree
-// is unavailable or contains no useful text.
+// It supplies focused-app attribution (App, Window, InputActive); its
+// focused-window text is preserved in event metadata when substantive but is not
+// the primary screen-text source, since it cannot see beyond the focused window
 type AccessibilityContext struct{}
 
 func (AccessibilityContext) Snapshot(ctx context.Context) (ScreenContext, error) {
@@ -74,7 +75,10 @@ func (AccessibilityContext) Snapshot(ctx context.Context) (ScreenContext, error)
 	}, nil
 }
 
-// VisionText performs on-device Apple Vision text recognition.
+// VisionText performs on-device Apple Vision text recognition over the full
+// display screenshot. It is the primary screen-text source, so the indexed text
+// reflects the entire screen (every visible window) rather than only the focused
+// application.
 type VisionText struct{}
 
 func (VisionText) Extract(ctx context.Context, imagePath string) (string, error) {
