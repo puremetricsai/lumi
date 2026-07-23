@@ -218,6 +218,9 @@ func TestRecordStatusAndStop(t *testing.T) {
 	if !strings.Contains(out, "recording stopped") {
 		t.Fatalf("stop output = %q, want %q", out, "recording stopped")
 	}
+	if !strings.Contains(out, "gracefully stopping") {
+		t.Fatalf("stop output = %q, want %q", out, "gracefully stopping")
+	}
 	if processAlive(pid) {
 		t.Fatalf("process %d still alive after stop", pid)
 	}

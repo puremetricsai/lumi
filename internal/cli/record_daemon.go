@@ -291,6 +291,7 @@ func (a *app) recordStopCommand() *cobra.Command {
 				fmt.Fprintln(cmd.OutOrStdout(), "not recording")
 				return nil
 			}
+			fmt.Fprintf(cmd.OutOrStdout(), "gracefully stopping recording (pid %d)...\n", state.PID)
 			if err := stopProcess(state.PID, stopTimeout); err != nil {
 				return err
 			}
