@@ -350,20 +350,27 @@ func (a *app) pruneCommand() *cobra.Command {
 			// confirmation. A dry run deletes nothing, and --yes is the escape
 			// hatch for scripts.
 			if all && !dryRun && !yes {
-				confirmed, err := confirmPruneAll(cmd.InOrStdin(), cmd.OutOrStdout())
+				// Confirmation banner, prompt, and abort notice are interactive
+				// text for a human, not command results, so they go to stderr;
+				// stdout stays reserved for the JSON/summary result (which would
+				// otherwise be corrupted under --json).
+				confirmed, err := confirmPruneAll(cmd.InOrStdin(), cmd.ErrOrStderr())
 				if err != nil {
 					return err
 				}
 				if !confirmed {
-					fmt.Fprintln(cmd.OutOrStdout(), "aborted; nothing was deleted")
+					fmt.Fprintln(cmd.ErrOrStderr(), "aborted; nothing was deleted")
 					return nil
 				}
 			}
-			s, _, err := a.openStore(cmd.Context())
+			s, paths, err := a.openStore(cmd.Context())
 			if err != nil {
 				return err
 			}
 			defer s.Close()
+			// --all sweeps orphaned media (files no row references) from the
+			// media directories; age/size policies ignore MediaDirs.
+			opts.MediaDirs = []string{paths.Screenshots, paths.Audio}
 			result, err := retention.Prune(cmd.Context(), s, opts)
 			if err != nil {
 				return err

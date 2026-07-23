@@ -213,6 +213,42 @@ func TestExpiredAndDeleteByIDs(t *testing.T) {
 	}
 }
 
+// AllEvents returns every row oldest-first with no cutoff — including one
+// timestamped far in the future that a bounded Expired cutoff would miss.
+func TestAllEventsReturnsEveryRow(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	old := Event{Kind: KindScreen, CapturedAt: now.Add(-48 * time.Hour), Text: "ancient", MediaPath: "old.jpg"}
+	fresh := Event{Kind: KindScreen, CapturedAt: now, Text: "current", MediaPath: "new.jpg"}
+	future := Event{Kind: KindScreen, CapturedAt: time.Date(3500, 1, 1, 0, 0, 0, 0, time.UTC), Text: "future", MediaPath: "future.jpg"}
+	for _, e := range []*Event{&fresh, &old, &future} {
+		if err := s.Insert(ctx, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	all, err := s.AllEvents(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("AllEvents returned %d events, want 3", len(all))
+	}
+	// Oldest first: old, fresh, future.
+	wantOrder := []int64{old.ID, fresh.ID, future.ID}
+	for i, want := range wantOrder {
+		if all[i].ID != want {
+			t.Fatalf("AllEvents[%d].ID = %d, want %d (expected oldest-first order)", i, all[i].ID, want)
+		}
+	}
+}
+
 func TestDeleteByIDsWithNoIDs(t *testing.T) {
 	ctx := context.Background()
 	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))
