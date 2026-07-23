@@ -223,7 +223,9 @@ func (a *app) askCommand() *cobra.Command {
 			case stageAnyTerm:
 				fmt.Fprintln(cmd.ErrOrStderr(), "note: no events matched every term; ranked by best partial match")
 			case stageRecent:
-				fmt.Fprintf(cmd.ErrOrStderr(), "note: the question had no searchable terms; using the %d most recent events\n", len(events))
+				fmt.Fprintf(cmd.ErrOrStderr(), "note: broad question; reviewing the %d most recent events\n", len(events))
+			case stageRecentUnmatched:
+				fmt.Fprintf(cmd.ErrOrStderr(), "note: no events matched the question terms; reviewing the %d most recent events instead\n", len(events))
 			}
 			answer, err := a.answerer(model).Answer(cmd.Context(), args[0], contextFor(events, maxContextChars))
 			if err != nil {

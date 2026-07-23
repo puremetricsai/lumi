@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -70,28 +71,101 @@ func compactScreenText(s string) string {
 	return strings.Join(kept, "\n")
 }
 
+func screenEvidence(event store.Event) (string, string) {
+	text := truncateRunes(compactScreenText(event.Text), maxEventChars)
+	if text != "" && text == strings.TrimSpace(event.Window) {
+		return "window_title_only", "[window title only; no file contents or user action captured]"
+	}
+	return "visible_extracted_text", text
+}
+
+func eventBlock(event store.Event) string {
+	text := truncateRunes(compactScreenText(event.Text), maxEventChars)
+	if event.Kind == store.KindAudio {
+		status := "present"
+		if text == "" {
+			status = "unavailable"
+			text = "[no searchable transcript was produced for this audio file]"
+		}
+		return fmt.Sprintf("[%s] kind=audio audio_source=%q transcript_status=%s media=%q duration_ms=%d\n%s\n\n",
+			event.CapturedAt.Format(time.RFC3339), event.AudioSource, status,
+			event.MediaPath, event.DurationMS, text)
+	}
+	observation, text := screenEvidence(event)
+	return fmt.Sprintf("[%s] kind=screen observation=%s app=%q window=%q text_source=%q display_id=%d media=%q\n%s\n\n",
+		event.CapturedAt.Format(time.RFC3339), observation, event.App, event.Window,
+		event.TextSource, event.DisplayID, event.MediaPath, text)
+}
+
+// sameScreenText reports whether adjacent selected screen events carry the
+// same evidence for ask. Their screenshots remain separate files in the store;
+// this only prevents a run of identical extracted text from dominating the LLM
+// context and being mistaken for distinct activity.
+func sameScreenText(a, b store.Event) bool {
+	return a.Kind == store.KindScreen && b.Kind == store.KindScreen &&
+		a.App == b.App && a.Window == b.Window && a.Text == b.Text &&
+		a.TextSource == b.TextSource && a.DisplayID == b.DisplayID
+}
+
+func repeatedScreenBlock(events []store.Event) string {
+	first := events[0]
+	last := events[len(events)-1]
+	observation, text := screenEvidence(first)
+	return fmt.Sprintf("[%s .. %s] kind=screen observation=unchanged_%s captures=%d app=%q window=%q text_source=%q display_id=%d media_files=%d\n%s\n\n",
+		first.CapturedAt.Format(time.RFC3339), last.CapturedAt.Format(time.RFC3339),
+		observation, len(events), first.App, first.Window, first.TextSource, first.DisplayID, len(events), text)
+}
+
 // contextFor renders events as the activity context for `ask`, capping each
 // event at maxEventChars and the whole string at budget.
 //
 // budget is counted in bytes of the returned string, including the per-event
-// header lines. Events arrive ranked best-first, so dropping the tail discards
-// the least relevant. At least one event is always emitted: handing the model
-// an empty context is worse than overshooting a soft budget.
+// header lines. Events arrive ranked best-first, so admission happens in that
+// order and dropping the tail discards the least relevant. The admitted events
+// are then rendered oldest-first so the model can reconstruct activity without
+// inventing an order from a relevance-ranked or newest-first list. At least one
+// event is always emitted: handing the model an empty context is worse than
+// overshooting a soft budget.
 func contextFor(events []store.Event, budget int) string {
-	var builder strings.Builder
+	selected := make([]store.Event, 0, len(events))
+	selectedBytes := 0
+	omitted := 0
 	for i, event := range events {
-		block := fmt.Sprintf("[%s] kind=%s app=%q window=%q text_source=%q display_id=%d audio_source=%q media=%q\n%s\n\n",
-			event.CapturedAt.Format(time.RFC3339), event.Kind, event.App, event.Window,
-			event.TextSource, event.DisplayID, event.AudioSource, event.MediaPath,
-			truncateRunes(compactScreenText(event.Text), maxEventChars))
+		block := eventBlock(event)
 		// The marker is part of the output, so its cost has to be reserved
 		// before the block is admitted — otherwise appending it overshoots.
 		marker := fmt.Sprintf(omissionMarker, len(events)-i)
-		if i > 0 && builder.Len()+len(block)+len(marker) > budget {
-			builder.WriteString(marker)
+		if i > 0 && selectedBytes+len(block)+len(marker) > budget {
+			omitted = len(events) - i
 			break
 		}
-		builder.WriteString(block)
+		selected = append(selected, event)
+		selectedBytes += len(block)
+	}
+
+	// Search still chooses which events make the cut. Sorting only after that
+	// choice preserves relevance while giving the answerer a trustworthy
+	// timeline. SliceStable preserves retrieval order for equal timestamps.
+	sort.SliceStable(selected, func(i, j int) bool {
+		return selected[i].CapturedAt.Before(selected[j].CapturedAt)
+	})
+
+	var builder strings.Builder
+	builder.Grow(selectedBytes)
+	for i := 0; i < len(selected); {
+		end := i + 1
+		for end < len(selected) && sameScreenText(selected[end-1], selected[end]) {
+			end++
+		}
+		if end-i > 1 {
+			builder.WriteString(repeatedScreenBlock(selected[i:end]))
+		} else {
+			builder.WriteString(eventBlock(selected[i]))
+		}
+		i = end
+	}
+	if omitted > 0 {
+		builder.WriteString(fmt.Sprintf(omissionMarker, omitted))
 	}
 	return builder.String()
 }

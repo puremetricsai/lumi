@@ -16,7 +16,14 @@ type retrievalStage string
 const (
 	stageAllTerms retrievalStage = "all-terms"
 	stageAnyTerm  retrievalStage = "any-term"
-	stageRecent   retrievalStage = "recent"
+	// stageRecent is a deliberate broad-question fallback: nothing in the
+	// question was useful as an FTS term.
+	stageRecent retrievalStage = "recent"
+	// stageRecentUnmatched is materially different from stageRecent. The
+	// question did contain useful terms, but none occurred in the selected
+	// activity window. Keeping the reasons separate prevents ask from telling
+	// users that a real query had "no searchable terms".
+	stageRecentUnmatched retrievalStage = "recent-unmatched"
 )
 
 const (
@@ -49,6 +56,8 @@ func init() {
 		by as and or but not no nor if then than so such
 		tell show remind find search look give list
 		anything something everything some any all
+		record records recorded recording save saved capture captured
+		activity activities logged indexed remembered far
 		yesterday today tonight tomorrow morning afternoon evening
 		day days week weeks month months year years
 		ago last recent recently earlier ago past now
@@ -119,6 +128,13 @@ func retrieveContext(ctx context.Context, s *store.Store, question string, opts 
 				return events, stage.name, nil
 			}
 		}
+		opts.Query = ""
+		opts.Match = store.MatchAll
+		events, err := s.Search(ctx, opts)
+		if err != nil {
+			return nil, stageRecentUnmatched, err
+		}
+		return events, stageRecentUnmatched, nil
 	}
 	opts.Query = ""
 	opts.Match = store.MatchAll
