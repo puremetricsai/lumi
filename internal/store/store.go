@@ -216,9 +216,26 @@ FROM events WHERE captured_at < ? ORDER BY captured_at ASC`
 		query += " LIMIT ?"
 		args = append(args, limit)
 	}
+	return s.queryEvents(ctx, query, args...)
+}
+
+// AllEvents returns every event, oldest first, with no timestamp cutoff. It
+// backs the `lumi prune --all` wipe, where a bounded `Expired` cutoff could
+// silently skip a row timestamped at or past the cutoff (e.g. a far-future
+// captured_at). Callers own deleting the returned rows and their media.
+func (s *Store) AllEvents(ctx context.Context) ([]Event, error) {
+	query := `SELECT id, kind, captured_at, text, app, window, media_path, duration_ms,
+text_source, display_id, audio_source, metadata_json
+FROM events ORDER BY captured_at ASC`
+	return s.queryEvents(ctx, query)
+}
+
+// queryEvents runs a SELECT with the standard event column list and scans the
+// rows into Events.
+func (s *Store) queryEvents(ctx context.Context, query string, args ...any) ([]Event, error) {
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("select expired events: %w", err)
+		return nil, fmt.Errorf("select events: %w", err)
 	}
 	defer rows.Close()
 	events := make([]Event, 0)
@@ -228,7 +245,7 @@ FROM events WHERE captured_at < ? ORDER BY captured_at ASC`
 		if err := rows.Scan(&event.ID, &event.Kind, &capturedAt, &event.Text, &event.App,
 			&event.Window, &event.MediaPath, &event.DurationMS, &event.TextSource, &event.DisplayID,
 			&event.AudioSource, &metadata); err != nil {
-			return nil, fmt.Errorf("scan expired event: %w", err)
+			return nil, fmt.Errorf("scan event: %w", err)
 		}
 		event.CapturedAt, err = time.Parse(time.RFC3339Nano, capturedAt)
 		if err != nil {
@@ -238,7 +255,7 @@ FROM events WHERE captured_at < ? ORDER BY captured_at ASC`
 		events = append(events, event)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate expired events: %w", err)
+		return nil, fmt.Errorf("iterate events: %w", err)
 	}
 	return events, nil
 }

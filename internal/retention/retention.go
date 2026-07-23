@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/puremetricsai/lumi/internal/store"
@@ -22,6 +23,14 @@ type Options struct {
 	// MaxBytes caps the total size of media files on disk. Oldest events are
 	// deleted until the footprint fits. Zero disables size-based pruning.
 	MaxBytes int64
+	// All deletes every event and its media, ignoring Before and MaxBytes. It
+	// is the destructive "wipe everything" policy behind `lumi prune --all`.
+	All bool
+	// MediaDirs are the directories the --all wipe sweeps for orphaned media
+	// (files no event row references) after deleting indexed rows and their
+	// files. Typically Paths.Screenshots and Paths.Audio. Only the All policy
+	// reads this; age and size policies never sweep directories.
+	MediaDirs []string
 	// DryRun reports what would be deleted without deleting anything.
 	DryRun bool
 }
@@ -30,13 +39,35 @@ type Result struct {
 	Events       int64 `json:"events"`
 	Bytes        int64 `json:"bytes"`
 	MissingFiles int   `json:"missing_files"`
+	// OrphanFiles counts media files removed by the --all sweep that no event
+	// row referenced. Their bytes are already included in Bytes.
+	OrphanFiles int `json:"orphan_files"`
 }
 
 // Prune applies the age policy first, then the size policy.
 func Prune(ctx context.Context, s *store.Store, opts Options) (Result, error) {
 	var result Result
+	if opts.All {
+		// The wipe enumerates every row with no timestamp cutoff — a bounded
+		// cutoff (even one 1000 years out) uses a strict `captured_at < ?`
+		// compare and would silently skip a row dated at or past it. Rows and
+		// their referenced files are deleted first (rows-before-files), then
+		// any orphaned media no row pointed at is swept from MediaDirs.
+		all, err := s.AllEvents(ctx)
+		if err != nil {
+			return result, err
+		}
+		partial, err := remove(ctx, s, all, opts.DryRun)
+		result.add(partial)
+		if err != nil {
+			return result, err
+		}
+		orphans, err := sweepOrphans(opts.MediaDirs, all, opts.DryRun)
+		result.add(orphans)
+		return result, err
+	}
 	if opts.Before == nil && opts.MaxBytes <= 0 {
-		return result, errors.New("prune requires --older-than or --max-bytes")
+		return result, errors.New("prune requires --all, --older-than, or --max-bytes")
 	}
 
 	agePruned := make(map[int64]bool)
@@ -131,6 +162,65 @@ func remove(ctx context.Context, s *store.Store, events []store.Event, dryRun bo
 	return result, nil
 }
 
+// sweepOrphans removes regular files remaining in the media directories that no
+// event row referenced. Only the --all wipe calls it: it is what makes the wipe
+// a true privacy guarantee, catching media a failed Insert never indexed or a
+// prior prune left behind after deleting its row but before unlinking the file.
+//
+// referenced holds the media paths of the just-removed rows. On a real run
+// those files are already unlinked so the skip is a no-op; on a dry run they are
+// still present, and skipping them keeps the reported bytes equal to a real run
+// (remove already counted them) instead of double-counting them as orphans.
+func sweepOrphans(dirs []string, referenced []store.Event, dryRun bool) (Result, error) {
+	var result Result
+	known := make(map[string]bool, len(referenced))
+	for _, event := range referenced {
+		known[filepath.Clean(event.MediaPath)] = true
+	}
+	seenDir := make(map[string]bool, len(dirs))
+	for _, dir := range dirs {
+		if dir == "" || seenDir[dir] {
+			continue
+		}
+		seenDir[dir] = true
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return result, fmt.Errorf("scan media directory %s: %w", dir, err)
+		}
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			path := filepath.Join(dir, entry.Name())
+			if known[filepath.Clean(path)] {
+				continue
+			}
+			info, err := entry.Info()
+			if err != nil {
+				if os.IsNotExist(err) {
+					continue
+				}
+				return result, fmt.Errorf("stat orphan media %s: %w", path, err)
+			}
+			if !info.Mode().IsRegular() {
+				continue
+			}
+			result.OrphanFiles++
+			result.Bytes += info.Size()
+			if dryRun {
+				continue
+			}
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				return result, fmt.Errorf("remove orphan media %s: %w", path, err)
+			}
+		}
+	}
+	return result, nil
+}
+
 func fileSize(path string) int64 {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -148,4 +238,5 @@ func (r *Result) add(other Result) {
 	r.Events += other.Events
 	r.Bytes += other.Bytes
 	r.MissingFiles += other.MissingFiles
+	r.OrphanFiles += other.OrphanFiles
 }
