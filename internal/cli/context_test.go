@@ -52,7 +52,8 @@ func TestContextForTruncatesPerEvent(t *testing.T) {
 	if len(got) > maxEventChars*2 {
 		t.Fatalf("single event rendered %d bytes, expected a per-event cap near %d", len(got), maxEventChars)
 	}
-	for _, want := range []string{"2026-07-19T12:00:00Z", "screen", "Arc", "Roadmap", "a.jpg"} {
+	localTime := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC).Local().Format(time.RFC3339)
+	for _, want := range []string{localTime, "screen", "Arc", "Roadmap", "a.jpg"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("header lost %q:\n%s", want, got)
 		}
@@ -161,6 +162,26 @@ func TestContextForDoesNotConsolidateAcrossOtherActivity(t *testing.T) {
 	got := contextFor([]store.Event{screen, audio, screenAgain}, defaultContextChars)
 	if strings.Contains(got, "captures=2") || strings.Count(got, "kind=screen") != 2 {
 		t.Fatalf("screen captures separated by audio were incorrectly consolidated:\n%s", got)
+	}
+}
+
+// TestContextForRendersLocalTime is the regression for `ask` echoing UTC (04:24Z)
+// when asked about a local time (9:15 pm). Stored-UTC timestamps must render local
+// so the model interprets and reports times the user recognizes.
+func TestContextForRendersLocalTime(t *testing.T) {
+	captured := time.Date(2026, 7, 23, 4, 24, 16, 0, time.UTC)
+	event := store.Event{
+		Kind: store.KindScreen, CapturedAt: captured,
+		App: "Zed", Window: "lumi", Text: "some visible text", MediaPath: "a.jpg",
+	}
+
+	got := contextFor([]store.Event{event}, defaultContextChars)
+	want := captured.Local().Format(time.RFC3339)
+	if !strings.Contains(got, want) {
+		t.Fatalf("context did not render local timestamp %q:\n%s", want, got)
+	}
+	if _, offset := captured.Local().Zone(); offset != 0 && strings.Contains(got, "T04:24:16Z") {
+		t.Fatalf("context leaked the UTC timestamp instead of local time:\n%s", got)
 	}
 }
 

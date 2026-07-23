@@ -35,10 +35,10 @@ const (
 
 // questionStopwords are words that carry no retrieval signal in a question.
 //
-// Temporal words are included deliberately: the time window is already
-// expressed by --since, and leaving "yesterday" in the term list makes the
-// all-terms pass fail on almost every naturally phrased question. Mapping time
-// expressions onto --since properly is a worthwhile follow-up.
+// Temporal words are dropped deliberately: the window comes from --since (or
+// parseTimeWindow upstream), and leaving "yesterday" in the terms makes the
+// all-terms pass fail on almost every naturally phrased question. Words
+// parseTimeWindow misses are still dropped here so they never reach FTS.
 //
 // "go" is deliberately absent: on a developer's machine it is far more often
 // the language than the verb.

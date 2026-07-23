@@ -245,7 +245,18 @@ func (a *app) askCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			events, stage, err := retrieveContext(cmd.Context(), s, args[0], opts)
+			// A recognized time expression ("around 9:15 pm") sets the window and is
+			// stripped from the question, unless --since was set explicitly.
+			question := args[0]
+			if !cmd.Flags().Changed("since") {
+				if winSince, winUntil, rest, ok := parseTimeWindow(question, time.Now()); ok {
+					opts.Since, opts.Until = winSince, winUntil
+					question = rest
+					fmt.Fprintf(cmd.ErrOrStderr(), "note: interpreting the time in your question as %s\n",
+						describeTimeWindow(*winSince, *winUntil))
+				}
+			}
+			events, stage, err := retrieveContext(cmd.Context(), s, question, opts)
 			if err != nil {
 				return err
 			}
@@ -254,8 +265,6 @@ func (a *app) askCommand() *cobra.Command {
 			}
 			// Never answer from a degraded retrieval silently.
 			switch stage {
-			case stageAnyTerm:
-				fmt.Fprintln(cmd.ErrOrStderr(), "note: no events matched every term; ranked by best partial match")
 			case stageRecent:
 				fmt.Fprintf(cmd.ErrOrStderr(), "note: broad question; reviewing the %d most recent events\n", len(events))
 			case stageRecentUnmatched:

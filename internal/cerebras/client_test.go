@@ -30,6 +30,12 @@ func TestAnswer(t *testing.T) {
 			"transcript_status=present",
 			"never merge it with a nearby transcript",
 			"not visible in the supplied records",
+			"second person",
+			"name only the focused window",
+			"never attribute that content to the focused app",
+			"never open with phrases like",
+			"local timezone",
+			"never in UTC",
 		} {
 			if !strings.Contains(string(body), instruction) {
 				t.Fatalf("request omitted %q guidance: %s", instruction, body)

@@ -79,6 +79,33 @@ func screenEvidence(event store.Event) (string, string) {
 	return "visible_extracted_text", text
 }
 
+// localTimestamp renders a UTC-stored instant in the user's local timezone.
+// `ask` questions and answers use local wall-clock time; RFC3339 keeps the
+// numeric offset so the instant stays unambiguous.
+func localTimestamp(t time.Time) string {
+	return t.Local().Format(time.RFC3339)
+}
+
+// describeTimeWindow renders a [since, until) window in the user's local
+// timezone as a short human-readable phrase. A window spanning exactly one
+// calendar day (midnight to midnight) reads as "the day of 2006-01-02"; a
+// window contained within a single day names the day once and gives the clock
+// range; anything crossing a day boundary spells out both ends.
+func describeTimeWindow(since, until time.Time) string {
+	s, u := since.Local(), until.Local()
+	const dayFmt, clockFmt = "2006-01-02", "3:04 PM"
+	midnight := func(t time.Time) bool {
+		return t.Hour() == 0 && t.Minute() == 0 && t.Second() == 0 && t.Nanosecond() == 0
+	}
+	if midnight(s) && midnight(u) && u.Sub(s) == 24*time.Hour {
+		return "the day of " + s.Format(dayFmt)
+	}
+	if s.Year() == u.Year() && s.YearDay() == u.YearDay() {
+		return s.Format(dayFmt) + ", " + s.Format(clockFmt) + " to " + u.Format(clockFmt)
+	}
+	return s.Format(dayFmt+" "+clockFmt) + " to " + u.Format(dayFmt+" "+clockFmt)
+}
+
 func eventBlock(event store.Event) string {
 	text := truncateRunes(compactScreenText(event.Text), maxEventChars)
 	if event.Kind == store.KindAudio {
@@ -88,12 +115,12 @@ func eventBlock(event store.Event) string {
 			text = "[no searchable transcript was produced for this audio file]"
 		}
 		return fmt.Sprintf("[%s] kind=audio audio_source=%q transcript_status=%s media=%q duration_ms=%d\n%s\n\n",
-			event.CapturedAt.Format(time.RFC3339), event.AudioSource, status,
+			localTimestamp(event.CapturedAt), event.AudioSource, status,
 			event.MediaPath, event.DurationMS, text)
 	}
 	observation, text := screenEvidence(event)
 	return fmt.Sprintf("[%s] kind=screen observation=%s app=%q window=%q text_source=%q display_id=%d media=%q\n%s\n\n",
-		event.CapturedAt.Format(time.RFC3339), observation, event.App, event.Window,
+		localTimestamp(event.CapturedAt), observation, event.App, event.Window,
 		event.TextSource, event.DisplayID, event.MediaPath, text)
 }
 
@@ -112,7 +139,7 @@ func repeatedScreenBlock(events []store.Event) string {
 	last := events[len(events)-1]
 	observation, text := screenEvidence(first)
 	return fmt.Sprintf("[%s .. %s] kind=screen observation=unchanged_%s captures=%d app=%q window=%q text_source=%q display_id=%d media_files=%d\n%s\n\n",
-		first.CapturedAt.Format(time.RFC3339), last.CapturedAt.Format(time.RFC3339),
+		localTimestamp(first.CapturedAt), localTimestamp(last.CapturedAt),
 		observation, len(events), first.App, first.Window, first.TextSource, first.DisplayID, len(events), text)
 }
 

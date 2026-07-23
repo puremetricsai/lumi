@@ -79,7 +79,7 @@ func TestAskRetrievesInsteadOfFallingBackToRecency(t *testing.T) {
 	}
 	fake, _, run := newAskTest(t, events...)
 
-	_, stderr, err := run("what did I read about postgres yesterday")
+	_, stderr, err := run("what did I read about postgres")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +131,7 @@ func TestAskReportsUnmatchedTermsAccurately(t *testing.T) {
 	}
 }
 
-func TestAskReportsPartialMatch(t *testing.T) {
+func TestAskPartialMatchIsSilent(t *testing.T) {
 	_, _, run := newAskTest(t, store.Event{
 		Kind: store.KindScreen, CapturedAt: time.Now().UTC(), Text: "postgres index tuning", MediaPath: "a.jpg",
 	})
@@ -140,8 +140,45 @@ func TestAskReportsPartialMatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(stderr, "best partial match") {
-		t.Fatalf("partial-match stage must be reported, stderr was %q", stderr)
+	if strings.Contains(stderr, "best partial match") {
+		t.Fatalf("partial-match stage must not be reported, stderr was %q", stderr)
+	}
+}
+
+func TestAskDerivesWindowFromQuestion(t *testing.T) {
+	now := time.Now().UTC()
+	fake, _, run := newAskTest(t,
+		store.Event{Kind: store.KindScreen, CapturedAt: now.Add(-90 * time.Minute), Text: "budget spreadsheet review", MediaPath: "a.jpg"},
+		store.Event{Kind: store.KindScreen, CapturedAt: now.Add(-10 * time.Hour), Text: "morning standup notes", MediaPath: "b.jpg"},
+	)
+
+	_, stderr, err := run("what was I doing in the last 2 hours")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stderr, "interpreting the time in your question") {
+		t.Fatalf("time window must be surfaced, stderr was %q", stderr)
+	}
+	if !strings.Contains(fake.activityContext, "budget spreadsheet review") {
+		t.Fatalf("in-window event was not retrieved:\n%s", fake.activityContext)
+	}
+	if strings.Contains(fake.activityContext, "morning standup notes") {
+		t.Fatalf("event outside the derived window leaked in:\n%s", fake.activityContext)
+	}
+}
+
+func TestAskExplicitSinceSkipsWindowDerivation(t *testing.T) {
+	now := time.Now().UTC()
+	_, _, run := newAskTest(t,
+		store.Event{Kind: store.KindScreen, CapturedAt: now.Add(-90 * time.Minute), Text: "budget spreadsheet review", MediaPath: "a.jpg"},
+	)
+
+	_, stderr, err := run("what was I doing in the last 2 hours", "--since", "48h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(stderr, "interpreting the time in your question") {
+		t.Fatalf("explicit --since must skip natural-time parsing, stderr was %q", stderr)
 	}
 }
 
