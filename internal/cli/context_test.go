@@ -117,6 +117,89 @@ func TestContextForEmpty(t *testing.T) {
 	}
 }
 
+func TestContextForRendersSelectedEventsChronologically(t *testing.T) {
+	base := time.Date(2026, 7, 23, 0, 0, 0, 0, time.UTC)
+	events := []store.Event{
+		{Kind: store.KindScreen, CapturedAt: base.Add(2 * time.Minute), Text: "third", MediaPath: "c.jpg"},
+		{Kind: store.KindScreen, CapturedAt: base, Text: "first", MediaPath: "a.jpg"},
+		{Kind: store.KindAudio, CapturedAt: base.Add(time.Minute), Text: "second", MediaPath: "b.wav"},
+	}
+
+	got := contextFor(events, defaultContextChars)
+	first := strings.Index(got, "first")
+	second := strings.Index(got, "second")
+	third := strings.Index(got, "third")
+	if first < 0 || second < 0 || third < 0 || !(first < second && second < third) {
+		t.Fatalf("events were not chronological:\n%s", got)
+	}
+}
+
+func TestContextForConsolidatesAdjacentIdenticalScreenText(t *testing.T) {
+	base := time.Date(2026, 7, 23, 0, 0, 0, 0, time.UTC)
+	events := []store.Event{
+		{Kind: store.KindScreen, CapturedAt: base, App: "Zed", Window: "lumi — README.md", TextSource: "accessibility", Text: "lumi — README.md", MediaPath: "a.jpg"},
+		{Kind: store.KindScreen, CapturedAt: base.Add(2 * time.Second), App: "Zed", Window: "lumi — README.md", TextSource: "accessibility", Text: "lumi — README.md", MediaPath: "b.jpg"},
+	}
+
+	got := contextFor(events, defaultContextChars)
+	if !strings.Contains(got, "captures=2") || !strings.Contains(got, "media_files=2") {
+		t.Fatalf("repeated captures were not consolidated:\n%s", got)
+	}
+	if strings.Count(got, "kind=screen") != 1 {
+		t.Fatalf("expected one consolidated screen block:\n%s", got)
+	}
+}
+
+func TestContextForDoesNotConsolidateAcrossOtherActivity(t *testing.T) {
+	base := time.Date(2026, 7, 23, 0, 0, 0, 0, time.UTC)
+	screen := store.Event{Kind: store.KindScreen, CapturedAt: base, App: "Zed", Window: "lumi", Text: "lumi", MediaPath: "a.jpg"}
+	audio := store.Event{Kind: store.KindAudio, CapturedAt: base.Add(time.Second), AudioSource: "system", Text: "spoken words", MediaPath: "a.wav"}
+	screenAgain := screen
+	screenAgain.CapturedAt = base.Add(2 * time.Second)
+	screenAgain.MediaPath = "b.jpg"
+
+	got := contextFor([]store.Event{screen, audio, screenAgain}, defaultContextChars)
+	if strings.Contains(got, "captures=2") || strings.Count(got, "kind=screen") != 2 {
+		t.Fatalf("screen captures separated by audio were incorrectly consolidated:\n%s", got)
+	}
+}
+
+func TestContextForLabelsUntranscribedAudioExplicitly(t *testing.T) {
+	event := store.Event{
+		Kind: store.KindAudio, CapturedAt: time.Date(2026, 7, 23, 0, 0, 0, 0, time.UTC),
+		AudioSource: "microphone", MediaPath: "mic.wav",
+	}
+
+	got := contextFor([]store.Event{event}, defaultContextChars)
+	for _, want := range []string{
+		`audio_source="microphone"`,
+		"transcript_status=unavailable",
+		"no searchable transcript was produced",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("audio context omitted %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestContextForLabelsWindowTitleOnlyScreenEvidence(t *testing.T) {
+	event := store.Event{
+		Kind: store.KindScreen, CapturedAt: time.Date(2026, 7, 23, 0, 0, 0, 0, time.UTC),
+		App: "Zed", Window: "lumi — .env", TextSource: "accessibility",
+		Text: "lumi — .env", MediaPath: "screen.jpg",
+	}
+
+	got := contextFor([]store.Event{event}, defaultContextChars)
+	for _, want := range []string{
+		"observation=window_title_only",
+		"no file contents or user action captured",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("screen context omitted %q:\n%s", want, got)
+		}
+	}
+}
+
 func TestCompactScreenText(t *testing.T) {
 	in := "  File   Edit  View  \n\n\n   \n  main.go — lumi  \n\n  func main() {  \n"
 	want := "File   Edit  View\nmain.go — lumi\nfunc main() {"

@@ -27,6 +27,11 @@ func TestQuestionTerms(t *testing.T) {
 			want:     nil,
 		},
 		{
+			name:     "a broad recording overview yields nothing",
+			question: "what has been recorded so far?",
+			want:     nil,
+		},
+		{
 			name:     "punctuation splits terms",
 			question: "postgres's index-tuning!",
 			want:     []string{"postgres", "index", "tuning"},
@@ -84,6 +89,7 @@ func TestRetrieveContextStages(t *testing.T) {
 		{"every term matches", "postgres indexes", stageAllTerms},
 		{"only some terms match", "what did I read about postgres and kubernetes", stageAnyTerm},
 		{"no searchable terms at all", "what was I doing?", stageRecent},
+		{"searchable terms do not match", "what about kubernetes", stageRecentUnmatched},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			events, stage, err := retrieveContext(ctx, s, tc.question, store.SearchOptions{Limit: 10})

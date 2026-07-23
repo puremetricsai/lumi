@@ -103,7 +103,7 @@ func TestAskReportsRecencyFallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(stderr, "no searchable terms") {
+	if !strings.Contains(stderr, "broad question") {
 		t.Fatalf("recency fallback must not be silent, stderr was %q", stderr)
 	}
 	if !strings.Contains(stdout, "fake answer") {
@@ -111,6 +111,23 @@ func TestAskReportsRecencyFallback(t *testing.T) {
 	}
 	if fake.activityContext == "" {
 		t.Fatal("the model must never be handed an empty context")
+	}
+}
+
+func TestAskReportsUnmatchedTermsAccurately(t *testing.T) {
+	_, run := newAskTest(t, store.Event{
+		Kind: store.KindScreen, CapturedAt: time.Now().UTC(), Text: "roadmap review", MediaPath: "a.jpg",
+	})
+
+	_, stderr, err := run("what did I read about kubernetes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stderr, "no events matched the question terms") {
+		t.Fatalf("unmatched-term fallback was misreported: %q", stderr)
+	}
+	if strings.Contains(stderr, "no searchable terms") {
+		t.Fatalf("real query terms were incorrectly called unsearchable: %q", stderr)
 	}
 }
 

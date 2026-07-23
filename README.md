@@ -72,11 +72,11 @@ export CEREBRAS_API_KEY="..."
 ./lumi ask "What changed in the quarterly plan?" --app "Safari" --since 24h
 ```
 
-Lumi turns the question into search terms (dropping question words and time words, which `--since` already covers) and retrieves in stages: events matching every term, else events ranked by best partial match, else the most recent events. When it falls back past the first stage it says so on stderr, so a recency-based answer is never mistaken for a retrieved one.
+Lumi turns the question into search terms (dropping question words, broad activity words, and time words, which `--since` already covers) and retrieves in stages: events matching every term, else events ranked by best partial match, else the most recent events. When it falls back past the first stage it says so on stderr and distinguishes a broad overview from terms that matched nothing, so a recency-based answer is never mistaken for a retrieved one.
 
 It sends only the retrieved text and metadata to Cerebras `POST /v1/chat/completions` and prints the answer. Media files are never sent by this command.
 
-The activity context is capped so a large Accessibility tree or Vision result cannot blow the model's context window — 60000 characters by default, adjustable with `--max-context-chars`. Dropped events are reported inline in the context.
+The activity context is capped so a large Accessibility tree or Vision result cannot blow the model's context window — 60000 characters by default, adjustable with `--max-context-chars`. Lumi selects records in retrieval order, renders the selected set chronologically, consolidates adjacent identical screen evidence, and labels title-only screens and untranscribed audio explicitly. Dropped events are reported inline in the context.
 
 The default model is `gpt-oss-120b`. Override it with `--model`, or set a default for every invocation:
 
