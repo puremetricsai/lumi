@@ -169,11 +169,8 @@ tasks:
       - ./{{.BINARY}} search {{.CLI_ARGS}}
 
   ask:
-    desc: 'Ask a question over captured events (e.g. task ask -- "what did I work on?")'
+    desc: 'Ask a question over captured events (needs `lumi configure`; e.g. task ask -- "what did I work on?")'
     deps: [build]
-    preconditions:
-      - sh: test -n "$CEREBRAS_API_KEY"
-        msg: 'CEREBRAS_API_KEY is not set (add it to .env)'
     cmds:
       - ./{{.BINARY}} ask {{.CLI_ARGS}}
 
