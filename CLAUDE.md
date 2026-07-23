@@ -4,14 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What Lumi is
 
-A local-first work-memory CLI for Apple Silicon Macs: continuously capture all displays plus system and microphone audio, extract screen text locally (Accessibility with Apple Vision fallback), transcribe audio with in-process Apple SpeechAnalyzer, store media on disk, index text in SQLite FTS5, and query it. Inspired by screenpipe but deliberately narrower — no GUI, server, plugins, or provider abstraction. Cerebras is the *only* inference backend, used solely by `lumi ask`.
+A local-first work-memory CLI for Apple Silicon Macs: continuously capture all displays plus system and microphone audio, extract screen text locally (full-display Apple Vision OCR, with Accessibility for focused-app attribution), transcribe audio with in-process Apple SpeechAnalyzer, store media on disk, index text in SQLite FTS5, and query it. Inspired by screenpipe but deliberately narrower — no GUI, server, plugins, or provider abstraction. Cerebras is the *only* inference backend, used solely by `lumi ask`.
 
 ## Commands
 
 ```sh
 task build                                  # compiles the Swift bridge (task speech), then go build
 task test                                   # full suite
-go vet ./...
+task vet
 task speech && go test ./internal/store -run TestSearch -v   # single test (needs the Swift archive)
 task test:native                            # permission-gated native smoke test
 ```
@@ -25,8 +25,8 @@ The CLI itself refuses to run on anything but `darwin/arm64` (`platform.Validate
 ## Architecture
 
 ```
-ScreenCaptureKit displays ─→ Accessibility ─┐
-                         └─→ Vision fallback ├─→ events + events_fts ─→ search ─→ Cerebras ask
+ScreenCaptureKit displays ─→ Vision OCR (full screen) ─┐
+                         └─→ Accessibility (attribution) ├─→ events + events_fts ─→ search ─→ Cerebras ask
 ScreenCaptureKit system + microphone ─→ WAV ─→ SpeechAnalyzer (in-process) ─┘
 ```
 
@@ -34,7 +34,7 @@ Data flows one way: `internal/cli` wires concrete processors into a `capture.Rec
 
 **`internal/macosnative`** — cgo/Objective-C bridge to ScreenCaptureKit, Accessibility, Apple Vision, AVFoundation WAV writing, and macOS permission preflight. It compiles into the Go binary and has a non-macOS stub for static/test portability.
 
-**`internal/capture`** — `Recorder` runs independent screen and audio goroutines until the context is cancelled. Native processors remain behind small interfaces (`ScreenSource`, `ContextExtractor`, `TextExtractor`, `AudioSource`, `SpeechTranscriber`). ScreenCaptureKit enumerates displays on each interval for hotplug; Accessibility text wins for the focused display, Vision handles fallback/other displays, and the comparer maintains independent per-display state. All capture and processing runs in-process through native Apple frameworks; no external subprocess remains.
+**`internal/capture`** — `Recorder` runs independent screen and audio goroutines until the context is cancelled. Native processors remain behind small interfaces (`ScreenSource`, `ContextExtractor`, `TextExtractor`, `AudioSource`, `SpeechTranscriber`). ScreenCaptureKit enumerates displays on each interval for hotplug; full-display Apple Vision OCR is the primary screen-text source (so the indexed text reflects the entire screen, not just the focused window), the Accessibility snapshot supplies focused-app attribution (App/Window/InputActive) and its focused-window text is preserved in event metadata when substantive, and the comparer maintains independent per-display state. All capture and processing runs in-process through native Apple frameworks; no external subprocess remains.
 
 **`internal/store`** — single-file SQLite via `modernc.org/sqlite` (pure Go, no cgo). `MaxOpenConns(1)` plus WAL; schema changes are versioned migrations in `internal/store/migrations.go`, applied on every `Open` and tracked by SQLite's `user_version` pragma (each migration runs in its own transaction). The `events_fts` external-content FTS5 table is kept in sync by insert/delete/update triggers, so writes go only to `events`. Timestamps are stored as RFC3339Nano UTC strings and compared lexicographically — any new time column must use the same format or range filters break.
 
