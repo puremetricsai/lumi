@@ -102,11 +102,11 @@ func TestSaveConfigRoundTripsProviderFields(t *testing.T) {
 
 func TestResolvedProvider(t *testing.T) {
 	cases := map[string]string{
-		"":          DefaultProvider,
-		"cerebras":  ProviderCerebras,
-		"llama.cpp": ProviderLlamaCpp,
-		"llamacpp":  ProviderLlamaCpp,
-		"LLAMA.CPP": ProviderLlamaCpp,
+		"":            DefaultProvider,
+		"cerebras":    ProviderCerebras,
+		"llama.cpp":   ProviderLlamaCpp,
+		"llamacpp":    ProviderLlamaCpp,
+		"LLAMA.CPP":   ProviderLlamaCpp,
 		" llama-cpp ": ProviderLlamaCpp,
 	}
 	for in, want := range cases {
