@@ -26,10 +26,11 @@ type AccessibilitySnapshot struct {
 }
 
 type Permissions struct {
-	ScreenRecording string `json:"screen_recording"`
-	Accessibility   string `json:"accessibility"`
-	InputMonitoring string `json:"input_monitoring"`
-	Microphone      string `json:"microphone"`
+	ScreenRecording   string `json:"screen_recording"`
+	Accessibility     string `json:"accessibility"`
+	InputMonitoring   string `json:"input_monitoring"`
+	Microphone        string `json:"microphone"`
+	SpeechRecognition string `json:"speech_recognition"`
 }
 
 type AudioFrame struct {
@@ -49,6 +50,10 @@ func Accessibility(context.Context) (AccessibilitySnapshot, error) {
 
 func RecognizeText(context.Context, string) (string, error) { return "", errUnsupported }
 
+func TranscribeAudio(context.Context, string, string) (string, error) { return "", errUnsupported }
+
+func EnsureSpeechAssets(context.Context, string) error { return errUnsupported }
+
 func PermissionStatus(context.Context) (Permissions, error) { return Permissions{}, errUnsupported }
 
 func RequestPermissions(context.Context, bool) (Permissions, error) {
@@ -60,3 +65,5 @@ func RecordAudio(context.Context, string, string, float64) ([]AudioFrame, error)
 }
 
 func OSVersion() (int, int, int, error) { return 0, 0, 0, errUnsupported }
+
+func SpeechAssetsInstalled(context.Context, string) (bool, error) { return false, errUnsupported }

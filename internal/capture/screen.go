@@ -84,11 +84,3 @@ func (VisionText) Extract(ctx context.Context, imagePath string) (string, error)
 	}
 	return strings.TrimSpace(text), nil
 }
-
-func commandError(action string, err error, output []byte) error {
-	detail := strings.TrimSpace(string(output))
-	if detail == "" {
-		return fmt.Errorf("%s: %w", action, err)
-	}
-	return fmt.Errorf("%s: %w: %s", action, err, detail)
-}

@@ -4,7 +4,7 @@ package macosnative
 
 /*
 #cgo CFLAGS: -fblocks -fobjc-arc
-#cgo LDFLAGS: -framework AppKit -framework ApplicationServices -framework AudioToolbox -framework AVFoundation -framework CoreGraphics -framework CoreMedia -framework CoreVideo -framework Foundation -framework ImageIO -framework ScreenCaptureKit -framework UniformTypeIdentifiers -framework Vision
+#cgo LDFLAGS: -framework AppKit -framework ApplicationServices -framework AudioToolbox -framework AVFoundation -framework CoreGraphics -framework CoreMedia -framework CoreVideo -framework Foundation -framework ImageIO -framework ScreenCaptureKit -framework UniformTypeIdentifiers -framework Vision -L${SRCDIR} -llumispeech -framework Speech
 #include <stdlib.h>
 #include <stdbool.h>
 
@@ -15,6 +15,9 @@ char *lumi_permissions_json(char **error_message);
 char *lumi_request_permissions_json(bool input_monitoring, char **error_message);
 char *lumi_record_audio_json(const char *directory, const char *prefix, double duration_seconds, char **error_message);
 void lumi_os_version(int *major, int *minor, int *patch);
+char *lumi_transcribe_audio_string(const char *audio_path, const char *locale, double timeout_seconds, char **error_message);
+char *lumi_speech_ensure_assets(const char *locale, double timeout_seconds, char **error_message);
+int lumi_speech_assets_installed(const char *locale);
 */
 import "C"
 
@@ -23,6 +26,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 	"unsafe"
 )
 
@@ -46,10 +50,11 @@ type AccessibilitySnapshot struct {
 }
 
 type Permissions struct {
-	ScreenRecording string `json:"screen_recording"`
-	Accessibility   string `json:"accessibility"`
-	InputMonitoring string `json:"input_monitoring"`
-	Microphone      string `json:"microphone"`
+	ScreenRecording   string `json:"screen_recording"`
+	Accessibility     string `json:"accessibility"`
+	InputMonitoring   string `json:"input_monitoring"`
+	Microphone        string `json:"microphone"`
+	SpeechRecognition string `json:"speech_recognition"`
 }
 
 type AudioFrame struct {
@@ -110,6 +115,67 @@ func RecognizeText(ctx context.Context, imagePath string) (string, error) {
 		return "", err
 	}
 	return result, nil
+}
+
+// TranscribeAudio transcribes a WAV file with on-device SpeechAnalyzer.
+func TranscribeAudio(ctx context.Context, audioPath, locale string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	timeout := nativeTimeout(ctx, 2*time.Minute)
+	type transcription struct {
+		text string
+		err  error
+	}
+	done := make(chan transcription, 1)
+	go func() {
+		pathC := C.CString(audioPath)
+		localeC := C.CString(locale)
+		var nativeErr *C.char
+		result, err := nativeString(
+			C.lumi_transcribe_audio_string(pathC, localeC, C.double(timeout.Seconds()), &nativeErr), nativeErr)
+		C.free(unsafe.Pointer(pathC))
+		C.free(unsafe.Pointer(localeC))
+		done <- transcription{text: result, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case r := <-done:
+		return r.text, r.err
+	}
+}
+
+// EnsureSpeechAssets downloads missing SpeechAnalyzer assets for locale.
+func EnsureSpeechAssets(ctx context.Context, locale string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	timeout := nativeTimeout(ctx, 10*time.Minute)
+	done := make(chan error, 1)
+	go func() {
+		localeC := C.CString(locale)
+		var nativeErr *C.char
+		_, err := nativeString(
+			C.lumi_speech_ensure_assets(localeC, C.double(timeout.Seconds()), &nativeErr), nativeErr)
+		C.free(unsafe.Pointer(localeC))
+		done <- err
+	}()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-done:
+		return err
+	}
+}
+
+func nativeTimeout(ctx context.Context, fallback time.Duration) time.Duration {
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining > 0 && remaining < fallback {
+			return remaining
+		}
+	}
+	return fallback
 }
 
 func PermissionStatus(ctx context.Context) (Permissions, error) {
@@ -175,6 +241,22 @@ func OSVersion() (major, minor, patch int, err error) {
 	var nativeMajor, nativeMinor, nativePatch C.int
 	C.lumi_os_version(&nativeMajor, &nativeMinor, &nativePatch)
 	return int(nativeMajor), int(nativeMinor), int(nativePatch), nil
+}
+
+func SpeechAssetsInstalled(ctx context.Context, locale string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	localeC := C.CString(locale)
+	defer C.free(unsafe.Pointer(localeC))
+	switch C.lumi_speech_assets_installed(localeC) {
+	case 0:
+		return false, nil
+	case 1:
+		return true, nil
+	default:
+		return false, errors.New("inspect SpeechAnalyzer assets: timed out")
+	}
 }
 
 func nativeJSON(value, errorMessage *C.char) ([]byte, error) {

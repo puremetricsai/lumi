@@ -4,41 +4,43 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What Lumi is
 
-A local-first work-memory CLI for Apple Silicon Macs: continuously capture all displays plus system and microphone audio, extract screen text locally (Accessibility with Apple Vision fallback), transcribe with whisper.cpp, store media on disk, index text in SQLite FTS5, and query it. Inspired by screenpipe but deliberately narrower — no GUI, server, plugins, or provider abstraction. Cerebras is the *only* inference backend, used solely by `lumi ask`.
+A local-first work-memory CLI for Apple Silicon Macs: continuously capture all displays plus system and microphone audio, extract screen text locally (Accessibility with Apple Vision fallback), transcribe audio with in-process Apple SpeechAnalyzer, store media on disk, index text in SQLite FTS5, and query it. Inspired by screenpipe but deliberately narrower — no GUI, server, plugins, or provider abstraction. Cerebras is the *only* inference backend, used solely by `lumi ask`.
 
 ## Commands
 
 ```sh
-go build -o lumi ./cmd/lumi
-go test ./...
+task build                                  # compiles the Swift bridge (task speech), then go build
+task test                                   # full suite
 go vet ./...
-go test ./internal/store -run TestSearch -v   # single test
+task speech && go test ./internal/store -run TestSearch -v   # single test (needs the Swift archive)
 task test:native                            # permission-gated native smoke test
 ```
 
 `internal/capture/recorder_test.go` runs the whole capture→store→search pipeline with fake `ScreenSource`/`ContextExtractor`/`TextExtractor`/`AudioSource`/`SpeechTranscriber` implementations, so it needs no permissions or external binaries. Prefer extending it over invoking real frameworks. `task test:native` builds the stable `./lumi` binary and runs the explicit, permission-gated integration smoke test.
 
-The CLI itself refuses to run on anything but `darwin/arm64` (`platform.Validate` in `PersistentPreRunE`), and native microphone capture requires macOS 15+. `./lumi doctor` reports native permission state, the whisper binary/model, and API configuration. For a bounded manual smoke test: `./lumi record --no-audio --duration 10s`.
+The CLI itself refuses to run on anything but `darwin/arm64` (`platform.Validate` in `PersistentPreRunE`), and native microphone capture requires macOS 26+. `./lumi doctor` reports native permission state, and API configuration. For a bounded manual smoke test: `./lumi record --no-audio --duration 10s`.
+
+`task build` compiles the Swift SpeechAnalyzer bridge (`task speech`) before `go build`; run `task build`/`task test` rather than raw `go build`/`go test`, which will not link without `liblumispeech.a`.
 
 ## Architecture
 
 ```
 ScreenCaptureKit displays ─→ Accessibility ─┐
                          └─→ Vision fallback ├─→ events + events_fts ─→ search ─→ Cerebras ask
-ScreenCaptureKit system + microphone ─→ WAV ─→ whisper.cpp ─┘
+ScreenCaptureKit system + microphone ─→ WAV ─→ SpeechAnalyzer (in-process) ─┘
 ```
 
 Data flows one way: `internal/cli` wires concrete processors into a `capture.Recorder`, the recorder writes `store.Event` rows, and `search`/`ask` read them back. There is no dependency in the reverse direction.
 
 **`internal/macosnative`** — cgo/Objective-C bridge to ScreenCaptureKit, Accessibility, Apple Vision, AVFoundation WAV writing, and macOS permission preflight. It compiles into the Go binary and has a non-macOS stub for static/test portability.
 
-**`internal/capture`** — `Recorder` runs independent screen and audio goroutines until the context is cancelled. Native processors remain behind small interfaces (`ScreenSource`, `ContextExtractor`, `TextExtractor`, `AudioSource`, `SpeechTranscriber`). ScreenCaptureKit enumerates displays on each interval for hotplug; Accessibility text wins for the focused display, Vision handles fallback/other displays, and the comparer maintains independent per-display state. Only whisper.cpp remains an external processor.
+**`internal/capture`** — `Recorder` runs independent screen and audio goroutines until the context is cancelled. Native processors remain behind small interfaces (`ScreenSource`, `ContextExtractor`, `TextExtractor`, `AudioSource`, `SpeechTranscriber`). ScreenCaptureKit enumerates displays on each interval for hotplug; Accessibility text wins for the focused display, Vision handles fallback/other displays, and the comparer maintains independent per-display state. All capture and processing runs in-process through native Apple frameworks; no external subprocess remains.
 
 **`internal/store`** — single-file SQLite via `modernc.org/sqlite` (pure Go, no cgo). `MaxOpenConns(1)` plus WAL; schema changes are versioned migrations in `internal/store/migrations.go`, applied on every `Open` and tracked by SQLite's `user_version` pragma (each migration runs in its own transaction). The `events_fts` external-content FTS5 table is kept in sync by insert/delete/update triggers, so writes go only to `events`. Timestamps are stored as RFC3339Nano UTC strings and compared lexicographically — any new time column must use the same format or range filters break.
 
 **`internal/retention`** — explicit age- and size-based pruning used by `lumi prune`. Age pruning runs before size pruning; size enforcement walks indexed events oldest-first. There is no background scheduler or default retention policy. Rows are deleted in bounded batches before media files are unlinked.
 
-**`internal/cli`** — Cobra commands (`record`, `search`, `ask`, `prune`, `doctor`, `permissions`, `native-smoke`, `version`). Capture and audio-chunk intervals and whisper settings are flags; native framework implementations are production defaults. `search` and `ask` expose exact case-insensitive app filtering and case-insensitive window-substring filtering. `permissions --request` invokes native TCC request flows; never add `tccutil reset` as an automatic side effect.
+**`internal/cli`** — Cobra commands (`record`, `search`, `ask`, `prune`, `doctor`, `permissions`, `native-smoke`, `version`). Capture and audio-chunk intervals and transcription settings are flags; native framework implementations are production defaults. `search` and `ask` expose exact case-insensitive app filtering and case-insensitive window-substring filtering. `permissions --request` invokes native TCC request flows; never add `tccutil reset` as an automatic side effect.
 
 **`internal/config`** — resolves `Paths` from `--data-dir`, else `LUMI_HOME`, else `~/Library/Application Support/Lumi`; directories are created 0700.
 
@@ -58,4 +60,4 @@ Data flows one way: `internal/cli` wires concrete processors into a `capture.Rec
 
 ## External dependencies
 
-Xcode Command Line Tools are required to build the native cgo bridge. Runtime processing requires only `whisper-cli` plus a model via `LUMI_WHISPER_MODEL`; `CEREBRAS_API_KEY` is needed for `ask` only. The Cerebras model resolves as `--model` → `LUMI_CEREBRAS_MODEL` → `config.DefaultCerebrasModel`.
+Xcode Command Line Tools plus a Swift toolchain are required to build the native cgo bridge (`swiftc` compiles the SpeechAnalyzer bridge into `liblumispeech.a`, linked by cgo). Runtime processing is fully native — no external binaries. `CEREBRAS_API_KEY` is needed for `ask` only. The Cerebras model resolves as `--model` → `LUMI_CEREBRAS_MODEL` → `config.DefaultCerebrasModel`.

@@ -7,9 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -98,7 +96,7 @@ func (a *app) openStore(ctx context.Context) (*store.Store, config.Paths, error)
 func (a *app) recordCommand() *cobra.Command {
 	var interval, audioChunk, duration time.Duration
 	var noScreen, noAudio bool
-	var whisperLanguage, whisperModel, whisperBinary string
+	var speechLocale string
 	cmd := &cobra.Command{
 		Use:   "record",
 		Short: "Continuously capture, process, and index screen and audio activity",
@@ -106,10 +104,7 @@ func (a *app) recordCommand() *cobra.Command {
 			if noScreen && noAudio {
 				return errors.New("--no-screen and --no-audio cannot be used together")
 			}
-			if !noAudio && whisperModel == "" {
-				return errors.New("audio transcription requires --whisper-model or LUMI_WHISPER_MODEL (use --no-audio for screen-only capture)")
-			}
-			if err := requireRecordingPermissions(cmd.Context(), !noScreen, !noAudio); err != nil {
+			if err := requireRecordingPermissions(cmd.Context(), !noScreen, !noAudio, !noAudio); err != nil {
 				return err
 			}
 			s, paths, err := a.openStore(cmd.Context())
@@ -118,12 +113,18 @@ func (a *app) recordCommand() *cobra.Command {
 			}
 			defer s.Close()
 			ctx := cmd.Context()
+			logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+			if !noAudio {
+				logger.Info("ensuring speech recognition assets", "locale", speechLocale)
+				if err := macosnative.EnsureSpeechAssets(ctx, speechLocale); err != nil {
+					return fmt.Errorf("ensure speech recognition assets for %s: %w", speechLocale, err)
+				}
+			}
 			if duration > 0 {
 				var cancel context.CancelFunc
 				ctx, cancel = context.WithTimeout(ctx, duration)
 				defer cancel()
 			}
-			logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 			recorder := capture.Recorder{
 				Store: s, Paths: paths, ScreenInterval: interval, AudioChunk: audioChunk,
 				CaptureScreen: !noScreen, CaptureAudio: !noAudio, Logger: logger,
@@ -131,7 +132,7 @@ func (a *app) recordCommand() *cobra.Command {
 				Text:        capture.VisionText{},
 				Context:     capture.AccessibilityContext{},
 				Audio:       capture.NativeAudio{},
-				Transcriber: capture.Transcriber{Binary: whisperBinary, ModelPath: whisperModel, Language: whisperLanguage},
+				Transcriber: capture.NativeSpeech{Locale: speechLocale},
 			}
 			logger.Info("recording started", "database", paths.Database, "screen", !noScreen, "audio", !noAudio)
 			return recorder.Run(ctx)
@@ -143,9 +144,7 @@ func (a *app) recordCommand() *cobra.Command {
 	flags.DurationVar(&duration, "duration", 0, "stop after this duration (zero runs until interrupted)")
 	flags.BoolVar(&noScreen, "no-screen", false, "disable screen capture and text extraction")
 	flags.BoolVar(&noAudio, "no-audio", false, "disable audio capture and transcription")
-	flags.StringVar(&whisperLanguage, "whisper-language", "en", "Whisper language")
-	flags.StringVar(&whisperModel, "whisper-model", os.Getenv("LUMI_WHISPER_MODEL"), "path to a whisper.cpp model")
-	flags.StringVar(&whisperBinary, "whisper-binary", "whisper-cli", "whisper.cpp executable")
+	flags.StringVar(&speechLocale, "speech-locale", "en-US", "SpeechAnalyzer recognition locale")
 	return cmd
 }
 
@@ -296,7 +295,8 @@ func (a *app) pruneCommand() *cobra.Command {
 }
 
 func (a *app) doctorCommand() *cobra.Command {
-	return &cobra.Command{
+	var speechLocale string
+	cmd := &cobra.Command{
 		Use:   "doctor",
 		Short: "Check platform, capture tools, models, and API configuration",
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -316,6 +316,7 @@ func (a *app) doctorCommand() *cobra.Command {
 					{"Accessibility", permissions.Accessibility, "Privacy & Security > Accessibility"},
 					{"Input Monitoring", permissions.InputMonitoring, "optional; only needed by future event-tap capture"},
 					{"Microphone", permissions.Microphone, "Privacy & Security > Microphone"},
+					{"Speech Recognition", permissions.SpeechRecognition, "Privacy & Security > Speech Recognition"},
 				} {
 					state := "ok"
 					if permission.status != "granted" {
@@ -329,23 +330,15 @@ func (a *app) doctorCommand() *cobra.Command {
 					fmt.Fprintf(os.Stdout, "%s permission\t%s\t%s (%s)\n", permission.name, state, permission.status, permission.settings)
 				}
 			}
-			for _, binary := range []string{"whisper-cli"} {
-				resolved, lookupErr := exec.LookPath(binary)
-				if lookupErr != nil {
-					fmt.Fprintf(os.Stdout, "%s\tmissing\t%s\n", filepath.Base(binary), lookupErr)
-					missing = true
-				} else {
-					fmt.Fprintf(os.Stdout, "%s\tok\t%s\n", filepath.Base(binary), resolved)
-				}
-			}
-			if model := os.Getenv("LUMI_WHISPER_MODEL"); model == "" {
-				fmt.Fprintln(os.Stdout, "whisper model\tmissing\tset LUMI_WHISPER_MODEL or pass --whisper-model")
+			assetsInstalled, speechErr := macosnative.SpeechAssetsInstalled(cmd.Context(), speechLocale)
+			if speechErr != nil {
+				fmt.Fprintf(os.Stdout, "speech assets (%s)\tmissing\t%v\n", speechLocale, speechErr)
 				missing = true
-			} else if _, statErr := os.Stat(model); statErr != nil {
-				fmt.Fprintf(os.Stdout, "whisper model\tmissing\t%v\n", statErr)
-				missing = true
+			} else if assetsInstalled {
+				fmt.Fprintf(os.Stdout, "speech assets (%s)\tok\tinstalled\n", speechLocale)
 			} else {
-				fmt.Fprintf(os.Stdout, "whisper model\tok\t%s\n", model)
+				fmt.Fprintf(os.Stdout, "speech assets (%s)\tmissing\tlocale assets not installed; `./lumi record` downloads them at startup\n", speechLocale)
+				missing = true
 			}
 			if os.Getenv("CEREBRAS_API_KEY") == "" {
 				fmt.Fprintln(os.Stdout, "Cerebras API key\toptional\tset CEREBRAS_API_KEY to use lumi ask")
@@ -360,6 +353,8 @@ func (a *app) doctorCommand() *cobra.Command {
 			return nil
 		},
 	}
+	cmd.Flags().StringVar(&speechLocale, "speech-locale", "en-US", "SpeechAnalyzer recognition locale")
+	return cmd
 }
 
 func (a *app) permissionsCommand() *cobra.Command {
@@ -382,8 +377,10 @@ func (a *app) permissionsCommand() *cobra.Command {
 			fmt.Fprintf(cmd.OutOrStdout(), "Accessibility\t%s\n", permissions.Accessibility)
 			fmt.Fprintf(cmd.OutOrStdout(), "Input Monitoring\t%s\n", permissions.InputMonitoring)
 			fmt.Fprintf(cmd.OutOrStdout(), "Microphone\t%s\n", permissions.Microphone)
+			fmt.Fprintf(cmd.OutOrStdout(), "Speech Recognition\t%s\n", permissions.SpeechRecognition)
 			if request && (permissions.ScreenRecording != "granted" ||
-				permissions.Accessibility != "granted" || permissions.Microphone != "granted") {
+				permissions.Accessibility != "granted" || permissions.Microphone != "granted" ||
+				permissions.SpeechRecognition != "granted") {
 				return errors.New("finish approving Lumi in System Settings, then restart the command")
 			}
 			return nil
@@ -400,7 +397,7 @@ func (a *app) nativeSmokeCommand() *cobra.Command {
 		Use:   "native-smoke",
 		Short: "Run a bounded native capture test without indexing media",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if err := requireRecordingPermissions(cmd.Context(), true, true); err != nil {
+			if err := requireRecordingPermissions(cmd.Context(), true, true, false); err != nil {
 				return err
 			}
 			directory, err := os.MkdirTemp("", "lumi-native-smoke-")
@@ -449,7 +446,7 @@ func (a *app) nativeSmokeCommand() *cobra.Command {
 	}
 }
 
-func requireRecordingPermissions(ctx context.Context, screen, audio bool) error {
+func requireRecordingPermissions(ctx context.Context, screen, audio, speech bool) error {
 	permissions, err := macosnative.PermissionStatus(ctx)
 	if err != nil {
 		return fmt.Errorf("check native macOS permissions: %w", err)
@@ -464,15 +461,17 @@ func requireRecordingPermissions(ctx context.Context, screen, audio bool) error 
 	if audio && permissions.Microphone != "granted" {
 		missing = append(missing, "Microphone (System Settings > Privacy & Security > Microphone)")
 	}
+	if speech && permissions.SpeechRecognition != "granted" {
+		missing = append(missing, "Speech Recognition (System Settings > Privacy & Security > Speech Recognition)")
+	}
 	if len(missing) > 0 {
 		return fmt.Errorf("grant required macOS permissions to this terminal or the Lumi binary: %s; run `./lumi permissions --request`", strings.Join(missing, "; "))
 	}
 	return nil
 }
 
-// defaultCerebrasModel resolves the model the same way --whisper-model
-// resolves LUMI_WHISPER_MODEL: an explicit flag beats the environment, which
-// beats the built-in default.
+// defaultCerebrasModel resolves the model: an explicit flag beats the
+// environment, which beats the built-in default.
 func defaultCerebrasModel() string {
 	if model := strings.TrimSpace(os.Getenv("LUMI_CEREBRAS_MODEL")); model != "" {
 		return model

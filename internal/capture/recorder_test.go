@@ -157,7 +157,7 @@ func (fakeTranscriber) Transcribe(context.Context, string) (string, error) {
 type failingTranscriber struct{}
 
 func (failingTranscriber) Transcribe(context.Context, string) (string, error) {
-	return "", errors.New("whisper failed")
+	return "", errors.New("transcription failed")
 }
 
 type countingTranscriber struct{ calls atomic.Int64 }

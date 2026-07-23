@@ -19,10 +19,11 @@ func TestPermissionStatusUsesKnownStates(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, status := range map[string]string{
-		"screen recording": permissions.ScreenRecording,
-		"accessibility":    permissions.Accessibility,
-		"input monitoring": permissions.InputMonitoring,
-		"microphone":       permissions.Microphone,
+		"screen recording":   permissions.ScreenRecording,
+		"accessibility":      permissions.Accessibility,
+		"input monitoring":   permissions.InputMonitoring,
+		"microphone":         permissions.Microphone,
+		"speech recognition": permissions.SpeechRecognition,
 	} {
 		if status == "" || status == "unknown" {
 			t.Errorf("%s permission has invalid status %q", name, status)
@@ -64,6 +65,25 @@ func TestAccessibilitySnapshotWhenPermissionIsGranted(t *testing.T) {
 	}
 	if snapshot.App == "" {
 		t.Fatal("Accessibility returned no frontmost application")
+	}
+}
+
+func TestTranscribeAudioSmoke(t *testing.T) {
+	if os.Getenv("LUMI_NATIVE_SMOKE") != "1" {
+		t.Skip("set LUMI_NATIVE_SMOKE=1 after granting Speech Recognition and installing en-US assets")
+	}
+	ctx := context.Background()
+	directory := t.TempDir()
+	audio, err := RecordAudio(ctx, directory, "speech", 1.0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(audio) == 0 {
+		t.Fatal("RecordAudio returned no frames")
+	}
+	// A short real recording may be silent, so only require successful analysis.
+	if _, err := TranscribeAudio(ctx, audio[0].Path, "en-US"); err != nil {
+		t.Fatalf("SpeechAnalyzer transcription failed: %v", err)
 	}
 }
 

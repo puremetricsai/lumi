@@ -13,11 +13,23 @@ tasks:
       - task --list
     silent: true
 
+  speech:
+    desc: Compile the Swift SpeechAnalyzer bridge into a static archive
+    platforms: [darwin]
+    sources:
+      - internal/macosnative/speech.swift
+    generates:
+      - internal/macosnative/liblumispeech.a
+    cmds:
+      - swiftc -emit-library -static -O -o internal/macosnative/liblumispeech.a internal/macosnative/speech.swift
+
   build:
     desc: Build the lumi binary
+    deps: [speech]
     sources:
       - '**/*.go'
       - '**/*.m'
+      - internal/macosnative/liblumispeech.a
       - go.mod
       - go.sum
     generates:
@@ -27,6 +39,7 @@ tasks:
 
   install:
     desc: Install the lumi binary system-wide into the Go bin directory
+    deps: [speech]
     vars:
       GOBIN:
         sh: go env GOBIN || true
@@ -48,11 +61,13 @@ tasks:
 
   test:
     desc: Run all tests
+    deps: [speech]
     cmds:
       - go test ./... {{.CLI_ARGS}}
 
   test:v:
     desc: Run all tests with verbose output
+    deps: [speech]
     cmds:
       - go test -v ./... {{.CLI_ARGS}}
 
@@ -68,16 +83,19 @@ tasks:
 
   bench:capture:
     desc: Benchmark perceptual frame comparison
+    deps: [speech]
     cmds:
       - go test ./internal/capture -run '^$' -bench 'Benchmark(SampledHistogram|FrameComparerExactDuplicate)' -benchmem -count=1
 
   test:one:
     desc: 'Run a single test (e.g. task test:one -- -run TestSearch ./internal/store)'
+    deps: [speech]
     cmds:
       - go test -v {{.CLI_ARGS}}
 
   cover:
     desc: Run tests with a coverage report
+    deps: [speech]
     cmds:
       - go test -coverprofile=coverage.out ./...
       - go tool cover -func=coverage.out
@@ -113,7 +131,7 @@ tasks:
   clean:
     desc: Remove build artifacts and coverage output
     cmds:
-      - rm -f {{.BINARY}} coverage.out
+      - rm -f {{.BINARY}} coverage.out internal/macosnative/liblumispeech.a
 
   doctor:
     desc: Report native permissions, models, binaries, and API configuration
