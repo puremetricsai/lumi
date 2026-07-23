@@ -104,6 +104,14 @@ func (fakeContext) Snapshot(context.Context) (ScreenContext, error) {
 	return ScreenContext{App: "Test App", Window: "Test Window"}, nil
 }
 
+// titleOnlyContext mimics a GPUI/Metal app (e.g. Zed) whose Accessibility tree
+// exposes only the window title, so Text equals Window.
+type titleOnlyContext struct{}
+
+func (titleOnlyContext) Snapshot(context.Context) (ScreenContext, error) {
+	return ScreenContext{App: "Zed", Window: "lumi — .env", Text: "lumi — .env", DisplayID: 1}, nil
+}
+
 type fakeAudio struct{}
 
 func (fakeAudio) Record(ctx context.Context, directory, prefix string, duration time.Duration) ([]AudioFrame, error) {
@@ -223,7 +231,7 @@ func TestRecorderCaptureProcessStoreSearch(t *testing.T) {
 	}
 }
 
-func TestRecorderPrefersAccessibilityOverVision(t *testing.T) {
+func TestRecorderUsesFullScreenVisionAndPreservesAccessibility(t *testing.T) {
 	ctx := context.Background()
 	paths, err := config.FromRoot(t.TempDir())
 	if err != nil {
@@ -248,15 +256,106 @@ func TestRecorderPrefersAccessibilityOverVision(t *testing.T) {
 	if err := recorder.Run(recordCtx); err != nil {
 		t.Fatal(err)
 	}
-	if got := vision.calls.Load(); got != 0 {
-		t.Fatalf("Vision called %d times despite useful Accessibility text", got)
+	// Full-screen OCR is the primary text source even when Accessibility has
+	// substantive text, so the whole display is captured rather than only the
+	// focused window.
+	if got := vision.calls.Load(); got == 0 {
+		t.Fatal("Vision OCR was not used as the primary screen-text source")
 	}
+	events, err := s.Search(ctx, store.SearchOptions{Query: "Vision fallback"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].TextSource != "vision" {
+		t.Fatalf("full-screen Vision text was not primary: %#v", events)
+	}
+	// App/Window attribution still comes from Accessibility, and the focused
+	// window's Accessibility text is preserved in metadata.
+	if events[0].App != "Notes" || events[0].Window != "Plan" {
+		t.Fatalf("Accessibility attribution was not retained: %#v", events[0])
+	}
+	if !strings.Contains(string(events[0].Metadata), "Accessibility primary text") {
+		t.Fatalf("substantive Accessibility text was not preserved in metadata: %s", events[0].Metadata)
+	}
+}
+
+func TestRecorderIndexesAccessibilityTextWhenVisionFails(t *testing.T) {
+	ctx := context.Background()
+	paths, err := config.FromRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := paths.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(ctx, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	recorder := Recorder{
+		Store: s, Paths: paths, Screen: &fakeScreen{}, Text: failingText{},
+		Context: accessibilityText{}, Comparer: &FrameComparer{},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	recorder.captureScreen(ctx)
+
+	// Vision produced no usable text, so the substantive Accessibility text must
+	// stay searchable via Event.Text (events_fts and ask never read metadata).
 	events, err := s.Search(ctx, store.SearchOptions{Query: "Accessibility primary"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 1 || events[0].TextSource != "accessibility" {
-		t.Fatalf("Accessibility text was not primary: %#v", events)
+	if len(events) != 1 || events[0].Text != "Accessibility primary text" {
+		t.Fatalf("Accessibility text was not indexed when Vision failed: %#v", events)
+	}
+	if events[0].TextSource != "accessibility" {
+		t.Fatalf("fallback provenance was not recorded: %#v", events[0])
+	}
+	// The failed Vision attempt is still recorded as diagnostic provenance.
+	if !strings.Contains(string(events[0].Metadata), "processor_error") {
+		t.Fatalf("Vision failure was not recorded in metadata: %s", events[0].Metadata)
+	}
+}
+
+func TestRecorderFallsBackToVisionWhenAccessibilityIsTitleOnly(t *testing.T) {
+	ctx := context.Background()
+	paths, err := config.FromRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := paths.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(ctx, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	recorder := Recorder{
+		Store: s, Paths: paths, Screen: &fakeScreen{}, Text: fakeVision{},
+		Context: titleOnlyContext{}, Comparer: &FrameComparer{},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	recorder.captureScreen(ctx)
+
+	// A GPUI/Metal app (e.g. Zed) exposes only its window title through
+	// Accessibility; the recorder must OCR the full screen instead of indexing
+	// the title as the body.
+	events, err := s.Search(ctx, store.SearchOptions{Query: "screen text"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].TextSource != "vision" {
+		t.Fatalf("title-only Accessibility did not fall back to Vision: %#v", events)
+	}
+	if events[0].Text == events[0].Window {
+		t.Fatalf("indexed text is still the window title only: %#v", events[0])
+	}
+	if strings.Contains(string(events[0].Metadata), "accessibility_text") {
+		t.Fatalf("title-only Accessibility text should not be preserved as substantive: %s", events[0].Metadata)
 	}
 }
 
