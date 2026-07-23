@@ -1,10 +1,12 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -328,20 +330,34 @@ func (a *app) askCommand() *cobra.Command {
 func (a *app) pruneCommand() *cobra.Command {
 	var olderThan string
 	var maxBytes int64
-	var dryRun, asJSON bool
+	var dryRun, asJSON, all, yes bool
 	cmd := &cobra.Command{
 		Use:   "prune",
 		Short: "Delete old events and their media files",
 		Long: "Delete indexed events and the screenshots or audio they point at.\n" +
-			"--older-than takes a Go duration (720h) or an RFC3339 timestamp; Go durations have no 'd' unit.",
+			"--older-than takes a Go duration (720h) or an RFC3339 timestamp; Go durations have no 'd' unit.\n" +
+			"--all wipes every indexed event and all media; it prompts for confirmation unless --yes or --dry-run is set.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			opts := retention.Options{MaxBytes: maxBytes, DryRun: dryRun}
+			opts := retention.Options{MaxBytes: maxBytes, DryRun: dryRun, All: all}
 			if olderThan != "" {
 				before, err := parseTime(olderThan, true)
 				if err != nil {
 					return fmt.Errorf("parse --older-than: %w", err)
 				}
 				opts.Before = before
+			}
+			// --all deletes everything irreversibly, so require an explicit
+			// confirmation. A dry run deletes nothing, and --yes is the escape
+			// hatch for scripts.
+			if all && !dryRun && !yes {
+				confirmed, err := confirmPruneAll(cmd.InOrStdin(), cmd.OutOrStdout())
+				if err != nil {
+					return err
+				}
+				if !confirmed {
+					fmt.Fprintln(cmd.OutOrStdout(), "aborted; nothing was deleted")
+					return nil
+				}
 			}
 			s, _, err := a.openStore(cmd.Context())
 			if err != nil {
@@ -372,9 +388,25 @@ func (a *app) pruneCommand() *cobra.Command {
 	flags := cmd.Flags()
 	flags.StringVar(&olderThan, "older-than", "", "delete events older than this duration (e.g. 720h) or RFC3339 time")
 	flags.Int64Var(&maxBytes, "max-bytes", 0, "cap total media size in bytes, deleting oldest first (zero disables)")
+	flags.BoolVar(&all, "all", false, "delete every indexed event and all media files (prompts to confirm)")
+	flags.BoolVarP(&yes, "yes", "y", false, "skip the --all confirmation prompt (for scripts)")
 	flags.BoolVar(&dryRun, "dry-run", false, "report what would be deleted without deleting")
 	flags.BoolVar(&asJSON, "json", false, "emit JSON")
 	return cmd
+}
+
+// confirmPruneAll asks the operator to type "yes" before an irreversible
+// `prune --all`. It reads a single line from in and returns whether the answer
+// was an unambiguous yes.
+func confirmPruneAll(in io.Reader, out io.Writer) (bool, error) {
+	fmt.Fprintln(out, "This will permanently delete ALL indexed events and every screenshot and")
+	fmt.Fprintln(out, "audio file Lumi has captured. This cannot be undone.")
+	fmt.Fprint(out, "Type 'yes' to continue: ")
+	line, err := bufio.NewReader(in).ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return false, fmt.Errorf("read confirmation: %w", err)
+	}
+	return strings.EqualFold(strings.TrimSpace(line), "yes"), nil
 }
 
 func (a *app) doctorCommand() *cobra.Command {
