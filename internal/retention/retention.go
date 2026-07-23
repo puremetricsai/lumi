@@ -22,6 +22,9 @@ type Options struct {
 	// MaxBytes caps the total size of media files on disk. Oldest events are
 	// deleted until the footprint fits. Zero disables size-based pruning.
 	MaxBytes int64
+	// All deletes every event and its media, ignoring Before and MaxBytes. It
+	// is the destructive "wipe everything" policy behind `lumi prune --all`.
+	All bool
 	// DryRun reports what would be deleted without deleting anything.
 	DryRun bool
 }
@@ -35,8 +38,15 @@ type Result struct {
 // Prune applies the age policy first, then the size policy.
 func Prune(ctx context.Context, s *store.Store, opts Options) (Result, error) {
 	var result Result
+	if opts.All {
+		// "All" is the age policy with a cutoff far past every row, including
+		// any future-timestamped ones. Routing through Before reuses the
+		// rows-before-files ordering and dry-run accounting unchanged.
+		everything := time.Now().UTC().AddDate(1000, 0, 0)
+		opts.Before = &everything
+	}
 	if opts.Before == nil && opts.MaxBytes <= 0 {
-		return result, errors.New("prune requires --older-than or --max-bytes")
+		return result, errors.New("prune requires --all, --older-than, or --max-bytes")
 	}
 
 	agePruned := make(map[int64]bool)

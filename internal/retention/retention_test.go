@@ -182,6 +182,69 @@ func TestPruneDryRunCombinedAgeAndSize(t *testing.T) {
 	}
 }
 
+func TestPruneAllDeletesEverything(t *testing.T) {
+	ctx := context.Background()
+	s, dir := newStore(t, ctx)
+	now := time.Now().UTC()
+
+	// Include an event captured in the future to prove All is not a stale
+	// "before now" cutoff in disguise.
+	oldPath := seed(t, ctx, s, dir, "old.jpg", now.Add(-48*time.Hour), 10)
+	freshPath := seed(t, ctx, s, dir, "fresh.jpg", now, 10)
+	futurePath := seed(t, ctx, s, dir, "future.jpg", now.Add(48*time.Hour), 10)
+
+	result, err := Prune(ctx, s, Options{All: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Events != 3 {
+		t.Fatalf("Result.Events = %d, want 3", result.Events)
+	}
+	if result.Bytes != 30 {
+		t.Fatalf("Result.Bytes = %d, want 30", result.Bytes)
+	}
+	for _, p := range []string{oldPath, freshPath, futurePath} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Fatalf("--all must remove media file %s, stat err = %v", p, err)
+		}
+	}
+	remaining, err := s.Search(ctx, store.SearchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remaining) != 0 {
+		t.Fatalf("--all must delete every row, got %d", len(remaining))
+	}
+}
+
+func TestPruneAllDryRunChangesNothing(t *testing.T) {
+	ctx := context.Background()
+	s, dir := newStore(t, ctx)
+	now := time.Now().UTC()
+	oldPath := seed(t, ctx, s, dir, "old.jpg", now.Add(-48*time.Hour), 10)
+	freshPath := seed(t, ctx, s, dir, "fresh.jpg", now, 10)
+
+	result, err := Prune(ctx, s, Options{All: true, DryRun: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Events != 2 || result.Bytes != 20 {
+		t.Fatalf("dry run should report what --all would delete, got %#v", result)
+	}
+	for _, p := range []string{oldPath, freshPath} {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("dry run must not delete files: %v", err)
+		}
+	}
+	remaining, err := s.Search(ctx, store.SearchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remaining) != 2 {
+		t.Fatalf("dry run must not delete rows, got %d", len(remaining))
+	}
+}
+
 func TestPruneWithNoPolicyIsAnError(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newStore(t, ctx)
