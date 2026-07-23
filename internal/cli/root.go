@@ -252,8 +252,8 @@ func (a *app) askCommand() *cobra.Command {
 				if winSince, winUntil, rest, ok := parseTimeWindow(question, time.Now()); ok {
 					opts.Since, opts.Until = winSince, winUntil
 					question = rest
-					fmt.Fprintf(cmd.ErrOrStderr(), "note: interpreting the time in your question as %s … %s\n",
-						localTimestamp(*winSince), localTimestamp(*winUntil))
+					fmt.Fprintf(cmd.ErrOrStderr(), "note: interpreting the time in your question as %s\n",
+						describeTimeWindow(*winSince, *winUntil))
 				}
 			}
 			events, stage, err := retrieveContext(cmd.Context(), s, question, opts)

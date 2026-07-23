@@ -86,6 +86,26 @@ func localTimestamp(t time.Time) string {
 	return t.Local().Format(time.RFC3339)
 }
 
+// describeTimeWindow renders a [since, until) window in the user's local
+// timezone as a short human-readable phrase. A window spanning exactly one
+// calendar day (midnight to midnight) reads as "the day of 2006-01-02"; a
+// window contained within a single day names the day once and gives the clock
+// range; anything crossing a day boundary spells out both ends.
+func describeTimeWindow(since, until time.Time) string {
+	s, u := since.Local(), until.Local()
+	const dayFmt, clockFmt = "2006-01-02", "3:04 PM"
+	midnight := func(t time.Time) bool {
+		return t.Hour() == 0 && t.Minute() == 0 && t.Second() == 0 && t.Nanosecond() == 0
+	}
+	if midnight(s) && midnight(u) && u.Sub(s) == 24*time.Hour {
+		return "the day of " + s.Format(dayFmt)
+	}
+	if s.Year() == u.Year() && s.YearDay() == u.YearDay() {
+		return s.Format(dayFmt) + ", " + s.Format(clockFmt) + " to " + u.Format(clockFmt)
+	}
+	return s.Format(dayFmt+" "+clockFmt) + " to " + u.Format(dayFmt+" "+clockFmt)
+}
+
 func eventBlock(event store.Event) string {
 	text := truncateRunes(compactScreenText(event.Text), maxEventChars)
 	if event.Kind == store.KindAudio {
