@@ -22,20 +22,23 @@ ScreenCaptureKit captures system output and the default microphone directly; no 
 task build # compiles the Swift SpeechAnalyzer bridge (task speech), then go build
 ./lumi permissions --request # or: task permissions
 ./lumi doctor
-./lumi record
+./lumi record start
 ```
 
-Recording runs until `Ctrl-C`. Useful options include:
+`record start` launches recording in the background and returns; check on it with
+`./lumi record status` and stop it with `./lumi record stop` (which waits for a graceful
+shutdown so in-flight media finishes indexing). Add `--foreground` to run in the current
+terminal until `Ctrl-C` instead. Useful options include:
 
 ```sh
 # Screen only, every ten seconds
-./lumi record --no-audio --interval 10s
+./lumi record start --no-audio --interval 10s
 
 # All displays plus 60-second system and microphone audio chunks
-./lumi record --audio-chunk 60s
+./lumi record start --audio-chunk 60s
 
-# Bounded smoke test
-./lumi record --no-audio --duration 10s
+# Bounded smoke test, in the foreground
+./lumi record start --foreground --no-audio --duration 10s
 ```
 
 The defaults are a two-second screen interval and 30-second audio chunks. Displays are discovered again on every interval, so connecting or disconnecting a display does not require restarting Lumi.
