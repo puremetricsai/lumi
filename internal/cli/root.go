@@ -248,12 +248,16 @@ func (a *app) askCommand() *cobra.Command {
 			// A recognized time expression ("around 9:15 pm") sets the window and is
 			// stripped from the question, unless --since was set explicitly.
 			question := args[0]
+			windowDir := dirCentered
+			explicitWindow := cmd.Flags().Changed("since")
 			if !cmd.Flags().Changed("since") {
-				if winSince, winUntil, rest, ok := parseTimeWindow(question, time.Now()); ok {
+				if winSince, winUntil, rest, dir, ok := parseTimeWindow(question, time.Now()); ok {
 					opts.Since, opts.Until = winSince, winUntil
 					question = rest
+					windowDir = dir
+					explicitWindow = true
 					fmt.Fprintf(cmd.ErrOrStderr(), "note: interpreting the time in your question as %s\n",
-						describeTimeWindow(*winSince, *winUntil))
+						describeTimeWindow(*winSince, *winUntil, dir))
 				}
 			}
 			events, stage, err := retrieveContext(cmd.Context(), s, question, opts)
@@ -261,6 +265,27 @@ func (a *app) askCommand() *cobra.Command {
 				return err
 			}
 			if len(events) == 0 {
+				// Report every criterion that could have emptied the result, not
+				// just the time window: an --app/--window filter can hide activity
+				// that does exist in the window, and blaming the window alone is a
+				// false diagnosis.
+				var criteria []string
+				if explicitWindow && opts.Since != nil {
+					until := time.Now()
+					if opts.Until != nil {
+						until = *opts.Until
+					}
+					criteria = append(criteria, "the time window "+describeTimeWindow(*opts.Since, until, windowDir))
+				}
+				if app != "" {
+					criteria = append(criteria, fmt.Sprintf("app %q", app))
+				}
+				if window != "" {
+					criteria = append(criteria, fmt.Sprintf("window text %q", window))
+				}
+				if len(criteria) > 0 {
+					return fmt.Errorf("no activity matched %s", strings.Join(criteria, " and "))
+				}
 				return errors.New("no local activity has been indexed yet")
 			}
 			// Never answer from a degraded retrieval silently.

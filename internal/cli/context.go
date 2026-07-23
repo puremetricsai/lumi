@@ -87,13 +87,22 @@ func localTimestamp(t time.Time) string {
 }
 
 // describeTimeWindow renders a [since, until) window in the user's local
-// timezone as a short human-readable phrase. A window spanning exactly one
-// calendar day (midnight to midnight) reads as "the day of 2006-01-02"; a
-// window contained within a single day names the day once and gives the clock
-// range; anything crossing a day boundary spells out both ends.
-func describeTimeWindow(since, until time.Time) string {
+// timezone as a short human-readable phrase. A directional window phrases the
+// bounded edge and its day ("from 3:00 PM onward (2006-01-02)" / "up to 5:00 PM
+// (2006-01-02)"), so an open-ended "after"/"before" reading is never mistaken
+// for a centered band. Otherwise: a window spanning exactly one calendar day
+// (midnight to midnight) reads as "the day of 2006-01-02"; a window contained
+// within a single day names the day once and gives the clock range; anything
+// crossing a day boundary spells out both ends.
+func describeTimeWindow(since, until time.Time, dir clockDir) string {
 	s, u := since.Local(), until.Local()
 	const dayFmt, clockFmt = "2006-01-02", "3:04 PM"
+	switch dir {
+	case dirForward:
+		return "from " + s.Format(clockFmt) + " onward (" + s.Format(dayFmt) + ")"
+	case dirBackward:
+		return "up to " + u.Format(clockFmt) + " (" + u.Format(dayFmt) + ")"
+	}
 	midnight := func(t time.Time) bool {
 		return t.Hour() == 0 && t.Minute() == 0 && t.Second() == 0 && t.Nanosecond() == 0
 	}

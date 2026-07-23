@@ -40,6 +40,14 @@ const (
 // all-terms pass fail on almost every naturally phrased question. Words
 // parseTimeWindow misses are still dropped here so they never reach FTS.
 //
+// Recording-modality words ("microphone", "audio", "heard", "said", "picked")
+// are dropped for a subtler reason: they name *how* something was captured, not
+// its content. A speech transcript never contains the word "microphone", but a
+// terminal screenshot showing a prior `lumi ask` command does — so leaving them
+// in makes the any-term pass rank UI screenshots above the actual audio and
+// answer "no microphone activity" when there is plenty. Modality is expressed by
+// event kind/audio_source, not by matching these tokens against text.
+//
 // "go" is deliberately absent: on a developer's machine it is far more often
 // the language than the verb.
 var questionStopwords = map[string]struct{}{}
@@ -57,8 +65,11 @@ func init() {
 		tell show remind find search look give list
 		anything something everything some any all
 		record records recorded recording save saved capture captured
+		microphone microphones mic mics audio sound sounds
+		heard hear said say saying spoke spoken speak picked
+		thing things stuff up
 		activity activities logged indexed remembered far
-		yesterday today tonight tomorrow morning afternoon evening
+		yesterday today tonight tomorrow morning afternoon evening night nights
 		day days week weeks month months year years
 		ago last recent recently earlier ago past now
 		time times

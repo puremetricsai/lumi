@@ -24,6 +24,7 @@ func TestParseTimeWindow(t *testing.T) {
 		wantSince time.Time
 		wantUntil time.Time
 		wantRest  string
+		wantDir   clockDir
 	}{
 		{
 			name:      "clock pm with minutes, earlier today",
@@ -137,9 +138,74 @@ func TestParseTimeWindow(t *testing.T) {
 			wantUntil: now,
 			wantRest:  "recap the",
 		},
+		{
+			name:      "after clock is forward to end of day",
+			question:  "what was said after 10:15 pm",
+			now:       now,
+			wantSince: at(2026, 7, 22, 22, 15),
+			wantUntil: at(2026, 7, 23, 0, 0),
+			wantRest:  "what was said",
+			wantDir:   dirForward,
+		},
+		{
+			name:      "since clock is forward",
+			question:  "emails since 3pm",
+			now:       now,
+			wantSince: at(2026, 7, 22, 15, 0),
+			wantUntil: at(2026, 7, 23, 0, 0),
+			wantRest:  "emails",
+			wantDir:   dirForward,
+		},
+		{
+			// After midnight, an unanchored "since 10pm" anchors to yesterday; the
+			// window must still reach now, not stop at yesterday's midnight, or
+			// captures between midnight and now are wrongly excluded.
+			name:      "unanchored forward after midnight extends to now",
+			question:  "what happened since 10pm",
+			now:       at(2026, 7, 23, 0, 30), // 12:30 AM
+			wantSince: at(2026, 7, 22, 22, 0),
+			wantUntil: at(2026, 7, 23, 0, 30),
+			wantRest:  "what happened",
+			wantDir:   dirForward,
+		},
+		{
+			name:      "before clock is backward from start of day",
+			question:  "anything before 9 am",
+			now:       now,
+			wantSince: at(2026, 7, 22, 0, 0),
+			wantUntil: at(2026, 7, 22, 9, 0),
+			wantRest:  "anything",
+			wantDir:   dirBackward,
+		},
+		{
+			name:      "until clock is backward",
+			question:  "work until 5pm",
+			now:       now,
+			wantSince: at(2026, 7, 22, 0, 0),
+			wantUntil: at(2026, 7, 22, 17, 0),
+			wantRest:  "work",
+			wantDir:   dirBackward,
+		},
+		{
+			name:      "last night standalone",
+			question:  "what happened last night",
+			now:       now,
+			wantSince: at(2026, 7, 21, 17, 0),
+			wantUntil: at(2026, 7, 22, 0, 0),
+			wantRest:  "what happened",
+		},
+		{
+			name:      "last night anchors an after clock to yesterday",
+			question:  "what was said last night after 10:15 pm",
+			now:       now,
+			wantSince: at(2026, 7, 21, 22, 15),
+			wantUntil: at(2026, 7, 22, 0, 0),
+			wantRest:  "what was said",
+			wantDir:   dirForward,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			since, until, rest, ok := parseTimeWindow(tc.question, tc.now)
+			since, until, rest, dir, ok := parseTimeWindow(tc.question, tc.now)
 			if !ok {
 				t.Fatalf("expected a match for %q", tc.question)
 			}
@@ -152,6 +218,9 @@ func TestParseTimeWindow(t *testing.T) {
 			if rest != tc.wantRest {
 				t.Fatalf("rest = %q, want %q", rest, tc.wantRest)
 			}
+			if dir != tc.wantDir {
+				t.Fatalf("dir = %d, want %d", dir, tc.wantDir)
+			}
 		})
 	}
 }
@@ -163,7 +232,7 @@ func TestParseTimeWindowNoMatch(t *testing.T) {
 		"summarize my work",
 		"", // empty
 	} {
-		if _, _, _, ok := parseTimeWindow(question, now); ok {
+		if _, _, _, _, ok := parseTimeWindow(question, now); ok {
 			t.Fatalf("did not expect a time match in %q", question)
 		}
 	}

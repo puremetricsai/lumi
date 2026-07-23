@@ -182,6 +182,30 @@ func TestAskExplicitSinceSkipsWindowDerivation(t *testing.T) {
 	}
 }
 
+func TestAskEmptyResultNamesActiveFilters(t *testing.T) {
+	now := time.Now().UTC()
+	// The event is inside the derived window, so the window is not empty — only
+	// the --app filter excludes it. The error must not blame the time window
+	// alone.
+	_, _, run := newAskTest(t,
+		store.Event{Kind: store.KindScreen, CapturedAt: now.Add(-30 * time.Minute), App: "Ghostty", Text: "roadmap review", MediaPath: "a.jpg"},
+	)
+
+	_, _, err := run("what was I doing in the last 2 hours", "--app", "Safari")
+	if err == nil {
+		t.Fatal("expected an error when the filter excludes all in-window activity")
+	}
+	if !strings.Contains(err.Error(), `app "Safari"`) {
+		t.Fatalf("error must name the app filter, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "time window") {
+		t.Fatalf("error must still name the time window, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "has been indexed yet") {
+		t.Fatalf("must not claim the store is empty when activity exists in the window: %v", err)
+	}
+}
+
 func TestAskRespectsMaxContextChars(t *testing.T) {
 	var events []store.Event
 	now := time.Now().UTC()
