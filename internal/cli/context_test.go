@@ -9,6 +9,58 @@ import (
 	"github.com/puremetricsai/lumi/internal/store"
 )
 
+// TestDescribeTimeWindow locks in the interpretation-note phrasing, including
+// the directional forms that keep "after"/"before" from reading like the old
+// centered band. Times are built in a fixed zone and rendered via .Local(), so
+// assertions target the day/clock structure rather than an absolute offset.
+func TestDescribeTimeWindow(t *testing.T) {
+	mk := func(y int, mo time.Month, d, h, mi int) time.Time {
+		return time.Date(y, mo, d, h, mi, 0, 0, time.Local)
+	}
+	for _, tc := range []struct {
+		name  string
+		since time.Time
+		until time.Time
+		dir   clockDir
+		want  string
+	}{
+		{
+			name:  "forward reads as onward",
+			since: mk(2026, 7, 22, 22, 15),
+			until: mk(2026, 7, 23, 0, 0),
+			dir:   dirForward,
+			want:  "from 10:15 PM onward (2026-07-22)",
+		},
+		{
+			name:  "backward reads as up to",
+			since: mk(2026, 7, 22, 0, 0),
+			until: mk(2026, 7, 22, 9, 0),
+			dir:   dirBackward,
+			want:  "up to 9:00 AM (2026-07-22)",
+		},
+		{
+			name:  "centered same-day range",
+			since: mk(2026, 7, 22, 21, 0),
+			until: mk(2026, 7, 22, 21, 30),
+			dir:   dirCentered,
+			want:  "2026-07-22, 9:00 PM to 9:30 PM",
+		},
+		{
+			name:  "centered full day",
+			since: mk(2026, 7, 21, 0, 0),
+			until: mk(2026, 7, 22, 0, 0),
+			dir:   dirCentered,
+			want:  "the day of 2026-07-21",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := describeTimeWindow(tc.since, tc.until, tc.dir); got != tc.want {
+				t.Fatalf("describeTimeWindow = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestContextForRespectsBudget is the regression for the reported defect:
 // contextFor used to concatenate every event's full screen text with no cap.
 func TestContextForRespectsBudget(t *testing.T) {
