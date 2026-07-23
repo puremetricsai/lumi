@@ -75,7 +75,7 @@ export CEREBRAS_API_KEY="..."
 ./lumi ask "What changed in the quarterly plan?" --app "Safari" --since 24h
 ```
 
-Lumi turns the question into search terms (dropping question words, broad activity words, and time words, which `--since` already covers) and retrieves in stages: events matching every term, else events ranked by best partial match, else the most recent events. When it falls back past the first stage it says so on stderr and distinguishes a broad overview from terms that matched nothing, so a recency-based answer is never mistaken for a retrieved one.
+Lumi turns the question into search terms (dropping question words, broad activity words, and time words, which `--since` already covers) and retrieves in stages: events matching every term, else events ranked by best partial match, else the most recent events. When it falls back to a recency-based stage it says so on stderr and distinguishes a broad overview from terms that matched nothing, so a recency-based answer is never mistaken for a retrieved one.
 
 It sends only the retrieved text and metadata to Cerebras `POST /v1/chat/completions` and prints the answer. Media files are never sent by this command.
 

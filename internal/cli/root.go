@@ -265,8 +265,6 @@ func (a *app) askCommand() *cobra.Command {
 			}
 			// Never answer from a degraded retrieval silently.
 			switch stage {
-			case stageAnyTerm:
-				fmt.Fprintln(cmd.ErrOrStderr(), "note: no events matched every term; ranked by best partial match")
 			case stageRecent:
 				fmt.Fprintf(cmd.ErrOrStderr(), "note: broad question; reviewing the %d most recent events\n", len(events))
 			case stageRecentUnmatched:

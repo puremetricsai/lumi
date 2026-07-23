@@ -131,7 +131,7 @@ func TestAskReportsUnmatchedTermsAccurately(t *testing.T) {
 	}
 }
 
-func TestAskReportsPartialMatch(t *testing.T) {
+func TestAskPartialMatchIsSilent(t *testing.T) {
 	_, _, run := newAskTest(t, store.Event{
 		Kind: store.KindScreen, CapturedAt: time.Now().UTC(), Text: "postgres index tuning", MediaPath: "a.jpg",
 	})
@@ -140,8 +140,8 @@ func TestAskReportsPartialMatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(stderr, "best partial match") {
-		t.Fatalf("partial-match stage must be reported, stderr was %q", stderr)
+	if strings.Contains(stderr, "best partial match") {
+		t.Fatalf("partial-match stage must not be reported, stderr was %q", stderr)
 	}
 }
 
