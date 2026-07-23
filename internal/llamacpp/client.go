@@ -22,8 +22,12 @@ type Client struct {
 // OpenAI-compatible chat-completions endpoint.
 func (c Client) Answer(ctx context.Context, question, activityContext string) (string, error) {
 	return llm.Client{
-		Endpoint:   strings.TrimRight(c.BaseURL, "/") + "/v1/chat/completions",
-		Model:      c.Model,
-		HTTPClient: c.HTTPClient,
+		Endpoint: strings.TrimRight(c.BaseURL, "/") + "/v1/chat/completions",
+		Model:    c.Model,
+		// llama-server bills reasoning tokens against the same completion budget
+		// as the answer, so a thinking model on a long activity context can
+		// exhaust the budget mid-scratchpad and return no answer at all.
+		DisableThinking: true,
+		HTTPClient:      c.HTTPClient,
 	}.Answer(ctx, question, activityContext)
 }
