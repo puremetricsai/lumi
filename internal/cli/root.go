@@ -38,11 +38,27 @@ type app struct {
 	newAnswerer func(model string) answerer
 }
 
-func (a *app) answerer(model string) answerer {
+func (a *app) answerer(model string) (answerer, error) {
 	if a.newAnswerer != nil {
-		return a.newAnswerer(model)
+		return a.newAnswerer(model), nil
 	}
-	return cerebras.Client{APIKey: os.Getenv("CEREBRAS_API_KEY"), Model: model}
+	cfg, err := a.loadConfig()
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(cfg.CerebrasAPIKey) == "" {
+		return nil, errors.New("no Cerebras API key configured; run `lumi configure`")
+	}
+	return cerebras.Client{APIKey: cfg.CerebrasAPIKey, Model: model}, nil
+}
+
+// loadConfig reads the persisted config from the resolved data directory.
+func (a *app) loadConfig() (config.Config, error) {
+	paths, err := a.paths()
+	if err != nil {
+		return config.Config{}, err
+	}
+	return config.LoadConfig(paths.Config)
 }
 
 func Execute() error {
@@ -64,7 +80,7 @@ func newRootCommand() *cobra.Command {
 	}
 	cmd.PersistentFlags().StringVar(&a.dataDir, "data-dir", "", "data directory (default: $LUMI_HOME or ~/Library/Application Support/Lumi)")
 	cmd.AddCommand(a.recordCommand(), a.searchCommand(), a.askCommand(), a.pruneCommand(),
-		a.doctorCommand(), a.permissionsCommand(), a.nativeSmokeCommand())
+		a.doctorCommand(), a.permissionsCommand(), a.nativeSmokeCommand(), a.configureCommand())
 	cmd.AddCommand(&cobra.Command{Use: "version", Short: "Print the Lumi version", Run: func(*cobra.Command, []string) {
 		fmt.Fprintln(os.Stdout, version)
 	}})
@@ -245,7 +261,20 @@ func (a *app) askCommand() *cobra.Command {
 			case stageRecentUnmatched:
 				fmt.Fprintf(cmd.ErrOrStderr(), "note: no events matched the question terms; reviewing the %d most recent events instead\n", len(events))
 			}
-			answer, err := a.answerer(model).Answer(cmd.Context(), args[0], contextFor(events, maxContextChars))
+			// Resolve the model: an explicit --model flag beats the configured
+			// model, which beats the built-in default.
+			if !cmd.Flags().Changed("model") {
+				cfg, err := a.loadConfig()
+				if err != nil {
+					return err
+				}
+				model = cfg.ResolvedModel()
+			}
+			ans, err := a.answerer(model)
+			if err != nil {
+				return err
+			}
+			answer, err := ans.Answer(cmd.Context(), args[0], contextFor(events, maxContextChars))
 			if err != nil {
 				return err
 			}
@@ -257,7 +286,7 @@ func (a *app) askCommand() *cobra.Command {
 	cmd.Flags().StringVar(&app, "app", "", "restrict activity to this application")
 	cmd.Flags().StringVar(&window, "window", "", "restrict activity to windows whose title contains this text")
 	cmd.Flags().IntVar(&limit, "limit", 50, "maximum activity records sent to Cerebras")
-	cmd.Flags().StringVar(&model, "model", defaultCerebrasModel(), "Cerebras model; set $LUMI_CEREBRAS_MODEL to change the default")
+	cmd.Flags().StringVar(&model, "model", "", "Cerebras model; overrides the configured default (run `lumi configure`)")
 	cmd.Flags().IntVar(&maxContextChars, "max-context-chars", defaultContextChars, "character budget for the activity context sent to Cerebras")
 	return cmd
 }
@@ -360,12 +389,15 @@ func (a *app) doctorCommand() *cobra.Command {
 				fmt.Fprintf(os.Stdout, "speech assets (%s)\tmissing\tlocale assets not installed; `./lumi record` downloads them at startup\n", speechLocale)
 				missing = true
 			}
-			if os.Getenv("CEREBRAS_API_KEY") == "" {
-				fmt.Fprintln(os.Stdout, "Cerebras API key\toptional\tset CEREBRAS_API_KEY to use lumi ask")
+			cfg, cfgErr := config.LoadConfig(paths.Config)
+			if cfgErr != nil {
+				fmt.Fprintf(os.Stdout, "Cerebras API key\tmissing\t%v\n", cfgErr)
+			} else if strings.TrimSpace(cfg.CerebrasAPIKey) == "" {
+				fmt.Fprintln(os.Stdout, "Cerebras API key\toptional\trun `lumi configure` to use lumi ask")
 			} else {
 				fmt.Fprintln(os.Stdout, "Cerebras API key\tok\tconfigured")
 			}
-			fmt.Fprintf(os.Stdout, "Cerebras model\tok\t%s\n", defaultCerebrasModel())
+			fmt.Fprintf(os.Stdout, "Cerebras model\tok\t%s\n", cfg.ResolvedModel())
 			fmt.Fprintf(os.Stdout, "data directory\tok\t%s\n", paths.Root)
 			if missing {
 				return errors.New("one or more recording requirements are missing; run `./lumi permissions --request` for macOS capture permissions")
@@ -488,15 +520,6 @@ func requireRecordingPermissions(ctx context.Context, screen, audio, speech bool
 		return fmt.Errorf("grant required macOS permissions to this terminal or the Lumi binary: %s; run `./lumi permissions --request`", strings.Join(missing, "; "))
 	}
 	return nil
-}
-
-// defaultCerebrasModel resolves the model: an explicit flag beats the
-// environment, which beats the built-in default.
-func defaultCerebrasModel() string {
-	if model := strings.TrimSpace(os.Getenv("LUMI_CEREBRAS_MODEL")); model != "" {
-		return model
-	}
-	return config.DefaultCerebrasModel
 }
 
 func searchOptions(query, kind, since, until, app, window string, limit int) (store.SearchOptions, error) {

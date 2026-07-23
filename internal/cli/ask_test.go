@@ -26,7 +26,7 @@ func (f *fakeAnswerer) Answer(_ context.Context, question, activityContext strin
 
 // newAskTest wires an ask command against a temporary data directory seeded
 // with events, and a fake answerer so nothing touches the network.
-func newAskTest(t *testing.T, events ...store.Event) (*fakeAnswerer, func(args ...string) (string, string, error)) {
+func newAskTest(t *testing.T, events ...store.Event) (*fakeAnswerer, string, func(args ...string) (string, string, error)) {
 	t.Helper()
 	dataDir := t.TempDir()
 
@@ -60,7 +60,7 @@ func newAskTest(t *testing.T, events ...store.Event) (*fakeAnswerer, func(args .
 		err := cmd.ExecuteContext(ctx)
 		return stdout.String(), stderr.String(), err
 	}
-	return fake, run
+	return fake, dataDir, run
 }
 
 func TestAskRetrievesInsteadOfFallingBackToRecency(t *testing.T) {
@@ -77,7 +77,7 @@ func TestAskRetrievesInsteadOfFallingBackToRecency(t *testing.T) {
 			Text: "unrelated inbox chatter", MediaPath: "b.jpg",
 		})
 	}
-	fake, run := newAskTest(t, events...)
+	fake, _, run := newAskTest(t, events...)
 
 	_, stderr, err := run("what did I read about postgres yesterday")
 	if err != nil {
@@ -95,7 +95,7 @@ func TestAskRetrievesInsteadOfFallingBackToRecency(t *testing.T) {
 }
 
 func TestAskReportsRecencyFallback(t *testing.T) {
-	fake, run := newAskTest(t, store.Event{
+	fake, _, run := newAskTest(t, store.Event{
 		Kind: store.KindScreen, CapturedAt: time.Now().UTC(), Text: "roadmap review", MediaPath: "a.jpg",
 	})
 
@@ -115,7 +115,7 @@ func TestAskReportsRecencyFallback(t *testing.T) {
 }
 
 func TestAskReportsUnmatchedTermsAccurately(t *testing.T) {
-	_, run := newAskTest(t, store.Event{
+	_, _, run := newAskTest(t, store.Event{
 		Kind: store.KindScreen, CapturedAt: time.Now().UTC(), Text: "roadmap review", MediaPath: "a.jpg",
 	})
 
@@ -132,7 +132,7 @@ func TestAskReportsUnmatchedTermsAccurately(t *testing.T) {
 }
 
 func TestAskReportsPartialMatch(t *testing.T) {
-	_, run := newAskTest(t, store.Event{
+	_, _, run := newAskTest(t, store.Event{
 		Kind: store.KindScreen, CapturedAt: time.Now().UTC(), Text: "postgres index tuning", MediaPath: "a.jpg",
 	})
 
@@ -154,7 +154,7 @@ func TestAskRespectsMaxContextChars(t *testing.T) {
 			Text: strings.Repeat("postgres tuning notes ", 300), MediaPath: "a.jpg",
 		})
 	}
-	fake, run := newAskTest(t, events...)
+	fake, _, run := newAskTest(t, events...)
 
 	if _, _, err := run("postgres tuning", "--max-context-chars", "3000"); err != nil {
 		t.Fatal(err)
@@ -168,9 +168,8 @@ func TestAskRespectsMaxContextChars(t *testing.T) {
 }
 
 func TestAskModelResolution(t *testing.T) {
-	t.Run("built-in default", func(t *testing.T) {
-		t.Setenv("LUMI_CEREBRAS_MODEL", "")
-		fake, run := newAskTest(t, store.Event{Kind: store.KindScreen, Text: "notes", MediaPath: "a.jpg"})
+	t.Run("built-in default when unconfigured", func(t *testing.T) {
+		fake, _, run := newAskTest(t, store.Event{Kind: store.KindScreen, Text: "notes", MediaPath: "a.jpg"})
 		if _, _, err := run("notes"); err != nil {
 			t.Fatal(err)
 		}
@@ -179,20 +178,20 @@ func TestAskModelResolution(t *testing.T) {
 		}
 	})
 
-	t.Run("environment overrides the default", func(t *testing.T) {
-		t.Setenv("LUMI_CEREBRAS_MODEL", "qwen-3-32b")
-		fake, run := newAskTest(t, store.Event{Kind: store.KindScreen, Text: "notes", MediaPath: "a.jpg"})
+	t.Run("config overrides the default", func(t *testing.T) {
+		fake, dataDir, run := newAskTest(t, store.Event{Kind: store.KindScreen, Text: "notes", MediaPath: "a.jpg"})
+		writeTestConfig(t, dataDir, config.Config{CerebrasModel: "qwen-3-32b"})
 		if _, _, err := run("notes"); err != nil {
 			t.Fatal(err)
 		}
 		if fake.model != "qwen-3-32b" {
-			t.Fatalf("model = %q, want the environment value", fake.model)
+			t.Fatalf("model = %q, want the configured value", fake.model)
 		}
 	})
 
-	t.Run("flag overrides the environment", func(t *testing.T) {
-		t.Setenv("LUMI_CEREBRAS_MODEL", "qwen-3-32b")
-		fake, run := newAskTest(t, store.Event{Kind: store.KindScreen, Text: "notes", MediaPath: "a.jpg"})
+	t.Run("flag overrides the config", func(t *testing.T) {
+		fake, dataDir, run := newAskTest(t, store.Event{Kind: store.KindScreen, Text: "notes", MediaPath: "a.jpg"})
+		writeTestConfig(t, dataDir, config.Config{CerebrasModel: "qwen-3-32b"})
 		if _, _, err := run("notes", "--model", "llama-4-scout"); err != nil {
 			t.Fatal(err)
 		}
@@ -200,4 +199,11 @@ func TestAskModelResolution(t *testing.T) {
 			t.Fatalf("model = %q, want the flag value", fake.model)
 		}
 	})
+}
+
+func writeTestConfig(t *testing.T, dataDir string, cfg config.Config) {
+	t.Helper()
+	if err := config.SaveConfig(filepath.Join(dataDir, config.ConfigFileName), cfg); err != nil {
+		t.Fatal(err)
+	}
 }
