@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What Lumi is
 
-A local-first work-memory CLI for Apple Silicon Macs: continuously capture all displays plus system and microphone audio, extract screen text locally (full-display Apple Vision OCR, with Accessibility for focused-app attribution), transcribe audio with in-process Apple SpeechAnalyzer, store media on disk, index text in SQLite FTS5, and query it. Inspired by screenpipe but deliberately narrower — no GUI, server, plugins, or provider abstraction. Cerebras is the *only* inference backend, used solely by `lumi ask`.
+A local-first work-memory CLI for Apple Silicon Macs: continuously capture all displays plus system and microphone audio, extract screen text locally (full-display Apple Vision OCR, with Accessibility for focused-app attribution), transcribe audio with in-process Apple SpeechAnalyzer, store media on disk, index text in SQLite FTS5, and query it. Inspired by screenpipe but deliberately narrower — no GUI, server, or plugins. Inference (used solely by `lumi ask`) has two selectable backends behind a shared OpenAI-compatible client: hosted **Cerebras** (default) and local **llama.cpp** (`llama-server`).
 
 ## Commands
 
@@ -26,7 +26,7 @@ The CLI itself refuses to run on anything but `darwin/arm64` (`platform.Validate
 
 ```
 ScreenCaptureKit displays ─→ Vision OCR (full screen) ─┐
-                         └─→ Accessibility (attribution) ├─→ events + events_fts ─→ search ─→ Cerebras ask
+                         └─→ Accessibility (attribution) ├─→ events + events_fts ─→ search ─→ ask (Cerebras | llama.cpp)
 ScreenCaptureKit system + microphone ─→ WAV ─→ SpeechAnalyzer (in-process) ─┘
 ```
 
@@ -40,7 +40,7 @@ Data flows one way: `internal/cli` wires concrete processors into a `capture.Rec
 
 **`internal/retention`** — explicit age- and size-based pruning used by `lumi prune`. Age pruning runs before size pruning; size enforcement walks indexed events oldest-first. There is no background scheduler or default retention policy. Rows are deleted in bounded batches before media files are unlinked.
 
-**`internal/cli`** — Cobra commands (`record start`/`status`/`stop`, `search`, `ask`, `prune`, `doctor`, `permissions`, `configure`, `native-smoke`, `version`). `configure` persists the Cerebras API key and model to `config.json` in the data-dir root (`0600`); with no flags it prompts interactively, and `--show` prints the current config with the key masked. `record` is a parent command: `record start` runs the capture pipeline, detaching to the background by default (`--foreground` keeps it in the terminal); the background worker is a re-exec of `record start --foreground` tracked by a JSON state file and log under the data dir (`internal/cli/record_daemon.go`). `record stop` sends SIGTERM and waits for the graceful-shutdown path. Capture and audio-chunk intervals and transcription settings are flags; native framework implementations are production defaults. `search` and `ask` expose exact case-insensitive app filtering and case-insensitive window-substring filtering. `permissions --request` invokes native TCC request flows; never add `tccutil reset` as an automatic side effect.
+**`internal/cli`** — Cobra commands (`record start`/`status`/`stop`, `search`, `ask`, `prune`, `doctor`, `permissions`, `configure`, `llama status`/`stop`, `native-smoke`, `version`). `configure` persists the provider and its settings (Cerebras API key + model, or llama.cpp model + base URL) to `config.json` in the data-dir root (`0600`); with no flags it prompts interactively (provider first, then that provider's fields), and `--show` prints the current config with the Cerebras key masked. `llama status`/`stop` report on and terminate a Lumi-launched `llama-server`. `record` is a parent command: `record start` runs the capture pipeline, detaching to the background by default (`--foreground` keeps it in the terminal); the background worker is a re-exec of `record start --foreground` tracked by a JSON state file and log under the data dir (`internal/cli/record_daemon.go`). `record stop` sends SIGTERM and waits for the graceful-shutdown path. Capture and audio-chunk intervals and transcription settings are flags; native framework implementations are production defaults. `search` and `ask` expose exact case-insensitive app filtering and case-insensitive window-substring filtering. `permissions --request` invokes native TCC request flows; never add `tccutil reset` as an automatic side effect.
 
 **`internal/config`** — resolves `Paths` from `--data-dir`, else `LUMI_HOME`, else `~/Library/Application Support/Lumi`; directories are created 0700.
 
@@ -61,4 +61,9 @@ Data flows one way: `internal/cli` wires concrete processors into a `capture.Rec
 
 ## External dependencies
 
-Xcode Command Line Tools plus a Swift toolchain are required to build the native cgo bridge (`swiftc` compiles the SpeechAnalyzer bridge into `liblumispeech.a`, linked by cgo). Runtime processing is fully native — no external binaries. `ask` requires a Cerebras API key persisted via `lumi configure` (stored in `config.json`, `0600`); there is no environment-variable fallback. The Cerebras model resolves as `--model` → configured `cerebras_model` → `config.DefaultCerebrasModel`.
+Xcode Command Line Tools plus a Swift toolchain are required to build the native cgo bridge (`swiftc` compiles the SpeechAnalyzer bridge into `liblumispeech.a`, linked by cgo). Capture/processing is fully native — no external binaries. `ask` selects a backend via the `provider` config field (`cerebras` default, or `llama.cpp`):
+
+- **Cerebras** requires an API key persisted via `lumi configure` (stored in `config.json`, `0600`; no environment-variable fallback). The model resolves as `--model` → configured `cerebras_model` → `config.DefaultCerebrasModel`.
+- **llama.cpp** requires `llama-server` on `PATH` (`brew install llama.cpp`); `lumi configure` refuses to select the provider until it is installed. The model (`--model` → `llama_model`, a GGUF path or HuggingFace repo) and `llama_base_url` (default `http://127.0.0.1:8080`) drive it. When the provider is active, `ask` auto-launches `llama-server` (detached, logging to `<root>/llama-server.log`, pid in `<root>/llama-server.pid`) if `/health` isn't already OK and leaves it running so the model stays warm; `lumi llama status`/`stop` manage it.
+
+Both backends share the single OpenAI-compatible client and system prompt in `internal/llm`; `internal/cerebras` and `internal/llamacpp` are thin wrappers over it, selected at the one construction site `app.answerer` in `internal/cli/root.go`. `lumi ask` still sends text and metadata only — never screenshots or WAVs — to whichever backend is active.
