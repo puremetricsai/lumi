@@ -44,7 +44,7 @@ type chatResponse struct {
 
 func (c Client) Answer(ctx context.Context, question, activityContext string) (string, error) {
 	if strings.TrimSpace(c.APIKey) == "" {
-		return "", errors.New("CEREBRAS_API_KEY is not set")
+		return "", errors.New("Cerebras API key is not set; run `lumi configure`")
 	}
 	model := c.Model
 	if model == "" {

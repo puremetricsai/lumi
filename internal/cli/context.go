@@ -18,7 +18,7 @@ const (
 	// tokenizes worse than prose. 60000 chars is therefore ~20k tokens, which leaves
 	// room for the 1200-token completion reserve and the prompt scaffold
 	// inside a 32k context. The floor is deliberately conservative: --model
-	// and LUMI_CEREBRAS_MODEL let users point at smaller models, and
+	// and the configured cerebras_model let users point at smaller models, and
 	// --max-context-chars is the escape hatch for larger ones.
 	defaultContextChars = 60000
 	// maxEventChars caps any single event so one full-page screen-text dump cannot
