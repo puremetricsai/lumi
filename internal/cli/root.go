@@ -245,7 +245,18 @@ func (a *app) askCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			events, stage, err := retrieveContext(cmd.Context(), s, args[0], opts)
+			// A recognized time expression ("around 9:15 pm") sets the window and is
+			// stripped from the question, unless --since was set explicitly.
+			question := args[0]
+			if !cmd.Flags().Changed("since") {
+				if winSince, winUntil, rest, ok := parseTimeWindow(question, time.Now()); ok {
+					opts.Since, opts.Until = winSince, winUntil
+					question = rest
+					fmt.Fprintf(cmd.ErrOrStderr(), "note: interpreting the time in your question as %s … %s\n",
+						localTimestamp(*winSince), localTimestamp(*winUntil))
+				}
+			}
+			events, stage, err := retrieveContext(cmd.Context(), s, question, opts)
 			if err != nil {
 				return err
 			}

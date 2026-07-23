@@ -1,0 +1,170 @@
+package cli
+
+import (
+	"testing"
+	"time"
+)
+
+// pdt is a fixed offset zone used so window math is deterministic regardless of
+// the machine's timezone.
+var pdt = time.FixedZone("PDT", -7*3600)
+
+func at(y int, mo time.Month, d, h, mi int) time.Time {
+	return time.Date(y, mo, d, h, mi, 0, 0, pdt)
+}
+
+func TestParseTimeWindow(t *testing.T) {
+	// A fixed "now": 2026-07-22 (Wed) 22:30 local.
+	now := at(2026, 7, 22, 22, 30)
+
+	for _, tc := range []struct {
+		name      string
+		question  string
+		now       time.Time
+		wantSince time.Time
+		wantUntil time.Time
+		wantRest  string
+	}{
+		{
+			name:      "clock pm with minutes, earlier today",
+			question:  "what was captured around 9:15 pm",
+			now:       now,
+			wantSince: at(2026, 7, 22, 21, 0),
+			wantUntil: at(2026, 7, 22, 21, 30),
+			wantRest:  "what was captured",
+		},
+		{
+			name:      "clock pm rolls to yesterday when still future today",
+			question:  "9:15 pm",
+			now:       at(2026, 7, 22, 10, 0), // 10am: 21:15 has not happened yet today
+			wantSince: at(2026, 7, 21, 21, 0),
+			wantUntil: at(2026, 7, 21, 21, 30),
+			wantRest:  "",
+		},
+		{
+			name:      "clock anchored to yesterday overrides most-recent heuristic",
+			question:  "yesterday at 9:15 pm",
+			now:       now, // 22:30: 21:15 already passed today, so the bare-clock heuristic would wrongly pick today
+			wantSince: at(2026, 7, 21, 21, 0),
+			wantUntil: at(2026, 7, 21, 21, 30),
+			wantRest:  "",
+		},
+		{
+			name:      "clock anchored to today overrides most-recent heuristic",
+			question:  "what happened today at 11pm",
+			now:       now, // 22:30: 23:00 is future, so the bare-clock heuristic would wrongly roll to yesterday
+			wantSince: at(2026, 7, 22, 22, 45),
+			wantUntil: at(2026, 7, 22, 23, 15),
+			wantRest:  "what happened",
+		},
+		{
+			name:      "bare hour pm",
+			question:  "tell me about 9pm",
+			now:       now,
+			wantSince: at(2026, 7, 22, 20, 45),
+			wantUntil: at(2026, 7, 22, 21, 15),
+			wantRest:  "tell me about",
+		},
+		{
+			name:      "24-hour clock",
+			question:  "screens at 21:15",
+			now:       now,
+			wantSince: at(2026, 7, 22, 21, 0),
+			wantUntil: at(2026, 7, 22, 21, 30),
+			wantRest:  "screens",
+		},
+		{
+			name:      "yesterday",
+			question:  "what did I work on yesterday",
+			now:       now,
+			wantSince: at(2026, 7, 21, 0, 0),
+			wantUntil: at(2026, 7, 22, 0, 0),
+			wantRest:  "what did I work on",
+		},
+		{
+			name:      "today",
+			question:  "summarize today",
+			now:       now,
+			wantSince: at(2026, 7, 22, 0, 0),
+			wantUntil: at(2026, 7, 23, 0, 0),
+			wantRest:  "summarize",
+		},
+		{
+			name:      "this morning",
+			question:  "meetings this morning",
+			now:       now,
+			wantSince: at(2026, 7, 22, 5, 0),
+			wantUntil: at(2026, 7, 22, 12, 0),
+			wantRest:  "meetings",
+		},
+		{
+			name:      "this afternoon",
+			question:  "what happened this afternoon",
+			now:       now,
+			wantSince: at(2026, 7, 22, 12, 0),
+			wantUntil: at(2026, 7, 22, 17, 0),
+			wantRest:  "what happened",
+		},
+		{
+			name:      "tonight",
+			question:  "anything tonight",
+			now:       now,
+			wantSince: at(2026, 7, 22, 17, 0),
+			wantUntil: at(2026, 7, 23, 0, 0),
+			wantRest:  "anything",
+		},
+		{
+			name:      "last hour",
+			question:  "what did I see last hour",
+			now:       now,
+			wantSince: at(2026, 7, 22, 21, 30),
+			wantUntil: now,
+			wantRest:  "what did I see",
+		},
+		{
+			name:      "last N minutes",
+			question:  "last 30 minutes please",
+			now:       now,
+			wantSince: at(2026, 7, 22, 22, 0),
+			wantUntil: now,
+			wantRest:  "please",
+		},
+		{
+			name:      "last N hours",
+			question:  "recap the last 2 hours",
+			now:       now,
+			wantSince: at(2026, 7, 22, 20, 30),
+			wantUntil: now,
+			wantRest:  "recap the",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			since, until, rest, ok := parseTimeWindow(tc.question, tc.now)
+			if !ok {
+				t.Fatalf("expected a match for %q", tc.question)
+			}
+			if since == nil || !since.Equal(tc.wantSince) {
+				t.Fatalf("since = %v, want %v", since, tc.wantSince)
+			}
+			if until == nil || !until.Equal(tc.wantUntil) {
+				t.Fatalf("until = %v, want %v", until, tc.wantUntil)
+			}
+			if rest != tc.wantRest {
+				t.Fatalf("rest = %q, want %q", rest, tc.wantRest)
+			}
+		})
+	}
+}
+
+func TestParseTimeWindowNoMatch(t *testing.T) {
+	now := at(2026, 7, 22, 22, 30)
+	for _, question := range []string{
+		"what did I read about postgres",
+		"summarize my work",
+		"", // empty
+	} {
+		if _, _, _, ok := parseTimeWindow(question, now); ok {
+			t.Fatalf("did not expect a time match in %q", question)
+		}
+	}
+}
