@@ -36,3 +36,24 @@ func TestClientAnswer(t *testing.T) {
 		t.Fatalf("local backend must not send Authorization, got %q", gotAuth)
 	}
 }
+
+// TestClientAnswerDisablesThinking pins the local backend to a non-reasoning
+// completion. llama-server draws reasoning tokens from the same budget as the
+// answer, so a thinking model can burn the entire budget on its scratchpad and
+// return an empty content field.
+func TestClientAnswerDisablesThinking(t *testing.T) {
+	var gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotBody = string(body)
+		io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"Local answer"}}]}`)
+	}))
+	defer srv.Close()
+
+	if _, err := (Client{BaseURL: srv.URL}).Answer(context.Background(), "What?", "local context"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(gotBody, `"enable_thinking":false`) {
+		t.Fatalf("local backend must disable thinking, got: %s", gotBody)
+	}
+}
