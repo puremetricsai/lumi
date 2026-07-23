@@ -51,6 +51,11 @@ func TestQuestionTerms(t *testing.T) {
 			question: "notes about café menus",
 			want:     []string{"notes", "café", "menus"},
 		},
+		{
+			name:     "a pure modality question yields nothing",
+			question: "what did I say on the microphone",
+			want:     nil,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := questionTerms(tc.question); !reflect.DeepEqual(got, tc.want) {
