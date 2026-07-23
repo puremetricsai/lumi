@@ -260,6 +260,24 @@ func TestAskModelResolution(t *testing.T) {
 			t.Fatalf("model = %q, want the flag value", fake.model)
 		}
 	})
+
+	t.Run("llama.cpp provider uses its own configured model", func(t *testing.T) {
+		// The test answerer override precedes provider logic, so no llama-server
+		// is needed; this asserts the llama.cpp model (not the Cerebras one) is
+		// resolved and handed to the backend.
+		fake, dataDir, run := newAskTest(t, store.Event{Kind: store.KindScreen, Text: "notes", MediaPath: "a.jpg"})
+		writeTestConfig(t, dataDir, config.Config{
+			Provider:      config.ProviderLlamaCpp,
+			CerebrasModel: "qwen-3-32b",
+			LlamaModel:    "ggml-org/gpt-oss-20b-GGUF",
+		})
+		if _, _, err := run("notes"); err != nil {
+			t.Fatal(err)
+		}
+		if fake.model != "ggml-org/gpt-oss-20b-GGUF" {
+			t.Fatalf("model = %q, want the configured llama.cpp model", fake.model)
+		}
+	})
 }
 
 func writeTestConfig(t *testing.T, dataDir string, cfg config.Config) {

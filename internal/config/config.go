@@ -13,23 +13,83 @@ const (
 	DefaultCerebrasModel = "gpt-oss-120b"
 	CerebrasEndpoint     = "https://api.cerebras.ai/v1/chat/completions"
 	ConfigFileName       = "config.json"
+
+	// Provider names for the `ask` inference backend.
+	ProviderCerebras = "cerebras"
+	ProviderLlamaCpp = "llama.cpp"
+	DefaultProvider  = ProviderCerebras
+
+	// DefaultLlamaBaseURL is where a local llama-server listens by default.
+	DefaultLlamaBaseURL = "http://127.0.0.1:8080"
 )
 
 // Config is the persisted, user-editable configuration. It lives at
 // <Paths.Root>/config.json and replaces the former CEREBRAS_API_KEY /
 // LUMI_CEREBRAS_MODEL environment variables.
 type Config struct {
+	// Provider selects the `ask` inference backend ("cerebras" or "llama.cpp").
+	// Empty means the built-in default (Cerebras).
+	Provider string `json:"provider,omitempty"`
+
 	CerebrasAPIKey string `json:"cerebras_api_key,omitempty"`
 	CerebrasModel  string `json:"cerebras_model,omitempty"`
+
+	// LlamaModel is a GGUF file path or a HuggingFace repo id passed to
+	// llama-server; LlamaBaseURL is the server address Lumi talks to (and
+	// launches at when it isn't already running).
+	LlamaModel   string `json:"llama_model,omitempty"`
+	LlamaBaseURL string `json:"llama_base_url,omitempty"`
 }
 
-// ResolvedModel returns the configured model, falling back to the built-in
-// default when none has been set.
+// ResolvedModel returns the configured Cerebras model, falling back to the
+// built-in default when none has been set.
 func (c Config) ResolvedModel() string {
 	if model := strings.TrimSpace(c.CerebrasModel); model != "" {
 		return model
 	}
 	return DefaultCerebrasModel
+}
+
+// ResolvedProvider returns the active provider, normalizing case and the
+// "llamacpp" spelling, and falling back to the built-in default when unset.
+func (c Config) ResolvedProvider() string {
+	switch strings.ToLower(strings.TrimSpace(c.Provider)) {
+	case "":
+		return DefaultProvider
+	case ProviderLlamaCpp, "llamacpp", "llama-cpp":
+		return ProviderLlamaCpp
+	case ProviderCerebras:
+		return ProviderCerebras
+	default:
+		return strings.TrimSpace(c.Provider)
+	}
+}
+
+// KnownProvider reports whether name resolves to a supported inference
+// backend (cerebras or llama.cpp), accepting the same aliases/casing as
+// ResolvedProvider. An empty name is known (it means the default).
+func KnownProvider(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "", ProviderCerebras, ProviderLlamaCpp, "llamacpp", "llama-cpp":
+		return true
+	default:
+		return false
+	}
+}
+
+// ResolvedLlamaBaseURL returns the configured llama-server base URL, falling
+// back to the built-in default.
+func (c Config) ResolvedLlamaBaseURL() string {
+	if url := strings.TrimSpace(c.LlamaBaseURL); url != "" {
+		return url
+	}
+	return DefaultLlamaBaseURL
+}
+
+// ResolvedLlamaModel returns the configured llama.cpp model. There is no
+// built-in default — llama-server has no universal model — so this may be empty.
+func (c Config) ResolvedLlamaModel() string {
+	return strings.TrimSpace(c.LlamaModel)
 }
 
 type Paths struct {
@@ -44,6 +104,10 @@ type Paths struct {
 	RecordLog   string
 	// Config is the persisted user configuration (API key, model).
 	Config string
+	// LlamaLog collects a Lumi-launched llama-server's stdout/stderr; LlamaPid
+	// records its process id. Both live directly under Root.
+	LlamaLog string
+	LlamaPid string
 }
 
 func DefaultPaths() (Paths, error) {
@@ -75,6 +139,8 @@ func FromRoot(root string) (Paths, error) {
 		RecordState: filepath.Join(root, "record.json"),
 		RecordLog:   filepath.Join(root, "record.log"),
 		Config:      filepath.Join(root, ConfigFileName),
+		LlamaLog:    filepath.Join(root, "llama-server.log"),
+		LlamaPid:    filepath.Join(root, "llama-server.pid"),
 	}, nil
 }
 

@@ -4,12 +4,27 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/puremetricsai/lumi/internal/config"
 )
+
+// withFakeLlamaServer puts an (unexecuted) llama-server binary on PATH so
+// configure's install check passes. present=false points PATH at an empty dir.
+func withFakeLlamaServer(t *testing.T, present bool) {
+	t.Helper()
+	dir := t.TempDir()
+	if present {
+		bin := filepath.Join(dir, "llama-server")
+		if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", dir)
+}
 
 // newConfigureTest returns the data dir and a runner that executes the
 // configure subcommand directly (bypassing root's platform.Validate) with the
@@ -53,7 +68,9 @@ func TestConfigureFlagsPersist(t *testing.T) {
 
 func TestConfigureInteractiveSetsValues(t *testing.T) {
 	dataDir, run := newConfigureTest(t)
-	if _, err := run("interactive-key\nllama-4-scout\n"); err != nil {
+	// First prompt is the provider (blank keeps the Cerebras default), then the
+	// Cerebras key and model.
+	if _, err := run("\ninteractive-key\nllama-4-scout\n"); err != nil {
 		t.Fatal(err)
 	}
 	cfg := readTestConfig(t, dataDir)
@@ -116,5 +133,70 @@ func TestConfigureShowMasksKey(t *testing.T) {
 	}
 	if !strings.Contains(out, "1234") || !strings.Contains(out, "qwen-3-32b") {
 		t.Fatalf("--show should fingerprint the key and print the model:\n%s", out)
+	}
+}
+
+func TestConfigureLlamaCppFlagsPersist(t *testing.T) {
+	withFakeLlamaServer(t, true)
+	dataDir, run := newConfigureTest(t)
+	if _, err := run("", "--provider", "llama.cpp",
+		"--llama-model", "ggml-org/gpt-oss-20b-GGUF",
+		"--llama-base-url", "http://127.0.0.1:9090"); err != nil {
+		t.Fatal(err)
+	}
+	cfg := readTestConfig(t, dataDir)
+	if cfg.ResolvedProvider() != config.ProviderLlamaCpp ||
+		cfg.LlamaModel != "ggml-org/gpt-oss-20b-GGUF" ||
+		cfg.LlamaBaseURL != "http://127.0.0.1:9090" {
+		t.Fatalf("persisted config = %+v", cfg)
+	}
+}
+
+func TestConfigureRejectsLlamaCppWhenMissing(t *testing.T) {
+	withFakeLlamaServer(t, false)
+	dataDir, run := newConfigureTest(t)
+	out, err := run("", "--provider", "llama.cpp", "--llama-model", "some/repo")
+	if err == nil {
+		t.Fatalf("expected rejection when llama-server is absent; output:\n%s", out)
+	}
+	if !strings.Contains(err.Error(), "llama-server not found") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// The provider must not have been persisted.
+	cfg := readTestConfig(t, dataDir)
+	if cfg.ResolvedProvider() == config.ProviderLlamaCpp {
+		t.Fatalf("rejected provider was persisted: %+v", cfg)
+	}
+}
+
+func TestConfigureRejectsUnknownProvider(t *testing.T) {
+	dataDir, run := newConfigureTest(t)
+	out, err := run("", "--provider", "bogus")
+	if err == nil {
+		t.Fatalf("expected rejection for an unknown provider; output:\n%s", out)
+	}
+	if !strings.Contains(err.Error(), "unknown provider") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// The unknown provider must not have been persisted; a fresh data dir with
+	// no saved config resolves to the default.
+	cfg := readTestConfig(t, dataDir)
+	if cfg.ResolvedProvider() != config.DefaultProvider {
+		t.Fatalf("rejected provider was persisted: %+v", cfg)
+	}
+}
+
+func TestConfigureShowLlamaCpp(t *testing.T) {
+	withFakeLlamaServer(t, true)
+	_, run := newConfigureTest(t)
+	if _, err := run("", "--provider", "llama.cpp", "--llama-model", "some/repo"); err != nil {
+		t.Fatal(err)
+	}
+	out, err := run("", "--show")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "llama.cpp") || !strings.Contains(out, "some/repo") {
+		t.Fatalf("--show should render the llama.cpp provider block:\n%s", out)
 	}
 }
