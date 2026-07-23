@@ -131,7 +131,7 @@ tasks:
   clean:
     desc: Remove build artifacts and coverage output
     cmds:
-      - rm -f {{.BINARY}} coverage.out
+      - rm -f {{.BINARY}} coverage.out internal/macosnative/liblumispeech.a
 
   doctor:
     desc: Report native permissions, models, binaries, and API configuration

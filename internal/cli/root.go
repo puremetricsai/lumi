@@ -104,7 +104,7 @@ func (a *app) recordCommand() *cobra.Command {
 			if noScreen && noAudio {
 				return errors.New("--no-screen and --no-audio cannot be used together")
 			}
-			if err := requireRecordingPermissions(cmd.Context(), !noScreen, !noAudio); err != nil {
+			if err := requireRecordingPermissions(cmd.Context(), !noScreen, !noAudio, !noAudio); err != nil {
 				return err
 			}
 			s, paths, err := a.openStore(cmd.Context())
@@ -113,20 +113,17 @@ func (a *app) recordCommand() *cobra.Command {
 			}
 			defer s.Close()
 			ctx := cmd.Context()
-			if duration > 0 {
-				var cancel context.CancelFunc
-				ctx, cancel = context.WithTimeout(ctx, duration)
-				defer cancel()
-			}
 			logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 			if !noAudio {
-				// Download the recognition assets up front so a first-run download
-				// never stalls transcription mid-recording. Failure is fatal here:
-				// audio was requested and cannot work without assets.
 				logger.Info("ensuring speech recognition assets", "locale", speechLocale)
 				if err := macosnative.EnsureSpeechAssets(ctx, speechLocale); err != nil {
 					return fmt.Errorf("ensure speech recognition assets for %s: %w", speechLocale, err)
 				}
+			}
+			if duration > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, duration)
+				defer cancel()
 			}
 			recorder := capture.Recorder{
 				Store: s, Paths: paths, ScreenInterval: interval, AudioChunk: audioChunk,
@@ -319,6 +316,7 @@ func (a *app) doctorCommand() *cobra.Command {
 					{"Accessibility", permissions.Accessibility, "Privacy & Security > Accessibility"},
 					{"Input Monitoring", permissions.InputMonitoring, "optional; only needed by future event-tap capture"},
 					{"Microphone", permissions.Microphone, "Privacy & Security > Microphone"},
+					{"Speech Recognition", permissions.SpeechRecognition, "Privacy & Security > Speech Recognition"},
 				} {
 					state := "ok"
 					if permission.status != "granted" {
@@ -332,29 +330,15 @@ func (a *app) doctorCommand() *cobra.Command {
 					fmt.Fprintf(os.Stdout, "%s permission\t%s\t%s (%s)\n", permission.name, state, permission.status, permission.settings)
 				}
 			}
-			speech, speechErr := macosnative.SpeechStatus(cmd.Context(), speechLocale)
+			assetsInstalled, speechErr := macosnative.SpeechAssetsInstalled(cmd.Context(), speechLocale)
 			if speechErr != nil {
-				fmt.Fprintf(os.Stdout, "speech transcription\tmissing\t%v\n", speechErr)
+				fmt.Fprintf(os.Stdout, "speech assets (%s)\tmissing\t%v\n", speechLocale, speechErr)
 				missing = true
+			} else if assetsInstalled {
+				fmt.Fprintf(os.Stdout, "speech assets (%s)\tok\tinstalled\n", speechLocale)
 			} else {
-				if speech.OSSupported {
-					fmt.Fprintf(os.Stdout, "speech OS support\tok\tmacOS 26+ (SpeechAnalyzer)\n")
-				} else {
-					fmt.Fprintf(os.Stdout, "speech OS support\tmissing\tSpeechAnalyzer requires macOS 26\n")
-					missing = true
-				}
-				authState := "ok"
-				if speech.Authorization != "granted" {
-					authState = "missing"
-					missing = true
-				}
-				fmt.Fprintf(os.Stdout, "Speech Recognition permission\t%s\t%s (Privacy & Security > Speech Recognition)\n", authState, speech.Authorization)
-				if speech.AssetsInstalled {
-					fmt.Fprintf(os.Stdout, "speech assets (%s)\tok\tinstalled\n", speech.Locale)
-				} else {
-					fmt.Fprintf(os.Stdout, "speech assets (%s)\tmissing\tlocale assets not installed; `./lumi record` downloads them at startup\n", speech.Locale)
-					missing = true
-				}
+				fmt.Fprintf(os.Stdout, "speech assets (%s)\tmissing\tlocale assets not installed; `./lumi record` downloads them at startup\n", speechLocale)
+				missing = true
 			}
 			if os.Getenv("CEREBRAS_API_KEY") == "" {
 				fmt.Fprintln(os.Stdout, "Cerebras API key\toptional\tset CEREBRAS_API_KEY to use lumi ask")
@@ -413,7 +397,7 @@ func (a *app) nativeSmokeCommand() *cobra.Command {
 		Use:   "native-smoke",
 		Short: "Run a bounded native capture test without indexing media",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if err := requireRecordingPermissions(cmd.Context(), true, true); err != nil {
+			if err := requireRecordingPermissions(cmd.Context(), true, true, false); err != nil {
 				return err
 			}
 			directory, err := os.MkdirTemp("", "lumi-native-smoke-")
@@ -462,7 +446,7 @@ func (a *app) nativeSmokeCommand() *cobra.Command {
 	}
 }
 
-func requireRecordingPermissions(ctx context.Context, screen, audio bool) error {
+func requireRecordingPermissions(ctx context.Context, screen, audio, speech bool) error {
 	permissions, err := macosnative.PermissionStatus(ctx)
 	if err != nil {
 		return fmt.Errorf("check native macOS permissions: %w", err)
@@ -476,6 +460,9 @@ func requireRecordingPermissions(ctx context.Context, screen, audio bool) error 
 	}
 	if audio && permissions.Microphone != "granted" {
 		missing = append(missing, "Microphone (System Settings > Privacy & Security > Microphone)")
+	}
+	if speech && permissions.SpeechRecognition != "granted" {
+		missing = append(missing, "Speech Recognition (System Settings > Privacy & Security > Speech Recognition)")
 	}
 	if len(missing) > 0 {
 		return fmt.Errorf("grant required macOS permissions to this terminal or the Lumi binary: %s; run `./lumi permissions --request`", strings.Join(missing, "; "))

@@ -68,12 +68,6 @@ func TestAccessibilitySnapshotWhenPermissionIsGranted(t *testing.T) {
 	}
 }
 
-func TestSpeechBridgeLinks(t *testing.T) {
-	if got := SpeechPing(); got != "pong" {
-		t.Fatalf("Swift speech bridge not linked: got %q, want \"pong\"", got)
-	}
-}
-
 func TestTranscribeAudioSmoke(t *testing.T) {
 	if os.Getenv("LUMI_NATIVE_SMOKE") != "1" {
 		t.Skip("set LUMI_NATIVE_SMOKE=1 after granting Speech Recognition and installing en-US assets")
@@ -87,10 +81,7 @@ func TestTranscribeAudioSmoke(t *testing.T) {
 	if len(audio) == 0 {
 		t.Fatal("RecordAudio returned no frames")
 	}
-	// A short real recording may be silence; we assert the pipeline runs
-	// without error and returns a string (possibly empty text is NOT allowed
-	// to be an error path — an empty successful transcript is valid here only
-	// because we control that emptiness comes from silence, not failure).
+	// A short real recording may be silent, so only require successful analysis.
 	if _, err := TranscribeAudio(ctx, audio[0].Path, "en-US"); err != nil {
 		t.Fatalf("SpeechAnalyzer transcription failed: %v", err)
 	}

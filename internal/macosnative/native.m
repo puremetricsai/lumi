@@ -383,36 +383,6 @@ char *lumi_request_permissions_json(bool input_monitoring, char **error_message)
     }
 }
 
-// Defined in speech.swift and linked from liblumispeech.a. Returns 1 when the
-// locale's on-device SpeechAnalyzer assets are installed, 0 when not, -1 on
-// error — the authoritative on-device signal, unlike SFSpeechRecognizer
-// supportedLocales, which only reports support.
-int lumi_speech_assets_installed(const char *locale);
-
-char *lumi_speech_status_json(const char *locale, char **error_message) {
-    @autoreleasepool {
-        NSString *localeID = locale != NULL ? [NSString stringWithUTF8String:locale] : @"en-US";
-        NSOperatingSystemVersion os = [[NSProcessInfo processInfo] operatingSystemVersion];
-        BOOL osSupported = os.majorVersion >= 26;
-        // Delegate the asset check to Swift, which canonicalizes the locale via
-        // Locale(identifier:) so hyphen/underscore forms cannot mismatch.
-        BOOL installed = lumi_speech_assets_installed(locale) == 1;
-        NSDictionary *status = @{
-            @"os_supported": @(osSupported),
-            @"locale": localeID,
-            @"assets_installed": @(installed),
-            @"authorization": LumiSpeechAuthorizationName([SFSpeechRecognizer authorizationStatus]),
-        };
-        NSError *jsonError = nil;
-        NSString *json = LumiJSONString(status, &jsonError);
-        if (json == nil) {
-            if (error_message != NULL) *error_message = LumiCopyError(jsonError);
-            return NULL;
-        }
-        return LumiCopyUTF8(json);
-    }
-}
-
 @interface LumiAudioWriter : NSObject
 @property(nonatomic, strong) AVAssetWriter *writer;
 @property(nonatomic, strong) AVAssetWriterInput *input;

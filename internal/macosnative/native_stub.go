@@ -33,16 +33,6 @@ type Permissions struct {
 	SpeechRecognition string `json:"speech_recognition"`
 }
 
-// SpeechCapability reports whether the current OS, authorization state, and
-// locale asset availability are sufficient for on-device SpeechAnalyzer
-// transcription.
-type SpeechCapability struct {
-	OSSupported     bool   `json:"os_supported"`
-	Locale          string `json:"locale"`
-	AssetsInstalled bool   `json:"assets_installed"`
-	Authorization   string `json:"authorization"`
-}
-
 type AudioFrame struct {
 	Path         string `json:"path"`
 	Source       string `json:"source"`
@@ -76,8 +66,4 @@ func RecordAudio(context.Context, string, string, float64) ([]AudioFrame, error)
 
 func OSVersion() (int, int, int, error) { return 0, 0, 0, errUnsupported }
 
-func SpeechPing() string { return "" }
-
-func SpeechStatus(context.Context, string) (SpeechCapability, error) {
-	return SpeechCapability{}, errUnsupported
-}
+func SpeechAssetsInstalled(context.Context, string) (bool, error) { return false, errUnsupported }
