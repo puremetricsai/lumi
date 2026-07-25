@@ -97,14 +97,14 @@ func TestRetrieveContextStages(t *testing.T) {
 		{"searchable terms do not match", "what about kubernetes", stageRecentUnmatched},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			events, stage, err := retrieveContext(ctx, s, tc.question, store.SearchOptions{Limit: 10})
+			got, err := retrieveContext(ctx, s, tc.question, store.SearchOptions{Limit: 10}, true)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if stage != tc.wantStage {
-				t.Fatalf("stage = %q, want %q", stage, tc.wantStage)
+			if got.stage != tc.wantStage {
+				t.Fatalf("stage = %q, want %q", got.stage, tc.wantStage)
 			}
-			if len(events) == 0 {
+			if len(got.events) == 0 {
 				t.Fatal("expected at least one event")
 			}
 		})
@@ -128,21 +128,21 @@ func TestRetrieveContextPreservesOptionsAcrossStages(t *testing.T) {
 		"what about postgres and kubernetes", // stageAnyTerm
 		"what was I doing?",                  // stageRecent
 	} {
-		events, stage, err := retrieveContext(ctx, s, question, store.SearchOptions{
+		got, err := retrieveContext(ctx, s, question, store.SearchOptions{
 			Kind: store.KindAudio, Since: &since, Limit: 10,
-		})
+		}, true)
 		if err != nil {
 			t.Fatalf("%q: %v", question, err)
 		}
-		if len(events) == 0 {
-			t.Fatalf("%q (stage %s): expected results", question, stage)
+		if len(got.events) == 0 {
+			t.Fatalf("%q (stage %s): expected results", question, got.stage)
 		}
-		for _, event := range events {
+		for _, event := range got.events {
 			if event.Kind != store.KindAudio {
-				t.Fatalf("%q (stage %s): kind filter dropped, got %s", question, stage, event.Kind)
+				t.Fatalf("%q (stage %s): kind filter dropped, got %s", question, got.stage, event.Kind)
 			}
 			if event.CapturedAt.Before(since) {
-				t.Fatalf("%q (stage %s): since filter dropped", question, stage)
+				t.Fatalf("%q (stage %s): since filter dropped", question, got.stage)
 			}
 		}
 	}

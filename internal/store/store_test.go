@@ -330,3 +330,42 @@ func TestDeleteByIDsBatchesLargeIDSets(t *testing.T) {
 		t.Fatalf("all real rows should be deleted, got %d remaining", len(got))
 	}
 }
+
+// RequireText exists for `ask`: a saved-but-untranscribed audio chunk answers
+// no content question, and Lumi keeps enough of them that they crowd real
+// transcripts out of a recency pass. Whitespace-only text counts as absent.
+func TestSearchRequireTextDropsEmptyAndBlankText(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	events := []Event{
+		{Kind: KindAudio, Text: "", MediaPath: "silent.wav", AudioSource: "system"},
+		{Kind: KindAudio, Text: "   \n\t ", MediaPath: "blank.wav", AudioSource: "system"},
+		{Kind: KindAudio, Text: "ship the retrieval fix", MediaPath: "speech.wav", AudioSource: "microphone"},
+	}
+	for i := range events {
+		if err := s.Insert(ctx, &events[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := s.Search(ctx, SearchOptions{Kind: KindAudio, RequireText: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].MediaPath != "speech.wav" {
+		t.Fatalf("RequireText must keep only transcript-bearing events, got %#v", got)
+	}
+
+	got, err = s.Search(ctx, SearchOptions{Kind: KindAudio})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("RequireText must be opt-in; unfiltered search returned %d events, want 3", len(got))
+	}
+}
