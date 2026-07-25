@@ -44,6 +44,12 @@ type SearchOptions struct {
 	Since  *time.Time
 	Until  *time.Time
 	Limit  int
+	// RequireText drops events whose extracted text or transcript is empty (or
+	// only whitespace). It exists for `ask`: media saved without a usable
+	// transcript answers no content question, and Lumi records enough silent
+	// audio chunks that they crowd real speech out of a recency pass. It stays
+	// opt-in so `search` and the JSON export still see every stored row.
+	RequireText bool
 }
 
 type Store struct {
@@ -148,6 +154,11 @@ func (s *Store) Search(ctx context.Context, opts SearchOptions) ([]Event, error)
 	if opts.Kind != "" {
 		where = append(where, "e.kind = ?")
 		args = append(args, opts.Kind)
+	}
+	if opts.RequireText {
+		// Trim the whitespace-only transcripts SpeechAnalyzer emits for a
+		// near-silent chunk; they are indistinguishable from no transcript.
+		where = append(where, `trim(e.text, char(32) || char(9) || char(10) || char(13)) <> ''`)
 	}
 	if app := strings.TrimSpace(opts.App); app != "" {
 		where = append(where, "e.app = ? COLLATE NOCASE")
