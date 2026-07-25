@@ -206,6 +206,81 @@ func TestAskEmptyResultNamesActiveFilters(t *testing.T) {
 	}
 }
 
+// TestAskInfersAudioCorpus is the reported-defect regression at the command
+// layer: a mic-worded question must be answered from the transcript, not from
+// the terminal screenshot of the question, and must announce the reading.
+func TestAskInfersAudioCorpus(t *testing.T) {
+	now := time.Now().UTC()
+	fake, _, run := newAskTest(t,
+		store.Event{Kind: store.KindScreen, CapturedAt: now, App: "Ghostty",
+			Text: `lumi ask "what did I say on the mic today"`, MediaPath: "term.jpg", TextSource: "vision"},
+		store.Event{Kind: store.KindAudio, CapturedAt: now.Add(time.Second), AudioSource: "microphone",
+			Text: "we agreed to ship the fix on friday", MediaPath: "a.wav"},
+	)
+
+	_, stderr, err := run("what did I say on the mic today")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stderr, "about audio recordings") {
+		t.Fatalf("the inferred audio reading must be announced, stderr: %q", stderr)
+	}
+	if !strings.Contains(fake.activityContext, "ship the fix on friday") {
+		t.Fatalf("the mic transcript was not retrieved:\n%s", fake.activityContext)
+	}
+	if strings.Contains(fake.activityContext, "lumi ask") {
+		t.Fatalf("answered from the terminal screenshot of the question:\n%s", fake.activityContext)
+	}
+}
+
+// TestAskTypeAllOverridesInference is the P1 regression: passing --type all must
+// suppress modality inference entirely, so the advertised escape hatch reaches
+// every corpus instead of being re-narrowed to audio.
+func TestAskTypeAllOverridesInference(t *testing.T) {
+	now := time.Now().UTC()
+	fake, _, run := newAskTest(t,
+		store.Event{Kind: store.KindScreen, CapturedAt: now, App: "Ghostty",
+			Text: `lumi ask "what did I say on the mic today"`, MediaPath: "term.jpg", TextSource: "vision"},
+		store.Event{Kind: store.KindAudio, CapturedAt: now.Add(time.Second), AudioSource: "microphone",
+			Text: "we agreed to ship the fix on friday", MediaPath: "a.wav"},
+	)
+
+	_, stderr, err := run("what did I say on the mic today", "--type", "all")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(stderr, "about audio recordings") {
+		t.Fatalf("--type all must bypass modality inference, stderr: %q", stderr)
+	}
+	if !strings.Contains(fake.activityContext, "lumi ask") {
+		t.Fatalf("--type all should search everything, including screen records:\n%s", fake.activityContext)
+	}
+}
+
+// TestAskAudioQuestionDoesNotSubstituteScreens is the P2 regression at the
+// command layer: a mic question whose audio corpus holds no transcript must
+// report the empty audio corpus, never quietly answer from recent screens.
+func TestAskAudioQuestionDoesNotSubstituteScreens(t *testing.T) {
+	now := time.Now().UTC()
+	fake, _, run := newAskTest(t,
+		store.Event{Kind: store.KindScreen, CapturedAt: now.Add(-30 * time.Minute), App: "Ghostty",
+			Text: "unrelated terminal output about a go build", MediaPath: "screen.jpg", TextSource: "vision"},
+		store.Event{Kind: store.KindAudio, CapturedAt: now.Add(-20 * time.Minute), AudioSource: "system",
+			Text: "", MediaPath: "silent.wav"},
+	)
+
+	_, _, err := run("anything on the mic in the last 2 hours?")
+	if err == nil {
+		t.Fatalf("expected an empty-corpus error, but the model was fed:\n%s", fake.activityContext)
+	}
+	if !strings.Contains(err.Error(), "audio recordings with a transcript") {
+		t.Fatalf("error must name the empty audio corpus, got: %v", err)
+	}
+	if strings.Contains(fake.activityContext, "go build") {
+		t.Fatalf("a mic question was answered from an unrelated screen:\n%s", fake.activityContext)
+	}
+}
+
 func TestAskRespectsMaxContextChars(t *testing.T) {
 	var events []store.Event
 	now := time.Now().UTC()
