@@ -90,6 +90,17 @@ Local llama.cpp, which requires `llama-server` on `PATH` (`brew install llama.cp
 
 `--llama-model` takes a GGUF file path or a HuggingFace repo id. `--llama-base-url` overrides where `llama-server` listens (default `http://127.0.0.1:8080`).
 
+Run `./lumi configure` with no flags to be prompted instead. With llama.cpp selected, the prompt lists what llama.cpp already has cached (`llama-server --cache-list`) so the model can be picked by number:
+
+```
+Cached llama.cpp models:
+  1. unsloth/gemma-4-26B-A4B-it-GGUF:MXFP4_MOE
+  2. ggml-org/gpt-oss-20b-GGUF:Q4_K_M
+llama.cpp model [not set] (number, GGUF path, or HuggingFace repo; blank to keep):
+```
+
+A path or repo id can still be typed directly, and an empty cache falls back to the plain prompt.
+
 `./lumi doctor` reports the active provider, whether the key or model is set, and — for llama.cpp — whether the server is reachable.
 
 ## Ask
@@ -112,10 +123,12 @@ The activity context is capped so a large Vision or Accessibility result cannot 
 
 ### Local llama-server lifecycle
 
-When the llama.cpp provider is active, `ask` checks `/health` and launches `llama-server` itself if it isn't already running, then leaves it running so the model stays warm. The process is detached, logs to `llama-server.log` in the data directory, and records its pid in `llama-server.pid`.
+When the llama.cpp provider is active, `ask` checks `/health` and launches `llama-server` itself if it isn't already running, then leaves it running so the model stays warm. The process is detached, logs to `llama-server.log` in the data directory, and records its pid and model in `llama-server.json`.
+
+Because the model is recorded, changing it takes effect immediately: if the configured model (or `ask --model`) differs from what the Lumi-launched server is serving, `ask` stops that server and relaunches it, noting the switch on stderr. A `llama-server` Lumi did not start is never stopped — `ask` uses it as is and says so, since its model cannot be known.
 
 ```sh
-./lumi llama status   # reachability and the pid Lumi launched
+./lumi llama status   # reachability, plus the pid and model Lumi launched
 ./lumi llama stop     # terminate the Lumi-launched server
 ```
 

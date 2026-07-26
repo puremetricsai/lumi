@@ -104,10 +104,12 @@ type Paths struct {
 	RecordLog   string
 	// Config is the persisted user configuration (API key, model).
 	Config string
-	// LlamaLog collects a Lumi-launched llama-server's stdout/stderr; LlamaPid
-	// records its process id. Both live directly under Root.
-	LlamaLog string
-	LlamaPid string
+	// LlamaLog collects a Lumi-launched llama-server's stdout/stderr;
+	// LlamaState records its pid and the model it was launched with, so a
+	// configuration change can be told apart from the warm server already
+	// answering. Both live directly under Root.
+	LlamaLog   string
+	LlamaState string
 }
 
 func DefaultPaths() (Paths, error) {
@@ -140,7 +142,7 @@ func FromRoot(root string) (Paths, error) {
 		RecordLog:   filepath.Join(root, "record.log"),
 		Config:      filepath.Join(root, ConfigFileName),
 		LlamaLog:    filepath.Join(root, "llama-server.log"),
-		LlamaPid:    filepath.Join(root, "llama-server.pid"),
+		LlamaState:  filepath.Join(root, "llama-server.json"),
 	}, nil
 }
 

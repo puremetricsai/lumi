@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 	"syscall"
 
@@ -46,11 +45,22 @@ func (a *app) llamaStatusCommand() *cobra.Command {
 			} else {
 				fmt.Fprintf(out, "llama-server: not running at %s\n", baseURL)
 			}
-			if pid, ok := readLlamaPid(paths.LlamaPid); ok {
-				if processAlive(pid) {
-					fmt.Fprintf(out, "launched by lumi: pid %d (running)\n", pid)
+			if st, ok := llamacpp.ReadState(paths.LlamaState); ok {
+				state := "not running"
+				switch {
+				case llamacpp.IsServerProcess(st.PID):
+					state = "running"
+				case processAlive(st.PID):
+					// The pid was reused; the recorded server is gone.
+					state = "no longer llama-server"
+				}
+				fmt.Fprintf(out, "launched by lumi: pid %d (%s)\n", st.PID, state)
+				// The recorded model is what distinguishes this server from the
+				// configured one; `ask` restarts it when they differ.
+				if model := strings.TrimSpace(st.Model); model != "" {
+					fmt.Fprintf(out, "serving model: %s\n", model)
 				} else {
-					fmt.Fprintf(out, "launched by lumi: pid %d (not running)\n", pid)
+					fmt.Fprintln(out, "serving model: not recorded")
 				}
 			} else {
 				fmt.Fprintln(out, "launched by lumi: none recorded")
@@ -69,39 +79,27 @@ func (a *app) llamaStopCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			pid, ok := readLlamaPid(paths.LlamaPid)
+			st, ok := llamacpp.ReadState(paths.LlamaState)
 			if !ok {
 				return errors.New("no lumi-launched llama-server recorded")
 			}
-			if processAlive(pid) {
-				proc, err := os.FindProcess(pid)
+			// A live pid is not proof of ownership: pids are reused, and the
+			// recorded server may have exited long ago.
+			if llamacpp.IsServerProcess(st.PID) {
+				proc, err := os.FindProcess(st.PID)
 				if err != nil {
 					return err
 				}
 				if err := proc.Signal(syscall.SIGTERM); err != nil && !errors.Is(err, os.ErrProcessDone) {
-					return fmt.Errorf("stop llama-server (pid %d): %w", pid, err)
+					return fmt.Errorf("stop llama-server (pid %d): %w", st.PID, err)
 				}
-				fmt.Fprintf(cmd.OutOrStdout(), "sent SIGTERM to llama-server (pid %d)\n", pid)
+				fmt.Fprintf(cmd.OutOrStdout(), "sent SIGTERM to llama-server (pid %d)\n", st.PID)
+			} else if processAlive(st.PID) {
+				fmt.Fprintf(cmd.OutOrStdout(), "pid %d is no longer llama-server; leaving it alone and clearing the record\n", st.PID)
 			} else {
-				fmt.Fprintf(cmd.OutOrStdout(), "llama-server (pid %d) was not running\n", pid)
+				fmt.Fprintf(cmd.OutOrStdout(), "llama-server (pid %d) was not running\n", st.PID)
 			}
-			if err := os.Remove(paths.LlamaPid); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return err
-			}
-			return nil
+			return llamacpp.RemoveState(paths.LlamaState)
 		},
 	}
-}
-
-// readLlamaPid reads the pid llama-server was launched with, if recorded.
-func readLlamaPid(path string) (int, bool) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0, false
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil || pid <= 0 {
-		return 0, false
-	}
-	return pid, true
 }

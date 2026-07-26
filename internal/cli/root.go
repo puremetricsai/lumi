@@ -60,10 +60,10 @@ func (a *app) answerer(ctx context.Context, model string, notes io.Writer) (answ
 		}
 		baseURL := cfg.ResolvedLlamaBaseURL()
 		if err := llamacpp.EnsureRunning(ctx, llamacpp.Options{
-			BaseURL: baseURL,
-			Model:   model,
-			LogPath: paths.LlamaLog,
-			PidPath: paths.LlamaPid,
+			BaseURL:   baseURL,
+			Model:     model,
+			LogPath:   paths.LlamaLog,
+			StatePath: paths.LlamaState,
 		}, notes); err != nil {
 			return nil, err
 		}
