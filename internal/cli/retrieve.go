@@ -40,13 +40,14 @@ const (
 // all-terms pass fail on almost every naturally phrased question. Words
 // parseTimeWindow misses are still dropped here so they never reach FTS.
 //
-// Recording-modality words ("microphone", "audio", "heard", "said", "picked")
-// are dropped for a subtler reason: they name *how* something was captured, not
-// its content. A speech transcript never contains the word "microphone", but a
-// terminal screenshot showing a prior `lumi ask` command does — so leaving them
-// in makes the any-term pass rank UI screenshots above the actual audio and
-// answer "no microphone activity" when there is plenty. Modality is expressed by
-// event kind/audio_source, not by matching these tokens against text.
+// Recording-modality words ("microphone", "conversation", "heard", "said") and
+// capture verbs ("captured", "caught", "picked up") are dropped for a subtler
+// reason: they name *how* something was recorded, not its content. A speech
+// transcript never contains the word "microphone", but a terminal screenshot
+// showing a prior `lumi ask` command does — so leaving them in makes the
+// all-terms pass answer a question about the mic out of a screenshot of that
+// very question. Modality is carried by event kind instead; see
+// questionModality in modality.go, which consumes exactly these words.
 //
 // "go" is deliberately absent: on a developer's machine it is far more often
 // the language than the verb.
@@ -65,8 +66,14 @@ func init() {
 		tell show remind find search look give list
 		anything something everything some any all
 		record records recorded recording save saved capture captured
+		catch catches caught catching pick picks picking picked grab grabs grabbed
 		microphone microphones mic mics audio sound sounds
-		heard hear said say saying spoke spoken speak picked
+		conversation conversations discussion discussions
+		talk talks talked talking
+		heard hear hears hearing overheard listen listens listened listening
+		said say says saying spoke spoken speak speaks speaking speech
+		transcript transcripts transcribed transcription transcriptions
+		voice voices aloud verbally
 		thing things stuff up
 		activity activities logged indexed remembered far
 		yesterday today tonight tomorrow morning afternoon evening night nights
@@ -111,8 +118,32 @@ func questionTerms(question string) []string {
 	return terms
 }
 
-// retrieveContext runs the staged retrieval used by `ask` and reports which
-// stage produced the returned events.
+// retrieval is what `ask` needs to describe its own answer honestly: the
+// events, which stage produced them, and how the corpus was narrowed to get
+// there. Every field that changed the result must be reportable, because a
+// silently narrowed retrieval is as misleading as a silent recency fallback.
+type retrieval struct {
+	events []store.Event
+	stage  retrievalStage
+	// kind is the corpus actually searched, "" when unrestricted. It is the
+	// question's derived modality unless the caller set one explicitly.
+	kind store.Kind
+	// derivedKind reports that kind came from the question's wording rather
+	// than from a flag, so `ask` can say which reading it took.
+	derivedKind bool
+	// widened records that a derived restriction was withdrawn in favor of the
+	// full corpus. Modality is inferred from wording, so it is sometimes wrong;
+	// answering "nothing was recorded" on a bad inference would be a lie.
+	widened bool
+}
+
+// retrieveContext runs the staged retrieval used by `ask`.
+//
+// Retrieval narrows in two dimensions. First the corpus: a question that names
+// a recording modality ("what did I say on the mic") is answered from that
+// modality's events, because the words that identify it are absent from its
+// own transcripts and present in screenshots of Lumi's UI — searching text for
+// them finds the opposite of what was asked. Then the terms, in stages.
 //
 // The all-terms pass runs first not because it ranks better than the any-term
 // pass — bm25 over a disjunction already ranks "matched more and rarer terms"
@@ -120,7 +151,70 @@ func questionTerms(question string) []string {
 // on topic and deserve the whole context budget.
 //
 // opts is taken by value; its kind and time predicates apply to every stage.
-func retrieveContext(ctx context.Context, s *store.Store, question string, opts store.SearchOptions) ([]store.Event, retrievalStage, error) {
+//
+// inferModality gates the corpus inference. `ask` passes false whenever the
+// user set --type explicitly — including --type all, which reaches here as an
+// empty opts.Kind indistinguishable from an omitted flag. Without this gate the
+// advertised "pass --type all to search everything" escape hatch is a no-op:
+// the inference re-narrows exactly the request the user was overriding.
+func retrieveContext(ctx context.Context, s *store.Store, question string, opts store.SearchOptions, inferModality bool) (retrieval, error) {
+	if opts.Kind != "" {
+		events, stage, err := stagedSearch(ctx, s, question, opts)
+		return retrieval{events: events, stage: stage, kind: opts.Kind}, err
+	}
+	var kind store.Kind
+	if inferModality {
+		kind = questionModality(question)
+	}
+	if kind == "" {
+		events, stage, err := stagedSearch(ctx, s, question, opts)
+		return retrieval{events: events, stage: stage}, err
+	}
+	restricted := opts
+	restricted.Kind = kind
+	// A content question about audio is not answered by a chunk that was saved
+	// without a transcript, and Lumi stores enough of those that a recency pass
+	// returns little else.
+	restricted.RequireText = true
+	events, stage, err := stagedSearch(ctx, s, question, restricted)
+	if err != nil {
+		return retrieval{stage: stage, kind: kind, derivedKind: true}, err
+	}
+	narrowed := retrieval{events: events, stage: stage, kind: kind, derivedKind: true}
+	// An inferred modality is only overridden by real term evidence elsewhere;
+	// the deciding question is whether the question carried content terms.
+	//
+	//   matched terms   — the modality reading paid off; keep it.
+	//   no usable terms — modality was the question's ONLY signal ("anything on
+	//                     the mic today?"). There is nothing to contradict the
+	//                     reading, so recency within that corpus is precisely
+	//                     the answer — even when it is empty. Widening here would
+	//                     answer a mic question from unrelated screenshots.
+	//   terms, no match — the reading is suspect. "What did the deploy freeze
+	//                     say" trips the audio router on a modality word but
+	//                     carries content terms that miss audio; only here does
+	//                     a wide term match justify overriding the corpus.
+	if stage != stageRecentUnmatched {
+		return narrowed, nil
+	}
+	wide, wideStage, err := stagedSearch(ctx, s, question, opts)
+	if err != nil {
+		return retrieval{stage: wideStage}, err
+	}
+	// Only a real term match — not a broader recency pass — outranks the
+	// narrowed result. stage is stageRecentUnmatched here, so the question did
+	// have terms; if the wide corpus also only reaches recency, there is no
+	// evidence the modality reading was wrong, and the focused corpus stands.
+	if len(wide) > 0 && (wideStage == stageAllTerms || wideStage == stageAnyTerm) {
+		return retrieval{events: wide, stage: wideStage, widened: true}, nil
+	}
+	return narrowed, nil
+}
+
+// stagedSearch is the all-terms → any-term → recency ladder. opts is applied
+// unchanged at every stage, so its corpus and time predicates never soften as
+// the term match does.
+func stagedSearch(ctx context.Context, s *store.Store, question string, opts store.SearchOptions) ([]store.Event, retrievalStage, error) {
 	if terms := questionTerms(question); len(terms) > 0 {
 		opts.Query = strings.Join(terms, " ")
 		for _, stage := range []struct {

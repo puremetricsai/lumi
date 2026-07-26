@@ -254,7 +254,7 @@ func (a *app) searchCommand() *cobra.Command {
 }
 
 func (a *app) askCommand() *cobra.Command {
-	var since, model, app, window string
+	var since, model, app, window, kind string
 	var limit, maxContextChars int
 	cmd := &cobra.Command{
 		Use:   "ask <question>",
@@ -266,7 +266,7 @@ func (a *app) askCommand() *cobra.Command {
 				return err
 			}
 			defer s.Close()
-			opts, err := searchOptions("", "all", since, "", app, window, limit)
+			opts, err := searchOptions("", kind, since, "", app, window, limit)
 			if err != nil {
 				return err
 			}
@@ -285,16 +285,28 @@ func (a *app) askCommand() *cobra.Command {
 						describeTimeWindow(*winSince, *winUntil, dir))
 				}
 			}
-			events, stage, err := retrieveContext(cmd.Context(), s, question, opts)
+			// An explicit --type (including "all") overrides the question's
+			// inferred modality; only an omitted flag lets ask infer the corpus.
+			inferModality := !cmd.Flags().Changed("type")
+			got, err := retrieveContext(cmd.Context(), s, question, opts, inferModality)
 			if err != nil {
 				return err
 			}
+			events, stage := got.events, got.stage
 			if len(events) == 0 {
 				// Report every criterion that could have emptied the result, not
 				// just the time window: an --app/--window filter can hide activity
 				// that does exist in the window, and blaming the window alone is a
 				// false diagnosis.
 				var criteria []string
+				// A derived audio corpus can now legitimately empty the result
+				// (a mic question when every chunk was saved without a
+				// transcript). Name it so the diagnosis is not misattributed to
+				// the time window, and so the answer never silently widens to
+				// screens the user did not ask about.
+				if got.derivedKind {
+					criteria = append(criteria, fmt.Sprintf("%s recordings with a transcript", got.kind))
+				}
 				if explicitWindow && opts.Since != nil {
 					until := time.Now()
 					if opts.Until != nil {
@@ -308,12 +320,24 @@ func (a *app) askCommand() *cobra.Command {
 				if window != "" {
 					criteria = append(criteria, fmt.Sprintf("window text %q", window))
 				}
+				if kind != "" && kind != "all" {
+					criteria = append(criteria, fmt.Sprintf("content type %q", kind))
+				}
 				if len(criteria) > 0 {
 					return fmt.Errorf("no activity matched %s", strings.Join(criteria, " and "))
 				}
 				return errors.New("no local activity has been indexed yet")
 			}
-			// Never answer from a degraded retrieval silently.
+			// Never narrow or degrade a retrieval silently: the user has to be
+			// able to tell a targeted answer from a broadened or fallback one.
+			if got.derivedKind {
+				fmt.Fprintf(cmd.ErrOrStderr(),
+					"note: reading your question as being about %s recordings; pass --type all to search everything\n", got.kind)
+			}
+			if got.widened {
+				fmt.Fprintln(cmd.ErrOrStderr(),
+					"note: nothing matched as a recording question, so all activity was searched")
+			}
 			switch stage {
 			case stageRecent:
 				fmt.Fprintf(cmd.ErrOrStderr(), "note: broad question; reviewing the %d most recent events\n", len(events))
@@ -347,6 +371,7 @@ func (a *app) askCommand() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&since, "since", "24h", "activity window (RFC3339 or duration)")
+	cmd.Flags().StringVar(&kind, "type", "", "content type: all, screen, or audio (default: inferred from the question)")
 	cmd.Flags().StringVar(&app, "app", "", "restrict activity to this application")
 	cmd.Flags().StringVar(&window, "window", "", "restrict activity to windows whose title contains this text")
 	cmd.Flags().IntVar(&limit, "limit", 50, "maximum activity records sent to the model")

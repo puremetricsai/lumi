@@ -93,6 +93,21 @@ tasks:
     cmds:
       - go test -v {{.CLI_ARGS}}
 
+  eval:
+    desc: Score `ask` retrieval against the eval corpus (hermetic; no provider needed)
+    deps: [speech]
+    cmds:
+      # -count=1 because an eval is a measurement, not a cached verdict.
+      - go test -tags eval -run 'TestEval' -v -count=1 ./internal/cli {{.CLI_ARGS}}
+
+  eval:llm:
+    desc: Run the evals including live model answer grading (needs `lumi configure`)
+    deps: [speech]
+    env:
+      LUMI_EVAL_LLM: '1'
+    cmds:
+      - go test -tags eval -run 'TestEval' -v -count=1 -timeout 20m ./internal/cli {{.CLI_ARGS}}
+
   cover:
     desc: Run tests with a coverage report
     deps: [speech]
