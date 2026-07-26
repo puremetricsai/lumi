@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,18 +13,41 @@ import (
 	"github.com/puremetricsai/lumi/internal/config"
 )
 
-// withFakeLlamaServer puts an (unexecuted) llama-server binary on PATH so
-// configure's install check passes. present=false points PATH at an empty dir.
+// withFakeLlamaServer puts a llama-server binary on PATH so configure's install
+// check passes. It prints nothing, so `--cache-list` discovery finds no models.
+// present=false points PATH at an empty dir.
 func withFakeLlamaServer(t *testing.T, present bool) {
 	t.Helper()
+	if !present {
+		t.Setenv("PATH", t.TempDir())
+		return
+	}
+	withFakeLlamaServerScript(t, "")
+}
+
+// withFakeLlamaServerScript puts a llama-server on PATH whose body is the given
+// shell script, so tests can supply real `--cache-list` output.
+func withFakeLlamaServerScript(t *testing.T, script string) {
+	t.Helper()
 	dir := t.TempDir()
-	if present {
-		bin := filepath.Join(dir, "llama-server")
-		if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755); err != nil {
-			t.Fatal(err)
-		}
+	bin := filepath.Join(dir, "llama-server")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"+script), 0o755); err != nil {
+		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir)
+}
+
+// cacheListScript makes the fake llama-server answer --cache-list with the
+// given models, formatted the way llama.cpp formats them.
+func cacheListScript(models ...string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "if [ \"$1\" = \"--cache-list\" ]; then\n")
+	fmt.Fprintf(&b, "  echo 'number of models in cache: %d'\n", len(models))
+	for i, m := range models {
+		fmt.Fprintf(&b, "  echo '   %d. %s'\n", i+1, m)
+	}
+	b.WriteString("fi\n")
+	return b.String()
 }
 
 // newConfigureTest returns the data dir and a runner that executes the
@@ -198,5 +222,83 @@ func TestConfigureShowLlamaCpp(t *testing.T) {
 	}
 	if !strings.Contains(out, "llama.cpp") || !strings.Contains(out, "some/repo") {
 		t.Fatalf("--show should render the llama.cpp provider block:\n%s", out)
+	}
+}
+
+const cachedModelA = "unsloth/gemma-4-26B-A4B-it-GGUF:MXFP4_MOE"
+const cachedModelB = "ggml-org/gpt-oss-20b-GGUF:Q4_K_M"
+
+func TestConfigureInteractiveListsCachedLlamaModels(t *testing.T) {
+	withFakeLlamaServerScript(t, cacheListScript(cachedModelA, cachedModelB))
+	dataDir, run := newConfigureTest(t)
+	// provider, then the model picked by number, then a blank base URL.
+	out, err := run("llama.cpp\n2\n\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, cachedModelA) || !strings.Contains(out, "2. "+cachedModelB) {
+		t.Fatalf("cached models were not listed:\n%s", out)
+	}
+	cfg := readTestConfig(t, dataDir)
+	if cfg.LlamaModel != cachedModelB {
+		t.Fatalf("picking 2 persisted %q, want %q", cfg.LlamaModel, cachedModelB)
+	}
+}
+
+func TestConfigureInteractiveLlamaModelAcceptsFreeText(t *testing.T) {
+	withFakeLlamaServerScript(t, cacheListScript(cachedModelA))
+	dataDir, run := newConfigureTest(t)
+	// A typed path must still be taken literally even when a list is offered.
+	if _, err := run("llama.cpp\n/models/qwen.gguf\n\n"); err != nil {
+		t.Fatal(err)
+	}
+	if cfg := readTestConfig(t, dataDir); cfg.LlamaModel != "/models/qwen.gguf" {
+		t.Fatalf("persisted %q, want the typed path", cfg.LlamaModel)
+	}
+}
+
+func TestConfigureInteractiveLlamaModelRejectsOutOfRange(t *testing.T) {
+	withFakeLlamaServerScript(t, cacheListScript(cachedModelA))
+	dataDir, run := newConfigureTest(t)
+	// 9 is not on the list: re-prompt rather than persisting "9" as a model.
+	out, err := run("llama.cpp\n9\n1\n\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "no model 9") {
+		t.Fatalf("out-of-range pick was not reported:\n%s", out)
+	}
+	if cfg := readTestConfig(t, dataDir); cfg.LlamaModel != cachedModelA {
+		t.Fatalf("persisted %q, want %q", cfg.LlamaModel, cachedModelA)
+	}
+}
+
+func TestConfigureInteractiveLlamaBlankKeepsModel(t *testing.T) {
+	withFakeLlamaServerScript(t, cacheListScript(cachedModelA))
+	dataDir, run := newConfigureTest(t)
+	if _, err := run("", "--provider", "llama.cpp", "--llama-model", "keep/this"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run("\n\n\n"); err != nil {
+		t.Fatal(err)
+	}
+	if cfg := readTestConfig(t, dataDir); cfg.LlamaModel != "keep/this" {
+		t.Fatalf("blank input clobbered the model: %+v", cfg)
+	}
+}
+
+func TestConfigureInteractiveLlamaNoCachedModels(t *testing.T) {
+	// A llama-server that reports an empty cache must not print a list header.
+	withFakeLlamaServerScript(t, cacheListScript())
+	dataDir, run := newConfigureTest(t)
+	out, err := run("llama.cpp\nsome/repo\n\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.ToLower(out), "cached llama.cpp models") {
+		t.Fatalf("empty cache should not print a list header:\n%s", out)
+	}
+	if cfg := readTestConfig(t, dataDir); cfg.LlamaModel != "some/repo" {
+		t.Fatalf("persisted %q, want %q", cfg.LlamaModel, "some/repo")
 	}
 }

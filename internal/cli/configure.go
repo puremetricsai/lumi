@@ -2,9 +2,11 @@ package cli
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -60,7 +62,7 @@ func (a *app) configureCommand() *cobra.Command {
 				if flags.Changed("llama-base-url") {
 					cfg.LlamaBaseURL = strings.TrimSpace(llamaBaseURL)
 				}
-			} else if err := promptConfig(cmd.InOrStdin(), out, &cfg); err != nil {
+			} else if err := promptConfig(cmd.Context(), cmd.InOrStdin(), out, &cfg); err != nil {
 				return err
 			}
 
@@ -101,7 +103,7 @@ func (a *app) configureCommand() *cobra.Command {
 
 // promptConfig interactively reads values, keeping the current value on a blank
 // line. It prompts for the provider first, then only that provider's fields.
-func promptConfig(in io.Reader, out io.Writer, cfg *config.Config) error {
+func promptConfig(ctx context.Context, in io.Reader, out io.Writer, cfg *config.Config) error {
 	reader := bufio.NewReader(in)
 
 	fmt.Fprintf(out, "Inference provider [%s] (cerebras or llama.cpp, blank to keep): ", cfg.ResolvedProvider())
@@ -112,11 +114,8 @@ func promptConfig(in io.Reader, out io.Writer, cfg *config.Config) error {
 	}
 
 	if cfg.ResolvedProvider() == config.ProviderLlamaCpp {
-		fmt.Fprintf(out, "llama.cpp model [%s] (GGUF path or HuggingFace repo, blank to keep): ", orNotSet(cfg.ResolvedLlamaModel()))
-		if entered, err := readLine(reader); err != nil {
+		if err := promptLlamaModel(ctx, reader, out, cfg); err != nil {
 			return err
-		} else if entered != "" {
-			cfg.LlamaModel = entered
 		}
 
 		fmt.Fprintf(out, "llama-server base URL [%s] (blank to keep): ", cfg.ResolvedLlamaBaseURL())
@@ -146,6 +145,46 @@ func promptConfig(in io.Reader, out io.Writer, cfg *config.Config) error {
 		cfg.CerebrasModel = model
 	}
 	return nil
+}
+
+// promptLlamaModel asks for the llama.cpp model, listing what llama.cpp already
+// has cached so the answer can be a number instead of an exact repo id or path.
+// Discovery is best-effort: with an empty cache (or no llama-server to ask) this
+// degrades to the plain free-text prompt.
+func promptLlamaModel(ctx context.Context, reader *bufio.Reader, out io.Writer, cfg *config.Config) error {
+	cached := llamacpp.CachedModels(ctx)
+	prompt := "llama.cpp model [%s] (GGUF path or HuggingFace repo, blank to keep): "
+	if len(cached) > 0 {
+		fmt.Fprintln(out, "Cached llama.cpp models:")
+		for i, model := range cached {
+			fmt.Fprintf(out, "  %d. %s\n", i+1, model)
+		}
+		prompt = "llama.cpp model [%s] (number, GGUF path, or HuggingFace repo; blank to keep): "
+	}
+
+	for {
+		fmt.Fprintf(out, prompt, orNotSet(cfg.ResolvedLlamaModel()))
+		entered, err := readLine(reader)
+		if err != nil {
+			return err
+		}
+		if entered == "" {
+			return nil
+		}
+		// A bare number selects from the list above. Nothing else is a plausible
+		// model id, so an out-of-range number is a mistake worth re-asking about
+		// rather than persisting as a model name.
+		if n, numeric := strconv.Atoi(entered); numeric == nil && len(cached) > 0 {
+			if n >= 1 && n <= len(cached) {
+				cfg.LlamaModel = cached[n-1]
+				return nil
+			}
+			fmt.Fprintf(out, "There is no model %d in the list; pick 1-%d, or type a path or repo id.\n", n, len(cached))
+			continue
+		}
+		cfg.LlamaModel = entered
+		return nil
+	}
 }
 
 func readLine(reader *bufio.Reader) (string, error) {
