@@ -30,6 +30,13 @@ func evalAt(hour, minute int) time.Time {
 	return evalDay.Add(time.Duration(hour)*time.Hour + time.Duration(minute)*time.Minute)
 }
 
+// evalDaysBefore places an event on an earlier calendar day, for the cases that
+// grade which *day* a question resolves to. Every existing case pins its own
+// [evalDay, evalDay+24h) window, so these rows are invisible to them.
+func evalDaysBefore(days, hour, minute int) time.Time {
+	return evalDay.AddDate(0, 0, -days).Add(time.Duration(hour)*time.Hour + time.Duration(minute)*time.Minute)
+}
+
 // evalCorpus is one workday containing every hazard that has produced a wrong
 // answer. Each event's media path is its stable ID in eval expectations.
 //
@@ -45,11 +52,37 @@ func evalAt(hour, minute int) time.Time {
 //  4. Junk transcripts. A near-silent chunk transcribes to a single token.
 //  5. Vocabulary collisions. "say", "talk" and "sound" appear in questions
 //     that are not about audio at all.
+//  6. Adjacent days. "the day before yesterday" contains the word "yesterday",
+//     so a question about one day is one regex away from being answered out of
+//     another. The two earlier days exist to catch that off-by-one from both
+//     sides: the right day must come back and the neighbouring day must not.
 func evalCorpus(t *testing.T) *store.Store {
 	t.Helper()
 	ctx := context.Background()
 	s := testStore(t)
 	insertAll(t, ctx, s,
+		// (6) two days before the corpus day — what "the day before yesterday"
+		// and "2 days ago" must resolve to.
+		store.Event{
+			Kind: store.KindScreen, CapturedAt: evalDaysBefore(2, 10, 0), App: "Figma",
+			Window:    "Onboarding — wireframes",
+			Text:      "onboarding wireframes v3: welcome step, workspace picker, invite teammates",
+			MediaPath: "daybefore-figma.jpg", TextSource: "vision", DisplayID: 1,
+		},
+		store.Event{
+			Kind: store.KindAudio, CapturedAt: evalDaysBefore(2, 10, 30), AudioSource: "microphone",
+			Text:       "in standup we agreed to cut the invite step from the onboarding flow",
+			MediaPath:  "daybefore-standup.wav",
+			DurationMS: 30000,
+		},
+		// The neighbouring day, so losing a day is a visible failure rather than
+		// an empty result that could be blamed on the corpus.
+		store.Event{
+			Kind: store.KindScreen, CapturedAt: evalDaysBefore(1, 14, 0), App: "Arc",
+			Window:    "LUMI-214 — Jira",
+			Text:      "LUMI-214 retention sweep: prune --all should unlink orphaned media",
+			MediaPath: "yesterday-jira.jpg", TextSource: "vision", DisplayID: 1,
+		},
 		// (1) Lumi's own terminal, echoing the question back at the index.
 		store.Event{
 			Kind: store.KindScreen, CapturedAt: evalAt(9, 0), App: "Ghostty",
