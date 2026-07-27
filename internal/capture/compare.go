@@ -18,6 +18,7 @@ type FrameComparer struct {
 	IdleThreshold   float64
 	ActiveThreshold float64
 	MaxSilence      time.Duration
+	ExactSilence    time.Duration
 
 	mu     sync.Mutex
 	states map[uint32]frameState
@@ -32,7 +33,9 @@ type frameState struct {
 // Duplicate reports whether a frame is visually redundant. It combines a
 // byte-hash fast path with a downsampled RGB histogram. Active input raises
 // the similarity threshold, retaining more subtle UI changes while the user
-// is interacting. MaxSilence guarantees a frame is periodically retained.
+// is interacting. A frame is still periodically retained: MaxSilence bounds the
+// gap for a frame that changed but scored as similar, and the longer
+// ExactSilence bounds it for a frame whose bytes are identical.
 func (c *FrameComparer) Duplicate(path string, displayID uint32, inputActive bool, capturedAt time.Time) (bool, float64, error) {
 	contents, err := os.ReadFile(path)
 	if err != nil {
@@ -45,12 +48,7 @@ func (c *FrameComparer) Duplicate(path string, displayID uint32, inputActive boo
 		c.states = make(map[uint32]frameState)
 	}
 	previous, exists := c.states[displayID]
-	maxSilence := c.MaxSilence
-	if maxSilence <= 0 {
-		maxSilence = 10 * time.Second
-	}
-	forceKeep := exists && capturedAt.Sub(previous.lastKept) >= maxSilence
-	if exists && !forceKeep && hash == previous.hash {
+	if exists && hash == previous.hash && capturedAt.Sub(previous.lastKept) < c.exactSilence() {
 		c.mu.Unlock()
 		return true, 1, nil
 	}
@@ -61,30 +59,69 @@ func (c *FrameComparer) Duplicate(path string, displayID uint32, inputActive boo
 		return false, 0, fmt.Errorf("decode frame for comparison: %w", err)
 	}
 
+	// The lock was released for the decode, so the identity check is repeated
+	// rather than assumed: FrameComparer is shared across displays and its state
+	// may have advanced. Identity is re-tested first so an unchanged frame is
+	// never force-kept by the shorter near-duplicate deadline.
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	previous, exists = c.states[displayID]
-	forceKeep = exists && capturedAt.Sub(previous.lastKept) >= maxSilence
+	identical := exists && hash == previous.hash
 	similarity := 0.0
 	duplicate := false
-	if exists && !forceKeep {
-		similarity = histogramSimilarity(previous.hist, hist)
-		threshold := c.IdleThreshold
-		if threshold <= 0 || threshold > 1 {
-			threshold = 0.985
+	if exists && capturedAt.Sub(previous.lastKept) < c.silence(identical) {
+		if identical {
+			similarity = 1
+			duplicate = true
+		} else {
+			similarity = histogramSimilarity(previous.hist, hist)
+			duplicate = similarity >= c.threshold(inputActive)
 		}
-		if inputActive {
-			threshold = c.ActiveThreshold
-			if threshold <= 0 || threshold > 1 {
-				threshold = 0.995
-			}
-		}
-		duplicate = similarity >= threshold
 	}
 	if !duplicate {
 		c.states[displayID] = frameState{hash: hash, hist: hist, lastKept: capturedAt}
 	}
 	return duplicate, similarity, nil
+}
+
+func (c *FrameComparer) maxSilence() time.Duration {
+	if c.MaxSilence <= 0 {
+		return 10 * time.Second
+	}
+	return c.MaxSilence
+}
+
+// exactSilence bounds how long a display may go unrecorded while its frames are
+// byte-identical. Identical bytes carry no new information, so re-indexing them
+// on the near-duplicate deadline is pure waste; the longer deadline still leaves
+// a periodic presence marker for `lumi ask`. It never falls below MaxSilence, so
+// an unchanged frame is never retained more eagerly than a changed one.
+func (c *FrameComparer) exactSilence() time.Duration {
+	silence := c.ExactSilence
+	if silence <= 0 {
+		silence = 5 * time.Minute
+	}
+	return max(silence, c.maxSilence())
+}
+
+func (c *FrameComparer) silence(identical bool) time.Duration {
+	if identical {
+		return c.exactSilence()
+	}
+	return c.maxSilence()
+}
+
+func (c *FrameComparer) threshold(inputActive bool) float64 {
+	if inputActive {
+		if c.ActiveThreshold <= 0 || c.ActiveThreshold > 1 {
+			return 0.995
+		}
+		return c.ActiveThreshold
+	}
+	if c.IdleThreshold <= 0 || c.IdleThreshold > 1 {
+		return 0.985
+	}
+	return c.IdleThreshold
 }
 
 func sampledHistogram(reader io.Reader) ([histogramBins * 3]float64, error) {
