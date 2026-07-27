@@ -47,6 +47,13 @@ func TestQuestionTerms(t *testing.T) {
 			want:     []string{"db", "go", "ui", "use"},
 		},
 		{
+			// "couple" is a content word outside "a couple (of) days ago",
+			// which parseTimeWindow consumes before terms are taken.
+			name:     "couple survives as a topical term",
+			question: "who was the couple?",
+			want:     []string{"couple"},
+		},
+		{
 			name:     "diacritics are preserved",
 			question: "notes about café menus",
 			want:     []string{"notes", "café", "menus"},

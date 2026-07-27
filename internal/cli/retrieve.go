@@ -50,7 +50,13 @@ const (
 // questionModality in modality.go, which consumes exactly these words.
 //
 // "go" is deliberately absent: on a developer's machine it is far more often
-// the language than the verb.
+// the language than the verb. "couple" is likewise absent — parseTimeWindow
+// consumes it in "a couple (of) days ago", and outside that phrase it is a
+// content word ("who was the couple"). "few" is present because it is a bare
+// quantifier that never carries the signal, and the one phrase it appears in,
+// "a few days ago", is deliberately left unparsed: reaching FTS it would
+// produce a spurious *term* match, which is worse than a recency fallback
+// because the all-terms stage prints no note.
 var questionStopwords = map[string]struct{}{}
 
 func init() {
@@ -78,7 +84,7 @@ func init() {
 		activity activities logged indexed remembered far
 		yesterday today tonight tomorrow morning afternoon evening night nights
 		day days week weeks month months year years
-		ago last recent recently earlier ago past now
+		ago last recent recently earlier ago past now few
 		time times
 	`)
 	for _, word := range words {
