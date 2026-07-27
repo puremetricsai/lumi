@@ -83,6 +83,75 @@ func TestParseTimeWindow(t *testing.T) {
 			wantRest:  "what did I work on",
 		},
 		{
+			// The reported defect: \byesterday\b matches inside this phrase, so
+			// without a rule of its own the question silently lost a day.
+			name:      "day before yesterday",
+			question:  "give me a recap of the day before yesterday",
+			now:       now,
+			wantSince: at(2026, 7, 20, 0, 0),
+			wantUntil: at(2026, 7, 21, 0, 0),
+			wantRest:  "give me a recap of",
+		},
+		{
+			name:      "day before yesterday anchors a clock",
+			question:  "the day before yesterday at 9:15 pm",
+			now:       now,
+			wantSince: at(2026, 7, 20, 21, 0),
+			wantUntil: at(2026, 7, 20, 21, 30),
+			wantRest:  "",
+		},
+		{
+			name:      "numeric days ago",
+			question:  "what did I do 2 days ago",
+			now:       now,
+			wantSince: at(2026, 7, 20, 0, 0),
+			wantUntil: at(2026, 7, 21, 0, 0),
+			wantRest:  "what did I do",
+		},
+		{
+			name:      "spelled days ago",
+			question:  "what did I do two days ago",
+			now:       now,
+			wantSince: at(2026, 7, 20, 0, 0),
+			wantUntil: at(2026, 7, 21, 0, 0),
+			wantRest:  "what did I do",
+		},
+		{
+			name:      "a day ago is yesterday",
+			question:  "what did I work on a day ago",
+			now:       now,
+			wantSince: at(2026, 7, 21, 0, 0),
+			wantUntil: at(2026, 7, 22, 0, 0),
+			wantRest:  "what did I work on",
+		},
+		{
+			name:      "a couple of days ago",
+			question:  "recap a couple of days ago",
+			now:       now,
+			wantSince: at(2026, 7, 20, 0, 0),
+			wantUntil: at(2026, 7, 21, 0, 0),
+			wantRest:  "recap",
+		},
+		{
+			// Without "of". Left unparsed it would leak "couple" into the FTS
+			// terms, which is what makes the word safe to keep out of the
+			// stopword list — see questionStopwords.
+			name:      "a couple days ago without of",
+			question:  "recap a couple days ago",
+			now:       now,
+			wantSince: at(2026, 7, 20, 0, 0),
+			wantUntil: at(2026, 7, 21, 0, 0),
+			wantRest:  "recap",
+		},
+		{
+			name:      "days ago anchors a clock",
+			question:  "what was said 3 days ago at 9:15 pm",
+			now:       now,
+			wantSince: at(2026, 7, 19, 21, 0),
+			wantUntil: at(2026, 7, 19, 21, 30),
+			wantRest:  "what was said",
+		},
+		{
 			name:      "today",
 			question:  "summarize today",
 			now:       now,
@@ -231,6 +300,9 @@ func TestParseTimeWindowNoMatch(t *testing.T) {
 		"what did I read about postgres",
 		"summarize my work",
 		"", // empty
+		// "a few" names no specific day. No window is more honest than a
+		// guessed one, so this deliberately falls through to the full corpus.
+		"what did I do a few days ago",
 	} {
 		if _, _, _, _, ok := parseTimeWindow(question, now); ok {
 			t.Fatalf("did not expect a time match in %q", question)

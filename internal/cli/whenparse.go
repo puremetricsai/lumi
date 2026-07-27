@@ -54,6 +54,19 @@ var (
 	// matching, and running after reClockAMPM keeps "9:15 pm" as 21:15.
 	reClock24 = regexp.MustCompile(`(?i)` + clockConnector + `\b([01]?\d|2[0-3]):([0-5]\d)\b`)
 
+	// reDayBeforeYesterday must be consulted before reYesterday everywhere:
+	// \byesterday\b matches *inside* this phrase, so without its own rule the
+	// question resolves to yesterday and silently loses a day.
+	reDayBeforeYesterday = regexp.MustCompile(`(?i)\b(?:the\s+)?day\s+before\s+yesterday\b`)
+	// reDaysAgo matches "2 days ago", "two days ago", "a day ago", "a couple
+	// (of) days ago". "a few days ago" is deliberately absent: it names no
+	// specific day, and no window is more honest than a guessed one. The
+	// alternatives are ordered so the longer "a couple" wins over the bare
+	// article, and "of" is optional because "a couple days ago" is at least as
+	// common as the full form — an unmatched phrasing would leak "couple" into
+	// the FTS terms.
+	reDaysAgo = regexp.MustCompile(`(?i)\b(?:(\d+)|a\s+couple(?:\s+of)?|an?|one|two|three|four|five|six|seven|eight|nine|ten)\s+days?\s+ago\b`)
+
 	reThisMorning      = regexp.MustCompile(`(?i)\bthis\s+morning\b`)
 	reThisAfternoon    = regexp.MustCompile(`(?i)\bthis\s+afternoon\b`)
 	reEveningOrTonight = regexp.MustCompile(`(?i)\b(?:this\s+evening|tonight)\b`)
@@ -61,6 +74,35 @@ var (
 	reYesterday        = regexp.MustCompile(`(?i)\byesterday\b`)
 	reToday            = regexp.MustCompile(`(?i)\btoday\b`)
 )
+
+// spelledDays maps the count words reDaysAgo accepts onto a number of days.
+var spelledDays = map[string]int{
+	"a": 1, "an": 1, "one": 1,
+	"a couple": 2, "a couple of": 2, "two": 2,
+	"three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+	"eight": 8, "nine": 9, "ten": 10,
+}
+
+// daysAgoCount reads the day count out of a reDaysAgo submatch (m from
+// FindStringSubmatchIndex over question). A non-positive or unrecognized count
+// falls back to 1: "0 days ago" is not a day in the past, and a phrase we
+// matched but cannot count is still at least a day back.
+func daysAgoCount(m []int, question string) int {
+	if m[2] >= 0 {
+		if n, err := strconv.Atoi(question[m[2]:m[3]]); err == nil && n > 0 {
+			return n
+		}
+		return 1
+	}
+	// The match ends in "day(s) ago"; everything before it is the count word.
+	fields := strings.Fields(strings.ToLower(question[m[0]:m[1]]))
+	if len(fields) > 2 {
+		if n, ok := spelledDays[strings.Join(fields[:len(fields)-2], " ")]; ok {
+			return n
+		}
+	}
+	return 1
+}
 
 // parseTimeWindow derives a [since, until] window from a natural-time expression
 // in question, resolved in now's timezone. rest is question with the match
@@ -126,12 +168,29 @@ func parseTimeWindow(question string, now time.Time) (since, until *time.Time, r
 			return c.Add(-clockHalfWindow), c.Add(clockHalfWindow)
 		}
 	}
+	// dayOffsetPhrase reports a phrase naming a whole day further back than
+	// yesterday ("the day before yesterday", "3 days ago"): its offset from now
+	// and its span. Every caller consults it *before* the single-day words,
+	// because \byesterday\b matches inside "the day before yesterday" and would
+	// otherwise answer one day late.
+	dayOffsetPhrase := func() (offset, lo, hi int, found bool) {
+		if m := reDayBeforeYesterday.FindStringIndex(question); m != nil {
+			return -2, m[0], m[1], true
+		}
+		if m := reDaysAgo.FindStringSubmatchIndex(question); m != nil {
+			return -daysAgoCount(m, question), m[0], m[1], true
+		}
+		return 0, 0, 0, false
+	}
 	// dayQualifier reports an explicit "last night"/"yesterday"/"today"
 	// accompanying a clock time: its offset from now and its span, so the clock
 	// anchors to that day (not clockInstant's most-recent guess) and the day word
 	// is stripped from the FTS terms rather than left to be silently dropped as a
 	// stopword (or, for "night", leaked into them).
 	dayQualifier := func() (offset, lo, hi int, found bool) {
+		if offset, lo, hi, found := dayOffsetPhrase(); found {
+			return offset, lo, hi, true
+		}
 		if m := reLastNight.FindStringIndex(question); m != nil {
 			return -1, m[0], m[1], true
 		}
@@ -197,6 +256,15 @@ func parseTimeWindow(question string, now time.Time) (since, until *time.Time, r
 		hour, _ := strconv.Atoi(question[m[4]:m[5]])
 		minute, _ := strconv.Atoi(question[m[6]:m[7]])
 		return resolveClock(hour, minute, m[0], m[1], dir)
+	}
+
+	// A day-offset phrase with no clock is the whole of that day. It is handled
+	// ahead of the named-window table both because its offset is computed (the
+	// table is static) and because reYesterday there would match inside it.
+	if offset, lo, hi, found := dayOffsetPhrase(); found {
+		s := time.Date(now.Year(), now.Month(), now.Day()+offset, 0, 0, 0, 0, loc)
+		u := time.Date(now.Year(), now.Month(), now.Day()+offset+1, 0, 0, 0, 0, loc)
+		return result(dirCentered, s, u, lo, hi)
 	}
 
 	for _, named := range []struct {
