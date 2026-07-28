@@ -452,3 +452,134 @@ func TestListAppsEmptyAppFiltersToUnattributedWindows(t *testing.T) {
 		t.Fatalf("expected Terminal and Editor windows, got %#v", windows)
 	}
 }
+
+// TestSearchEventsRejectsQueryWithNoSearchableTerms pins finding 1 from the
+// final review: FTS5 tokenizes pure punctuation/emoji to nothing, so
+// store.Search silently drops the MATCH clause and returns the most recent
+// events — indistinguishable from real hits unless the handler catches it
+// first. A broken implementation that skips this check would return the
+// unrelated "roadmap" event with no error and no notice.
+func TestSearchEventsRejectsQueryWithNoSearchableTerms(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	insertEvents(t, ctx, s, store.Event{Kind: store.KindScreen, Text: "roadmap", MediaPath: "/tmp/a.jpg"})
+	h := &handlers{store: s}
+
+	for _, query := range []string{"???", "🎉", "---", "   ***   "} {
+		_, _, err := h.searchEvents(ctx, nil, searchEventsInput{Query: query})
+		if err == nil {
+			t.Fatalf("query %q must be rejected as a tool error, not silently browse everything", query)
+		}
+		if !strings.Contains(err.Error(), "searchable term") {
+			t.Fatalf("error %q for query %q does not mention searchable terms", err, query)
+		}
+	}
+}
+
+// TestSearchEventsWithAlphanumericQueryStillWorks guards against the guard
+// above regressing into rejecting valid queries: any query with at least one
+// letter or digit, however mixed with punctuation, must still search normally.
+func TestSearchEventsWithAlphanumericQueryStillWorks(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	insertEvents(t, ctx, s, store.Event{Kind: store.KindScreen, Text: "quarterly roadmap review", MediaPath: "/tmp/a.jpg"})
+	h := &handlers{store: s}
+
+	for _, query := range []string{"roadmap", "??roadmap??", "🎉roadmap", "roadmap!"} {
+		out := callSearch(t, ctx, h, searchEventsInput{Query: query})
+		if len(out.Events) != 1 {
+			t.Fatalf("query %q must still find the event, got %d results (notice=%q)", query, len(out.Events), out.Notice)
+		}
+	}
+}
+
+// TestSearchEventsCapNoticeIsAnElseBranch pins finding 2: a full page must
+// carry a cap notice so an agent can tell it saw a recency-truncated slice,
+// while a partial page and an empty page keep their own distinct notices
+// (or none). A broken implementation that always/never sets the cap notice,
+// or that clobbers the empty/no-match notices, would fail one of these three.
+func TestSearchEventsCapNoticeIsAnElseBranch(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	base := time.Now().UTC().Truncate(time.Second)
+	for i := 0; i < 3; i++ {
+		insertEvents(t, ctx, s, store.Event{
+			Kind: store.KindScreen, CapturedAt: base.Add(time.Duration(i) * time.Second),
+			Text: "roadmap", MediaPath: "/tmp/a.jpg",
+		})
+	}
+	h := &handlers{store: s}
+
+	// Full page: limit equals the number of matching events.
+	full := callSearch(t, ctx, h, searchEventsInput{Limit: 3})
+	if len(full.Events) != 3 {
+		t.Fatalf("expected 3 events, got %d", len(full.Events))
+	}
+	if !strings.Contains(full.Notice, "capped") {
+		t.Fatalf("full-page notice = %q, want it to mention the cap", full.Notice)
+	}
+
+	// Partial page: limit exceeds the number of matching events.
+	partial := callSearch(t, ctx, h, searchEventsInput{Limit: 10})
+	if len(partial.Events) != 3 {
+		t.Fatalf("expected 3 events, got %d", len(partial.Events))
+	}
+	if partial.Notice != "" {
+		t.Fatalf("partial-page notice = %q, want none", partial.Notice)
+	}
+
+	// Empty result: the existing no-match notice must still fire, not the cap notice.
+	empty := callSearch(t, ctx, h, searchEventsInput{Query: "kubernetes"})
+	if len(empty.Events) != 0 {
+		t.Fatalf("expected no events, got %d", len(empty.Events))
+	}
+	if !strings.Contains(empty.Notice, "matched") || strings.Contains(empty.Notice, "capped") {
+		t.Fatalf("empty-result notice = %q, want the no-match notice and not the cap notice", empty.Notice)
+	}
+}
+
+// TestSearchEventsClampsLimitToMax pins the handler-level 500 ceiling: the
+// parameter hint documents "capped at 500", so the handler must enforce it
+// itself rather than relying on store.Search's own unexported clamp.
+func TestSearchEventsClampsLimitToMax(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	for i := 0; i < 3; i++ {
+		insertEvents(t, ctx, s, store.Event{Kind: store.KindScreen, Text: "roadmap", MediaPath: "/tmp/a.jpg"})
+	}
+	h := &handlers{store: s}
+
+	out := callSearch(t, ctx, h, searchEventsInput{Limit: 100000})
+	if len(out.Events) != 3 {
+		t.Fatalf("expected all 3 events, got %d", len(out.Events))
+	}
+	// With only 3 events stored, a clamp to 500 (not 100000) must still read
+	// as a partial page, not a capped one.
+	if strings.Contains(out.Notice, "capped") {
+		t.Fatalf("notice = %q, an oversized limit clamped to 500 must not read as a full page with only 3 events stored", out.Notice)
+	}
+}
+
+// TestSearchEventsEmptyStoreNoticeIncludesDatabasePath pins finding 4: a
+// mistyped --data-dir yields a fresh empty database that is otherwise
+// indistinguishable from "you never recorded anything". Once Options carries
+// the resolved database path, the empty-store notice must name it.
+func TestSearchEventsEmptyStoreNoticeIncludesDatabasePath(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	h := &handlers{store: s, databasePath: "/tmp/typo-data-dir/lumi.db"}
+
+	out := callSearch(t, ctx, h, searchEventsInput{})
+	if !strings.Contains(out.Notice, "/tmp/typo-data-dir/lumi.db") {
+		t.Fatalf("empty-store notice = %q, want it to include the database path", out.Notice)
+	}
+
+	// list_apps shares the same wording and must carry the path too.
+	_, appsOut, err := h.listApps(ctx, nil, listAppsInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(appsOut.Notice, "/tmp/typo-data-dir/lumi.db") {
+		t.Fatalf("list_apps empty-store notice = %q, want it to include the database path", appsOut.Notice)
+	}
+}

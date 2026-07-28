@@ -14,6 +14,14 @@ import (
 type Options struct {
 	Name    string
 	Version string
+	// DatabasePath is the resolved database file the store was opened from. It
+	// is surfaced only in "this index is empty" tool notices, so a mistyped
+	// --data-dir (which openStore happily creates as a fresh empty database)
+	// reads as "wrong/empty file" rather than "you never recorded anything" —
+	// it leaks nothing new, since every media_path a tool returns already sits
+	// under that same directory. Optional; an empty value falls back to the
+	// generic notice.
+	DatabasePath string
 }
 
 // Serve runs the MCP server on stdin/stdout until the client closes the
@@ -34,7 +42,7 @@ func newServer(s *store.Store, opts Options) *sdk.Server {
 		opts.Name = "lumi"
 	}
 	server := sdk.NewServer(&sdk.Implementation{Name: opts.Name, Version: opts.Version}, nil)
-	h := &handlers{store: s}
+	h := &handlers{store: s, databasePath: opts.DatabasePath}
 
 	// AddTool infers each tool's input and output schema from the Go types and
 	// validates arguments before the handler runs, so the descriptions below are
@@ -44,6 +52,8 @@ func newServer(s *store.Store, opts Options) *sdk.Server {
 		Name: "search_events",
 		Description: "Search the user's captured screen text and audio transcripts. " +
 			"Every parameter is optional; with none it returns the most recent activity. " +
+			"Results are ranked by relevance when query is set, and newest-first otherwise — " +
+			"with a query, result[0] is the best match, not necessarily the most recent. " +
 			"Text is capped per event — when a result says truncated, call get_event for the full text. " +
 			"Returns text and metadata only: screenshots and audio never leave the user's machine, " +
 			"and media_path is a local path the user can open themselves.",

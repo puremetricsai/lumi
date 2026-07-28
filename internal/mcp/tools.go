@@ -14,15 +14,26 @@ import (
 const (
 	// defaultLimit matches `lumi search`'s default page.
 	defaultLimit = 20
+	// maxLimit mirrors the ceiling store.Search itself clamps to; enforcing it
+	// here too keeps the "capped at 500" parameter hint honest rather than
+	// relying on an unexported literal in internal/store.
+	maxLimit = 500
 	// defaultMaxTextChars keeps a page of results inside a reasonable share of
 	// an agent's context. An agent that needs a whole document calls get_event.
 	defaultMaxTextChars = 600
+	// defaultAttributionLimit keeps an orientation call small; a machine that
+	// has been recording for months can hold thousands of distinct windows.
+	defaultAttributionLimit = 50
+	maxAttributionLimit     = 500
 )
 
-// handlers binds the tool implementations to a store. It holds nothing else:
-// this package has no configuration and no state of its own.
+// handlers binds the tool implementations to a store. databasePath is only
+// used to name the file in "this index is empty" notices — it leaks nothing
+// new, since every media_path a tool returns already sits under that
+// directory — and is empty when Options carried none.
 type handlers struct {
-	store *store.Store
+	store        *store.Store
+	databasePath string
 }
 
 // EventRecord is one event as an MCP client sees it. It deliberately carries no
@@ -117,6 +128,17 @@ type searchEventsOutput struct {
 
 func (h *handlers) searchEvents(ctx context.Context, _ *sdk.CallToolRequest, in searchEventsInput) (*sdk.CallToolResult, searchEventsOutput, error) {
 	var empty searchEventsOutput
+	// A query that tokenizes to nothing (pure punctuation or emoji) must not
+	// silently fall through to store.Search's "no MATCH clause at all"
+	// behavior, which returns the most recent events with no way for an agent
+	// to tell they are not real hits. Reject it here instead, at the MCP
+	// boundary — internal/store stays unchanged.
+	if in.Query != "" && !hasSearchableTerm(in.Query) {
+		return nil, empty, fmt.Errorf(
+			"query %q has no searchable terms: FTS5 tokenizes punctuation and emoji to nothing, "+
+				"so this would silently match every event instead of none; "+
+				"omit query entirely to browse by time and app instead", in.Query)
+	}
 	opts := store.SearchOptions{
 		Query:       in.Query,
 		App:         in.App,
@@ -140,6 +162,9 @@ func (h *handlers) searchEvents(ctx context.Context, _ *sdk.CallToolRequest, in 
 	if opts.Limit <= 0 {
 		opts.Limit = defaultLimit
 	}
+	if opts.Limit > maxLimit {
+		opts.Limit = maxLimit
+	}
 	events, err := h.store.Search(ctx, opts)
 	if err != nil {
 		return nil, empty, fmt.Errorf("search the activity index: %w", err)
@@ -152,18 +177,40 @@ func (h *handlers) searchEvents(ctx context.Context, _ *sdk.CallToolRequest, in 
 	for _, event := range events {
 		out.Events = append(out.Events, newEventRecord(event, maxTextChars, false))
 	}
-	if len(out.Events) == 0 {
+	switch {
+	case len(out.Events) == 0:
 		storeEmpty, err := h.storeIsEmpty(ctx)
 		if err != nil {
 			return nil, empty, err
 		}
 		if storeEmpty {
-			out.Notice = "this Lumi index holds no events at all yet; run `lumi record start` to begin capturing"
+			out.Notice = h.emptyStoreNotice()
 		} else {
 			out.Notice = "no events matched these filters; try widening the time range, dropping the app filter, or match: \"any\""
 		}
+	case len(out.Events) == opts.Limit:
+		// A full page is indistinguishable from "there happen to be exactly
+		// this many results" unless we say so: an agent that gets exactly the
+		// limit back cannot otherwise tell it saw a recency-truncated slice.
+		out.Notice = fmt.Sprintf(
+			"results were capped at %d events; there may be more — narrow since/until or raise limit to see them",
+			opts.Limit)
 	}
 	return nil, out, nil
+}
+
+// emptyStoreNotice names the database file when it is known, so a typo'd
+// --data-dir (which openStore happily creates as a fresh empty database)
+// reads as "this file has nothing in it" rather than steering the agent to
+// tell the user to start recording when they already have, elsewhere.
+func (h *handlers) emptyStoreNotice() string {
+	if h.databasePath == "" {
+		return "this Lumi index holds no events at all yet; run `lumi record start` to begin capturing"
+	}
+	return fmt.Sprintf(
+		"this Lumi index (%s) holds no events at all yet; run `lumi record start` to begin capturing, "+
+			"or check that this is the right --data-dir/LUMI_HOME if you expected existing history",
+		h.databasePath)
 }
 
 // storeIsEmpty distinguishes "nothing recorded yet" from "nothing matched". It
@@ -176,13 +223,6 @@ func (h *handlers) storeIsEmpty(ctx context.Context) (bool, error) {
 	}
 	return len(events) == 0, nil
 }
-
-const (
-	// defaultAttributionLimit keeps an orientation call small; a machine that
-	// has been recording for months can hold thousands of distinct windows.
-	defaultAttributionLimit = 50
-	maxAttributionLimit     = 500
-)
 
 type getEventInput struct {
 	ID int64 `json:"id" jsonschema:"the id of an event returned by search_events"`
@@ -266,7 +306,7 @@ func (h *handlers) listApps(ctx context.Context, _ *sdk.CallToolRequest, in list
 			return nil, empty, err
 		}
 		if storeEmpty {
-			out.Notice = "this Lumi index holds no events at all yet; run `lumi record start` to begin capturing"
+			out.Notice = h.emptyStoreNotice()
 		} else {
 			out.Notice = "no activity in this range; try widening since and until"
 		}

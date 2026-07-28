@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/puremetricsai/lumi/internal/store"
@@ -65,6 +66,22 @@ func parseMatch(value string) (store.MatchMode, error) {
 		return store.MatchAny, nil
 	}
 	return store.MatchAll, fmt.Errorf(`match must be "all" or "any"; got %q`, value)
+}
+
+// hasSearchableTerm reports whether query contains at least one letter or
+// digit. internal/store's ftsExpression silently drops every term that has
+// none (punctuation, emoji, whitespace), and if that empties the expression
+// entirely, store.Search runs no MATCH clause at all — it just returns the
+// most recent events, indistinguishable from real hits. This mirrors the
+// store's unexported hasAlphanumeric rather than importing it, so the check
+// stays at the MCP boundary where the tool-error decision belongs.
+func hasSearchableTerm(query string) bool {
+	for _, r := range query {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			return true
+		}
+	}
+	return false
 }
 
 // truncateText caps text at maxChars runes, reporting whether it cut and the

@@ -29,14 +29,15 @@ func (a *app) mcpCommand() *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			s, _, err := a.openStore(cmd.Context())
+			s, paths, err := a.openStore(cmd.Context())
 			if err != nil {
 				return err
 			}
 			defer s.Close()
 			// A cancelled context is how a signal shuts this down; that is a
 			// clean exit, not a failure worth printing.
-			if err := mcp.Serve(cmd.Context(), s, mcp.Options{Name: "lumi", Version: version}); err != nil &&
+			opts := mcp.Options{Name: "lumi", Version: version, DatabasePath: paths.Database}
+			if err := mcp.Serve(cmd.Context(), s, opts); err != nil &&
 				!errors.Is(err, context.Canceled) {
 				return err
 			}
