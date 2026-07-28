@@ -231,3 +231,132 @@ func TestSearchEventsDistinguishesEmptyStoreFromNoMatch(t *testing.T) {
 		t.Fatalf("no-match notice = %q, want it to say nothing matched the filters", out.Notice)
 	}
 }
+
+func TestGetEventReturnsUntruncatedTextAndMetadata(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	long := strings.Repeat("b", 2000)
+	events := insertEvents(t, ctx, s, store.Event{
+		Kind: store.KindScreen, Text: long, App: "Safari", Window: "Quarterly plan",
+		MediaPath: "/tmp/a.jpg", TextSource: "vision", DisplayID: 1,
+		Metadata: []byte(`{"ocr_ms":42,"focused_window_text":"plan"}`),
+	})
+	h := &handlers{store: s}
+
+	// The escape hatch only works if search really did flag the cut.
+	searched := callSearch(t, ctx, h, searchEventsInput{})
+	if !searched.Events[0].Truncated || searched.Events[0].TextLength != 2000 {
+		t.Fatalf("search must flag the truncation: %#v", searched.Events[0])
+	}
+
+	_, out, err := h.getEvent(ctx, nil, getEventInput{ID: events[0].ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Event.Truncated {
+		t.Fatalf("get_event must never truncate: %#v", out.Event)
+	}
+	if out.Event.Text != long || out.Event.TextLength != 2000 {
+		t.Fatalf("text was not returned in full: %d chars", len(out.Event.Text))
+	}
+	if out.Event.Metadata["ocr_ms"] != float64(42) {
+		t.Fatalf("metadata missing or wrong: %#v", out.Event.Metadata)
+	}
+	if out.Event.MediaPath != "/tmp/a.jpg" {
+		t.Fatalf("media_path = %q", out.Event.MediaPath)
+	}
+}
+
+func TestGetEventUnknownIDIsAToolError(t *testing.T) {
+	ctx := context.Background()
+	h := &handlers{store: testStore(t)}
+
+	_, _, err := h.getEvent(ctx, nil, getEventInput{ID: 4711})
+	if err == nil {
+		t.Fatal("an unknown id must be a tool error, not an empty result")
+	}
+	if !strings.Contains(err.Error(), "4711") {
+		t.Fatalf("error %q does not name the id", err)
+	}
+}
+
+func TestListAppsReportsAppsThenWindows(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	base := time.Now().UTC().Truncate(time.Second)
+	insertEvents(t, ctx, s,
+		store.Event{Kind: store.KindScreen, CapturedAt: base, App: "Safari", Window: "Plan", Text: "a", MediaPath: "/tmp/a.jpg"},
+		store.Event{Kind: store.KindScreen, CapturedAt: base.Add(time.Minute), App: "Safari", Window: "Plan", Text: "b", MediaPath: "/tmp/b.jpg"},
+		store.Event{Kind: store.KindScreen, CapturedAt: base.Add(2 * time.Minute), App: "Safari", Window: "Docs", Text: "c", MediaPath: "/tmp/c.jpg"},
+		store.Event{Kind: store.KindAudio, CapturedAt: base.Add(3 * time.Minute), Text: "d", MediaPath: "/tmp/d.wav"},
+	)
+	h := &handlers{store: s}
+
+	_, out, err := h.listApps(ctx, nil, listAppsInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Entries) != 2 {
+		t.Fatalf("expected Safari and the unattributed bucket, got %#v", out.Entries)
+	}
+	if out.Entries[0].App != "Safari" || out.Entries[0].Events != 3 {
+		t.Fatalf("unexpected first entry: %#v", out.Entries[0])
+	}
+	if _, err := time.Parse(time.RFC3339, out.Entries[0].LastSeen); err != nil {
+		t.Fatalf("last_seen %q is not RFC3339: %v", out.Entries[0].LastSeen, err)
+	}
+	if out.Entries[1].App != "" || out.Entries[1].Events != 1 {
+		t.Fatalf("the empty-app bucket must be reported explicitly: %#v", out.Entries[1])
+	}
+
+	app := "safari"
+	_, out, err = h.listApps(ctx, nil, listAppsInput{App: &app})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Entries) != 2 {
+		t.Fatalf("expected two Safari windows, got %#v", out.Entries)
+	}
+	if out.Entries[0].Window != "Plan" || out.Entries[0].Events != 2 {
+		t.Fatalf("unexpected first window: %#v", out.Entries[0])
+	}
+}
+
+func TestListAppsHonorsTimeRangeAndRejectsBadTimes(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	base := time.Now().UTC().Truncate(time.Second)
+	insertEvents(t, ctx, s,
+		store.Event{Kind: store.KindScreen, CapturedAt: base.Add(-72 * time.Hour), App: "Old", Text: "a", MediaPath: "/tmp/a.jpg"},
+		store.Event{Kind: store.KindScreen, CapturedAt: base, App: "Safari", Text: "b", MediaPath: "/tmp/b.jpg"},
+	)
+	h := &handlers{store: s}
+
+	_, out, err := h.listApps(ctx, nil, listAppsInput{Since: "24h"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Entries) != 1 || out.Entries[0].App != "Safari" {
+		t.Fatalf("since was not applied: %#v", out.Entries)
+	}
+
+	if _, _, err := h.listApps(ctx, nil, listAppsInput{Since: "yesterday"}); err == nil {
+		t.Fatal("an unparseable since must be a tool error")
+	}
+}
+
+func TestListAppsOnAnEmptyStoreSaysSo(t *testing.T) {
+	ctx := context.Background()
+	h := &handlers{store: testStore(t)}
+
+	_, out, err := h.listApps(ctx, nil, listAppsInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Entries) != 0 {
+		t.Fatalf("expected no entries, got %#v", out.Entries)
+	}
+	if !strings.Contains(out.Notice, "no events") {
+		t.Fatalf("notice = %q, want it to say the index holds no events", out.Notice)
+	}
+}

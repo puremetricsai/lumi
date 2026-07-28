@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -174,4 +175,101 @@ func (h *handlers) storeIsEmpty(ctx context.Context) (bool, error) {
 		return false, fmt.Errorf("check whether the activity index is empty: %w", err)
 	}
 	return len(events) == 0, nil
+}
+
+const (
+	// defaultAttributionLimit keeps an orientation call small; a machine that
+	// has been recording for months can hold thousands of distinct windows.
+	defaultAttributionLimit = 50
+	maxAttributionLimit     = 500
+)
+
+type getEventInput struct {
+	ID int64 `json:"id" jsonschema:"the id of an event returned by search_events"`
+}
+
+type getEventOutput struct {
+	Event EventRecord `json:"event"`
+}
+
+// getEvent returns one event with its text in full and its processor metadata
+// attached. It is what makes search_events' truncation safe: an agent that sees
+// truncated: true fetches the rest here.
+func (h *handlers) getEvent(ctx context.Context, _ *sdk.CallToolRequest, in getEventInput) (*sdk.CallToolResult, getEventOutput, error) {
+	var empty getEventOutput
+	event, err := h.store.EventByID(ctx, in.ID)
+	if errors.Is(err, store.ErrEventNotFound) {
+		return nil, empty, fmt.Errorf("no event has id %d; use search_events to find valid ids", in.ID)
+	}
+	if err != nil {
+		return nil, empty, fmt.Errorf("read event %d: %w", in.ID, err)
+	}
+	return nil, getEventOutput{Event: newEventRecord(*event, 0, true)}, nil
+}
+
+// AttributionRecord is one row of the list_apps inventory. In app mode Window
+// is empty; in window mode App echoes the requested application.
+type AttributionRecord struct {
+	App      string `json:"app"`
+	Window   string `json:"window,omitempty"`
+	Events   int64  `json:"events"`
+	LastSeen string `json:"last_seen"`
+}
+
+type listAppsInput struct {
+	App   *string `json:"app,omitempty" jsonschema:"omit to list applications; set it to list the window titles seen for that one application, including \"\" for events with no attribution"`
+	Since string  `json:"since,omitempty" jsonschema:"earliest capture time: an RFC3339 timestamp, or a duration such as 24h meaning that long ago"`
+	Until string  `json:"until,omitempty" jsonschema:"latest capture time, in the same forms as since"`
+	Limit int     `json:"limit,omitempty" jsonschema:"maximum rows to return; defaults to 50 and is capped at 500"`
+}
+
+type listAppsOutput struct {
+	Entries []AttributionRecord `json:"entries"`
+	Notice  string              `json:"notice,omitempty"`
+}
+
+// listApps reports which applications and window titles the index actually
+// holds. Without it an agent guesses app filter values from the user's wording
+// and silently filters everything away.
+func (h *handlers) listApps(ctx context.Context, _ *sdk.CallToolRequest, in listAppsInput) (*sdk.CallToolResult, listAppsOutput, error) {
+	var empty listAppsOutput
+	opts := store.AttributionOptions{App: in.App, Limit: in.Limit}
+	var err error
+	if opts.Since, err = parseTimestamp("since", in.Since); err != nil {
+		return nil, empty, err
+	}
+	if opts.Until, err = parseTimestamp("until", in.Until); err != nil {
+		return nil, empty, err
+	}
+	if opts.Limit <= 0 {
+		opts.Limit = defaultAttributionLimit
+	}
+	if opts.Limit > maxAttributionLimit {
+		opts.Limit = maxAttributionLimit
+	}
+	rows, err := h.store.ListAttribution(ctx, opts)
+	if err != nil {
+		return nil, empty, fmt.Errorf("list captured applications: %w", err)
+	}
+	out := listAppsOutput{Entries: make([]AttributionRecord, 0, len(rows))}
+	for _, row := range rows {
+		out.Entries = append(out.Entries, AttributionRecord{
+			App:      row.App,
+			Window:   row.Window,
+			Events:   row.Events,
+			LastSeen: row.LastSeen.Local().Format(time.RFC3339Nano),
+		})
+	}
+	if len(out.Entries) == 0 {
+		storeEmpty, err := h.storeIsEmpty(ctx)
+		if err != nil {
+			return nil, empty, err
+		}
+		if storeEmpty {
+			out.Notice = "this Lumi index holds no events at all yet; run `lumi record start` to begin capturing"
+		} else {
+			out.Notice = "no activity in this range; try widening since and until"
+		}
+	}
+	return nil, out, nil
 }
