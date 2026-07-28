@@ -2,9 +2,6 @@ package mcp
 
 import (
 	"context"
-	"io"
-	"os"
-	"time"
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/puremetricsai/lumi/internal/store"
@@ -27,52 +24,8 @@ type Options struct {
 // corrupts the stream, and the failure reaches the user as "the agent cannot
 // see Lumi" with no error text anywhere. Diagnostics go to stderr.
 func Serve(ctx context.Context, s *store.Store, opts Options) error {
-	// sdk.StdioTransport reads os.Stdin directly, and the SDK's connection
-	// treats a read EOF as an immediate signal to reject any response still
-	// being written — even for a call it already accepted. A client (or a
-	// non-interactive caller, such as this project's own smoke test) that
-	// writes its last request and closes stdin without waiting to read the
-	// reply can therefore lose that reply outright: the handler finishes and
-	// tries to write, but the connection has already decided it is shutting
-	// down. stdinEOFGrace wraps stdin so the SDK only learns about EOF after a
-	// short delay, giving an in-flight handler (a local SQLite query, in
-	// practice sub-millisecond to a few milliseconds) room to finish and flush
-	// before the connection tears down. It costs nothing on the common path —
-	// a still-open stdin never sees the delay — and only applies once, to the
-	// read that actually observes end of stream.
-	transport := &sdk.IOTransport{
-		Reader: io.NopCloser(stdinEOFGrace{os.Stdin}),
-		Writer: nopCloseWriter{os.Stdout},
-	}
-	return newServer(s, opts).Run(ctx, transport)
+	return newServer(s, opts).Run(ctx, &sdk.StdioTransport{})
 }
-
-// stdinEOFGraceDelay bounds how long Serve waits after stdin reports EOF
-// before passing that EOF along. It is not a promise — a handler slower than
-// this can still lose its response — but it comfortably covers the local
-// SQLite reads and JSON encoding this server's tools do.
-const stdinEOFGraceDelay = 200 * time.Millisecond
-
-// stdinEOFGrace delays reporting an EOF (or any other read error, since a
-// closed pipe on this end reads the same way) from the wrapped reader, so a
-// handler that is still writing its response is not raced by the SDK's
-// shutdown-on-EOF behavior.
-type stdinEOFGrace struct{ r io.Reader }
-
-func (g stdinEOFGrace) Read(p []byte) (int, error) {
-	n, err := g.r.Read(p)
-	if err != nil {
-		time.Sleep(stdinEOFGraceDelay)
-	}
-	return n, err
-}
-
-// nopCloseWriter adapts os.Stdout to io.WriteCloser without ever actually
-// closing the process's real stdout, mirroring sdk.StdioTransport's own
-// nopCloserWriter (which is unexported, hence this local copy).
-type nopCloseWriter struct{ io.Writer }
-
-func (nopCloseWriter) Close() error { return nil }
 
 // newServer builds the server and registers the tools. It is separate from
 // Serve so tests can drive it over an in-memory transport.
