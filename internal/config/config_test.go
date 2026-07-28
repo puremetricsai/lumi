@@ -6,127 +6,83 @@ import (
 	"testing"
 )
 
-func TestLoadConfigMissingFileIsZero(t *testing.T) {
-	cfg, err := LoadConfig(filepath.Join(t.TempDir(), "does-not-exist.json"))
-	if err != nil {
-		t.Fatalf("missing config must not error: %v", err)
-	}
-	if cfg != (Config{}) {
-		t.Fatalf("missing config must be zero, got %+v", cfg)
-	}
-}
-
-func TestSaveConfigRoundTrips(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "nested", ConfigFileName)
-	want := Config{CerebrasAPIKey: "secret-key", CerebrasModel: "qwen-3-32b"}
-	if err := SaveConfig(path, want); err != nil {
-		t.Fatal(err)
-	}
-
-	info, err := os.Stat(path)
+func TestFromRootDerivesEveryPath(t *testing.T) {
+	root := t.TempDir()
+	paths, err := FromRoot(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if perm := info.Mode().Perm(); perm != 0o600 {
-		t.Fatalf("config permissions = %o, want 600 (may hold a secret)", perm)
-	}
-
-	got, err := LoadConfig(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != want {
-		t.Fatalf("round-trip = %+v, want %+v", got, want)
-	}
-}
-
-func TestSaveConfigForces0600OnExistingFile(t *testing.T) {
-	path := filepath.Join(t.TempDir(), ConfigFileName)
-	// Simulate a pre-existing, group/world-readable config file.
-	if err := os.WriteFile(path, []byte("{}\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(path, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	want := Config{CerebrasAPIKey: "secret-key", CerebrasModel: "qwen-3-32b"}
-	if err := SaveConfig(path, want); err != nil {
-		t.Fatal(err)
-	}
-
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if perm := info.Mode().Perm(); perm != 0o600 {
-		t.Fatalf("config permissions = %o, want 600 (may hold a secret)", perm)
-	}
-
-	got, err := LoadConfig(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != want {
-		t.Fatalf("round-trip = %+v, want %+v", got, want)
-	}
-}
-
-func TestResolvedModelFallsBackToDefault(t *testing.T) {
-	if got := (Config{}).ResolvedModel(); got != DefaultCerebrasModel {
-		t.Fatalf("empty model = %q, want %q", got, DefaultCerebrasModel)
-	}
-	if got := (Config{CerebrasModel: "custom"}).ResolvedModel(); got != "custom" {
-		t.Fatalf("set model = %q, want %q", got, "custom")
-	}
-}
-
-func TestSaveConfigRoundTripsProviderFields(t *testing.T) {
-	path := filepath.Join(t.TempDir(), ConfigFileName)
-	want := Config{
-		Provider:     ProviderLlamaCpp,
-		LlamaModel:   "ggml-org/gpt-oss-20b-GGUF",
-		LlamaBaseURL: "http://127.0.0.1:9090",
-	}
-	if err := SaveConfig(path, want); err != nil {
-		t.Fatal(err)
-	}
-	got, err := LoadConfig(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != want {
-		t.Fatalf("round-trip = %+v, want %+v", got, want)
-	}
-}
-
-func TestResolvedProvider(t *testing.T) {
-	cases := map[string]string{
-		"":            DefaultProvider,
-		"cerebras":    ProviderCerebras,
-		"llama.cpp":   ProviderLlamaCpp,
-		"llamacpp":    ProviderLlamaCpp,
-		"LLAMA.CPP":   ProviderLlamaCpp,
-		" llama-cpp ": ProviderLlamaCpp,
-	}
-	for in, want := range cases {
-		if got := (Config{Provider: in}).ResolvedProvider(); got != want {
-			t.Fatalf("ResolvedProvider(%q) = %q, want %q", in, got, want)
+	for _, c := range []struct{ name, got, want string }{
+		{"Root", paths.Root, root},
+		{"Database", paths.Database, filepath.Join(root, "lumi.db")},
+		{"Screenshots", paths.Screenshots, filepath.Join(root, "screenshots")},
+		{"Audio", paths.Audio, filepath.Join(root, "audio")},
+		{"RecordState", paths.RecordState, filepath.Join(root, "record.json")},
+		{"RecordLog", paths.RecordLog, filepath.Join(root, "record.log")},
+	} {
+		if c.got != c.want {
+			t.Errorf("%s = %q, want %q", c.name, c.got, c.want)
 		}
 	}
 }
 
-func TestResolvedLlamaDefaults(t *testing.T) {
-	if got := (Config{}).ResolvedLlamaBaseURL(); got != DefaultLlamaBaseURL {
-		t.Fatalf("empty base URL = %q, want %q", got, DefaultLlamaBaseURL)
+func TestFromRootMakesRelativeRootsAbsolute(t *testing.T) {
+	paths, err := FromRoot("relative/dir")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := (Config{LlamaBaseURL: "http://x:1"}).ResolvedLlamaBaseURL(); got != "http://x:1" {
-		t.Fatalf("set base URL = %q", got)
+	if !filepath.IsAbs(paths.Root) {
+		t.Fatalf("Root = %q, want an absolute path", paths.Root)
 	}
-	if got := (Config{}).ResolvedLlamaModel(); got != "" {
-		t.Fatalf("empty llama model = %q, want empty", got)
+}
+
+func TestDefaultPathsHonorsLumiHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("LUMI_HOME", home)
+	paths, err := DefaultPaths()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := (Config{LlamaModel: " m "}).ResolvedLlamaModel(); got != "m" {
-		t.Fatalf("trimmed llama model = %q", got)
+	if paths.Root != home {
+		t.Fatalf("Root = %q, want %q", paths.Root, home)
+	}
+}
+
+// Ensure creates the media directories 0700: the data directory holds
+// screenshots of everything on screen, so it must never be group- or
+// world-readable.
+func TestEnsureCreatesDirectories0700(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "nested", "lumi")
+	paths, err := FromRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := paths.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{paths.Root, paths.Screenshots, paths.Audio} {
+		info, err := os.Stat(dir)
+		if err != nil {
+			t.Fatalf("stat %s: %v", dir, err)
+		}
+		if !info.IsDir() {
+			t.Fatalf("%s is not a directory", dir)
+		}
+		if perm := info.Mode().Perm(); perm != 0o700 {
+			t.Fatalf("%s permissions = %o, want 700 (holds captured media)", dir, perm)
+		}
+	}
+}
+
+func TestEnsureIsIdempotent(t *testing.T) {
+	paths, err := FromRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := paths.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	if err := paths.Ensure(); err != nil {
+		t.Fatalf("second Ensure must succeed on existing directories: %v", err)
 	}
 }
