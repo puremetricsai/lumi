@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -176,6 +177,33 @@ func TestSearchEventsTruncation(t *testing.T) {
 	out = callSearch(t, ctx, h, searchEventsInput{App: "Long", MaxTextChars: &none})
 	if record := byApp(out, "Long"); record.Truncated || record.Text != long {
 		t.Fatalf("max_text_chars 0 must mean no cap: truncated=%v len=%d", record.Truncated, len(record.Text))
+	}
+}
+
+// TestEventRecordAlwaysSerializesTruncated guards the wire form of the pair
+// that makes truncation safe. An `omitempty` on Truncated would drop the key
+// for every complete text and drop it from the generated schema's required
+// list, so an agent would have to infer "not truncated" from a missing field
+// while text_length stayed present — exactly the ambiguity the pair exists to
+// remove.
+func TestEventRecordAlwaysSerializesTruncated(t *testing.T) {
+	encoded, err := json.Marshal(newEventRecord(store.Event{Kind: store.KindScreen, Text: "short"}, 600, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	truncated, ok := decoded["truncated"]
+	if !ok {
+		t.Fatalf("untruncated text dropped the truncated key: %s", encoded)
+	}
+	if truncated != false {
+		t.Fatalf("truncated = %v, want false", truncated)
+	}
+	if _, ok := decoded["text_length"]; !ok {
+		t.Fatalf("text_length must always travel with truncated: %s", encoded)
 	}
 }
 

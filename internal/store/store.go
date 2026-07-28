@@ -45,8 +45,9 @@ type SearchOptions struct {
 	Until  *time.Time
 	Limit  int
 	// RequireText drops events whose extracted text or transcript is empty (or
-	// only whitespace). It has no caller today and is retained for `lumi mcp`:
-	// media saved without a usable transcript answers no content question, and
+	// only whitespace). Its only caller is `lumi mcp`, as the `require_text`
+	// tool parameter: media saved without a usable transcript answers no
+	// content question, and
 	// Lumi records enough silent audio chunks that they crowd real speech out of
 	// a recency pass. It stays opt-in so `search` and the JSON export still see
 	// every stored row. See CLAUDE.md.

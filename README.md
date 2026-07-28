@@ -1,13 +1,13 @@
 # Lumi
 
-Lumi is an open-source, local-first work memory for Apple Silicon Macs. It continuously captures every display plus system and microphone audio, extracts screen text with full-display Apple Vision OCR (using macOS Accessibility for focused-app attribution), transcribes speech on-device with Apple SpeechAnalyzer, stores the media on disk, indexes the text in SQLite FTS5, and lets you search and manage it from a Go CLI. Agent access is coming via `lumi mcp`, an MCP server that exposes the same index to the AI agent of your choice.
+Lumi is an open-source, local-first work memory for Apple Silicon Macs. It continuously captures every display plus system and microphone audio, extracts screen text with full-display Apple Vision OCR (using macOS Accessibility for focused-app attribution), transcribes speech on-device with Apple SpeechAnalyzer, stores the media on disk, indexes the text in SQLite FTS5, and lets you search and manage it from a Go CLI. `lumi mcp` exposes the same index to the AI agent of your choice over MCP.
 
 Lumi deliberately targets a small surface: capture → process → store → query, with no GUI, server, or plugins.
 
 ## Requirements
 
 - Apple Silicon Mac running macOS 26 or newer (`darwin/arm64`)
-- Go 1.24 or newer (to build)
+- Go 1.25 or newer (to build)
 - Xcode Command Line Tools and a Swift toolchain (`swiftc` compiles the SpeechAnalyzer bridge into a static archive that cgo links)
 - Screen Recording, Accessibility, Microphone, and Speech Recognition permissions for your terminal or the Lumi binary
 

@@ -21,8 +21,8 @@ const (
 	// (and how rare) the terms they matched are. This is what makes
 	// natural-language questions retrievable; see ftsExpression.
 	//
-	// It has no caller until `lumi mcp` exposes it as a tool parameter; it is
-	// retained deliberately rather than left over. See CLAUDE.md.
+	// Its only caller is `lumi mcp`, which exposes it as the `match: "any"`
+	// tool parameter; `lumi search` stays conjunctive. See CLAUDE.md.
 	MatchAny
 )
 

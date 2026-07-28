@@ -46,8 +46,11 @@ type EventRecord struct {
 	CapturedAt string `json:"captured_at"`
 	Text       string `json:"text"`
 	// Truncated and TextLength always travel together with Text, so a cut can
-	// never be mistaken for the end of the content.
-	Truncated   bool           `json:"truncated,omitempty"`
+	// never be mistaken for the end of the content. Neither carries omitempty:
+	// an absent truncated would drop out of the generated output schema's
+	// required list while text_length stayed in it, leaving an agent to infer
+	// from a missing key the one thing this pair exists to state outright.
+	Truncated   bool           `json:"truncated"`
 	TextLength  int            `json:"text_length"`
 	App         string         `json:"app,omitempty"`
 	Window      string         `json:"window,omitempty"`
