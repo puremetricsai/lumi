@@ -302,7 +302,7 @@ func TestRecorderIndexesAccessibilityTextWhenVisionFails(t *testing.T) {
 	recorder.captureScreen(ctx)
 
 	// Vision produced no usable text, so the substantive Accessibility text must
-	// stay searchable via Event.Text (events_fts and ask never read metadata).
+	// stay searchable via Event.Text (events_fts and search never read metadata).
 	events, err := s.Search(ctx, store.SearchOptions{Query: "Accessibility primary"})
 	if err != nil {
 		t.Fatal(err)

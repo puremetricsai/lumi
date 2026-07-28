@@ -1,6 +1,6 @@
 # Lumi
 
-Lumi is an open-source, local-first work memory for Apple Silicon Macs. It continuously captures every display plus system and microphone audio, extracts screen text with full-display Apple Vision OCR (using macOS Accessibility for focused-app attribution), transcribes speech on-device with Apple SpeechAnalyzer, stores the media on disk, indexes the text in SQLite FTS5, and lets you search and manage it from a Go CLI. An optional `lumi ask` command sends only the retrieved text context to an inference backend — hosted Cerebras or a local `llama-server` — for an answer.
+Lumi is an open-source, local-first work memory for Apple Silicon Macs. It continuously captures every display plus system and microphone audio, extracts screen text with full-display Apple Vision OCR (using macOS Accessibility for focused-app attribution), transcribes speech on-device with Apple SpeechAnalyzer, stores the media on disk, indexes the text in SQLite FTS5, and lets you search and manage it from a Go CLI. Agent access is coming via `lumi mcp`, an MCP server that exposes the same index to the AI agent of your choice.
 
 Lumi deliberately targets a small surface: capture → process → store → query, with no GUI, server, or plugins.
 
@@ -10,7 +10,6 @@ Lumi deliberately targets a small surface: capture → process → store → que
 - Go 1.24 or newer (to build)
 - Xcode Command Line Tools and a Swift toolchain (`swiftc` compiles the SpeechAnalyzer bridge into a static archive that cgo links)
 - Screen Recording, Accessibility, Microphone, and Speech Recognition permissions for your terminal or the Lumi binary
-- For `lumi ask` only: a Cerebras API key, or `llama-server` on `PATH` (`brew install llama.cpp`)
 
 Transcription runs entirely on-device through Apple SpeechAnalyzer — no external processor or model file to install. The recognition assets for your locale (default `en-US`) download automatically on first use; override the locale with `record --speech-locale`.
 
@@ -48,12 +47,15 @@ The default data directory is `~/Library/Application Support/Lumi`:
 ```text
 Lumi/
 ├── lumi.db
-├── config.json
+├── record.json
+├── record.log
 ├── screenshots/
 └── audio/
 ```
 
-Override it with `--data-dir` or `LUMI_HOME`. The background recorder also writes its state file and log into the root, as does a Lumi-launched `llama-server`.
+Override it with `--data-dir` or `LUMI_HOME`. `record.json` and `record.log` are the background recorder's state file and log.
+
+Earlier versions also wrote a `config.json` here to hold the provider settings for the removed `lumi ask` command. Lumi no longer reads it, and upgrading leaves it in place. If yours holds an API key, delete the file and rotate the key.
 
 ## Search
 
@@ -65,72 +67,6 @@ Override it with `--data-dir` or `LUMI_HOME`. The background recorder also write
 ```
 
 Search terms are safely combined with FTS5 `AND`. With no text argument, Lumi returns the most recent events. `--app` is an exact case-insensitive filter; `--window` is a case-insensitive substring filter. Results include timestamps and paths to the original screenshot or WAV chunk. JSON output also preserves screen-text source, display ID, audio source, and processor diagnostics.
-
-## Configure
-
-`lumi ask` needs an inference backend. Configuration is persisted to `config.json` in the data directory (mode `0600`); there is no environment-variable fallback.
-
-```sh
-./lumi configure          # interactive: provider first, then that provider's fields
-./lumi configure --show   # print the current config (Cerebras key masked)
-```
-
-Hosted Cerebras (the default provider):
-
-```sh
-./lumi configure --provider cerebras --api-key "..." --model gpt-oss-120b
-```
-
-Local llama.cpp, which requires `llama-server` on `PATH` (`brew install llama.cpp`; `configure` refuses to select the provider until it is installed):
-
-```sh
-./lumi configure --provider llama.cpp --llama-model ~/models/qwen3-8b-q4.gguf
-./lumi configure --provider llama.cpp --llama-model unsloth/Qwen3-8B-GGUF
-```
-
-`--llama-model` takes a GGUF file path or a HuggingFace repo id. `--llama-base-url` overrides where `llama-server` listens (default `http://127.0.0.1:8080`).
-
-Run `./lumi configure` with no flags to be prompted instead. With llama.cpp selected, the prompt lists what llama.cpp already has cached (`llama-server --cache-list`) so the model can be picked by number:
-
-```
-Cached llama.cpp models:
-  1. unsloth/gemma-4-26B-A4B-it-GGUF:MXFP4_MOE
-  2. ggml-org/gpt-oss-20b-GGUF:Q4_K_M
-llama.cpp model [not set] (number, GGUF path, or HuggingFace repo; blank to keep):
-```
-
-A path or repo id can still be typed directly, and an empty cache falls back to the plain prompt.
-
-`./lumi doctor` reports the active provider, whether the key or model is set, and — for llama.cpp — whether the server is reachable.
-
-## Ask
-
-```sh
-./lumi ask "What did I work on this afternoon?"
-./lumi ask "What was on screen around 9:15 pm?"
-./lumi ask "What changed in the quarterly plan?" --app "Safari" --since 24h
-```
-
-Lumi derives the time window from the question itself: expressions like "around 9:15 pm", "yesterday", "this morning", "last 2 hours", and "last night" set the window in your local timezone, and the words are stripped so they never leak into the search terms. Directional connectors change the shape — "after 10:15 pm" opens forward to the end of that day, "before 9 am" opens backward from that day's start, while "around"/"at" keep a centered ±15-minute band. The interpreted window is printed to stderr. An explicit `--since` skips derivation entirely.
-
-Lumi then turns the question into search terms (dropping question words, broad activity words, recording-modality words, and time words) and retrieves in stages: events matching every term, else events ranked by best partial match, else the most recent events. When it falls back to a recency-based stage it says so on stderr and distinguishes a broad overview from terms that matched nothing, so a recency-based answer is never mistaken for a retrieved one.
-
-It sends only the retrieved text and metadata to the configured backend's OpenAI-compatible `POST /v1/chat/completions` and prints the answer. Media files are never sent by this command.
-
-The activity context is capped so a large Vision or Accessibility result cannot blow the model's context window — 60000 characters by default, adjustable with `--max-context-chars`. Lumi selects records in retrieval order, renders the selected set chronologically, consolidates adjacent identical screen evidence, and labels title-only screens and untranscribed audio explicitly. Dropped events are reported inline in the context. `--limit` caps how many records are considered (default 50).
-
-`--model` overrides the configured model for a single invocation; otherwise the resolved value comes from `config.json`, falling back to `gpt-oss-120b` for Cerebras.
-
-### Local llama-server lifecycle
-
-When the llama.cpp provider is active, `ask` checks `/health` and launches `llama-server` itself if it isn't already running, then leaves it running so the model stays warm. The process is detached, logs to `llama-server.log` in the data directory, and records its pid and model in `llama-server.json`.
-
-Because the model is recorded, changing it takes effect immediately: if the configured model (or `ask --model`) differs from what the Lumi-launched server is serving, `ask` stops that server and relaunches it, noting the switch on stderr. A `llama-server` Lumi did not start is never stopped — `ask` uses it as is and says so, since its model cannot be known.
-
-```sh
-./lumi llama status   # reachability, plus the pid and model Lumi launched
-./lumi llama stop     # terminate the Lumi-launched server
-```
 
 ## Retention
 
@@ -164,7 +100,7 @@ Lumi does not schedule retention automatically. Run `prune` periodically yoursel
 
 ```text
 ScreenCaptureKit displays ─→ Vision OCR (full screen) ─┐
-                         └─→ Accessibility (attribution) ├─→ events + FTS5 ─→ search ─→ ask
+                         └─→ Accessibility (attribution) ├─→ events + FTS5 ─→ search
 ScreenCaptureKit system + microphone ─→ WAV ─→ SpeechAnalyzer (in-process) ─┘
 ```
 
@@ -172,9 +108,7 @@ ScreenCaptureKit system + microphone ─→ WAV ─→ SpeechAnalyzer (in-proces
 - `internal/capture`: testable capture orchestration, perceptual deduplication, and transcription
 - `internal/store`: versioned SQLite migrations, FTS5 triggers, inserts, and filtered search
 - `internal/retention`: age-, size-, and wipe-based event/media pruning
-- `internal/llm`: shared OpenAI-compatible chat-completions client and system prompt
-- `internal/cerebras`, `internal/llamacpp`: thin provider wrappers over that client, plus `llama-server` lifecycle
-- `internal/config`: data-directory paths and the persisted `config.json`
+- `internal/config`: data-directory path resolution
 - `internal/cli`: Cobra commands and lifecycle
 
 Frames use a hash fast path plus a sampled color-histogram comparison with independent state per display; recent user input makes the threshold more sensitive, and a ten-second safety interval prevents capture from going silent. Full-display Vision OCR is the primary screen-text source, so the index reflects the whole screen rather than just the focused window; the Accessibility snapshot supplies focused-app attribution and its window text is kept in event metadata when substantive. If Accessibility, Vision, comparison, or transcription fails after media was captured, Lumi preserves and indexes the event with processor diagnostics instead of silently losing the original data.

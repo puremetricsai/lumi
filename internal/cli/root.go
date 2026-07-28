@@ -14,11 +14,10 @@ import (
 	"syscall"
 	"text/tabwriter"
 	"time"
+	"unicode/utf8"
 
 	"github.com/puremetricsai/lumi/internal/capture"
-	"github.com/puremetricsai/lumi/internal/cerebras"
 	"github.com/puremetricsai/lumi/internal/config"
-	"github.com/puremetricsai/lumi/internal/llamacpp"
 	"github.com/puremetricsai/lumi/internal/macosnative"
 	"github.com/puremetricsai/lumi/internal/platform"
 	"github.com/puremetricsai/lumi/internal/retention"
@@ -28,61 +27,8 @@ import (
 
 const version = "0.1.0-dev"
 
-// answerer is the inference backend used by `ask`. It exists so tests can
-// exercise the command without a network call; production always uses
-// cerebras.Client.
-type answerer interface {
-	Answer(ctx context.Context, question, activityContext string) (string, error)
-}
-
 type app struct {
 	dataDir string
-	// newAnswerer is overridden in tests. Nil means the real Cerebras client.
-	newAnswerer func(model string) answerer
-}
-
-func (a *app) answerer(ctx context.Context, model string, notes io.Writer) (answerer, error) {
-	if a.newAnswerer != nil {
-		return a.newAnswerer(model), nil
-	}
-	paths, err := a.paths()
-	if err != nil {
-		return nil, err
-	}
-	cfg, err := config.LoadConfig(paths.Config)
-	if err != nil {
-		return nil, err
-	}
-	switch cfg.ResolvedProvider() {
-	case config.ProviderLlamaCpp:
-		if _, ok := llamacpp.Installed(); !ok {
-			return nil, fmt.Errorf("provider is llama.cpp but llama-server is not on PATH; install llama.cpp (brew install llama.cpp) — https://github.com/ggml-org/llama.cpp")
-		}
-		baseURL := cfg.ResolvedLlamaBaseURL()
-		if err := llamacpp.EnsureRunning(ctx, llamacpp.Options{
-			BaseURL:   baseURL,
-			Model:     model,
-			LogPath:   paths.LlamaLog,
-			StatePath: paths.LlamaState,
-		}, notes); err != nil {
-			return nil, err
-		}
-		return llamacpp.Client{BaseURL: baseURL, Model: model}, nil
-	default:
-		if strings.TrimSpace(cfg.CerebrasAPIKey) == "" {
-			return nil, errors.New("no Cerebras API key configured; run `lumi configure`")
-		}
-		return cerebras.Client{APIKey: cfg.CerebrasAPIKey, Model: model}, nil
-	}
-}
-
-// loadConfig reads the persisted config from the resolved data directory.
-func (a *app) loadConfig() (config.Config, error) {
-	paths, err := a.paths()
-	if err != nil {
-		return config.Config{}, err
-	}
-	return config.LoadConfig(paths.Config)
 }
 
 func Execute() error {
@@ -103,9 +49,8 @@ func newRootCommand() *cobra.Command {
 		},
 	}
 	cmd.PersistentFlags().StringVar(&a.dataDir, "data-dir", "", "data directory (default: $LUMI_HOME or ~/Library/Application Support/Lumi)")
-	cmd.AddCommand(a.recordCommand(), a.searchCommand(), a.askCommand(), a.pruneCommand(),
-		a.doctorCommand(), a.permissionsCommand(), a.nativeSmokeCommand(), a.configureCommand(),
-		a.llamaCommand())
+	cmd.AddCommand(a.recordCommand(), a.searchCommand(), a.pruneCommand(),
+		a.doctorCommand(), a.permissionsCommand(), a.nativeSmokeCommand())
 	cmd.AddCommand(&cobra.Command{Use: "version", Short: "Print the Lumi version", Run: func(*cobra.Command, []string) {
 		fmt.Fprintln(os.Stdout, version)
 	}})
@@ -253,133 +198,6 @@ func (a *app) searchCommand() *cobra.Command {
 	return cmd
 }
 
-func (a *app) askCommand() *cobra.Command {
-	var since, model, app, window, kind string
-	var limit, maxContextChars int
-	cmd := &cobra.Command{
-		Use:   "ask <question>",
-		Short: "Answer a question from local activity using the configured inference provider",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			s, _, err := a.openStore(cmd.Context())
-			if err != nil {
-				return err
-			}
-			defer s.Close()
-			opts, err := searchOptions("", kind, since, "", app, window, limit)
-			if err != nil {
-				return err
-			}
-			// A recognized time expression ("around 9:15 pm") sets the window and is
-			// stripped from the question, unless --since was set explicitly.
-			question := args[0]
-			windowDir := dirCentered
-			explicitWindow := cmd.Flags().Changed("since")
-			if !cmd.Flags().Changed("since") {
-				if winSince, winUntil, rest, dir, ok := parseTimeWindow(question, time.Now()); ok {
-					opts.Since, opts.Until = winSince, winUntil
-					question = rest
-					windowDir = dir
-					explicitWindow = true
-					fmt.Fprintf(cmd.ErrOrStderr(), "note: interpreting the time in your question as %s\n",
-						describeTimeWindow(*winSince, *winUntil, dir))
-				}
-			}
-			// An explicit --type (including "all") overrides the question's
-			// inferred modality; only an omitted flag lets ask infer the corpus.
-			inferModality := !cmd.Flags().Changed("type")
-			got, err := retrieveContext(cmd.Context(), s, question, opts, inferModality)
-			if err != nil {
-				return err
-			}
-			events, stage := got.events, got.stage
-			if len(events) == 0 {
-				// Report every criterion that could have emptied the result, not
-				// just the time window: an --app/--window filter can hide activity
-				// that does exist in the window, and blaming the window alone is a
-				// false diagnosis.
-				var criteria []string
-				// A derived audio corpus can now legitimately empty the result
-				// (a mic question when every chunk was saved without a
-				// transcript). Name it so the diagnosis is not misattributed to
-				// the time window, and so the answer never silently widens to
-				// screens the user did not ask about.
-				if got.derivedKind {
-					criteria = append(criteria, fmt.Sprintf("%s recordings with a transcript", got.kind))
-				}
-				if explicitWindow && opts.Since != nil {
-					until := time.Now()
-					if opts.Until != nil {
-						until = *opts.Until
-					}
-					criteria = append(criteria, "the time window "+describeTimeWindow(*opts.Since, until, windowDir))
-				}
-				if app != "" {
-					criteria = append(criteria, fmt.Sprintf("app %q", app))
-				}
-				if window != "" {
-					criteria = append(criteria, fmt.Sprintf("window text %q", window))
-				}
-				if kind != "" && kind != "all" {
-					criteria = append(criteria, fmt.Sprintf("content type %q", kind))
-				}
-				if len(criteria) > 0 {
-					return fmt.Errorf("no activity matched %s", strings.Join(criteria, " and "))
-				}
-				return errors.New("no local activity has been indexed yet")
-			}
-			// Never narrow or degrade a retrieval silently: the user has to be
-			// able to tell a targeted answer from a broadened or fallback one.
-			if got.derivedKind {
-				fmt.Fprintf(cmd.ErrOrStderr(),
-					"note: reading your question as being about %s recordings; pass --type all to search everything\n", got.kind)
-			}
-			if got.widened {
-				fmt.Fprintln(cmd.ErrOrStderr(),
-					"note: nothing matched as a recording question, so all activity was searched")
-			}
-			switch stage {
-			case stageRecent:
-				fmt.Fprintf(cmd.ErrOrStderr(), "note: broad question; reviewing the %d most recent events\n", len(events))
-			case stageRecentUnmatched:
-				fmt.Fprintf(cmd.ErrOrStderr(), "note: no events matched the question terms; reviewing the %d most recent events instead\n", len(events))
-			}
-			// Resolve the model: an explicit --model flag beats the configured
-			// model, which beats the built-in default. The configured default is
-			// provider-specific (llama.cpp has no built-in default model).
-			if !cmd.Flags().Changed("model") {
-				cfg, err := a.loadConfig()
-				if err != nil {
-					return err
-				}
-				if cfg.ResolvedProvider() == config.ProviderLlamaCpp {
-					model = cfg.ResolvedLlamaModel()
-				} else {
-					model = cfg.ResolvedModel()
-				}
-			}
-			ans, err := a.answerer(cmd.Context(), model, cmd.ErrOrStderr())
-			if err != nil {
-				return err
-			}
-			answer, err := ans.Answer(cmd.Context(), args[0], contextFor(events, maxContextChars))
-			if err != nil {
-				return err
-			}
-			fmt.Fprintln(cmd.OutOrStdout(), answer)
-			return nil
-		},
-	}
-	cmd.Flags().StringVar(&since, "since", "24h", "activity window (RFC3339 or duration)")
-	cmd.Flags().StringVar(&kind, "type", "", "content type: all, screen, or audio (default: inferred from the question)")
-	cmd.Flags().StringVar(&app, "app", "", "restrict activity to this application")
-	cmd.Flags().StringVar(&window, "window", "", "restrict activity to windows whose title contains this text")
-	cmd.Flags().IntVar(&limit, "limit", 50, "maximum activity records sent to the model")
-	cmd.Flags().StringVar(&model, "model", "", "inference model; overrides the configured default (run `lumi configure`)")
-	cmd.Flags().IntVar(&maxContextChars, "max-context-chars", defaultContextChars, "character budget for the activity context sent to the model")
-	return cmd
-}
-
 func (a *app) pruneCommand() *cobra.Command {
 	var olderThan string
 	var maxBytes int64
@@ -473,7 +291,7 @@ func (a *app) doctorCommand() *cobra.Command {
 	var speechLocale string
 	cmd := &cobra.Command{
 		Use:   "doctor",
-		Short: "Check platform, capture tools, models, and API configuration",
+		Short: "Check platform, capture permissions, speech assets, and the data directory",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			paths, err := a.paths()
 			if err != nil {
@@ -514,36 +332,6 @@ func (a *app) doctorCommand() *cobra.Command {
 			} else {
 				fmt.Fprintf(os.Stdout, "speech assets (%s)\tmissing\tlocale assets not installed; `./lumi record` downloads them at startup\n", speechLocale)
 				missing = true
-			}
-			cfg, cfgErr := config.LoadConfig(paths.Config)
-			if cfgErr != nil {
-				fmt.Fprintf(os.Stdout, "inference config\tmissing\t%v\n", cfgErr)
-			} else if cfg.ResolvedProvider() == config.ProviderLlamaCpp {
-				fmt.Fprintln(os.Stdout, "inference provider\tok\tllama.cpp")
-				if path, ok := llamacpp.Installed(); ok {
-					fmt.Fprintf(os.Stdout, "llama-server binary\tok\t%s\n", path)
-				} else {
-					fmt.Fprintln(os.Stdout, "llama-server binary\tmissing\tnot on PATH; install llama.cpp (brew install llama.cpp)")
-				}
-				if model := cfg.ResolvedLlamaModel(); model != "" {
-					fmt.Fprintf(os.Stdout, "llama.cpp model\tok\t%s\n", model)
-				} else {
-					fmt.Fprintln(os.Stdout, "llama.cpp model\tmissing\trun `lumi configure` to set a GGUF path or HuggingFace repo")
-				}
-				baseURL := cfg.ResolvedLlamaBaseURL()
-				if llamacpp.Healthy(cmd.Context(), baseURL) {
-					fmt.Fprintf(os.Stdout, "llama-server health\tok\treachable at %s\n", baseURL)
-				} else {
-					fmt.Fprintf(os.Stdout, "llama-server health\tinfo\tnot running at %s; `lumi ask` will launch it\n", baseURL)
-				}
-			} else {
-				fmt.Fprintln(os.Stdout, "inference provider\tok\tcerebras")
-				if strings.TrimSpace(cfg.CerebrasAPIKey) == "" {
-					fmt.Fprintln(os.Stdout, "Cerebras API key\toptional\trun `lumi configure` to use lumi ask")
-				} else {
-					fmt.Fprintln(os.Stdout, "Cerebras API key\tok\tconfigured")
-				}
-				fmt.Fprintf(os.Stdout, "Cerebras model\tok\t%s\n", cfg.ResolvedModel())
 			}
 			fmt.Fprintf(os.Stdout, "data directory\tok\t%s\n", paths.Root)
 			if missing {
@@ -707,6 +495,35 @@ func parseTime(value string, allowDuration bool) (*time.Time, error) {
 		}
 	}
 	return nil, fmt.Errorf("%q is not RFC3339%s", value, map[bool]string{true: " or a duration", false: ""}[allowDuration])
+}
+
+const ellipsis = "…"
+
+// truncateRunes limits s to max bytes without ever splitting a rune,
+// appending an ellipsis when it had to cut.
+func truncateRunes(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	if len(s) <= max {
+		return s
+	}
+	limit := max - len(ellipsis)
+	if limit <= 0 {
+		// No room for the marker; return whole runes only.
+		return trimToRunes(s, max)
+	}
+	return trimToRunes(s, limit) + ellipsis
+}
+
+func trimToRunes(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	for max > 0 && !utf8.RuneStart(s[max]) {
+		max--
+	}
+	return s[:max]
 }
 
 func printEvents(events []store.Event) {

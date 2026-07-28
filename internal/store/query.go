@@ -17,6 +17,9 @@ const (
 	// MatchAny requires only one term, letting bm25 rank events by how many
 	// (and how rare) the terms they matched are. This is what makes
 	// natural-language questions retrievable; see ftsExpression.
+	//
+	// It has no caller until `lumi mcp` exposes it as a tool parameter; it is
+	// retained deliberately rather than left over. See CLAUDE.md.
 	MatchAny
 )
 

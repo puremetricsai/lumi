@@ -94,7 +94,7 @@ func (c *FrameComparer) maxSilence() time.Duration {
 // exactSilence bounds how long a display may go unrecorded while its frames are
 // byte-identical. Identical bytes carry no new information, so re-indexing them
 // on the near-duplicate deadline is pure waste; the longer deadline still leaves
-// a periodic presence marker for `lumi ask`. It never falls below MaxSilence, so
+// a periodic presence marker for later queries. It never falls below MaxSilence, so
 // an unchanged frame is never retained more eagerly than a changed one.
 func (c *FrameComparer) exactSilence() time.Duration {
 	silence := c.ExactSilence

@@ -145,8 +145,8 @@ func (r *Recorder) captureScreen(ctx context.Context) {
 			axText = screenContext.Text
 		}
 		// If Vision produced no usable text, fall back to indexing the substantive
-		// Accessibility text so the event stays searchable: events_fts and ask read
-		// Event.Text, not metadata. Otherwise keep the AX text as supplementary
+		// Accessibility text so the event stays searchable: events_fts and search
+		// read Event.Text, not metadata. Otherwise keep the AX text as supplementary
 		// provenance in metadata alongside the full-screen OCR body.
 		axMetadata := axText
 		if strings.TrimSpace(text) == "" && axText != "" {
