@@ -134,7 +134,7 @@ tasks:
       - rm -f {{.BINARY}} coverage.out internal/macosnative/liblumispeech.a
 
   doctor:
-    desc: Report native permissions, models, binaries, and API configuration
+    desc: Report native permissions and speech assets
     deps: [build]
     cmds:
       - ./{{.BINARY}} doctor

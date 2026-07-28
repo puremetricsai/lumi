@@ -18,7 +18,6 @@ import (
 
 	"github.com/puremetricsai/lumi/internal/capture"
 	"github.com/puremetricsai/lumi/internal/config"
-	"github.com/puremetricsai/lumi/internal/llamacpp"
 	"github.com/puremetricsai/lumi/internal/macosnative"
 	"github.com/puremetricsai/lumi/internal/platform"
 	"github.com/puremetricsai/lumi/internal/retention"
@@ -51,8 +50,7 @@ func newRootCommand() *cobra.Command {
 	}
 	cmd.PersistentFlags().StringVar(&a.dataDir, "data-dir", "", "data directory (default: $LUMI_HOME or ~/Library/Application Support/Lumi)")
 	cmd.AddCommand(a.recordCommand(), a.searchCommand(), a.pruneCommand(),
-		a.doctorCommand(), a.permissionsCommand(), a.nativeSmokeCommand(), a.configureCommand(),
-		a.llamaCommand())
+		a.doctorCommand(), a.permissionsCommand(), a.nativeSmokeCommand())
 	cmd.AddCommand(&cobra.Command{Use: "version", Short: "Print the Lumi version", Run: func(*cobra.Command, []string) {
 		fmt.Fprintln(os.Stdout, version)
 	}})
@@ -293,7 +291,7 @@ func (a *app) doctorCommand() *cobra.Command {
 	var speechLocale string
 	cmd := &cobra.Command{
 		Use:   "doctor",
-		Short: "Check platform, capture tools, models, and API configuration",
+		Short: "Check platform, capture permissions, and speech assets",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			paths, err := a.paths()
 			if err != nil {
@@ -334,36 +332,6 @@ func (a *app) doctorCommand() *cobra.Command {
 			} else {
 				fmt.Fprintf(os.Stdout, "speech assets (%s)\tmissing\tlocale assets not installed; `./lumi record` downloads them at startup\n", speechLocale)
 				missing = true
-			}
-			cfg, cfgErr := config.LoadConfig(paths.Config)
-			if cfgErr != nil {
-				fmt.Fprintf(os.Stdout, "inference config\tmissing\t%v\n", cfgErr)
-			} else if cfg.ResolvedProvider() == config.ProviderLlamaCpp {
-				fmt.Fprintln(os.Stdout, "inference provider\tok\tllama.cpp")
-				if path, ok := llamacpp.Installed(); ok {
-					fmt.Fprintf(os.Stdout, "llama-server binary\tok\t%s\n", path)
-				} else {
-					fmt.Fprintln(os.Stdout, "llama-server binary\tmissing\tnot on PATH; install llama.cpp (brew install llama.cpp)")
-				}
-				if model := cfg.ResolvedLlamaModel(); model != "" {
-					fmt.Fprintf(os.Stdout, "llama.cpp model\tok\t%s\n", model)
-				} else {
-					fmt.Fprintln(os.Stdout, "llama.cpp model\tmissing\trun `lumi configure` to set a GGUF path or HuggingFace repo")
-				}
-				baseURL := cfg.ResolvedLlamaBaseURL()
-				if llamacpp.Healthy(cmd.Context(), baseURL) {
-					fmt.Fprintf(os.Stdout, "llama-server health\tok\treachable at %s\n", baseURL)
-				} else {
-					fmt.Fprintf(os.Stdout, "llama-server health\tinfo\tnot running at %s; `lumi ask` will launch it\n", baseURL)
-				}
-			} else {
-				fmt.Fprintln(os.Stdout, "inference provider\tok\tcerebras")
-				if strings.TrimSpace(cfg.CerebrasAPIKey) == "" {
-					fmt.Fprintln(os.Stdout, "Cerebras API key\toptional\trun `lumi configure` to use lumi ask")
-				} else {
-					fmt.Fprintln(os.Stdout, "Cerebras API key\tok\tconfigured")
-				}
-				fmt.Fprintf(os.Stdout, "Cerebras model\tok\t%s\n", cfg.ResolvedModel())
 			}
 			fmt.Fprintf(os.Stdout, "data directory\tok\t%s\n", paths.Root)
 			if missing {
