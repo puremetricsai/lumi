@@ -432,3 +432,22 @@ func TestEventByIDUnknownIDIsNotFound(t *testing.T) {
 		t.Fatalf("error %q does not name the missing id", err)
 	}
 }
+
+func TestHasEventsReportsWhetherTheIndexHoldsAnything(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	has, err := s.HasEvents(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if has {
+		t.Fatal("a fresh index reported that it holds events")
+	}
+	insertAll(t, ctx, s, Event{Kind: KindScreen, Text: "hello", CapturedAt: time.Now().UTC()})
+	if has, err = s.HasEvents(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !has {
+		t.Fatal("an index holding one event reported that it is empty")
+	}
+}

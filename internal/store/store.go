@@ -54,6 +54,17 @@ type SearchOptions struct {
 	RequireText bool
 }
 
+const (
+	// DefaultSearchLimit is the page Search returns when a caller asks for no
+	// particular limit. `lumi search`'s --limit default and `lumi mcp`'s limit
+	// parameter both derive from it rather than restating the number.
+	DefaultSearchLimit = 20
+	// MaxSearchLimit is the ceiling Search clamps to. Callers that document a
+	// cap to their users (the MCP tool schema does) must read it from here, or
+	// the documented contract silently stops matching the clamp.
+	MaxSearchLimit = 500
+)
+
 type Store struct {
 	db *sql.DB
 }
@@ -126,10 +137,10 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, event.Kind, event.CapturedAt.UTC().Fo
 
 func (s *Store) Search(ctx context.Context, opts SearchOptions) ([]Event, error) {
 	if opts.Limit <= 0 {
-		opts.Limit = 20
+		opts.Limit = DefaultSearchLimit
 	}
-	if opts.Limit > 500 {
-		opts.Limit = 500
+	if opts.Limit > MaxSearchLimit {
+		opts.Limit = MaxSearchLimit
 	}
 	where := make([]string, 0, 4)
 	args := make([]any, 0, 5)
@@ -148,9 +159,9 @@ func (s *Store) Search(ctx context.Context, opts SearchOptions) ([]Event, error)
 		// let stray window titles outrank substantive content. Weights are
 		// applied only here so `search` ranking is unchanged.
 		//
-		// Nothing selects MatchAny today; the weighted branch is retained for
-		// `lumi mcp` and pinned by TestSearchMatchAnyWeightsBodyTextOverAppAndWindow.
-		// See CLAUDE.md.
+		// MatchAny's only caller is `lumi mcp`, which exposes it as the
+		// `match: "any"` tool parameter; the weighting is pinned by
+		// TestSearchMatchAnyWeightsBodyTextOverAppAndWindow. See CLAUDE.md.
 		if opts.Match == MatchAny {
 			rank = "bm25(events_fts, 1.0, 0.4, 0.4)"
 		} else {
@@ -222,12 +233,16 @@ e.media_path, e.duration_ms, e.text_source, e.display_id, e.audio_source, e.meta
 	return events, nil
 }
 
+// eventSelect is the column list every queryEvents caller must select, in the
+// order queryEvents scans them. Keeping it in one place means a new column is a
+// single edit rather than four that fail at runtime if one is missed.
+const eventSelect = `SELECT id, kind, captured_at, text, app, window, media_path, duration_ms,
+text_source, display_id, audio_source, metadata_json FROM events`
+
 // Expired returns events captured strictly before the cutoff, oldest first.
 // A limit of zero or less means no limit.
 func (s *Store) Expired(ctx context.Context, before time.Time, limit int) ([]Event, error) {
-	query := `SELECT id, kind, captured_at, text, app, window, media_path, duration_ms,
-text_source, display_id, audio_source, metadata_json
-FROM events WHERE captured_at < ? ORDER BY captured_at ASC`
+	query := eventSelect + ` WHERE captured_at < ? ORDER BY captured_at ASC`
 	args := []any{before.UTC().Format(time.RFC3339Nano)}
 	if limit > 0 {
 		query += " LIMIT ?"
@@ -241,10 +256,20 @@ FROM events WHERE captured_at < ? ORDER BY captured_at ASC`
 // silently skip a row timestamped at or past the cutoff (e.g. a far-future
 // captured_at). Callers own deleting the returned rows and their media.
 func (s *Store) AllEvents(ctx context.Context) ([]Event, error) {
-	query := `SELECT id, kind, captured_at, text, app, window, media_path, duration_ms,
-text_source, display_id, audio_source, metadata_json
-FROM events ORDER BY captured_at ASC`
-	return s.queryEvents(ctx, query)
+	return s.queryEvents(ctx, eventSelect+` ORDER BY captured_at ASC`)
+}
+
+// HasEvents reports whether the index holds any event at all. It answers the
+// question with EXISTS rather than a one-row Search so callers that only need
+// the boolean do not materialize an event — a screen row carries a full page of
+// OCR text and its metadata blob.
+func (s *Store) HasEvents(ctx context.Context) (bool, error) {
+	var exists int
+	err := s.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM events)").Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check for stored events: %w", err)
+	}
+	return exists != 0, nil
 }
 
 // ErrEventNotFound reports that no stored event carries the requested id.
@@ -255,9 +280,7 @@ var ErrEventNotFound = errors.New("event not found")
 // event, so `lumi mcp`'s get_event can name the id in a tool error instead of
 // returning an empty result an agent would read as "no content".
 func (s *Store) EventByID(ctx context.Context, id int64) (*Event, error) {
-	events, err := s.queryEvents(ctx, `SELECT id, kind, captured_at, text, app, window, media_path, duration_ms,
-text_source, display_id, audio_source, metadata_json
-FROM events WHERE id = ?`, id)
+	events, err := s.queryEvents(ctx, eventSelect+` WHERE id = ?`, id)
 	if err != nil {
 		return nil, err
 	}

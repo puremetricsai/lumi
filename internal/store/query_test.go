@@ -297,3 +297,22 @@ func TestListAttributionAppliesTimeRangeAndLimit(t *testing.T) {
 		t.Fatalf("until must keep only the old app, got %#v", got)
 	}
 }
+
+func TestHasSearchableTermsTracksTheExpressionBuilder(t *testing.T) {
+	for _, tc := range []struct {
+		query string
+		want  bool
+	}{
+		{"meeting notes", true},
+		{"lumi2", true},
+		{"", false},
+		{"   ", false},
+		{"!!! ??? ...", false},
+		{"🎉", false},
+		{"!!! notes", true},
+	} {
+		if got := HasSearchableTerms(tc.query); got != tc.want {
+			t.Errorf("HasSearchableTerms(%q) = %v, want %v", tc.query, got, tc.want)
+		}
+	}
+}

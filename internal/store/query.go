@@ -63,6 +63,18 @@ func joinTerms(input, operator string) string {
 	return strings.Join(quoted, operator)
 }
 
+// HasSearchableTerms reports whether query still yields a MATCH expression once
+// FTS5's drop rule is applied. It is derived from ftsExpression rather than
+// restating the rule, so a caller that must distinguish "no query" from "a query
+// that tokenizes to nothing" cannot drift out of step with joinTerms.
+//
+// Its caller is `lumi mcp`: when a query survives TrimSpace but empties the
+// expression, Search runs no MATCH clause at all and returns the most recent
+// events, which an agent cannot tell apart from real hits.
+func HasSearchableTerms(query string) bool {
+	return ftsExpression(query, MatchAll) != ""
+}
+
 func hasAlphanumeric(s string) bool {
 	for _, r := range s {
 		if unicode.IsLetter(r) || unicode.IsDigit(r) {
@@ -104,11 +116,11 @@ type AttributionOptions struct {
 // dropped: audio chunks and screens Accessibility could not attribute are real
 // captured activity, and a gap in attribution is itself information.
 func (s *Store) ListAttribution(ctx context.Context, opts AttributionOptions) ([]Attribution, error) {
-	group, tiebreak := "app", "app"
+	group := "app"
 	where := make([]string, 0, 3)
 	args := make([]any, 0, 4)
 	if opts.App != nil {
-		group, tiebreak = "window", "window"
+		group = "window"
 		where = append(where, "app = ? COLLATE NOCASE")
 		args = append(args, *opts.App)
 	}
@@ -124,7 +136,7 @@ func (s *Store) ListAttribution(ctx context.Context, opts AttributionOptions) ([
 	if len(where) > 0 {
 		query += " WHERE " + strings.Join(where, " AND ")
 	}
-	query += " GROUP BY " + group + " ORDER BY events DESC, " + tiebreak + " ASC"
+	query += " GROUP BY " + group + " ORDER BY events DESC, " + group + " ASC"
 	if opts.Limit > 0 {
 		query += " LIMIT ?"
 		args = append(args, opts.Limit)
