@@ -246,6 +246,26 @@ FROM events ORDER BY captured_at ASC`
 	return s.queryEvents(ctx, query)
 }
 
+// ErrEventNotFound reports that no stored event carries the requested id.
+var ErrEventNotFound = errors.New("event not found")
+
+// EventByID returns a single event by id, with its full untruncated text and
+// metadata. A missing id is reported as ErrEventNotFound rather than a nil
+// event, so `lumi mcp`'s get_event can name the id in a tool error instead of
+// returning an empty result an agent would read as "no content".
+func (s *Store) EventByID(ctx context.Context, id int64) (*Event, error) {
+	events, err := s.queryEvents(ctx, `SELECT id, kind, captured_at, text, app, window, media_path, duration_ms,
+text_source, display_id, audio_source, metadata_json
+FROM events WHERE id = ?`, id)
+	if err != nil {
+		return nil, err
+	}
+	if len(events) == 0 {
+		return nil, fmt.Errorf("event %d: %w", id, ErrEventNotFound)
+	}
+	return &events[0], nil
+}
+
 // queryEvents runs a SELECT with the standard event column list and scans the
 // rows into Events.
 func (s *Store) queryEvents(ctx context.Context, query string, args ...any) ([]Event, error) {

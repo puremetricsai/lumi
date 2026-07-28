@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -367,5 +369,66 @@ func TestSearchRequireTextDropsEmptyAndBlankText(t *testing.T) {
 	}
 	if len(got) != 3 {
 		t.Fatalf("RequireText must be opt-in; unfiltered search returned %d events, want 3", len(got))
+	}
+}
+
+func TestEventByIDReturnsTheStoredEvent(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	event := Event{
+		Kind:       KindScreen,
+		CapturedAt: time.Now().UTC().Truncate(time.Second),
+		Text:       "Quarterly roadmap review",
+		App:        "Safari",
+		Window:     "Quarterly plan",
+		MediaPath:  "/tmp/a.jpg",
+		TextSource: "vision",
+		DisplayID:  1,
+		Metadata:   []byte(`{"ocr_ms":42}`),
+	}
+	if err := s.Insert(ctx, &event); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.EventByID(ctx, event.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != event.ID || got.Text != event.Text || got.App != event.App {
+		t.Fatalf("unexpected event: %#v", got)
+	}
+	if string(got.Metadata) != `{"ocr_ms":42}` {
+		t.Fatalf("metadata was not preserved: %s", got.Metadata)
+	}
+	if !got.CapturedAt.Equal(event.CapturedAt) {
+		t.Fatalf("captured_at = %s, want %s", got.CapturedAt, event.CapturedAt)
+	}
+}
+
+// TestEventByIDUnknownIDIsNotFound pins the sentinel: `lumi mcp`'s get_event
+// has to tell an agent "no such id" rather than return an empty result, and it
+// distinguishes that from a real query failure with errors.Is.
+func TestEventByIDUnknownIDIsNotFound(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	got, err := s.EventByID(ctx, 4711)
+	if got != nil {
+		t.Fatalf("expected no event, got %#v", got)
+	}
+	if !errors.Is(err, ErrEventNotFound) {
+		t.Fatalf("error = %v, want ErrEventNotFound", err)
+	}
+	if !strings.Contains(err.Error(), "4711") {
+		t.Fatalf("error %q does not name the missing id", err)
 	}
 }
