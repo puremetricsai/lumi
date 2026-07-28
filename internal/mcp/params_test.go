@@ -1,6 +1,8 @@
 package mcp
 
 import (
+	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -145,5 +147,21 @@ func TestTruncateText(t *testing.T) {
 				t.Fatalf("truncation broke UTF-8: %q", out)
 			}
 		})
+	}
+}
+
+// TestSearchLimitDescriptionMatchesStoreBounds guards the one place where the
+// agent-facing contract is a literal rather than a constant: the limit
+// parameter's jsonschema tag names the default and cap that store.Search
+// actually enforces, and a struct tag cannot interpolate them.
+func TestSearchLimitDescriptionMatchesStoreBounds(t *testing.T) {
+	field, ok := reflect.TypeOf(searchEventsInput{}).FieldByName("Limit")
+	if !ok {
+		t.Fatal("searchEventsInput has no Limit field")
+	}
+	description := field.Tag.Get("jsonschema")
+	want := fmt.Sprintf("defaults to %d and is capped at %d", store.DefaultSearchLimit, store.MaxSearchLimit)
+	if !strings.Contains(description, want) {
+		t.Fatalf("limit description %q does not state %q", description, want)
 	}
 }

@@ -187,7 +187,7 @@ func TestSearchEventsTruncation(t *testing.T) {
 // while text_length stayed present — exactly the ambiguity the pair exists to
 // remove.
 func TestEventRecordAlwaysSerializesTruncated(t *testing.T) {
-	encoded, err := json.Marshal(newEventRecord(store.Event{Kind: store.KindScreen, Text: "short"}, 600, false))
+	encoded, err := json.Marshal(newEventRecord(store.Event{Kind: store.KindScreen, Text: "short"}, 600))
 	if err != nil {
 		t.Fatal(err)
 	}

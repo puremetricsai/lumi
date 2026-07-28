@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"strings"
 	"time"
-	"unicode"
 	"unicode/utf8"
 
 	"github.com/puremetricsai/lumi/internal/store"
@@ -68,20 +67,18 @@ func parseMatch(value string) (store.MatchMode, error) {
 	return store.MatchAll, fmt.Errorf(`match must be "all" or "any"; got %q`, value)
 }
 
-// hasSearchableTerm reports whether query contains at least one letter or
-// digit. internal/store's ftsExpression silently drops every term that has
-// none (punctuation, emoji, whitespace), and if that empties the expression
-// entirely, store.Search runs no MATCH clause at all — it just returns the
-// most recent events, indistinguishable from real hits. This mirrors the
-// store's unexported hasAlphanumeric rather than importing it, so the check
-// stays at the MCP boundary where the tool-error decision belongs.
-func hasSearchableTerm(query string) bool {
-	for _, r := range query {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
-			return true
-		}
+// clampLimit resolves a caller-supplied page size: zero or less takes the
+// default, anything above the ceiling is capped. Handlers must clamp before
+// calling the store so the value they report back in a "capped at N" notice is
+// the limit that was actually applied.
+func clampLimit(limit, fallback, max int) int {
+	if limit <= 0 {
+		return fallback
 	}
-	return false
+	if limit > max {
+		return max
+	}
+	return limit
 }
 
 // truncateText caps text at maxChars runes, reporting whether it cut and the
@@ -97,12 +94,5 @@ func truncateText(text string, maxChars int) (string, bool, int) {
 	if maxChars <= 0 || length <= maxChars {
 		return text, false, length
 	}
-	kept := 0
-	for offset := range text {
-		if kept == maxChars {
-			return text[:offset], true, length
-		}
-		kept++
-	}
-	return text, false, length
+	return string([]rune(text)[:maxChars]), true, length
 }

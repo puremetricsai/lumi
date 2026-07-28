@@ -129,7 +129,6 @@ func TestServeWritesOnlyJSONRPCFramesToStdout(t *testing.T) {
 		t.Fatal("Serve did not return after stdin closed")
 	}
 	stdoutWriter.Close()
-	os.Stdout = originalOut
 
 	// Drain and validate anything written after the tools/call response
 	// (there should be none, but the scanner goroutine is still checking).
