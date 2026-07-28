@@ -1,13 +1,13 @@
 # Lumi
 
-Lumi is an open-source, local-first work memory for Apple Silicon Macs. It continuously captures every display plus system and microphone audio, extracts screen text with full-display Apple Vision OCR (using macOS Accessibility for focused-app attribution), transcribes speech on-device with Apple SpeechAnalyzer, stores the media on disk, indexes the text in SQLite FTS5, and lets you search and manage it from a Go CLI. Agent access is coming via `lumi mcp`, an MCP server that exposes the same index to the AI agent of your choice.
+Lumi is an open-source, local-first work memory for Apple Silicon Macs. It continuously captures every display plus system and microphone audio, extracts screen text with full-display Apple Vision OCR (using macOS Accessibility for focused-app attribution), transcribes speech on-device with Apple SpeechAnalyzer, stores the media on disk, indexes the text in SQLite FTS5, and lets you search and manage it from a Go CLI. `lumi mcp` exposes the same index to the AI agent of your choice over MCP.
 
 Lumi deliberately targets a small surface: capture → process → store → query, with no GUI, server, or plugins.
 
 ## Requirements
 
 - Apple Silicon Mac running macOS 26 or newer (`darwin/arm64`)
-- Go 1.24 or newer (to build)
+- Go 1.25 or newer (to build)
 - Xcode Command Line Tools and a Swift toolchain (`swiftc` compiles the SpeechAnalyzer bridge into a static archive that cgo links)
 - Screen Recording, Accessibility, Microphone, and Speech Recognition permissions for your terminal or the Lumi binary
 
@@ -68,6 +68,40 @@ Earlier versions also wrote a `config.json` here to hold the provider settings f
 
 Search terms are safely combined with FTS5 `AND`. With no text argument, Lumi returns the most recent events. `--app` is an exact case-insensitive filter; `--window` is a case-insensitive substring filter. Results include timestamps and paths to the original screenshot or WAV chunk. JSON output also preserves screen-text source, display ID, audio source, and processor diagnostics.
 
+## Connect an AI agent
+
+`lumi mcp` serves the index to any MCP-capable agent — Claude Desktop, Claude Code, Cursor, Codex — over stdin/stdout. The agent brings its own model; Lumi does no inference.
+
+```json
+{ "mcpServers": { "lumi": { "command": "lumi", "args": ["mcp"] } } }
+```
+
+If your capture data lives outside the default directory, pass it explicitly — agents launch MCP servers with a bare environment, so `LUMI_HOME` from your shell profile will not reach it:
+
+```json
+{ "mcpServers": { "lumi": { "command": "lumi", "args": ["mcp", "--data-dir", "/Users/you/Lumi"] } } }
+```
+
+Three tools are exposed:
+
+| Tool | Parameters | Returns |
+|---|---|---|
+| `search_events` | `query`, `kind` (`screen`/`audio`), `app`, `window`, `since`, `until`, `limit`, `match` (`all`/`any`), `require_text`, `max_text_chars` — all optional | matching events, ranked by relevance when `query` is set and newest first otherwise, with text capped at 600 characters by default and 20 events per page (500 maximum) |
+| `get_event` | `id` | one event with its full untruncated text and processor metadata |
+| `list_apps` | `app`, `since`, `until`, `limit` — all optional | the applications captured, most active first, or the window titles for one application |
+
+`since` and `until` take an RFC3339 timestamp or a duration such as `2h`. When `search_events` truncates an event's text it says so and reports the true length, so an agent can fetch the rest with `get_event`.
+
+Results also come back with a `notice` when the outcome would otherwise be ambiguous: whether an empty page means the index itself is empty (the notice names the database file, so a mistyped `--data-dir` is obvious) or that the filters simply matched nothing, and whether a full page was capped and more results exist.
+
+**No screenshot or audio ever leaves your machine through this interface.** The tools return text and metadata only. `media_path` is a local path you can open yourself; no tool reads those bytes.
+
+Smoke-test the server without an agent:
+
+```sh
+task mcp
+```
+
 ## Retention
 
 Captured JPEG and WAV files remain on disk until explicitly pruned. Preview an age policy before applying it:
@@ -100,7 +134,7 @@ Lumi does not schedule retention automatically. Run `prune` periodically yoursel
 
 ```text
 ScreenCaptureKit displays ─→ Vision OCR (full screen) ─┐
-                         └─→ Accessibility (attribution) ├─→ events + FTS5 ─→ search
+                         └─→ Accessibility (attribution) ├─→ events + FTS5 ─→ search / mcp
 ScreenCaptureKit system + microphone ─→ WAV ─→ SpeechAnalyzer (in-process) ─┘
 ```
 
@@ -108,6 +142,7 @@ ScreenCaptureKit system + microphone ─→ WAV ─→ SpeechAnalyzer (in-proces
 - `internal/capture`: testable capture orchestration, perceptual deduplication, and transcription
 - `internal/store`: versioned SQLite migrations, FTS5 triggers, inserts, and filtered search
 - `internal/retention`: age-, size-, and wipe-based event/media pruning
+- `internal/mcp`: the read-only MCP tool surface served over stdio
 - `internal/config`: data-directory path resolution
 - `internal/cli`: Cobra commands and lifecycle
 

@@ -168,6 +168,22 @@ tasks:
     cmds:
       - ./{{.BINARY}} search {{.CLI_ARGS}}
 
+  mcp:
+    desc: Hand-feed an MCP handshake to the stdio server as a smoke test
+    deps: [build]
+    cmds:
+      - |
+        { printf '%s\n' \
+          '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"task","version":"0"}}}' \
+          '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+          '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'; \
+          sleep 1; } \
+          | ./{{.BINARY}} mcp
+        # The `sleep 1` holds stdin open after the last request so the server has
+        # time to reply before the pipe closes. Closing stdin immediately ends
+        # the session mid-response; do not remove this to "clean up" the smoke
+        # test or make the server itself tolerate early stdin EOF instead.
+
   version:
     desc: Print the Lumi version
     deps: [build]

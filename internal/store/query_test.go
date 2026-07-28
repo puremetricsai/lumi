@@ -193,3 +193,126 @@ func insertAll(t *testing.T, ctx context.Context, s *Store, events ...Event) {
 		}
 	}
 }
+
+func TestListAttributionGroupsByApp(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	base := time.Now().UTC().Truncate(time.Second)
+	insertAll(t, ctx, s,
+		Event{Kind: KindScreen, CapturedAt: base, App: "Safari", Window: "Plan", Text: "a", MediaPath: "a.jpg"},
+		Event{Kind: KindScreen, CapturedAt: base.Add(time.Minute), App: "Safari", Window: "Docs", Text: "b", MediaPath: "b.jpg"},
+		Event{Kind: KindScreen, CapturedAt: base.Add(2 * time.Minute), App: "Ghostty", Window: "zsh", Text: "c", MediaPath: "c.jpg"},
+		// An audio chunk has no app attribution at all.
+		Event{Kind: KindAudio, CapturedAt: base.Add(3 * time.Minute), Text: "d", MediaPath: "d.wav"},
+	)
+
+	got, err := s.ListAttribution(ctx, AttributionOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("expected Safari, Ghostty and the empty bucket, got %#v", got)
+	}
+	if got[0].App != "Safari" || got[0].Events != 2 {
+		t.Fatalf("expected Safari with 2 events first, got %#v", got[0])
+	}
+	if !got[0].LastSeen.Equal(base.Add(time.Minute)) {
+		t.Fatalf("Safari last_seen = %s, want %s", got[0].LastSeen, base.Add(time.Minute))
+	}
+	// An unattributed row is information, not noise: it must be reported under
+	// an explicit empty app rather than dropped.
+	var sawEmpty bool
+	for _, row := range got {
+		if row.App == "" {
+			sawEmpty = true
+			if row.Events != 1 {
+				t.Fatalf("empty-app bucket = %d events, want 1", row.Events)
+			}
+		}
+	}
+	if !sawEmpty {
+		t.Fatalf("the empty-app bucket was dropped: %#v", got)
+	}
+}
+
+func TestListAttributionGroupsByWindowForOneApp(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	base := time.Now().UTC().Truncate(time.Second)
+	insertAll(t, ctx, s,
+		Event{Kind: KindScreen, CapturedAt: base, App: "Safari", Window: "Plan", Text: "a", MediaPath: "a.jpg"},
+		Event{Kind: KindScreen, CapturedAt: base.Add(time.Minute), App: "Safari", Window: "Plan", Text: "b", MediaPath: "b.jpg"},
+		Event{Kind: KindScreen, CapturedAt: base.Add(2 * time.Minute), App: "Safari", Window: "Docs", Text: "c", MediaPath: "c.jpg"},
+		Event{Kind: KindScreen, CapturedAt: base.Add(3 * time.Minute), App: "Ghostty", Window: "zsh", Text: "d", MediaPath: "d.jpg"},
+	)
+
+	// The app filter matches case-insensitively, exactly like Search's.
+	app := "safari"
+	got, err := s.ListAttribution(ctx, AttributionOptions{App: &app})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected two Safari windows, got %#v", got)
+	}
+	if got[0].Window != "Plan" || got[0].Events != 2 {
+		t.Fatalf("expected Plan with 2 events first, got %#v", got[0])
+	}
+	if got[0].App != "safari" {
+		t.Fatalf("window rows must carry the requested app, got %q", got[0].App)
+	}
+}
+
+func TestListAttributionAppliesTimeRangeAndLimit(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	base := time.Now().UTC().Truncate(time.Second)
+	insertAll(t, ctx, s,
+		Event{Kind: KindScreen, CapturedAt: base.Add(-48 * time.Hour), App: "Old", Text: "a", MediaPath: "a.jpg"},
+		Event{Kind: KindScreen, CapturedAt: base, App: "Safari", Text: "b", MediaPath: "b.jpg"},
+		Event{Kind: KindScreen, CapturedAt: base.Add(time.Minute), App: "Ghostty", Text: "c", MediaPath: "c.jpg"},
+	)
+
+	since := base.Add(-time.Hour)
+	got, err := s.ListAttribution(ctx, AttributionOptions{Since: &since})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("since must exclude the 48h-old app, got %#v", got)
+	}
+	got, err = s.ListAttribution(ctx, AttributionOptions{Since: &since, Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("limit was ignored, got %#v", got)
+	}
+	until := base.Add(-24 * time.Hour)
+	got, err = s.ListAttribution(ctx, AttributionOptions{Until: &until})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].App != "Old" {
+		t.Fatalf("until must keep only the old app, got %#v", got)
+	}
+}
+
+func TestHasSearchableTermsTracksTheExpressionBuilder(t *testing.T) {
+	for _, tc := range []struct {
+		query string
+		want  bool
+	}{
+		{"meeting notes", true},
+		{"lumi2", true},
+		{"", false},
+		{"   ", false},
+		{"!!! ??? ...", false},
+		{"🎉", false},
+		{"!!! notes", true},
+	} {
+		if got := HasSearchableTerms(tc.query); got != tc.want {
+			t.Errorf("HasSearchableTerms(%q) = %v, want %v", tc.query, got, tc.want)
+		}
+	}
+}
