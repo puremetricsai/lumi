@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -358,5 +359,96 @@ func TestListAppsOnAnEmptyStoreSaysSo(t *testing.T) {
 	}
 	if !strings.Contains(out.Notice, "no events") {
 		t.Fatalf("notice = %q, want it to say the index holds no events", out.Notice)
+	}
+}
+
+func TestListAppsLimitDefaults(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	base := time.Now().UTC().Truncate(time.Second)
+
+	// Seed 55 distinct apps: with Limit: 0, the default is 50, so we get 50 back;
+	// with an explicit small limit like 20, we get exactly 20. This distinguishes
+	// the "default" branch from the "honor explicit" branch. The ceiling clamp
+	// (600 → 500) cannot be observed end-to-end without 500+ apps, so it is
+	// documented here but not tested (a regression that dropped or flipped the
+	// ceiling comparison would pass this test because 55 < 500).
+	for i := 1; i <= 55; i++ {
+		insertEvents(t, ctx, s, store.Event{
+			Kind:       store.KindScreen,
+			CapturedAt: base.Add(time.Duration(i) * time.Millisecond),
+			App:        fmt.Sprintf("App%02d", i),
+			Text:       "text",
+			MediaPath:  fmt.Sprintf("/tmp/%d.jpg", i),
+		})
+	}
+	h := &handlers{store: s}
+
+	// Omitted Limit defaults to 50
+	_, out, err := h.listApps(ctx, nil, listAppsInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Entries) != 50 {
+		t.Fatalf("omitted limit should default to 50, got %d entries", len(out.Entries))
+	}
+
+	// Explicit Limit: 0 also defaults to 50
+	_, out, err = h.listApps(ctx, nil, listAppsInput{Limit: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Entries) != 50 {
+		t.Fatalf("limit 0 should default to 50, got %d entries", len(out.Entries))
+	}
+
+	// Explicit small limit is honored exactly
+	_, out, err = h.listApps(ctx, nil, listAppsInput{Limit: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Entries) != 20 {
+		t.Fatalf("explicit limit 20 must be honored exactly, got %d entries", len(out.Entries))
+	}
+}
+
+func TestListAppsEmptyAppFiltersToUnattributedWindows(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	base := time.Now().UTC().Truncate(time.Second)
+
+	// The empty-string app mode is a distinct code path: App: nil lists apps
+	// (grouping by app), while App: pointer-to-"" lists windows within
+	// unattributed events. Without this test, a regression that merged the two
+	// branches or failed to filter by app would go undetected.
+	insertEvents(t, ctx, s,
+		store.Event{Kind: store.KindScreen, CapturedAt: base, App: "", Window: "Terminal", Text: "a", MediaPath: "/tmp/a.jpg"},
+		store.Event{Kind: store.KindScreen, CapturedAt: base.Add(time.Second), App: "", Window: "Editor", Text: "b", MediaPath: "/tmp/b.jpg"},
+		store.Event{Kind: store.KindScreen, CapturedAt: base.Add(2 * time.Second), App: "Safari", Window: "Web", Text: "c", MediaPath: "/tmp/c.jpg"},
+	)
+	h := &handlers{store: s}
+
+	// Query for windows of the empty-app bucket
+	emptyApp := ""
+	_, out, err := h.listApps(ctx, nil, listAppsInput{App: &emptyApp})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Must return exactly the two unattributed windows, not the Safari event
+	if len(out.Entries) != 2 {
+		t.Fatalf("expected 2 unattributed windows, got %d: %#v", len(out.Entries), out.Entries)
+	}
+
+	windows := make(map[string]bool)
+	for _, entry := range out.Entries {
+		if entry.App != "" {
+			t.Fatalf("entries filtered by empty app should have App: \"\", got App: %q", entry.App)
+		}
+		windows[entry.Window] = true
+	}
+
+	if !windows["Terminal"] || !windows["Editor"] {
+		t.Fatalf("expected Terminal and Editor windows, got %#v", windows)
 	}
 }
