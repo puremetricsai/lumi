@@ -3,6 +3,7 @@ module github.com/puremetricsai/lumi
 go 1.25.0
 
 require (
+	github.com/modelcontextprotocol/go-sdk v1.6.1
 	github.com/spf13/cobra v1.10.1
 	modernc.org/sqlite v1.39.1
 )
