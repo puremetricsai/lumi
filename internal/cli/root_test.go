@@ -3,7 +3,10 @@ package cli
 import (
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
+
+	"github.com/puremetricsai/lumi/internal/store"
 )
 
 // TestTruncateRunes covers the helper behind `lumi search`'s human-readable
@@ -45,5 +48,155 @@ func TestTruncateRunes(t *testing.T) {
 	// truncated search row reads as complete text.
 	if got := truncateRunes(strings.Repeat("x", 100), 20); !strings.HasSuffix(got, ellipsis) {
 		t.Fatalf("truncated output lost its ellipsis: %q", got)
+	}
+}
+
+// TestSearchOptions pins the whole flag→store.SearchOptions mapping behind
+// `lumi search`, whose behavior — including `--json` — must not change.
+func TestSearchOptions(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		kind string
+		want store.Kind
+	}{
+		{"empty type means every kind", "", ""},
+		{"all means every kind", "all", ""},
+		{"screen", "screen", store.KindScreen},
+		{"audio", "audio", store.KindAudio},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opts, err := searchOptions("roadmap", tc.kind, "", "", "", "", 0)
+			if err != nil {
+				t.Fatalf("searchOptions(%q) returned %v", tc.kind, err)
+			}
+			if opts.Kind != tc.want {
+				t.Fatalf("Kind = %q, want %q", opts.Kind, tc.want)
+			}
+		})
+	}
+
+	t.Run("invalid type is rejected", func(t *testing.T) {
+		if _, err := searchOptions("", "video", "", "", "", "", 0); err == nil {
+			t.Fatal("an unknown --type must be an error")
+		}
+	})
+
+	t.Run("query, app, window, and limit pass through unchanged", func(t *testing.T) {
+		opts, err := searchOptions("quarterly roadmap", "all", "", "", "Safari", "Quarterly Plan", 7)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if opts.Query != "quarterly roadmap" {
+			t.Errorf("Query = %q", opts.Query)
+		}
+		if opts.App != "Safari" {
+			t.Errorf("App = %q", opts.App)
+		}
+		if opts.Window != "Quarterly Plan" {
+			t.Errorf("Window = %q", opts.Window)
+		}
+		if opts.Limit != 7 {
+			t.Errorf("Limit = %d", opts.Limit)
+		}
+		// No time flags means no window at all, not a zero-valued one.
+		if opts.Since != nil || opts.Until != nil {
+			t.Errorf("Since = %v, Until = %v, want both nil", opts.Since, opts.Until)
+		}
+		// searchOptions never chooses a match mode; MatchAll is the zero value.
+		if opts.Match != store.MatchAll {
+			t.Errorf("Match = %v, want MatchAll", opts.Match)
+		}
+	})
+
+	t.Run("--since accepts RFC3339", func(t *testing.T) {
+		stamp := "2026-07-18T09:00:00-07:00"
+		opts, err := searchOptions("", "", stamp, "", "", "", 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, _ := time.Parse(time.RFC3339, stamp)
+		if opts.Since == nil || !opts.Since.Equal(want) {
+			t.Fatalf("Since = %v, want %v", opts.Since, want)
+		}
+	})
+
+	t.Run("--since accepts a duration", func(t *testing.T) {
+		before := time.Now()
+		opts, err := searchOptions("", "", "8h", "", "", "", 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		after := time.Now()
+		if opts.Since == nil {
+			t.Fatal("Since = nil, want a resolved timestamp")
+		}
+		// A duration is an offset back from now, so it must land in the window
+		// the call itself spanned.
+		if opts.Since.Before(before.Add(-8*time.Hour)) || opts.Since.After(after.Add(-8*time.Hour)) {
+			t.Fatalf("Since = %v, want roughly 8h before now", opts.Since)
+		}
+	})
+
+	t.Run("--until accepts RFC3339", func(t *testing.T) {
+		stamp := "2026-07-18T17:30:00Z"
+		opts, err := searchOptions("", "", "", stamp, "", "", 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, _ := time.Parse(time.RFC3339, stamp)
+		if opts.Until == nil || !opts.Until.Equal(want) {
+			t.Fatalf("Until = %v, want %v", opts.Until, want)
+		}
+	})
+
+	// The asymmetry is deliberate: parseTime is called with allowDuration=false
+	// for --until, so "8h" is an error rather than eight hours ago.
+	t.Run("--until rejects a duration", func(t *testing.T) {
+		if _, err := searchOptions("", "", "", "8h", "", "", 0); err == nil {
+			t.Fatal("--until must not accept a duration")
+		}
+	})
+
+	t.Run("an unparseable time is an error", func(t *testing.T) {
+		if _, err := searchOptions("", "", "yesterday", "", "", "", 0); err == nil {
+			t.Fatal("--since must reject text that is neither RFC3339 nor a duration")
+		}
+	})
+}
+
+// TestParseTime pins the helper directly, including the allowDuration switch
+// that gives --since and --until different vocabularies.
+func TestParseTime(t *testing.T) {
+	stamp := "2026-07-18T09:00:00Z"
+	want, _ := time.Parse(time.RFC3339, stamp)
+	for _, allow := range []bool{true, false} {
+		got, err := parseTime(stamp, allow)
+		if err != nil {
+			t.Fatalf("parseTime(%q, %v) returned %v", stamp, allow, err)
+		}
+		if !got.Equal(want) {
+			t.Fatalf("parseTime(%q, %v) = %v, want %v", stamp, allow, got, want)
+		}
+	}
+
+	if _, err := parseTime("90m", true); err != nil {
+		t.Fatalf("a duration must parse when allowed: %v", err)
+	}
+	_, err := parseTime("90m", false)
+	if err == nil {
+		t.Fatal("a duration must not parse when disallowed")
+	}
+	// The message has to name the accepted vocabulary, since that is the only
+	// hint the user gets about the asymmetry.
+	if !strings.Contains(err.Error(), "RFC3339") {
+		t.Fatalf("error %q does not mention RFC3339", err)
+	}
+	if strings.Contains(err.Error(), "duration") {
+		t.Fatalf("error %q offers a duration that is not accepted", err)
+	}
+	if _, err := parseTime("not a time", true); err == nil {
+		t.Fatal("unparseable text must be an error")
+	} else if !strings.Contains(err.Error(), "duration") {
+		t.Fatalf("error %q should mention that a duration was accepted", err)
 	}
 }
