@@ -45,10 +45,11 @@ type SearchOptions struct {
 	Until  *time.Time
 	Limit  int
 	// RequireText drops events whose extracted text or transcript is empty (or
-	// only whitespace). It exists for `ask`: media saved without a usable
-	// transcript answers no content question, and Lumi records enough silent
-	// audio chunks that they crowd real speech out of a recency pass. It stays
-	// opt-in so `search` and the JSON export still see every stored row.
+	// only whitespace). It has no caller today and is retained for `lumi mcp`:
+	// media saved without a usable transcript answers no content question, and
+	// Lumi records enough silent audio chunks that they crowd real speech out of
+	// a recency pass. It stays opt-in so `search` and the JSON export still see
+	// every stored row. See CLAUDE.md.
 	RequireText bool
 }
 
@@ -145,6 +146,10 @@ func (s *Store) Search(ctx context.Context, opts SearchOptions) ([]Event, error)
 		// of screen text. Under MatchAll that rarely mattered; under MatchAny it would
 		// let stray window titles outrank substantive content. Weights are
 		// applied only here so `search` ranking is unchanged.
+		//
+		// Nothing selects MatchAny today; the weighted branch is retained for
+		// `lumi mcp` and pinned by TestSearchMatchAnyWeightsBodyTextOverAppAndWindow.
+		// See CLAUDE.md.
 		if opts.Match == MatchAny {
 			rank = "bm25(events_fts, 1.0, 0.4, 0.4)"
 		} else {

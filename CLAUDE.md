@@ -11,6 +11,7 @@ A local-first work-memory CLI for Apple Silicon Macs: continuously capture all d
 ```sh
 task build                                  # compiles the Swift bridge (task speech), then go build
 task test                                   # full suite
+task check                                  # fmt → vet → test; the verification command
 task vet
 task speech && go test ./internal/store -run TestSearch -v   # single test (needs the Swift archive)
 task test:native                            # permission-gated native smoke test
@@ -18,7 +19,7 @@ task test:native                            # permission-gated native smoke test
 
 `internal/capture/recorder_test.go` runs the whole capture→store→search pipeline with fake `ScreenSource`/`ContextExtractor`/`TextExtractor`/`AudioSource`/`SpeechTranscriber` implementations, so it needs no permissions or external binaries. Prefer extending it over invoking real frameworks. `task test:native` builds the stable `./lumi` binary and runs the explicit, permission-gated integration smoke test.
 
-The CLI itself refuses to run on anything but `darwin/arm64` (`platform.Validate` in `PersistentPreRunE`), and native microphone capture requires macOS 26+. `./lumi doctor` reports native permission state. For a bounded manual smoke test: `./lumi record start --foreground --no-audio --duration 10s`.
+The CLI itself refuses to run on anything but `darwin/arm64` (`platform.Validate` in `PersistentPreRunE`), and native microphone capture requires macOS 26+. `./lumi doctor` checks platform, capture permissions, speech assets, and the data directory. For a bounded manual smoke test: `./lumi record start --foreground --no-audio --duration 10s`.
 
 `task build` compiles the Swift SpeechAnalyzer bridge (`task speech`) before `go build`; run `task build`/`task test` rather than raw `go build`/`go test`, which will not link without `liblumispeech.a`.
 

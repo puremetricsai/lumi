@@ -106,8 +106,8 @@ func TestSearchFiltersByApp(t *testing.T) {
 	}
 }
 
-// The filters must compose with MatchAny, which is the mode ask's second
-// retrieval stage uses.
+// The filters must compose with MatchAny, the any-term mode retained for
+// `lumi mcp`.
 func TestSearchFiltersApplyUnderMatchAny(t *testing.T) {
 	ctx := context.Background()
 	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))
@@ -331,9 +331,9 @@ func TestDeleteByIDsBatchesLargeIDSets(t *testing.T) {
 	}
 }
 
-// RequireText exists for `ask`: a saved-but-untranscribed audio chunk answers
-// no content question, and Lumi keeps enough of them that they crowd real
-// transcripts out of a recency pass. Whitespace-only text counts as absent.
+// RequireText is retained for `lumi mcp`: a saved-but-untranscribed audio chunk
+// answers no content question, and Lumi keeps enough of them that they crowd
+// real transcripts out of a recency pass. Whitespace-only text counts as absent.
 func TestSearchRequireTextDropsEmptyAndBlankText(t *testing.T) {
 	ctx := context.Background()
 	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))

@@ -60,8 +60,8 @@ func TestSearchDefaultMatchModeIsAll(t *testing.T) {
 }
 
 // TestSearchMatchAnyFindsPartialMatches is the regression for the reported
-// defect: a natural-language question ANDed together matches nothing, so `ask`
-// silently degraded to recency.
+// defect: a natural-language question ANDed together matches nothing, so a
+// caller relying on MatchAll silently degraded to recency.
 func TestSearchMatchAnyFindsPartialMatches(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
