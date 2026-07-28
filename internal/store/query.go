@@ -1,7 +1,10 @@
 package store
 
 import (
+	"context"
+	"fmt"
 	"strings"
+	"time"
 	"unicode"
 )
 
@@ -67,4 +70,91 @@ func hasAlphanumeric(s string) bool {
 		}
 	}
 	return false
+}
+
+// Attribution is one row of the app/window inventory ListAttribution returns.
+// In app mode Window is empty; in window mode App carries the requested app.
+type Attribution struct {
+	App      string    `json:"app"`
+	Window   string    `json:"window,omitempty"`
+	Events   int64     `json:"events"`
+	LastSeen time.Time `json:"last_seen"`
+}
+
+// AttributionOptions selects what ListAttribution groups by and over what span.
+type AttributionOptions struct {
+	// App selects the mode. Nil groups every event by application. Non-nil
+	// groups the events of exactly that application (matched case-insensitively)
+	// by window title — including a pointer to the empty string, which lists the
+	// windows of events that carry no app attribution.
+	App   *string
+	Since *time.Time
+	Until *time.Time
+	// Limit caps the returned rows. Zero or less means no limit, matching
+	// Expired's convention; callers that face an agent set their own ceiling.
+	Limit int
+}
+
+// ListAttribution reports which applications (or, within one application, which
+// windows) the index actually holds, most events first. It exists because an
+// agent that cannot discover the real values of `app` will guess them and
+// filter everything away.
+//
+// Rows with an empty app are grouped under an explicit empty entry rather than
+// dropped: audio chunks and screens Accessibility could not attribute are real
+// captured activity, and a gap in attribution is itself information.
+func (s *Store) ListAttribution(ctx context.Context, opts AttributionOptions) ([]Attribution, error) {
+	group, tiebreak := "app", "app"
+	where := make([]string, 0, 3)
+	args := make([]any, 0, 4)
+	if opts.App != nil {
+		group, tiebreak = "window", "window"
+		where = append(where, "app = ? COLLATE NOCASE")
+		args = append(args, *opts.App)
+	}
+	if opts.Since != nil {
+		where = append(where, "captured_at >= ?")
+		args = append(args, opts.Since.UTC().Format(time.RFC3339Nano))
+	}
+	if opts.Until != nil {
+		where = append(where, "captured_at <= ?")
+		args = append(args, opts.Until.UTC().Format(time.RFC3339Nano))
+	}
+	query := "SELECT " + group + " AS label, COUNT(*) AS events, MAX(captured_at) AS last_seen FROM events"
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	query += " GROUP BY " + group + " ORDER BY events DESC, " + tiebreak + " ASC"
+	if opts.Limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, opts.Limit)
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list attribution: %w", err)
+	}
+	defer rows.Close()
+	results := make([]Attribution, 0)
+	for rows.Next() {
+		var label, lastSeen string
+		var count int64
+		if err := rows.Scan(&label, &count, &lastSeen); err != nil {
+			return nil, fmt.Errorf("scan attribution row: %w", err)
+		}
+		row := Attribution{Events: count}
+		if opts.App != nil {
+			row.App, row.Window = *opts.App, label
+		} else {
+			row.App = label
+		}
+		row.LastSeen, err = time.Parse(time.RFC3339Nano, lastSeen)
+		if err != nil {
+			return nil, fmt.Errorf("parse attribution timestamp %q: %w", lastSeen, err)
+		}
+		results = append(results, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate attribution rows: %w", err)
+	}
+	return results, nil
 }
