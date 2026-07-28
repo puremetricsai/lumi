@@ -179,6 +179,10 @@ tasks:
           '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'; \
           sleep 1; } \
           | ./{{.BINARY}} mcp
+        # The `sleep 1` holds stdin open after the last request so the server has
+        # time to reply before the pipe closes. Closing stdin immediately ends
+        # the session mid-response; do not remove this to "clean up" the smoke
+        # test or make the server itself tolerate early stdin EOF instead.
 
   version:
     desc: Print the Lumi version

@@ -86,7 +86,7 @@ Three tools are exposed:
 
 | Tool | Parameters | Returns |
 |---|---|---|
-| `search_events` | `query`, `kind` (`screen`/`audio`), `app`, `window`, `since`, `until`, `limit`, `match` (`all`/`any`), `require_text`, `max_text_chars` — all optional | matching events, newest first, with text capped at 600 characters by default |
+| `search_events` | `query`, `kind` (`screen`/`audio`), `app`, `window`, `since`, `until`, `limit`, `match` (`all`/`any`), `require_text`, `max_text_chars` — all optional | matching events, ranked by relevance when `query` is set and newest first otherwise, with text capped at 600 characters by default |
 | `get_event` | `id` | one event with its full untruncated text and processor metadata |
 | `list_apps` | `app`, `since`, `until`, `limit` — all optional | the applications captured, most active first, or the window titles for one application |
 
