@@ -105,6 +105,52 @@ func TestSearchMatchAnyFindsPartialMatches(t *testing.T) {
 	}
 }
 
+// TestSearchMatchAnyWeightsBodyTextOverAppAndWindow pins the column weights in
+// `bm25(events_fts, 1.0, 0.4, 0.4)`. bm25 length-normalizes per column, so a
+// term that is the whole of a one-word app or window title scores far higher
+// than the same term buried in a page of screen text — which would let a stray
+// window title outrank the event that actually discusses the subject. Removing
+// the three weights must turn this test red.
+func TestSearchMatchAnyWeightsBodyTextOverAppAndWindow(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	now := time.Now().UTC().Truncate(time.Second)
+
+	body := "The gateway rollout is blocked on the staging certificate rotation, " +
+		"which the platform team scheduled for Thursday after the load test finished. " +
+		"Notes from the review call cover the gateway retry budget, the timeout defaults, " +
+		"and the plan to shift gateway traffic in ten percent increments once the " +
+		"certificate lands and the canary has been observed for a full business day."
+	events := []Event{
+		// The term is the entire window title, with a body that never mentions
+		// it: the shortest possible column hit.
+		{Kind: KindScreen, Text: "lunch order for the offsite", App: "Ghostty", Window: "Gateway", MediaPath: "a.jpg"},
+		// The term appears once, inside substantive screen text.
+		{Kind: KindScreen, Text: body, App: "Ghostty", Window: "notes", MediaPath: "b.jpg"},
+		// Filler so FTS5's IDF term is not degenerate on a two-row corpus.
+		{Kind: KindScreen, Text: "standup notes about the mobile release", MediaPath: "c.jpg"},
+		{Kind: KindScreen, Text: "expense report submission", MediaPath: "d.jpg"},
+		{Kind: KindScreen, Text: "design review of the onboarding flow", MediaPath: "e.jpg"},
+		{Kind: KindScreen, Text: "flight itinerary confirmation", MediaPath: "f.jpg"},
+	}
+	for i := range events {
+		events[i].CapturedAt = now.Add(time.Duration(i) * time.Second)
+	}
+	insertAll(t, ctx, s, events...)
+
+	got, err := s.Search(ctx, SearchOptions{Query: "gateway", Match: MatchAny})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected both gateway events, got %d", len(got))
+	}
+	if got[0].MediaPath != "b.jpg" {
+		t.Fatalf("the body-text match must outrank the title-only match; got %q first (ranks %v, %v)",
+			got[0].MediaPath, got[0].Rank, got[1].Rank)
+	}
+}
+
 func TestSearchMatchAnyTreatsFTSSyntaxAsText(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
