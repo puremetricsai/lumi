@@ -153,14 +153,14 @@ tasks:
     deps: [build]
     interactive: true
     cmds:
-      - ./{{.BINARY}} record {{.CLI_ARGS}}
+      - ./{{.BINARY}} record start {{.CLI_ARGS}}
 
   smoke:
     desc: Bounded 10s screen-only capture smoke test
     platforms: [darwin]
     deps: [build]
     cmds:
-      - ./{{.BINARY}} record --no-audio --duration 10s
+      - ./{{.BINARY}} record start --foreground --no-audio --duration 10s
 
   search:
     desc: 'Search captured events (e.g. task search -- "invoice")'
