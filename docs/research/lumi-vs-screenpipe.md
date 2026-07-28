@@ -38,7 +38,7 @@ Two facts that change how this comparison should be used:
 | Query filters | Kind, time, exact app, window substring | App, window, browser URL, speaker, length, focus, content type, and time |
 | Interface | CLI only | CLI + Axum HTTP API, SSE, WebSocket, MCP, JS SDK |
 | Process model | Foreground process with loop-level retries | Tauri app + sidecar server, PID watchdog, recovery loops |
-| Text retrieval | FTS5/BM25 with staged all-term → any-term → recent retrieval for `ask` | FTS5/BM25 (vector search is vestigial — see below) |
+| Text retrieval | FTS5/BM25 conjunctive keyword search from the CLI; no query-interpretation layer | FTS5/BM25 (vector search is vestigial — see below) |
 
 ---
 
@@ -95,7 +95,7 @@ screenpipe uses `sqlx::migrate!` against versioned migration files, with explici
 
 ## 7. Query surface — Lumi added the highest-value filters
 
-Lumi's `SearchOptions` now supports content kind, time range, **exact case-insensitive application**, and **case-insensitive window-title substring** filters. The CLI exposes these on both `search` and `ask`. FTS terms are safely quoted and use conjunctive BM25 search by default; `ask` strips question stopwords and degrades explicitly through all-term, weighted any-term, then recent-event retrieval.
+Lumi's `SearchOptions` now supports content kind, time range, **exact case-insensitive application**, and **case-insensitive window-title substring** filters. The CLI exposes these on `search`. FTS terms are safely quoted and use conjunctive BM25 search by default. Lumi layers no query interpretation over that: the natural-language `ask` path and its staged retrieval were removed, and agent-driven querying is instead planned as `lumi mcp`, which will expose the same filters as MCP tool parameters and leave question interpretation to the calling agent.
 
 screenpipe's `GET /search` additionally filters on `browser_url`, text length, speaker IDs/name, and focus state, with offset pagination and a Moka LRU cache keyed on the full parameter hash. A second `GET /search/keyword` endpoint adds fuzzy matching, explicit ordering (`timestamp_asc|timestamp_desc|relevance`), and result grouping. `browser_url` is captured atomically with the screenshot to avoid timing mismatch.
 
@@ -125,7 +125,7 @@ This is an intentional scope distinction in Lumi rather than unfinished capture 
 
 **Semantic/vector search.** `sqlite_vec` is imported in `screenpipe-db`, but there is no text-embedding table or vector query path. The only real embeddings are Pyannote *audio* embeddings for speaker identity. screenpipe's advertised "semantic search using embeddings" is, in the code, an LLM writing FTS5 keyword queries. Lumi's FTS5/BM25-only retrieval matches screenpipe's actual behavior; building a text-embedding pipeline would be leapfrogging, not catching up.
 
-**Provider abstraction.** screenpipe supports OpenAI, Anthropic, Ollama, custom OpenAI-compatible endpoints, and its own gateway, with requests routed through an external agent process (`@mariozechner/pi-coding-agent`) over JSON-RPC. Lumi's single-backend Cerebras decision is a deliberate scope choice, not an oversight.
+**Provider abstraction.** screenpipe supports OpenAI, Anthropic, Ollama, custom OpenAI-compatible endpoints, and its own gateway, with requests routed through an external agent process (`@mariozechner/pi-coding-agent`) over JSON-RPC. Lumi has no provider abstraction because it performs no inference at all; the planned `lumi mcp` server hands the index to whatever agent the user already runs, which keeps model choice outside Lumi rather than inside a configuration surface it would have to maintain.
 
 **Basic macOS capture coverage.** Both projects capture all displays, handle display hotplug, prefer Accessibility text with Apple Vision fallback, record system and microphone audio, and suppress near-duplicate frames. Differences remain in storage density, Accessibility event richness, and audio processing, but the basic source matrix is now aligned.
 

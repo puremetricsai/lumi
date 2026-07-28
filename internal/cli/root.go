@@ -291,7 +291,7 @@ func (a *app) doctorCommand() *cobra.Command {
 	var speechLocale string
 	cmd := &cobra.Command{
 		Use:   "doctor",
-		Short: "Check platform, capture permissions, and speech assets",
+		Short: "Check platform, capture permissions, speech assets, and the data directory",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			paths, err := a.paths()
 			if err != nil {
