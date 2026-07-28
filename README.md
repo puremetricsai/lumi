@@ -47,11 +47,15 @@ The default data directory is `~/Library/Application Support/Lumi`:
 ```text
 Lumi/
 ├── lumi.db
+├── record.json
+├── record.log
 ├── screenshots/
 └── audio/
 ```
 
-Override it with `--data-dir` or `LUMI_HOME`. The background recorder also writes its state file and log into the root.
+Override it with `--data-dir` or `LUMI_HOME`. `record.json` and `record.log` are the background recorder's state file and log.
+
+Earlier versions also wrote a `config.json` here to hold the provider settings for the removed `lumi ask` command. Lumi no longer reads it, and upgrading leaves it in place. If yours holds an API key, delete the file and rotate the key.
 
 ## Search
 
