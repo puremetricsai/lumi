@@ -31,8 +31,18 @@ func TestFromRootMakesRelativeRootsAbsolute(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !filepath.IsAbs(paths.Root) {
-		t.Fatalf("Root = %q, want an absolute path", paths.Root)
+	// Absoluteness alone would be satisfied by any hardcoded path; the contract
+	// is that the relative root resolves against the working directory.
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(wd, "relative", "dir")
+	if paths.Root != want {
+		t.Fatalf("Root = %q, want %q", paths.Root, want)
+	}
+	if paths.Database != filepath.Join(want, "lumi.db") {
+		t.Fatalf("Database = %q, want it derived from %q", paths.Database, want)
 	}
 }
 
