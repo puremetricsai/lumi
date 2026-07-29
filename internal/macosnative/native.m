@@ -11,6 +11,7 @@
 
 #include <stdlib.h>
 #include <stdbool.h>
+#include <unistd.h>
 
 static char *LumiCopyUTF8(NSString *value) {
     if (value == nil) {
@@ -248,7 +249,167 @@ static CGDirectDisplayID LumiAXDisplayID(AXUIElementRef window) {
     return LumiDisplayIDForRect(CGRectMake(position.x, position.y, size.width, size.height));
 }
 
-// LumiWindowListTitle is the attribution fallback for when the Accessibility
+static NSString *const LumiAppSourceAccessibility = @"accessibility";
+static NSString *const LumiAppSourceWindowList = @"window_list";
+static NSString *const LumiAppSourceWorkspace = @"workspace";
+static NSString *const LumiAppSourceRunningApplication = @"running_application";
+
+// LumiActivationPID asks the system-wide Accessibility element which application
+// holds focus. This is the only *activation* source that is both live and
+// correct for an application with no on-screen window — a Finder with every
+// window closed, or an app whose windows are all minimized — where the window
+// list necessarily reports whichever app is visually behind it.
+//
+// It returns 0 rather than an error because it is genuinely unreliable: it needs
+// Accessibility trust, and it fails per-application (observed returning
+// kAXErrorNotImplemented for some Electron apps while succeeding for others in
+// the same session). Callers fall through to the window list when it does.
+static pid_t LumiActivationPID(void) {
+    AXUIElementRef systemWide = AXUIElementCreateSystemWide();
+    AXUIElementSetMessagingTimeout(systemWide, 1.0);
+    CFTypeRef application = NULL;
+    AXError axError = AXUIElementCopyAttributeValue(systemWide, kAXFocusedApplicationAttribute, &application);
+    pid_t pid = 0;
+    if (axError == kAXErrorSuccess && application != NULL) {
+        if (AXUIElementGetPid((AXUIElementRef)application, &pid) != kAXErrorSuccess) pid = 0;
+        CFRelease(application);
+    }
+    CFRelease(systemWide);
+    return pid;
+}
+
+// LumiResolveFrontmost decides which process a captured frame is attributed to.
+// It is pure — it makes no CoreGraphics and no NSWorkspace call — so the branch
+// order it encodes is testable off a live session, the way LumiHIDAccessName is.
+//
+// The order is Accessibility, then the window list, then NSWorkspace — and
+// NSWorkspace coming last is the opposite of the obvious ordering. Its
+// frontmostApplication is backed by activation state maintained through
+// notification delivery on a run loop. The recorder is a detached daemon
+// (record_daemon.go sets Setsid) that never runs one, so that value freezes at
+// whichever app was frontmost when the process started — the terminal that
+// launched it. Every event then names that terminal, while the window title,
+// read live against its stale pid, keeps advancing; a live-looking title is
+// therefore no evidence the app is right. Measured over a minute of real focus
+// changes, frontmostApplication never moved off its start value, and
+// runningApplications/isActive froze identically — so neither can lead.
+//
+// activePID (from LumiActivationPID) leads when it is available because it is
+// the only source that answers *activation* rather than *visibility*: an app
+// whose windows are all closed or minimized is still what the user is working
+// in, and CLAUDE.md defines attribution as "what was the user working in", not
+// "what is shown in this image". The window list cannot see such an app and
+// would name whatever is visually behind it. The window list still leads over
+// NSWorkspace: it is copied fresh per call, cannot go stale, and needs only
+// Screen Recording, which is definitionally granted whenever there is a frame
+// to attribute.
+static NSDictionary *LumiResolveFrontmost(NSArray *windows, pid_t activePID,
+                                          pid_t workspacePID, NSString *workspaceName,
+                                          pid_t selfPID) {
+    NSString *fallbackName = workspaceName ?: @"";
+    if (activePID != 0 && activePID != selfPID) {
+        // The name is completed by the caller from the pid when no source here
+        // knows it; a pid alone is still correct attribution the caller can fix.
+        NSString *name = @"";
+        for (NSDictionary *window in windows) {
+            if (![window isKindOfClass:NSDictionary.class]) continue;
+            NSNumber *pid = window[(__bridge NSString *)kCGWindowOwnerPID];
+            if (pid == nil || (pid_t)pid.intValue != activePID) continue;
+            NSString *owner = window[(__bridge NSString *)kCGWindowOwnerName];
+            if (owner.length > 0) { name = owner; break; }
+        }
+        if (name.length == 0 && activePID == workspacePID) name = fallbackName;
+        return @{@"pid": @(activePID), @"app": name, @"app_source": LumiAppSourceAccessibility};
+    }
+    for (NSDictionary *window in windows) {
+        if (![window isKindOfClass:NSDictionary.class]) continue;
+        NSNumber *pid = window[(__bridge NSString *)kCGWindowOwnerPID];
+        NSNumber *layer = window[(__bridge NSString *)kCGWindowLayer];
+        // Layer 0 excludes the menu bar, status items, notification banners and
+        // window shadows, so attribution lands on the app whose pixels the
+        // full-display OCR actually captured.
+        if (pid == nil || layer.intValue != 0) continue;
+        pid_t owner = (pid_t)pid.intValue;
+        if (owner == 0 || owner == selfPID) continue;
+        NSString *name = window[(__bridge NSString *)kCGWindowOwnerName];
+        if (name.length == 0) {
+            // A name is borrowable from NSWorkspace only when both sources mean
+            // the same process. Borrowing it across differing pids would name
+            // one app while reading another's title — the exact bug this
+            // function exists to prevent — so leave it to the caller instead.
+            name = (owner == workspacePID) ? fallbackName : @"";
+        }
+        return @{@"pid": @(owner), @"app": name, @"app_source": LumiAppSourceWindowList};
+    }
+    return @{@"pid": @(workspacePID), @"app": fallbackName, @"app_source": LumiAppSourceWorkspace};
+}
+
+// lumi_resolve_frontmost_json exposes the branch order above so every case is
+// testable on a machine that can only ever sit in one of them. Asserting the
+// live resolution instead would pass vacuously wherever NSWorkspace happens to
+// be correct — which is every foreground process, and so every test run.
+char *lumi_resolve_frontmost_json(const char *windows_json, int active_pid, int workspace_pid,
+                                  const char *workspace_app, int self_pid,
+                                  char **error_message) {
+    @autoreleasepool {
+        NSArray *windows = nil;
+        if (windows_json != NULL) {
+            NSData *data = [@(windows_json) dataUsingEncoding:NSUTF8StringEncoding];
+            NSError *parseError = nil;
+            id decoded = [NSJSONSerialization JSONObjectWithData:data
+                                                         options:NSJSONReadingAllowFragments
+                                                           error:&parseError];
+            if (decoded == nil) {
+                if (error_message != NULL) *error_message = LumiCopyError(parseError);
+                return NULL;
+            }
+            // A JSON null decodes to NSNull, not an array: that is the "the
+            // window list could not be copied" case, and it must fall back.
+            if ([decoded isKindOfClass:NSArray.class]) windows = decoded;
+        }
+        NSDictionary *resolved = LumiResolveFrontmost(
+            windows, (pid_t)active_pid, (pid_t)workspace_pid,
+            workspace_app == NULL ? @"" : @(workspace_app), (pid_t)self_pid);
+        NSError *jsonError = nil;
+        NSString *json = LumiJSONString(resolved, &jsonError);
+        if (json == nil) {
+            if (error_message != NULL) *error_message = LumiCopyError(jsonError);
+            return NULL;
+        }
+        return LumiCopyUTF8(json);
+    }
+}
+
+// LumiResolveFrontmostLive completes LumiResolveFrontmost against the frameworks
+// it deliberately does not touch. The pure function can name a pid it cannot
+// name an app for; only here may that be repaired.
+static NSDictionary *LumiResolveFrontmostLive(NSArray *windows, pid_t activePID,
+                                              NSRunningApplication *frontmost) {
+    pid_t workspacePID = frontmost == nil ? 0 : frontmost.processIdentifier;
+    NSString *workspaceName = frontmost.localizedName ?: @"";
+    NSMutableDictionary *resolved =
+        [LumiResolveFrontmost(windows, activePID, workspacePID, workspaceName, getpid()) mutableCopy];
+    if ([resolved[@"app"] length] > 0) return resolved;
+
+    pid_t pid = (pid_t)[resolved[@"pid"] intValue];
+    NSString *name = pid == 0 ? nil :
+        [NSRunningApplication runningApplicationWithProcessIdentifier:pid].localizedName;
+    if (name.length > 0) {
+        resolved[@"app"] = name;
+        resolved[@"app_source"] = LumiAppSourceRunningApplication;
+    } else if (workspaceName.length > 0) {
+        // Fall back to the workspace pair *wholesale*, pid included. Keeping the
+        // window list's pid while borrowing NSWorkspace's name would attribute
+        // one app's title to another app's name; a stale-but-consistent pair is
+        // the lesser failure, and app_source says which one this is.
+        resolved[@"pid"] = @(workspacePID);
+        resolved[@"app"] = workspaceName;
+        resolved[@"app_source"] = LumiAppSourceWorkspace;
+    }
+    return resolved;
+}
+
+// LumiWindowListTitleIn is the attribution fallback for when the Accessibility
 // tree cannot be read: an untrusted process, a wedged AX message, or a
 // Chromium/Electron app that has not built its tree. kCGWindowName is populated
 // only for clients holding Screen Recording, which is definitionally granted
@@ -256,13 +417,12 @@ static CGDirectDisplayID LumiAXDisplayID(AXUIElementRef window) {
 //
 // The window list is ordered front-to-back, so the first layer-0 window owned by
 // the frontmost process is its focused window. Layer 0 excludes the menu bar,
-// status items and window shadows.
-static NSString *LumiWindowListTitle(pid_t owner, CGDirectDisplayID *displayID) {
-    CFArrayRef windows = CGWindowListCopyWindowInfo(
-        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID);
-    if (windows == NULL) return nil;
+// status items and window shadows. It takes the array rather than copying one so
+// that the title and the app name resolved above come from the same snapshot of
+// the window server, and so the copy is made once per tick rather than twice.
+static NSString *LumiWindowListTitleIn(NSArray *windows, pid_t owner, CGDirectDisplayID *displayID) {
     NSString *title = nil;
-    for (NSDictionary *window in (__bridge NSArray *)windows) {
+    for (NSDictionary *window in windows) {
         NSNumber *pid = window[(__bridge NSString *)kCGWindowOwnerPID];
         NSNumber *layer = window[(__bridge NSString *)kCGWindowLayer];
         if (pid.intValue != (int)owner || layer.intValue != 0) continue;
@@ -280,7 +440,6 @@ static NSString *LumiWindowListTitle(pid_t owner, CGDirectDisplayID *displayID) 
         }
         break;
     }
-    CFRelease(windows);
     return title;
 }
 
@@ -290,8 +449,8 @@ static NSString *LumiWindowListTitle(pid_t owner, CGDirectDisplayID *displayID) 
 // NULL here costs the caller the frontmost application name, which NSWorkspace
 // hands over for free — that loss is what left months of events unattributed.
 //
-// NULL is reserved for a genuine total failure: no frontmost application, or a
-// payload that will not serialize.
+// NULL is reserved for a genuine total failure: no source could name the
+// frontmost process at all, or a payload that will not serialize.
 char *lumi_accessibility_snapshot_json(char **error_message) {
     @autoreleasepool {
         BOOL inputActive = CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateCombinedSessionState,
@@ -300,20 +459,36 @@ char *lumi_accessibility_snapshot_json(char **error_message) {
         // check at startup cannot distinguish "trust was revoked mid-run" from
         // "AX messaging is wedged", and those have different remedies.
         BOOL trusted = AXIsProcessTrusted();
-        NSRunningApplication *frontmost = NSWorkspace.sharedWorkspace.frontmostApplication;
-        if (frontmost == nil) {
+
+        // The window list is copied once, before the first AX call, and is the
+        // primary source of the frontmost pid — see LumiResolveFrontmost for why
+        // NSWorkspace cannot be trusted for it in this process. The same array
+        // then serves the title fallback below.
+        CFArrayRef windowList = CGWindowListCopyWindowInfo(
+            kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID);
+        NSArray *windows = windowList == NULL ? nil : (__bridge NSArray *)windowList;
+        NSDictionary *resolved = LumiResolveFrontmostLive(
+            windows, LumiActivationPID(), NSWorkspace.sharedWorkspace.frontmostApplication);
+        pid_t frontmostPID = (pid_t)[resolved[@"pid"] intValue];
+        NSString *frontmostApp = resolved[@"app"];
+        // Both sources failed: there is nothing to attribute and nothing to
+        // read a title against. Anything less than this stays a snapshot,
+        // because a snapshot naming an app is worth more than an error.
+        if (frontmostApp.length == 0 && frontmostPID == 0) {
+            if (windowList != NULL) CFRelease(windowList);
             if (error_message != NULL) *error_message = LumiCopyUTF8(@"no frontmost application");
             return NULL;
         }
-        NSMutableDictionary *snapshot = [@{@"app": frontmost.localizedName ?: @"",
+        NSMutableDictionary *snapshot = [@{@"app": frontmostApp,
                                            @"window": @"",
                                            @"text": @"",
                                            @"display_id": @(0),
                                            @"input_active": @(inputActive),
                                            @"trusted": @(trusted),
+                                           @"app_source": resolved[@"app_source"],
                                            @"title_source": @"none"} mutableCopy];
 
-        AXUIElementRef application = AXUIElementCreateApplication(frontmost.processIdentifier);
+        AXUIElementRef application = AXUIElementCreateApplication(frontmostPID);
         AXUIElementSetMessagingTimeout(application, 1.0);
         CFTypeRef windowValue = NULL;
         AXError windowError = AXUIElementCopyAttributeValue(application, kAXFocusedWindowAttribute, &windowValue);
@@ -332,7 +507,7 @@ char *lumi_accessibility_snapshot_json(char **error_message) {
             snapshot[@"error"] = [NSString stringWithFormat:
                                   @"read focused Accessibility window (AX error %d)", windowError];
             CGDirectDisplayID displayID = 0;
-            NSString *title = LumiWindowListTitle(frontmost.processIdentifier, &displayID);
+            NSString *title = LumiWindowListTitleIn(windows, frontmostPID, &displayID);
             if (title != nil) {
                 snapshot[@"window"] = title;
                 snapshot[@"display_id"] = @(displayID);
@@ -340,9 +515,58 @@ char *lumi_accessibility_snapshot_json(char **error_message) {
             }
         }
         CFRelease(application);
+        if (windowList != NULL) CFRelease(windowList);
 
         NSError *jsonError = nil;
         NSString *json = LumiJSONString(snapshot, &jsonError);
+        if (json == nil) {
+            if (error_message != NULL) *error_message = LumiCopyError(jsonError);
+            return NULL;
+        }
+        return LumiCopyUTF8(json);
+    }
+}
+
+// lumi_frontmost_diagnostic_json reports the two frontmost sources side by side.
+// It runs the same LumiResolveFrontmost the snapshot does, so the diagnostic and
+// the behaviour it describes cannot drift apart.
+//
+// The disagreement it exists to surface only appears in a process launched by
+// one app while another is frontmost — which is the recorder daemon's situation
+// and not a foreground test's, so this is reported rather than asserted.
+char *lumi_frontmost_diagnostic_json(char **error_message) {
+    @autoreleasepool {
+        CFArrayRef windowList = CGWindowListCopyWindowInfo(
+            kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID);
+        NSArray *windows = windowList == NULL ? nil : (__bridge NSArray *)windowList;
+        NSRunningApplication *frontmost = NSWorkspace.sharedWorkspace.frontmostApplication;
+        pid_t workspacePID = frontmost == nil ? 0 : frontmost.processIdentifier;
+        NSString *workspaceName = frontmost.localizedName ?: @"";
+
+        // Resolving with no activation pid and no workspace pair isolates what
+        // the window list alone knows; a "workspace" verdict here means the list
+        // named nothing.
+        NSDictionary *listOnly = LumiResolveFrontmost(windows, 0, 0, @"", getpid());
+        BOOL listNamed = [listOnly[@"app_source"] isEqualToString:LumiAppSourceWindowList];
+        pid_t activePID = LumiActivationPID();
+        NSString *activeName = activePID == 0 ? @"" :
+            ([NSRunningApplication runningApplicationWithProcessIdentifier:activePID].localizedName ?: @"");
+        NSDictionary *resolved = LumiResolveFrontmostLive(windows, activePID, frontmost);
+        if (windowList != NULL) CFRelease(windowList);
+
+        // Boxed through a BOOL local deliberately: @(a && b) boxes a C int and
+        // serializes as 0/1, which decodes as a number rather than a bool.
+        BOOL agree = listNamed && [listOnly[@"pid"] intValue] == (int)workspacePID;
+        NSDictionary *payload = @{
+            @"accessibility": @{@"pid": @(activePID), @"app": activeName},
+            @"workspace": @{@"pid": @(workspacePID), @"app": workspaceName},
+            @"window_list": @{@"pid": listNamed ? listOnly[@"pid"] : @(0),
+                              @"app": listNamed ? listOnly[@"app"] : @""},
+            @"resolved": resolved,
+            @"agree": @(agree),
+        };
+        NSError *jsonError = nil;
+        NSString *json = LumiJSONString(payload, &jsonError);
         if (json == nil) {
             if (error_message != NULL) *error_message = LumiCopyError(jsonError);
             return NULL;

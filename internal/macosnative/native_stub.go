@@ -24,8 +24,28 @@ type AccessibilitySnapshot struct {
 	DisplayID   uint32 `json:"display_id"`
 	InputActive bool   `json:"input_active"`
 	Trusted     *bool  `json:"trusted,omitempty"`
+	AppSource   string `json:"app_source,omitempty"`
 	TitleSource string `json:"title_source,omitempty"`
 	Error       string `json:"error,omitempty"`
+}
+
+type FrontmostProcess struct {
+	PID int32  `json:"pid"`
+	App string `json:"app"`
+}
+
+type FrontmostResolution struct {
+	PID       int32  `json:"pid"`
+	App       string `json:"app"`
+	AppSource string `json:"app_source"`
+}
+
+type FrontmostDiagnosticReport struct {
+	Accessibility FrontmostProcess    `json:"accessibility"`
+	Workspace     FrontmostProcess    `json:"workspace"`
+	WindowList    FrontmostProcess    `json:"window_list"`
+	Resolved      FrontmostResolution `json:"resolved"`
+	Agree         bool                `json:"agree"`
 }
 
 type Permissions struct {
@@ -49,6 +69,10 @@ func CaptureScreens(context.Context, string, string) ([]ScreenFrame, error) {
 
 func Accessibility(context.Context) (AccessibilitySnapshot, error) {
 	return AccessibilitySnapshot{}, errUnsupported
+}
+
+func FrontmostDiagnostic(context.Context) (FrontmostDiagnosticReport, error) {
+	return FrontmostDiagnosticReport{}, errUnsupported
 }
 
 func RecognizeText(context.Context, string) (string, error) { return "", errUnsupported }
