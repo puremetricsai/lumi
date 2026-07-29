@@ -29,6 +29,100 @@ type Recorder struct {
 	CaptureScreen  bool
 	CaptureAudio   bool
 	Logger         *slog.Logger
+
+	// attribution is owned by the screen goroutine alone; captureScreen is the
+	// only reader and writer, so it needs no lock.
+	attribution attributionHealth
+}
+
+// attributionEscalationDelay is how long attribution must stay degraded before
+// the recorder escalates, and attributionReminderInterval how often it repeats
+// while the outage persists. Both are durations rather than tick counts because
+// ScreenInterval is a flag: counting ticks would escalate after 1.5s at one
+// setting and 150s at another.
+const (
+	attributionEscalationDelay  = 30 * time.Second
+	attributionReminderInterval = 5 * time.Minute
+)
+
+type attributionHealth struct {
+	degradedSince  time.Time
+	lastEscalation time.Time
+}
+
+// noteAttribution escalates a sustained degradation. The previous behaviour — a
+// Warn on every frame — produced tens of lines per minute, which is precisely
+// how a day of unattributed capture went unnoticed.
+//
+// Two outcomes are reported differently, because they cost different things. An
+// Accessibility failure that the window-list fallback covers loses only the
+// supplementary AX text and warns; one that leaves no application name at all
+// makes the event unfindable by app and is an error. Escalating both as "indexed
+// without an app" would fire on every routine fallback and train the reader to
+// ignore the line — the exact failure this monitor exists to prevent.
+func (r *Recorder) noteAttribution(now time.Time, screenContext ScreenContext, contextErr error) {
+	if contextErr == nil && !screenContext.Degraded() {
+		if !r.attribution.degradedSince.IsZero() {
+			r.Logger.Info("app attribution recovered", "app", screenContext.App)
+		}
+		r.attribution = attributionHealth{}
+		return
+	}
+	unattributed := contextErr != nil || screenContext.Unattributed()
+	if r.attribution.degradedSince.IsZero() {
+		r.attribution.degradedSince = now
+		r.Logger.Warn("Accessibility read failed", "attributed", !unattributed,
+			"error", attributionCause(screenContext, contextErr))
+		return
+	}
+	if now.Sub(r.attribution.degradedSince) < attributionEscalationDelay {
+		return
+	}
+	if !r.attribution.lastEscalation.IsZero() &&
+		now.Sub(r.attribution.lastEscalation) < attributionReminderInterval {
+		return
+	}
+	r.attribution.lastEscalation = now
+	arguments := []any{
+		"since", r.attribution.degradedSince.Format(time.RFC3339),
+		"remedy", attributionRemedy(screenContext, contextErr),
+		"error", attributionCause(screenContext, contextErr),
+	}
+	if unattributed {
+		r.Logger.Error("app attribution has been unavailable; screen events are being indexed without an app",
+			arguments...)
+		return
+	}
+	r.Logger.Warn("Accessibility has been unavailable; app attribution is using the window-list fallback "+
+		"and Accessibility text is not being captured",
+		append(arguments, "app", screenContext.App)...)
+}
+
+// attributionRemedy branches on all three trust states. Reporting "trust was
+// revoked" whenever a bool reads false would be wrong for the total-failure
+// case, where trust was never sampled at all.
+func attributionRemedy(screenContext ScreenContext, contextErr error) string {
+	switch {
+	case contextErr != nil, screenContext.Trusted == nil:
+		return "the Accessibility snapshot itself is failing; run 'lumi doctor'"
+	case !*screenContext.Trusted:
+		return "this process no longer holds Accessibility; re-grant it in System Settings " +
+			"> Privacy & Security > Accessibility, then restart 'lumi record'"
+	default:
+		return "Accessibility is granted but focused-window reads keep failing; " +
+			"attribution is using the window-list fallback"
+	}
+}
+
+func attributionCause(screenContext ScreenContext, contextErr error) string {
+	switch {
+	case contextErr != nil:
+		return contextErr.Error()
+	case screenContext.AccessibilityError != "":
+		return screenContext.AccessibilityError
+	default:
+		return "no frontmost application name was resolved"
+	}
 }
 
 type SpeechTranscriber interface {
@@ -106,16 +200,20 @@ func (r *Recorder) captureScreen(ctx context.Context) {
 		}
 		return
 	}
+	// One focused-window snapshot is taken per tick and its App/Window are
+	// stamped onto every display's frame. On a multi-display setup an app filter
+	// therefore returns frames from displays where that app was not visible:
+	// the attribution answers "what was the user working in when this was
+	// captured", not "what is shown in this image". Per-display attribution
+	// would need a snapshot per display and is deliberately not done here.
 	var screenContext ScreenContext
 	var contextErr error
 	if r.Context != nil {
 		processingCtx, cancel := preservationContext(ctx)
 		screenContext, contextErr = r.Context.Snapshot(processingCtx)
 		cancel()
-		if contextErr != nil {
-			r.Logger.Warn("Accessibility extraction failed; using Vision fallback", "error", contextErr)
-		}
 	}
+	r.noteAttribution(now, screenContext, contextErr)
 	for _, frame := range frames {
 		duplicate, similarity, compareErr := r.Comparer.Duplicate(
 			frame.Path, frame.DisplayID, screenContext.InputActive, now)
@@ -139,8 +237,11 @@ func (r *Recorder) captureScreen(ctx context.Context) {
 		text, processErr := r.Text.Extract(processingCtx, frame.Path)
 		cancel()
 
+		// No contextErr guard: a degraded snapshot may still carry substantive
+		// Accessibility text, and substantiveAXText already rejects the empty
+		// text a failed read leaves behind.
 		axText := ""
-		if contextErr == nil && substantiveAXText(screenContext) &&
+		if substantiveAXText(screenContext) &&
 			(screenContext.DisplayID == 0 || screenContext.DisplayID == frame.DisplayID) {
 			axText = screenContext.Text
 		}
@@ -154,7 +255,8 @@ func (r *Recorder) captureScreen(ctx context.Context) {
 			textSource = "accessibility"
 			axMetadata = ""
 		}
-		metadata := screenMetadata(frame, textSource, axMetadata, similarity, processErr, contextErr, compareErr)
+		metadata := screenMetadata(frame, textSource, axMetadata, screenContext,
+			similarity, processErr, contextErr, compareErr)
 		event := &store.Event{Kind: store.KindScreen, CapturedAt: now, Text: text,
 			App: screenContext.App, Window: screenContext.Window, MediaPath: frame.Path,
 			TextSource: textSource, DisplayID: frame.DisplayID, Metadata: metadata}
@@ -182,7 +284,8 @@ func substantiveAXText(c ScreenContext) bool {
 	return text != "" && text != strings.TrimSpace(c.Window)
 }
 
-func screenMetadata(frame ScreenFrame, textSource, axText string, similarity float64, processErr, contextErr, compareErr error) json.RawMessage {
+func screenMetadata(frame ScreenFrame, textSource, axText string, screenContext ScreenContext,
+	similarity float64, processErr, contextErr, compareErr error) json.RawMessage {
 	metadata := map[string]any{
 		"display_id":       frame.DisplayID,
 		"width":            frame.Width,
@@ -193,11 +296,23 @@ func screenMetadata(frame ScreenFrame, textSource, axText string, similarity flo
 	if axText != "" {
 		metadata["accessibility_text"] = axText
 	}
+	if screenContext.TitleSource != "" {
+		metadata["attribution_source"] = screenContext.TitleSource
+	}
+	if screenContext.Trusted != nil {
+		metadata["accessibility_trusted"] = *screenContext.Trusted
+	}
 	if processErr != nil {
 		metadata["processor_error"] = processErr.Error()
 	}
-	if contextErr != nil {
+	// accessibility_error keeps exactly the meaning it has for events already in
+	// the index — "the Accessibility read did not succeed" — whether the read
+	// degraded the snapshot or destroyed it.
+	switch {
+	case contextErr != nil:
 		metadata["accessibility_error"] = contextErr.Error()
+	case screenContext.AccessibilityError != "":
+		metadata["accessibility_error"] = screenContext.AccessibilityError
 	}
 	if compareErr != nil {
 		metadata["comparison_error"] = compareErr.Error()

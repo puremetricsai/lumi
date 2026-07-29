@@ -1,13 +1,91 @@
 package cli
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 	"unicode/utf8"
 
+	"github.com/puremetricsai/lumi/internal/config"
 	"github.com/puremetricsai/lumi/internal/store"
 )
+
+// A mistyped --data-dir must read as "there is nothing here", not be silently
+// created and then reported as a healthy index.
+func TestReportAttributionHealthDoesNotCreateAnIndex(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "typo")
+	paths, err := config.FromRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out strings.Builder
+	if err := reportAttributionHealth(context.Background(), &out, paths); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "no screen history") {
+		t.Errorf("output = %q, want a no-screen-history notice", out.String())
+	}
+	if _, err := os.Stat(paths.Database); !os.IsNotExist(err) {
+		t.Errorf("doctor created an index at %s", paths.Database)
+	}
+}
+
+func TestReportAttributionHealthWarnsOnUnattributedEvents(t *testing.T) {
+	ctx := context.Background()
+	paths, err := config.FromRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := paths.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(ctx, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	for _, event := range []store.Event{
+		{Kind: store.KindScreen, CapturedAt: now.Add(-time.Minute), App: "Ghostty", MediaPath: "a.jpg"},
+		{Kind: store.KindScreen, CapturedAt: now, MediaPath: "b.jpg"},
+	} {
+		if err := s.Insert(ctx, &event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.Close()
+
+	var out strings.Builder
+	if err := reportAttributionHealth(ctx, &out, paths); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "attribution\twarn\t1 of 2 screen events") {
+		t.Errorf("output = %q, want a warn row counting 1 of 2", out.String())
+	}
+}
+
+// An hour holds thousands of events at the default interval, so a real gap is a
+// fraction of a percent. Integer division reported it as "warn 0% have no app",
+// which reads as "nothing is wrong".
+func TestFormatPercentNeverRoundsARealGapToZero(t *testing.T) {
+	for _, testCase := range []struct {
+		part, total int64
+		want        string
+	}{
+		{part: 5, total: 505, want: "<1%"},
+		{part: 1, total: 3600, want: "<1%"},
+		{part: 1, total: 2, want: "50%"},
+		{part: 3407, total: 3407, want: "100%"},
+		{part: 0, total: 0, want: "0%"},
+	} {
+		if got := formatPercent(testCase.part, testCase.total); got != testCase.want {
+			t.Errorf("formatPercent(%d, %d) = %s, want %s",
+				testCase.part, testCase.total, got, testCase.want)
+		}
+	}
+}
 
 // TestTruncateRunes covers the helper behind `lumi search`'s human-readable
 // output. A byte-indexed cut through multi-byte text is the reason it exists,

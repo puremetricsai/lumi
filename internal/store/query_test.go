@@ -235,6 +235,91 @@ func TestListAttributionGroupsByApp(t *testing.T) {
 	}
 }
 
+func TestListAttributionFiltersByKind(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	base := time.Now().UTC().Truncate(time.Second)
+	insertAll(t, ctx, s,
+		Event{Kind: KindScreen, CapturedAt: base, App: "Safari", Text: "a", MediaPath: "a.jpg"},
+		Event{Kind: KindAudio, CapturedAt: base.Add(time.Minute), Text: "b", MediaPath: "b.wav"},
+	)
+
+	got, err := s.ListAttribution(ctx, AttributionOptions{Kind: KindScreen})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].App != "Safari" {
+		t.Fatalf("kind filter did not exclude the audio chunk: %#v", got)
+	}
+}
+
+// The ratio must not be diluted by audio, which carries no app by design.
+func TestAttributionHealthCountsScreenEventsOnly(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	base := time.Now().UTC().Truncate(time.Second)
+	insertAll(t, ctx, s,
+		Event{Kind: KindScreen, CapturedAt: base, App: "Ghostty", Text: "a", MediaPath: "a.jpg"},
+		Event{Kind: KindScreen, CapturedAt: base.Add(time.Minute), Text: "b", MediaPath: "b.jpg"},
+		Event{Kind: KindScreen, CapturedAt: base.Add(2 * time.Minute), Text: "c", MediaPath: "c.jpg"},
+		Event{Kind: KindAudio, CapturedAt: base.Add(3 * time.Minute), Text: "d", MediaPath: "d.wav"},
+	)
+
+	got, err := s.AttributionHealth(ctx, base.Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Total != 3 {
+		t.Errorf("Total = %d, want 3 screen events (audio excluded)", got.Total)
+	}
+	if got.Unattributed != 2 {
+		t.Errorf("Unattributed = %d, want 2", got.Unattributed)
+	}
+	if !got.HasLastAttributed || !got.LastAttributed.Equal(base) {
+		t.Errorf("LastAttributed = %v (ok=%t), want %s", got.LastAttributed, got.HasLastAttributed, base)
+	}
+}
+
+// The outage this report explains is usually longer than the window it is asked
+// about. Scoping LastAttributed to `since` would blank it out precisely then.
+func TestAttributionHealthReportsLastAttributedFromBeforeTheWindow(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	base := time.Now().UTC().Truncate(time.Second)
+	attributed := base.Add(-24 * time.Hour)
+	insertAll(t, ctx, s,
+		Event{Kind: KindScreen, CapturedAt: attributed, App: "Ghostty", Text: "a", MediaPath: "a.jpg"},
+		Event{Kind: KindScreen, CapturedAt: base, Text: "b", MediaPath: "b.jpg"},
+	)
+
+	got, err := s.AttributionHealth(ctx, base.Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Total != 1 || got.Unattributed != 1 {
+		t.Fatalf("window should hold exactly the one unattributed event: %#v", got)
+	}
+	if !got.HasLastAttributed || !got.LastAttributed.Equal(attributed) {
+		t.Errorf("LastAttributed = %v (ok=%t), want the event from before the window (%s)",
+			got.LastAttributed, got.HasLastAttributed, attributed)
+	}
+}
+
+// SUM and MAX are NULL over an empty set; scanning them into plain integers and
+// strings would fail rather than report an empty index.
+func TestAttributionHealthOverEmptySet(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+
+	got, err := s.AttributionHealth(ctx, time.Now().UTC().Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("empty index must report cleanly, got %v", err)
+	}
+	if got.Total != 0 || got.Unattributed != 0 || got.HasLastAttributed {
+		t.Errorf("empty index reported %#v", got)
+	}
+}
+
 func TestListAttributionGroupsByWindowForOneApp(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)

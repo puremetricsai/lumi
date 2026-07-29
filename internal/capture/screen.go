@@ -19,13 +19,37 @@ type ScreenFrame struct {
 	CaptureError string
 }
 
+// ScreenContext is what the recorder knows about the focused application at one
+// capture tick. It is deliberately degradable: App and InputActive come from
+// sources that need no Accessibility grant, so a failed Accessibility read
+// yields a partial context carrying AccessibilityError rather than nothing at
+// all. A degraded snapshot is a value, not an error.
+//
+// Trusted is nil when trust is unknown — the snapshot failed outright — which is
+// distinct from a known-false "trust was revoked". Callers that report a cause
+// to the user must branch on all three states.
 type ScreenContext struct {
-	App         string
-	Window      string
-	Text        string
-	DisplayID   uint32
-	InputActive bool
+	App                string
+	Window             string
+	Text               string
+	DisplayID          uint32
+	InputActive        bool
+	Trusted            *bool
+	TitleSource        string
+	AccessibilityError string
 }
+
+// Degraded reports whether anything about this tick is incomplete: either the
+// Accessibility read failed, or no application name was resolved at all. A
+// degraded tick is not necessarily an unattributed one — the whole point of the
+// window-list fallback is that App survives a failed Accessibility read.
+func (c ScreenContext) Degraded() bool {
+	return c.AccessibilityError != "" || c.App == ""
+}
+
+// Unattributed reports the failure that actually costs the index something:
+// no application name at all, so the event cannot be found by an app filter.
+func (c ScreenContext) Unattributed() bool { return c.App == "" }
 
 type ScreenSource interface {
 	Capture(context.Context, string, string) ([]ScreenFrame, error)
@@ -64,15 +88,24 @@ func (NativeScreens) Capture(ctx context.Context, directory, prefix string) ([]S
 // the primary screen-text source, since it cannot see beyond the focused window
 type AccessibilityContext struct{}
 
+// Snapshot returns an error only when nothing at all could be read. A snapshot
+// whose Accessibility read failed still carries the frontmost application name
+// and, where the window list could supply one, a window title; that arrives as a
+// populated ScreenContext with AccessibilityError set.
 func (AccessibilityContext) Snapshot(ctx context.Context) (ScreenContext, error) {
 	snapshot, err := macosnative.Accessibility(ctx)
 	if err != nil {
 		return ScreenContext{}, fmt.Errorf("read macOS Accessibility tree: %w", err)
 	}
-	return ScreenContext{
+	screenContext := ScreenContext{
 		App: snapshot.App, Window: snapshot.Window, Text: snapshot.Text,
 		DisplayID: snapshot.DisplayID, InputActive: snapshot.InputActive,
-	}, nil
+		Trusted: snapshot.Trusted, TitleSource: snapshot.TitleSource,
+	}
+	if snapshot.Error != "" {
+		screenContext.AccessibilityError = fmt.Sprintf("read macOS Accessibility tree: %s", snapshot.Error)
+	}
+	return screenContext, nil
 }
 
 // VisionText performs on-device Apple Vision text recognition over the full

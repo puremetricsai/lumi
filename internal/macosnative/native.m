@@ -4,6 +4,7 @@
 #import <AudioToolbox/AudioToolbox.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <ImageIO/ImageIO.h>
+#import <IOKit/hidsystem/IOHIDLib.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <Speech/Speech.h>
 #import <Vision/Vision.h>
@@ -210,6 +211,20 @@ static void LumiCollectAXText(AXUIElementRef element, NSMutableOrderedSet<NSStri
     CFRelease(childrenValue);
 }
 
+// LumiDisplayIDForRect maps a window rectangle to the display containing its
+// centre. Both Accessibility positions and kCGWindowBounds are expressed in
+// top-left-origin global coordinates, so the same lookup serves both callers.
+static CGDirectDisplayID LumiDisplayIDForRect(CGRect frame) {
+    CGPoint center = CGPointMake(CGRectGetMidX(frame), CGRectGetMidY(frame));
+    CGDirectDisplayID displays[32];
+    uint32_t count = 0;
+    if (CGGetOnlineDisplayList(32, displays, &count) != kCGErrorSuccess) return 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (CGRectContainsPoint(CGDisplayBounds(displays[i]), center)) return displays[i];
+    }
+    return 0;
+}
+
 static CGDirectDisplayID LumiAXDisplayID(AXUIElementRef window) {
     CFTypeRef positionValue = NULL;
     CFTypeRef sizeValue = NULL;
@@ -230,48 +245,102 @@ static CGDirectDisplayID LumiAXDisplayID(AXUIElementRef window) {
     }
     CFRelease(positionValue);
     CFRelease(sizeValue);
-    CGPoint center = CGPointMake(position.x + size.width / 2.0, position.y + size.height / 2.0);
-    CGDirectDisplayID displays[32];
-    uint32_t count = 0;
-    if (CGGetOnlineDisplayList(32, displays, &count) != kCGErrorSuccess) return 0;
-    for (uint32_t i = 0; i < count; i++) {
-        if (CGRectContainsPoint(CGDisplayBounds(displays[i]), center)) return displays[i];
-    }
-    return 0;
+    return LumiDisplayIDForRect(CGRectMake(position.x, position.y, size.width, size.height));
 }
 
+// LumiWindowListTitle is the attribution fallback for when the Accessibility
+// tree cannot be read: an untrusted process, a wedged AX message, or a
+// Chromium/Electron app that has not built its tree. kCGWindowName is populated
+// only for clients holding Screen Recording, which is definitionally granted
+// whenever there is a captured frame to attribute.
+//
+// The window list is ordered front-to-back, so the first layer-0 window owned by
+// the frontmost process is its focused window. Layer 0 excludes the menu bar,
+// status items and window shadows.
+static NSString *LumiWindowListTitle(pid_t owner, CGDirectDisplayID *displayID) {
+    CFArrayRef windows = CGWindowListCopyWindowInfo(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID);
+    if (windows == NULL) return nil;
+    NSString *title = nil;
+    for (NSDictionary *window in (__bridge NSArray *)windows) {
+        NSNumber *pid = window[(__bridge NSString *)kCGWindowOwnerPID];
+        NSNumber *layer = window[(__bridge NSString *)kCGWindowLayer];
+        if (pid.intValue != (int)owner || layer.intValue != 0) continue;
+        // kCGWindowName is absent rather than empty for some applications; a
+        // window with no readable title still fixes the display, so keep going
+        // only until the first matching window is found.
+        title = window[(__bridge NSString *)kCGWindowName];
+        if (displayID != NULL) {
+            CGRect bounds = CGRectZero;
+            CFDictionaryRef boundsDict =
+                (__bridge CFDictionaryRef)window[(__bridge NSString *)kCGWindowBounds];
+            if (boundsDict != NULL && CGRectMakeWithDictionaryRepresentation(boundsDict, &bounds)) {
+                *displayID = LumiDisplayIDForRect(bounds);
+            }
+        }
+        break;
+    }
+    CFRelease(windows);
+    return title;
+}
+
+// lumi_accessibility_snapshot_json is deliberately total: every field that can be
+// obtained without an Accessibility grant is gathered before the first AX call,
+// and an AX failure degrades the snapshot rather than discarding it. Returning
+// NULL here costs the caller the frontmost application name, which NSWorkspace
+// hands over for free — that loss is what left months of events unattributed.
+//
+// NULL is reserved for a genuine total failure: no frontmost application, or a
+// payload that will not serialize.
 char *lumi_accessibility_snapshot_json(char **error_message) {
     @autoreleasepool {
+        BOOL inputActive = CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateCombinedSessionState,
+                                                                  kCGAnyInputEventType) < 2.0;
+        // Trust is sampled from the running process on every tick. A one-shot
+        // check at startup cannot distinguish "trust was revoked mid-run" from
+        // "AX messaging is wedged", and those have different remedies.
+        BOOL trusted = AXIsProcessTrusted();
         NSRunningApplication *frontmost = NSWorkspace.sharedWorkspace.frontmostApplication;
-        if (frontmost == nil) return LumiCopyUTF8(@"{\"app\":\"\",\"window\":\"\",\"text\":\"\",\"input_active\":false}");
+        if (frontmost == nil) {
+            if (error_message != NULL) *error_message = LumiCopyUTF8(@"no frontmost application");
+            return NULL;
+        }
+        NSMutableDictionary *snapshot = [@{@"app": frontmost.localizedName ?: @"",
+                                           @"window": @"",
+                                           @"text": @"",
+                                           @"display_id": @(0),
+                                           @"input_active": @(inputActive),
+                                           @"trusted": @(trusted),
+                                           @"title_source": @"none"} mutableCopy];
+
         AXUIElementRef application = AXUIElementCreateApplication(frontmost.processIdentifier);
         AXUIElementSetMessagingTimeout(application, 1.0);
         CFTypeRef windowValue = NULL;
         AXError windowError = AXUIElementCopyAttributeValue(application, kAXFocusedWindowAttribute, &windowValue);
-        if (windowError != kAXErrorSuccess || windowValue == NULL) {
-            CFRelease(application);
-            if (error_message != NULL) {
-                NSString *message = [NSString stringWithFormat:@"read focused Accessibility window (AX error %d)", windowError];
-                *error_message = LumiCopyUTF8(message);
+        if (windowError == kAXErrorSuccess && windowValue != NULL) {
+            AXUIElementRef window = (AXUIElementRef)windowValue;
+            NSString *title = LumiAXString(window, kAXTitleAttribute);
+            NSMutableOrderedSet<NSString *> *lines = [NSMutableOrderedSet orderedSet];
+            NSUInteger visited = 0;
+            LumiCollectAXText(window, lines, 0, &visited);
+            snapshot[@"window"] = title ?: @"";
+            snapshot[@"text"] = [lines.array componentsJoinedByString:@"\n"] ?: @"";
+            snapshot[@"display_id"] = @(LumiAXDisplayID(window));
+            snapshot[@"title_source"] = @"accessibility";
+            CFRelease(windowValue);
+        } else {
+            snapshot[@"error"] = [NSString stringWithFormat:
+                                  @"read focused Accessibility window (AX error %d)", windowError];
+            CGDirectDisplayID displayID = 0;
+            NSString *title = LumiWindowListTitle(frontmost.processIdentifier, &displayID);
+            if (title != nil) {
+                snapshot[@"window"] = title;
+                snapshot[@"display_id"] = @(displayID);
+                snapshot[@"title_source"] = @"window_list";
             }
-            return NULL;
         }
-        AXUIElementRef window = (AXUIElementRef)windowValue;
-        NSString *title = LumiAXString(window, kAXTitleAttribute);
-        NSMutableOrderedSet<NSString *> *lines = [NSMutableOrderedSet orderedSet];
-        NSUInteger visited = 0;
-        LumiCollectAXText(window, lines, 0, &visited);
-        NSString *text = [lines.array componentsJoinedByString:@"\n"];
-        BOOL inputActive = CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateCombinedSessionState,
-                                                                  kCGAnyInputEventType) < 2.0;
-        CGDirectDisplayID displayID = LumiAXDisplayID(window);
-        NSDictionary *snapshot = @{@"app": frontmost.localizedName ?: @"",
-                                   @"window": title ?: @"",
-                                   @"text": text ?: @"",
-                                   @"display_id": @(displayID),
-                                   @"input_active": @(inputActive)};
-        CFRelease(windowValue);
         CFRelease(application);
+
         NSError *jsonError = nil;
         NSString *json = LumiJSONString(snapshot, &jsonError);
         if (json == nil) {
@@ -336,12 +405,40 @@ static NSString *LumiSpeechAuthorizationName(SFSpeechRecognizerAuthorizationStat
     return @"unknown";
 }
 
+// LumiHIDAccessName maps IOHIDCheckAccess's tri-state to a status string.
+// CGPreflightListenEventAccess wraps the same query in a BOOL and throws the
+// distinction away, but "denied" and "not_determined" need opposite remedies:
+// a denied subject is never re-prompted and can only be fixed in System
+// Settings, while a not-determined one is exactly what `--request` can still
+// resolve. Reporting one string for both leaves no way to tell them apart.
+static NSString *LumiHIDAccessName(IOHIDAccessType access) {
+    switch (access) {
+        case kIOHIDAccessTypeGranted: return @"granted";
+        case kIOHIDAccessTypeDenied: return @"denied";
+        case kIOHIDAccessTypeUnknown: return @"not_determined";
+    }
+    return @"unknown";
+}
+
+// lumi_hid_access_name exposes the mapping above so it can be tested for every
+// state on a machine that sits in only one of them.
+char *lumi_hid_access_name(int access) {
+    @autoreleasepool {
+        return LumiCopyUTF8(LumiHIDAccessName((IOHIDAccessType)access));
+    }
+}
+
 char *lumi_permissions_json(char **error_message) {
     @autoreleasepool {
+        // Screen Recording and Accessibility stay conflated on purpose:
+        // CGPreflightScreenCaptureAccess and AXIsProcessTrusted return a bare
+        // BOOL, and the only ways to split them either need Full Disk Access
+        // (reading TCC.db) or raise a prompt as a side effect of asking
+        // (SCShareableContent) — unacceptable in a read-only status call.
         NSDictionary *permissions = @{
             @"screen_recording": CGPreflightScreenCaptureAccess() ? @"granted" : @"denied_or_not_determined",
             @"accessibility": AXIsProcessTrusted() ? @"granted" : @"denied_or_not_determined",
-            @"input_monitoring": CGPreflightListenEventAccess() ? @"granted" : @"denied_or_not_determined",
+            @"input_monitoring": LumiHIDAccessName(IOHIDCheckAccess(kIOHIDRequestTypeListenEvent)),
             @"microphone": LumiAuthorizationName([AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio]),
             @"speech_recognition": LumiSpeechAuthorizationName([SFSpeechRecognizer authorizationStatus]),
         };
