@@ -495,6 +495,19 @@ func (a *app) nativeSmokeCommand() *cobra.Command {
 				return fmt.Errorf("Accessibility smoke test reported title source %q with an empty window",
 					snapshot.TitleSource)
 			}
+			if snapshot.AppSource == "" {
+				return errors.New("Accessibility smoke test resolved no app source")
+			}
+			frontmost, err := macosnative.FrontmostDiagnostic(cmd.Context())
+			if err != nil {
+				return fmt.Errorf("run frontmost diagnostic: %w", err)
+			}
+			// The diagnostic is reported, never asserted against the snapshot
+			// above. They are separate native calls, so a focus change between
+			// them makes them differ for an entirely legitimate reason — which
+			// would fail this smoke test intermittently while proving nothing.
+			// That they share a resolver is guaranteed by construction, and is
+			// pinned by the unit tests over lumi_resolve_frontmost_json.
 			audio, err := macosnative.RecordAudio(cmd.Context(), directory, "audio", 0.5)
 			if err != nil {
 				return err
@@ -517,11 +530,21 @@ func (a *app) nativeSmokeCommand() *cobra.Command {
 			if snapshot.Trusted != nil {
 				trusted = strconv.FormatBool(*snapshot.Trusted)
 			}
+			agreement := "disagree"
+			if frontmost.Agree {
+				agreement = "agree"
+			}
 			fmt.Fprintf(cmd.OutOrStdout(),
-				"native capture ok: %d displays, app %q, window %q via %s (AX trusted=%s%s), "+
-					"Vision ok, system audio ok, microphone ok\n",
-				len(frames), snapshot.App, snapshot.Window, snapshot.TitleSource, trusted,
-				smokeAccessibilityNote(snapshot.Error))
+				"native capture ok: %d displays, app %q via %s, window %q via %s (AX trusted=%s%s), "+
+					"Vision ok, system audio ok, microphone ok\n"+
+					"frontmost: Accessibility pid=%d %q | NSWorkspace pid=%d %q | "+
+					"window list pid=%d %q | resolved %q via %s (%s)\n",
+				len(frames), snapshot.App, snapshot.AppSource, snapshot.Window, snapshot.TitleSource,
+				trusted, smokeAccessibilityNote(snapshot.Error),
+				frontmost.Accessibility.PID, frontmost.Accessibility.App,
+				frontmost.Workspace.PID, frontmost.Workspace.App,
+				frontmost.WindowList.PID, frontmost.WindowList.App,
+				frontmost.Resolved.App, frontmost.Resolved.AppSource, agreement)
 			return nil
 		},
 	}

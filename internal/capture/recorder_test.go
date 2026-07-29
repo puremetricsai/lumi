@@ -101,7 +101,7 @@ func (accessibilityText) Snapshot(context.Context) (ScreenContext, error) {
 type fakeContext struct{}
 
 func (fakeContext) Snapshot(context.Context) (ScreenContext, error) {
-	return ScreenContext{App: "Test App", Window: "Test Window"}, nil
+	return ScreenContext{App: "Test App", Window: "Test Window", AppSource: "workspace"}, nil
 }
 
 // titleOnlyContext mimics a GPUI/Metal app (e.g. Zed) whose Accessibility tree
@@ -122,6 +122,7 @@ func (degradedContext) Snapshot(context.Context) (ScreenContext, error) {
 	return ScreenContext{
 		App: "Comet", Window: "Booking — Shashi Hotel", DisplayID: 1,
 		Trusted:            &trusted,
+		AppSource:          "window_list",
 		TitleSource:        "window_list",
 		AccessibilityError: "read macOS Accessibility tree: read focused Accessibility window (AX error -25204)",
 	}, nil
@@ -137,6 +138,7 @@ func (degradedWithTextContext) Snapshot(context.Context) (ScreenContext, error) 
 	return ScreenContext{
 		App: "Notes", Window: "Plan", Text: "Accessibility primary text", DisplayID: 1,
 		Trusted:            &trusted,
+		AppSource:          "window_list",
 		TitleSource:        "window_list",
 		AccessibilityError: "read macOS Accessibility tree: degraded",
 	}, nil
@@ -608,6 +610,12 @@ func TestRecorderAttributesEventsWhenAccessibilityFails(t *testing.T) {
 	metadata := unmarshalMetadata(t, events[0].Metadata)
 	if metadata["attribution_source"] != "window_list" {
 		t.Errorf("attribution_source = %v, want window_list", metadata["attribution_source"])
+	}
+	// app_source is recorded alongside attribution_source, not merged into it:
+	// the source that named the app and the source that supplied the title are
+	// separately diagnosable.
+	if metadata["app_source"] != "window_list" {
+		t.Errorf("app_source = %v, want window_list", metadata["app_source"])
 	}
 	if metadata["accessibility_trusted"] != true {
 		t.Errorf("accessibility_trusted = %v, want true", metadata["accessibility_trusted"])

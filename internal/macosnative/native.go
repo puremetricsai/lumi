@@ -10,6 +10,12 @@ package macosnative
 
 char *lumi_capture_screens_json(const char *directory, const char *prefix, char **error_message);
 char *lumi_accessibility_snapshot_json(char **error_message);
+char *lumi_resolve_frontmost_json(const char *windows_json, int active_pid, int workspace_pid,
+                                  const char *workspace_app, int self_pid,
+                                  char **error_message);
+char *lumi_frontmost_diagnostic_json(char **error_message);
+char *lumi_frontmost_candidates_json(const char *windows_json, const char *regular_pids_json,
+                                     int self_pid, char **error_message);
 char *lumi_vision_recognize(const char *image_path, char **error_message);
 char *lumi_permissions_json(char **error_message);
 char *lumi_hid_access_name(int access);
@@ -57,8 +63,37 @@ type AccessibilitySnapshot struct {
 	DisplayID   uint32 `json:"display_id"`
 	InputActive bool   `json:"input_active"`
 	Trusted     *bool  `json:"trusted,omitempty"`
+	AppSource   string `json:"app_source,omitempty"`
 	TitleSource string `json:"title_source,omitempty"`
 	Error       string `json:"error,omitempty"`
+}
+
+// FrontmostProcess is one source's answer to "which process is frontmost".
+type FrontmostProcess struct {
+	PID int32  `json:"pid"`
+	App string `json:"app"`
+}
+
+// FrontmostResolution is FrontmostProcess plus which source produced it.
+type FrontmostResolution struct {
+	PID       int32  `json:"pid"`
+	App       string `json:"app"`
+	AppSource string `json:"app_source"`
+}
+
+// FrontmostDiagnosticReport compares the three frontmost sources. Agree
+// concerns only NSWorkspace against the window list: it is false whenever they
+// name different processes, which is the signature of a stale NSWorkspace in a
+// process that runs no run loop. Accessibility is reported separately, and is
+// whichever activation stage answered — the system-wide read or the per-
+// application frontmost validation — because it is unavailable often enough
+// that its absence is not itself a disagreement.
+type FrontmostDiagnosticReport struct {
+	Accessibility FrontmostProcess    `json:"accessibility"`
+	Workspace     FrontmostProcess    `json:"workspace"`
+	WindowList    FrontmostProcess    `json:"window_list"`
+	Resolved      FrontmostResolution `json:"resolved"`
+	Agree         bool                `json:"agree"`
 }
 
 type Permissions struct {
@@ -113,6 +148,68 @@ func Accessibility(ctx context.Context) (AccessibilitySnapshot, error) {
 		return snapshot, fmt.Errorf("decode Accessibility snapshot: %w", err)
 	}
 	return snapshot, nil
+}
+
+// FrontmostDiagnostic reports what each frontmost source sees, for
+// `lumi native-smoke`. It shares a resolver with Accessibility, so the two
+// cannot disagree about what the recorder will actually attribute.
+func FrontmostDiagnostic(ctx context.Context) (FrontmostDiagnosticReport, error) {
+	if err := ctx.Err(); err != nil {
+		return FrontmostDiagnosticReport{}, err
+	}
+	var nativeErr *C.char
+	result, err := nativeJSON(C.lumi_frontmost_diagnostic_json(&nativeErr), nativeErr)
+	if err != nil {
+		return FrontmostDiagnosticReport{}, err
+	}
+	var report FrontmostDiagnosticReport
+	if err := json.Unmarshal(result, &report); err != nil {
+		return report, fmt.Errorf("decode frontmost diagnostic: %w", err)
+	}
+	return report, nil
+}
+
+// resolveFrontmost drives the pure native resolver directly, so its branch order
+// can be tested without a live session. Unexported: it exists for the test.
+func resolveFrontmost(windowsJSON string, activePID, workspacePID int32, workspaceApp string, selfPID int32) (FrontmostResolution, error) {
+	windowsC := C.CString(windowsJSON)
+	appC := C.CString(workspaceApp)
+	defer C.free(unsafe.Pointer(windowsC))
+	defer C.free(unsafe.Pointer(appC))
+	var nativeErr *C.char
+	result, err := nativeJSON(
+		C.lumi_resolve_frontmost_json(windowsC, C.int(activePID), C.int(workspacePID), appC,
+			C.int(selfPID), &nativeErr),
+		nativeErr)
+	if err != nil {
+		return FrontmostResolution{}, err
+	}
+	var resolution FrontmostResolution
+	if err := json.Unmarshal(result, &resolution); err != nil {
+		return resolution, fmt.Errorf("decode frontmost resolution: %w", err)
+	}
+	return resolution, nil
+}
+
+// frontmostCandidates drives the pure candidate enumeration directly, so which
+// processes are eligible for the frontmost walk is testable without a live
+// session. Unexported: it exists for the test.
+func frontmostCandidates(windowsJSON, regularPIDsJSON string, selfPID int32) ([]int32, error) {
+	windowsC := C.CString(windowsJSON)
+	regularC := C.CString(regularPIDsJSON)
+	defer C.free(unsafe.Pointer(windowsC))
+	defer C.free(unsafe.Pointer(regularC))
+	var nativeErr *C.char
+	result, err := nativeJSON(
+		C.lumi_frontmost_candidates_json(windowsC, regularC, C.int(selfPID), &nativeErr), nativeErr)
+	if err != nil {
+		return nil, err
+	}
+	var candidates []int32
+	if err := json.Unmarshal(result, &candidates); err != nil {
+		return nil, fmt.Errorf("decode frontmost candidates: %w", err)
+	}
+	return candidates, nil
 }
 
 func RecognizeText(ctx context.Context, imagePath string) (string, error) {

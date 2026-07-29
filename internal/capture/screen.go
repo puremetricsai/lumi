@@ -29,12 +29,17 @@ type ScreenFrame struct {
 // distinct from a known-false "trust was revoked". Callers that report a cause
 // to the user must branch on all three states.
 type ScreenContext struct {
-	App                string
-	Window             string
-	Text               string
-	DisplayID          uint32
-	InputActive        bool
-	Trusted            *bool
+	App         string
+	Window      string
+	Text        string
+	DisplayID   uint32
+	InputActive bool
+	Trusted     *bool
+	// AppSource names where App and the pid behind it came from; TitleSource
+	// names where Window came from. They routinely differ — the common case is
+	// an app named by the window list whose title was read over Accessibility —
+	// so they answer different questions and must not be conflated.
+	AppSource          string
 	TitleSource        string
 	AccessibilityError string
 }
@@ -100,7 +105,8 @@ func (AccessibilityContext) Snapshot(ctx context.Context) (ScreenContext, error)
 	screenContext := ScreenContext{
 		App: snapshot.App, Window: snapshot.Window, Text: snapshot.Text,
 		DisplayID: snapshot.DisplayID, InputActive: snapshot.InputActive,
-		Trusted: snapshot.Trusted, TitleSource: snapshot.TitleSource,
+		Trusted: snapshot.Trusted, AppSource: snapshot.AppSource,
+		TitleSource: snapshot.TitleSource,
 	}
 	if snapshot.Error != "" {
 		screenContext.AccessibilityError = fmt.Sprintf("read macOS Accessibility tree: %s", snapshot.Error)
