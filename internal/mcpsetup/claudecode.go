@@ -146,7 +146,7 @@ func (c *ClaudeCode) Apply(ctx context.Context, spec Spec, opts Options) (Result
 	if cli == "" {
 		result.Status = StatusSkipped
 		result.Detail = "the claude CLI was not found on PATH"
-		result.Manual = ManualSnippet(spec)
+		result.manualJSON(spec)
 		if c.Required {
 			return result, notInstalledErr(claudeCodeName, result.Detail)
 		}
@@ -159,7 +159,7 @@ func (c *ClaudeCode) Apply(ctx context.Context, spec Spec, opts Options) (Result
 		result.Status = StatusConflict
 		result.Detail = "an entry already exists that Lumi cannot read"
 		result.Current = unreadableEntry
-		result.Manual = ManualSnippet(spec)
+		result.manualJSON(spec)
 		return result, conflictErr(claudeCodeName, spec.Name)
 	case found && existing.matches(spec):
 		result.Status = StatusUnchanged
@@ -169,7 +169,7 @@ func (c *ClaudeCode) Apply(ctx context.Context, spec Spec, opts Options) (Result
 		result.Status = StatusConflict
 		result.Detail = "an entry with different settings already exists"
 		result.Current = existing.commandLine()
-		result.Manual = ManualSnippet(spec)
+		result.manualJSON(spec)
 		return result, conflictErr(claudeCodeName, spec.Name)
 	}
 
