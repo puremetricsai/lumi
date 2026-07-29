@@ -32,15 +32,33 @@ var (
 	newSetupTargets = defaultSetupTargets
 )
 
+// clientSelection is the set of clients one --client value asks for.
+//
+// A struct rather than positional bools: at two clients the argument list was
+// still readable, at three a caller passing them in the wrong order would
+// compile and silently configure the wrong client.
+type clientSelection struct {
+	code    bool
+	desktop bool
+	codex   bool
+	// explicit reports whether the user named a specific client. A client asked
+	// for by name that turns out to be unconfigurable is an error, while the
+	// same client reached through "all" is a visible skip.
+	explicit bool
+}
+
 // defaultSetupTargets builds the real clients. explicit marks the target as
 // Required, which turns "not installed" from a skip into an error.
-func defaultSetupTargets(code, desktop, explicit bool) []mcpsetup.Target {
+func defaultSetupTargets(sel clientSelection) []mcpsetup.Target {
 	var targets []mcpsetup.Target
-	if code {
-		targets = append(targets, &mcpsetup.ClaudeCode{Required: explicit})
+	if sel.code {
+		targets = append(targets, &mcpsetup.ClaudeCode{Required: sel.explicit})
 	}
-	if desktop {
-		targets = append(targets, &mcpsetup.ClaudeDesktop{Required: explicit})
+	if sel.desktop {
+		targets = append(targets, &mcpsetup.ClaudeDesktop{Required: sel.explicit})
+	}
+	if sel.codex {
+		targets = append(targets, &mcpsetup.Codex{Required: sel.explicit})
 	}
 	return targets
 }
@@ -64,10 +82,11 @@ func (a *app) mcpSetupCommand() *cobra.Command {
 	var f mcpSetupFlags
 	cmd := &cobra.Command{
 		Use:   "setup",
-		Short: "Register lumi as an MCP server with Claude Code and Claude Desktop",
+		Short: "Register lumi as an MCP server with Claude Code, Claude Desktop, and Codex CLI",
 		Long: "Write the lumi MCP server entry into the configuration of every MCP client\n" +
-			"installed on this machine. Clients launch `lumi mcp` themselves over stdio,\n" +
-			"so nothing runs in the background and no port is opened.\n\n" +
+			"installed on this machine — Claude Code, Claude Desktop, and Codex CLI.\n" +
+			"Clients launch `lumi mcp` themselves over stdio, so nothing runs in the\n" +
+			"background and no port is opened.\n\n" +
 			"Setup is idempotent: a second run reports 'unchanged' and writes nothing. An\n" +
 			"entry that already exists with different settings is never overwritten without\n" +
 			"--force.",
@@ -76,7 +95,7 @@ func (a *app) mcpSetupCommand() *cobra.Command {
 			return a.runMCPSetup(cmd, f)
 		},
 	}
-	cmd.Flags().StringVar(&f.client, "client", "all", "which clients to configure (code, desktop, all)")
+	cmd.Flags().StringVar(&f.client, "client", "all", "which clients to configure (code, desktop, codex, all)")
 	cmd.Flags().StringVar(&f.name, "name", "lumi", "name to register the server under")
 	cmd.Flags().BoolVar(&f.dryRun, "dry-run", false, "report what would change without writing anything")
 	cmd.Flags().BoolVar(&f.force, "force", false, "replace an existing entry that differs")
@@ -84,7 +103,7 @@ func (a *app) mcpSetupCommand() *cobra.Command {
 }
 
 func (a *app) runMCPSetup(cmd *cobra.Command, f mcpSetupFlags) error {
-	wantCode, wantDesktop, explicit, err := parseClientSelection(f.client)
+	selection, err := parseClientSelection(f.client)
 	if err != nil {
 		return err
 	}
@@ -122,7 +141,7 @@ func (a *app) runMCPSetup(cmd *cobra.Command, f mcpSetupFlags) error {
 	}
 	opts := mcpsetup.Options{Force: f.force, DryRun: f.dryRun}
 
-	targets := newSetupTargets(wantCode, wantDesktop, explicit)
+	targets := newSetupTargets(selection)
 	results := make([]mcpsetup.Result, 0, len(targets))
 	var errs []error
 	for _, target := range targets {
@@ -140,21 +159,20 @@ func (a *app) runMCPSetup(cmd *cobra.Command, f mcpSetupFlags) error {
 	return errors.Join(errs...)
 }
 
-// parseClientSelection maps --client onto the target set. The bool reports
-// whether the user named a specific client: a client asked for by name that
-// turns out to be unconfigurable is an error, while the same client reached
-// through "all" is a visible skip.
-func parseClientSelection(value string) (code, desktop, explicit bool, err error) {
+// parseClientSelection maps --client onto the target set.
+func parseClientSelection(value string) (clientSelection, error) {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "all":
-		return true, true, false, nil
+		return clientSelection{code: true, desktop: true, codex: true}, nil
 	case "code":
-		return true, false, true, nil
+		return clientSelection{code: true, explicit: true}, nil
 	case "desktop":
-		return false, true, true, nil
+		return clientSelection{desktop: true, explicit: true}, nil
+	case "codex":
+		return clientSelection{codex: true, explicit: true}, nil
 	default:
-		return false, false, false, fmt.Errorf(
-			"unknown --client %q: expected code, desktop, or all", value)
+		return clientSelection{}, fmt.Errorf(
+			"unknown --client %q: expected code, desktop, codex, or all", value)
 	}
 }
 
@@ -252,10 +270,15 @@ func printSetupDiagnostics(w io.Writer, results []mcpsetup.Result, spec mcpsetup
 	desktopChanged := false
 	for _, r := range results {
 		switch r.Status {
-		case mcpsetup.StatusSkipped:
-			fmt.Fprintf(w, "\n%s: skipped — %s.\n"+
-				"  To configure it by hand, add this under \"mcpServers\":\n\n%s\n",
-				r.Target, r.Detail, r.Manual)
+		case mcpsetup.StatusSkipped, mcpsetup.StatusFailed:
+			// Both mean "nothing was written and you are on your own", so both
+			// hand back the snippet. The instruction comes from the target, not
+			// from here: the two Claude clients take JSON under "mcpServers" and
+			// Codex takes a TOML table, and one hardcoded sentence would be
+			// wrong for one of them.
+			fmt.Fprintf(w, "\n%s: %s — %s.\n"+
+				"  To configure it by hand, %s:\n\n%s\n",
+				r.Target, r.Status, r.Detail, r.ManualHint, r.Manual)
 		case mcpsetup.StatusConflict:
 			fmt.Fprintf(w, "\n%s: %s\n    current:  %s\n    desired:  %s\n"+
 				"  Re-run with --force to replace it, or --name to add a second entry.\n",
