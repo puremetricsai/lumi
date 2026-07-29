@@ -14,6 +14,8 @@ char *lumi_resolve_frontmost_json(const char *windows_json, int active_pid, int 
                                   const char *workspace_app, int self_pid,
                                   char **error_message);
 char *lumi_frontmost_diagnostic_json(char **error_message);
+char *lumi_frontmost_candidates_json(const char *windows_json, const char *regular_pids_json,
+                                     int self_pid, char **error_message);
 char *lumi_vision_recognize(const char *image_path, char **error_message);
 char *lumi_permissions_json(char **error_message);
 char *lumi_hid_access_name(int access);
@@ -82,8 +84,10 @@ type FrontmostResolution struct {
 // FrontmostDiagnosticReport compares the three frontmost sources. Agree
 // concerns only NSWorkspace against the window list: it is false whenever they
 // name different processes, which is the signature of a stale NSWorkspace in a
-// process that runs no run loop. Accessibility is reported separately because
-// it is unavailable often enough that its absence is not itself a disagreement.
+// process that runs no run loop. Accessibility is reported separately, and is
+// whichever activation stage answered — the system-wide read or the per-
+// application frontmost validation — because it is unavailable often enough
+// that its absence is not itself a disagreement.
 type FrontmostDiagnosticReport struct {
 	Accessibility FrontmostProcess    `json:"accessibility"`
 	Workspace     FrontmostProcess    `json:"workspace"`
@@ -185,6 +189,27 @@ func resolveFrontmost(windowsJSON string, activePID, workspacePID int32, workspa
 		return resolution, fmt.Errorf("decode frontmost resolution: %w", err)
 	}
 	return resolution, nil
+}
+
+// frontmostCandidates drives the pure candidate enumeration directly, so which
+// processes are eligible for the frontmost walk is testable without a live
+// session. Unexported: it exists for the test.
+func frontmostCandidates(windowsJSON, regularPIDsJSON string, selfPID int32) ([]int32, error) {
+	windowsC := C.CString(windowsJSON)
+	regularC := C.CString(regularPIDsJSON)
+	defer C.free(unsafe.Pointer(windowsC))
+	defer C.free(unsafe.Pointer(regularC))
+	var nativeErr *C.char
+	result, err := nativeJSON(
+		C.lumi_frontmost_candidates_json(windowsC, regularC, C.int(selfPID), &nativeErr), nativeErr)
+	if err != nil {
+		return nil, err
+	}
+	var candidates []int32
+	if err := json.Unmarshal(result, &candidates); err != nil {
+		return nil, fmt.Errorf("decode frontmost candidates: %w", err)
+	}
+	return candidates, nil
 }
 
 func RecognizeText(ctx context.Context, imagePath string) (string, error) {

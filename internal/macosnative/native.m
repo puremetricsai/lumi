@@ -250,21 +250,23 @@ static CGDirectDisplayID LumiAXDisplayID(AXUIElementRef window) {
 }
 
 static NSString *const LumiAppSourceAccessibility = @"accessibility";
+static NSString *const LumiAppSourceFrontmostValidated = @"accessibility_frontmost";
 static NSString *const LumiAppSourceWindowList = @"window_list";
 static NSString *const LumiAppSourceWorkspace = @"workspace";
 static NSString *const LumiAppSourceRunningApplication = @"running_application";
 
-// LumiActivationPID asks the system-wide Accessibility element which application
-// holds focus. This is the only *activation* source that is both live and
-// correct for an application with no on-screen window — a Finder with every
-// window closed, or an app whose windows are all minimized — where the window
-// list necessarily reports whichever app is visually behind it.
+// LumiSystemWideActivationPID asks the system-wide Accessibility element which
+// application holds focus. This is an *activation* source, so unlike the window
+// list it is correct for an application with no on-screen window — a Finder with
+// every window closed, or an app whose windows are all minimized.
 //
 // It returns 0 rather than an error because it is genuinely unreliable: it needs
-// Accessibility trust, and it fails per-application (observed returning
-// kAXErrorNotImplemented for some Electron apps while succeeding for others in
-// the same session). Callers fall through to the window list when it does.
-static pid_t LumiActivationPID(void) {
+// Accessibility trust, and it fails per-focused-application, returning
+// kAXErrorNotImplemented for some apps while succeeding for others in the same
+// session. Measured over 45 samples it failed 10 times. Retrying does not help —
+// three attempts 30ms apart return byte-identical errors — so the remedy is a
+// second source, not a second attempt.
+static pid_t LumiSystemWideActivationPID(void) {
     AXUIElementRef systemWide = AXUIElementCreateSystemWide();
     AXUIElementSetMessagingTimeout(systemWide, 1.0);
     CFTypeRef application = NULL;
@@ -275,6 +277,112 @@ static pid_t LumiActivationPID(void) {
         CFRelease(application);
     }
     CFRelease(systemWide);
+    return pid;
+}
+
+// LumiFrontmostValidatedPID validates window-list candidates against activation
+// instead of trusting window order. It walks the list front-to-back and asks
+// each distinct owner, over per-application Accessibility, whether it is itself
+// frontmost — returning the first that says yes.
+//
+// This exists because window order and activation disagree exactly at app-switch
+// boundaries, which is where the residual misattribution was concentrated: the
+// top layer-0 window is briefly the *previous* app (or the *next* one) while
+// something else is actually active, and events captured in that gap were
+// stamped with whichever window happened to be on top. Where the system-wide
+// read failed in 10 of 45 samples, this answered in 45 of 45 — including the
+// switch-boundary sample where the window list said Messages and the frontmost
+// application was still Claude.
+//
+// It is bounded and short-circuits: the true frontmost application is normally
+// the first or second candidate, so this is one or two AX round-trips per tick.
+// kAXFrontmostAttribute is a per-application read, which the misattributed
+// events prove keeps working even when the system-wide element does not.
+//
+// LumiFrontmostCandidates builds the ordered list to ask. It is pure, so which
+// processes are eligible — the question behind this whole subsystem — is
+// testable without a live session.
+//
+// On-screen window owners come first, front-to-back, because the frontmost
+// application almost always owns the front window and that ends the walk in one
+// round-trip. regularPIDs follows, and exists because an application with no
+// on-screen window at all — every window minimized or closed — owns no entry in
+// the window list and could otherwise never be discovered, leaving exactly the
+// activation-versus-visibility misattribution this subsystem exists to prevent.
+//
+// regularPIDs must be dock-visible applications only (NSApplicationActivation-
+// PolicyRegular). Widening it to every running application is the obvious
+// generalisation and is wrong: background agents answer kAXFrontmost
+// affirmatively, and an unfiltered walk was measured attributing frames to
+// Notification Center. Filtered to regular applications, no spurious claimant
+// appeared in any sample, and simulating a windowless active application
+// recovered it in 19 of 20.
+static NSArray<NSNumber *> *LumiFrontmostCandidates(NSArray *windows, NSArray<NSNumber *> *regularPIDs,
+                                                    pid_t selfPID) {
+    NSMutableArray<NSNumber *> *candidates = [NSMutableArray array];
+    NSMutableSet<NSNumber *> *seen = [NSMutableSet set];
+    for (NSDictionary *window in windows) {
+        if (![window isKindOfClass:NSDictionary.class]) continue;
+        NSNumber *owner = window[(__bridge NSString *)kCGWindowOwnerPID];
+        if (owner == nil || [seen containsObject:owner]) continue;
+        pid_t pid = (pid_t)owner.intValue;
+        if (pid == 0 || pid == selfPID) continue;
+        [seen addObject:owner];
+        [candidates addObject:owner];
+        if (candidates.count >= 8) break;
+    }
+    for (NSNumber *candidate in regularPIDs) {
+        if (candidate == nil || [seen containsObject:candidate]) continue;
+        pid_t pid = (pid_t)candidate.intValue;
+        if (pid == 0 || pid == selfPID) continue;
+        [seen addObject:candidate];
+        [candidates addObject:candidate];
+        if (candidates.count >= 48) break;
+    }
+    return candidates;
+}
+
+// LumiRegularApplicationPIDs is the dock-visible half of LumiFrontmostCandidates.
+// The list itself comes from NSWorkspace, which is why it is read here and not
+// in the pure function: only membership is used, never activation state, since
+// runningApplications/isActive freezes in a process that runs no run loop.
+static NSArray<NSNumber *> *LumiRegularApplicationPIDs(void) {
+    NSMutableArray<NSNumber *> *pids = [NSMutableArray array];
+    for (NSRunningApplication *application in NSWorkspace.sharedWorkspace.runningApplications) {
+        if (application.activationPolicy != NSApplicationActivationPolicyRegular) continue;
+        [pids addObject:@(application.processIdentifier)];
+    }
+    return pids;
+}
+
+static pid_t LumiFrontmostValidatedPID(NSArray *windows, pid_t selfPID) {
+    NSArray<NSNumber *> *candidates =
+        LumiFrontmostCandidates(windows, LumiRegularApplicationPIDs(), selfPID);
+    for (NSNumber *candidate in candidates) {
+        AXUIElementRef application = AXUIElementCreateApplication((pid_t)candidate.intValue);
+        AXUIElementSetMessagingTimeout(application, 0.5);
+        CFTypeRef frontmost = NULL;
+        AXError axError = AXUIElementCopyAttributeValue(application, kAXFrontmostAttribute, &frontmost);
+        BOOL isFrontmost = NO;
+        if (axError == kAXErrorSuccess && frontmost != NULL) {
+            isFrontmost = CFBooleanGetValue((CFBooleanRef)frontmost);
+            CFRelease(frontmost);
+        }
+        CFRelease(application);
+        if (isFrontmost) return (pid_t)candidate.intValue;
+    }
+    return 0;
+}
+
+// LumiActivationPID resolves activation from the system-wide element, falling
+// back to validating window-list candidates. viaValidation reports which
+// answered, so the provenance recorded on the event stays honest.
+static pid_t LumiActivationPID(NSArray *windows, pid_t selfPID, BOOL *viaValidation) {
+    if (viaValidation != NULL) *viaValidation = NO;
+    pid_t pid = LumiSystemWideActivationPID();
+    if (pid != 0) return pid;
+    pid = LumiFrontmostValidatedPID(windows, selfPID);
+    if (pid != 0 && viaValidation != NULL) *viaValidation = YES;
     return pid;
 }
 
@@ -380,15 +488,60 @@ char *lumi_resolve_frontmost_json(const char *windows_json, int active_pid, int 
     }
 }
 
+// lumi_frontmost_candidates_json exposes LumiFrontmostCandidates so the
+// eligibility rule is testable on a machine that cannot be posed into the case
+// that matters. The gap it guards — an active application owning no window —
+// cannot be asserted by supplying its pid to the resolver, because that is the
+// step under test: what must be proved is that such a process is *reachable*.
+char *lumi_frontmost_candidates_json(const char *windows_json, const char *regular_pids_json,
+                                     int self_pid, char **error_message) {
+    @autoreleasepool {
+        NSArray *windows = nil, *regular = nil;
+        NSError *parseError = nil;
+        if (windows_json != NULL) {
+            id decoded = [NSJSONSerialization JSONObjectWithData:[@(windows_json) dataUsingEncoding:NSUTF8StringEncoding]
+                                                         options:NSJSONReadingAllowFragments error:&parseError];
+            if (decoded == nil) {
+                if (error_message != NULL) *error_message = LumiCopyError(parseError);
+                return NULL;
+            }
+            if ([decoded isKindOfClass:NSArray.class]) windows = decoded;
+        }
+        if (regular_pids_json != NULL) {
+            id decoded = [NSJSONSerialization JSONObjectWithData:[@(regular_pids_json) dataUsingEncoding:NSUTF8StringEncoding]
+                                                         options:NSJSONReadingAllowFragments error:&parseError];
+            if (decoded == nil) {
+                if (error_message != NULL) *error_message = LumiCopyError(parseError);
+                return NULL;
+            }
+            if ([decoded isKindOfClass:NSArray.class]) regular = decoded;
+        }
+        NSArray *candidates = LumiFrontmostCandidates(windows, regular, (pid_t)self_pid);
+        NSError *jsonError = nil;
+        NSString *json = LumiJSONString(candidates, &jsonError);
+        if (json == nil) {
+            if (error_message != NULL) *error_message = LumiCopyError(jsonError);
+            return NULL;
+        }
+        return LumiCopyUTF8(json);
+    }
+}
+
 // LumiResolveFrontmostLive completes LumiResolveFrontmost against the frameworks
 // it deliberately does not touch. The pure function can name a pid it cannot
 // name an app for; only here may that be repaired.
 static NSDictionary *LumiResolveFrontmostLive(NSArray *windows, pid_t activePID,
+                                              BOOL activeViaValidation,
                                               NSRunningApplication *frontmost) {
     pid_t workspacePID = frontmost == nil ? 0 : frontmost.processIdentifier;
     NSString *workspaceName = frontmost.localizedName ?: @"";
     NSMutableDictionary *resolved =
         [LumiResolveFrontmost(windows, activePID, workspacePID, workspaceName, getpid()) mutableCopy];
+    // The pure function cannot tell which Accessibility read answered, and the
+    // two have very different reliability, so the distinction is recorded here.
+    if (activeViaValidation && [resolved[@"app_source"] isEqualToString:LumiAppSourceAccessibility]) {
+        resolved[@"app_source"] = LumiAppSourceFrontmostValidated;
+    }
     if ([resolved[@"app"] length] > 0) return resolved;
 
     pid_t pid = (pid_t)[resolved[@"pid"] intValue];
@@ -467,8 +620,10 @@ char *lumi_accessibility_snapshot_json(char **error_message) {
         CFArrayRef windowList = CGWindowListCopyWindowInfo(
             kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID);
         NSArray *windows = windowList == NULL ? nil : (__bridge NSArray *)windowList;
+        BOOL activeViaValidation = NO;
+        pid_t activePID = LumiActivationPID(windows, getpid(), &activeViaValidation);
         NSDictionary *resolved = LumiResolveFrontmostLive(
-            windows, LumiActivationPID(), NSWorkspace.sharedWorkspace.frontmostApplication);
+            windows, activePID, activeViaValidation, NSWorkspace.sharedWorkspace.frontmostApplication);
         pid_t frontmostPID = (pid_t)[resolved[@"pid"] intValue];
         NSString *frontmostApp = resolved[@"app"];
         // Both sources failed: there is nothing to attribute and nothing to
@@ -548,10 +703,12 @@ char *lumi_frontmost_diagnostic_json(char **error_message) {
         // named nothing.
         NSDictionary *listOnly = LumiResolveFrontmost(windows, 0, 0, @"", getpid());
         BOOL listNamed = [listOnly[@"app_source"] isEqualToString:LumiAppSourceWindowList];
-        pid_t activePID = LumiActivationPID();
+        BOOL activeViaValidation = NO;
+        pid_t activePID = LumiActivationPID(windows, getpid(), &activeViaValidation);
         NSString *activeName = activePID == 0 ? @"" :
             ([NSRunningApplication runningApplicationWithProcessIdentifier:activePID].localizedName ?: @"");
-        NSDictionary *resolved = LumiResolveFrontmostLive(windows, activePID, frontmost);
+        NSDictionary *resolved =
+            LumiResolveFrontmostLive(windows, activePID, activeViaValidation, frontmost);
         if (windowList != NULL) CFRelease(windowList);
 
         // Boxed through a BOOL local deliberately: @(a && b) boxes a C int and

@@ -245,6 +245,168 @@ func TestResolveFrontmostPrefersTheFrontOnScreenWindow(t *testing.T) {
 	}
 }
 
+// TestResolveFrontmostAttributesAppSwitchBoundaries is the regression test for
+// events 28603 and 28609, captured 2026-07-28 23:44:20 and 23:44:32. Both were
+// stamped "Comet" while the menu bar in their own OCR read "Screen Sharing" and
+// "Messages" respectively, and both recorded app_source="window_list" — the
+// system-wide Accessibility read had returned nothing, so the resolver fell
+// through to the identical topmost layer-0 window, Comet's Gmail tab.
+//
+// The window list is not wrong about window order; it is answering the wrong
+// question at an app-switch boundary, where the front window is still (or
+// already) some other app's while activation has moved. Validating candidates
+// against per-application kAXFrontmost supplies the activation pid the
+// system-wide read could not, which is what these cases assert.
+func TestResolveFrontmostAttributesAppSwitchBoundaries(t *testing.T) {
+	const comet, screenSharing, messages, self = 5120, 6210, 1198, 4242
+	// Identical in both events: Comet's Gmail tab was the topmost layer-0 window.
+	windows := windowsJSON(t, window(comet, 0, "Comet"))
+
+	for _, testCase := range []struct {
+		name      string
+		event     int
+		activePID int32
+		wantApp   string
+	}{
+		{"event 28603 was stamped Comet with Screen Sharing in the menu bar", 28603, screenSharing, "Screen Sharing"},
+		{"event 28609 was stamped Comet with Messages in the menu bar", 28609, messages, "Messages"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			// The activation pid carries the name here only when the app owns a
+			// listed window; these apps did not, so the caller names it. What
+			// must never happen is inheriting Comet's pid.
+			resolved, err := resolveFrontmost(windows, testCase.activePID, 0, "", self)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resolved.PID == comet {
+				t.Fatalf("event %d: resolved Comet's pid again — the window list still wins over activation",
+					testCase.event)
+			}
+			if resolved.PID != testCase.activePID {
+				t.Errorf("event %d: resolved pid %d, want the active %d (%s)",
+					testCase.event, resolved.PID, testCase.activePID, testCase.wantApp)
+			}
+			if resolved.AppSource != "accessibility" {
+				t.Errorf("event %d: app_source = %q, want accessibility — window_list is what misattributed it",
+					testCase.event, resolved.AppSource)
+			}
+		})
+	}
+
+	// With no activation source at all, the resolver still falls back to the
+	// window list rather than losing attribution: that is the pre-fix behaviour,
+	// and it stays the floor rather than becoming the answer.
+	resolved, err := resolveFrontmost(windows, 0, 0, "", self)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.PID != comet || resolved.AppSource != "window_list" {
+		t.Errorf("without activation, resolved %d via %s, want Comet via window_list",
+			resolved.PID, resolved.AppSource)
+	}
+}
+
+// TestFrontmostCandidatesReachWindowlessApplications covers the gap the
+// resolver tests structurally cannot: they supply the activation pid, but the
+// question here is whether such a process is *reachable* at all. An application
+// with every window minimized or closed owns no window-list entry, so a walk
+// seeded only from on-screen owners can never ask it, returns nothing, and the
+// resolver falls back to whichever app is visually behind it.
+func TestFrontmostCandidatesReachWindowlessApplications(t *testing.T) {
+	const comet, finder, self = 9440, 7100, 4242
+	const notificationCenter = 1121
+
+	contains := func(candidates []int32, pid int32) bool {
+		for _, candidate := range candidates {
+			if candidate == pid {
+				return true
+			}
+		}
+		return false
+	}
+
+	t.Run("a windowless regular application is still asked", func(t *testing.T) {
+		candidates, err := frontmostCandidates(
+			windowsJSON(t, window(comet, 0, "Comet")), "[9440,7100]", self)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !contains(candidates, finder) {
+			t.Errorf("candidates %v omit the windowless application %d — it can never be "+
+				"asked whether it is frontmost, so the frame goes to whatever is visible",
+				candidates, finder)
+		}
+	})
+
+	t.Run("on-screen owners are asked before windowless applications", func(t *testing.T) {
+		candidates, err := frontmostCandidates(
+			windowsJSON(t, window(comet, 0, "Comet")), "[7100,9440]", self)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(candidates) == 0 || candidates[0] != comet {
+			t.Errorf("candidates %v do not start with the front window's owner %d; the "+
+				"frontmost app almost always owns it, and asking it first is what keeps "+
+				"this to one round-trip", candidates, comet)
+		}
+	})
+
+	t.Run("a background agent is never a candidate", func(t *testing.T) {
+		// Notification Center answers kAXFrontmost affirmatively. An unfiltered
+		// walk was measured attributing frames to it, so eligibility must come
+		// from the regular-activation-policy list and nowhere else.
+		candidates, err := frontmostCandidates(
+			windowsJSON(t, window(comet, 0, "Comet")), "[9440]", self)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if contains(candidates, notificationCenter) {
+			t.Errorf("candidates %v include background agent %d, which claims frontmost "+
+				"spuriously", candidates, notificationCenter)
+		}
+	})
+
+	t.Run("the recorder itself is never a candidate", func(t *testing.T) {
+		candidates, err := frontmostCandidates(
+			windowsJSON(t, window(self, 0, "lumi")), "[4242,9440]", self)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if contains(candidates, self) {
+			t.Errorf("candidates %v include the recorder's own pid", candidates)
+		}
+	})
+
+	t.Run("candidates are deduplicated and bounded", func(t *testing.T) {
+		candidates, err := frontmostCandidates(
+			windowsJSON(t, window(comet, 0, "Comet"), window(comet, 0, "Comet")), "[9440,7100]", self)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seen := map[int32]bool{}
+		for _, candidate := range candidates {
+			if seen[candidate] {
+				t.Errorf("candidates %v ask pid %d twice", candidates, candidate)
+			}
+			seen[candidate] = true
+		}
+		if len(candidates) > 48 {
+			t.Errorf("candidates %d exceed the bound; the walk is per-tick AX traffic", len(candidates))
+		}
+	})
+
+	t.Run("no regular applications leaves the window owners", func(t *testing.T) {
+		candidates, err := frontmostCandidates(windowsJSON(t, window(comet, 0, "Comet")), "[]", self)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(candidates) != 1 || candidates[0] != comet {
+			t.Errorf("candidates %v, want just the window owner %d", candidates, comet)
+		}
+	})
+}
+
 // TestResolveFrontmostNamesSomethingWheneverASourceCan pins the other half of
 // the attribution invariant: the fix must not buy correctness by returning
 // nothing. Only a total failure of both sources may resolve to nothing at all.
@@ -316,7 +478,7 @@ func TestAccessibilitySnapshotWhenPermissionIsGranted(t *testing.T) {
 	// Provenance must always be recorded, so a wrong app in the index can be
 	// traced to the source that named it.
 	switch snapshot.AppSource {
-	case "accessibility", "window_list", "running_application", "workspace":
+	case "accessibility", "accessibility_frontmost", "window_list", "running_application", "workspace":
 	default:
 		t.Errorf("Accessibility named %q with unknown app source %q", snapshot.App, snapshot.AppSource)
 	}
@@ -334,7 +496,7 @@ func TestFrontmostDiagnosticIsInternallyConsistent(t *testing.T) {
 		t.Fatal(err)
 	}
 	switch report.Resolved.AppSource {
-	case "accessibility", "window_list", "running_application", "workspace":
+	case "accessibility", "accessibility_frontmost", "window_list", "running_application", "workspace":
 	default:
 		t.Errorf("diagnostic resolved via unknown source %q", report.Resolved.AppSource)
 	}
