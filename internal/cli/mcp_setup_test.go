@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -44,7 +45,7 @@ func newSetupTest(t *testing.T, targets ...mcpsetup.Target) (string, func(args .
 
 	swap(t, &resolveLumiBinary, func() (string, error) { return "/usr/local/bin/lumi", nil })
 	swap(t, &verifyLumiBinary, func(context.Context, string) error { return nil })
-	swap(t, &newSetupTargets, func(_, _, _ bool) []mcpsetup.Target { return targets })
+	swap(t, &newSetupTargets, func(clientSelection) []mcpsetup.Target { return targets })
 
 	a := &app{dataDir: dataDir}
 	run := func(args ...string) (string, string, error) {
@@ -273,9 +274,10 @@ func TestMCPSetupResultsGoToStdoutAndDiagnosticsToStderr(t *testing.T) {
 	skipped := &fakeTarget{
 		name: "claude-desktop",
 		result: mcpsetup.Result{
-			Status: mcpsetup.StatusSkipped,
-			Detail: "Claude Desktop is not installed",
-			Manual: `  "lumi": {}`,
+			Status:     mcpsetup.StatusSkipped,
+			Detail:     "Claude Desktop is not installed",
+			Manual:     `  "lumi": {}`,
+			ManualHint: `add this under "mcpServers"`,
 		},
 	}
 	_, run := newSetupTest(t, conflicted, skipped)
@@ -311,7 +313,7 @@ func TestMCPSetupDryRunCreatesNoDirectories(t *testing.T) {
 		Status: mcpsetup.StatusAdded, Detail: "…"}}
 	swap(t, &resolveLumiBinary, func() (string, error) { return "/usr/local/bin/lumi", nil })
 	swap(t, &verifyLumiBinary, func(context.Context, string) error { return nil })
-	swap(t, &newSetupTargets, func(_, _, _ bool) []mcpsetup.Target { return []mcpsetup.Target{target} })
+	swap(t, &newSetupTargets, func(clientSelection) []mcpsetup.Target { return []mcpsetup.Target{target} })
 
 	root := filepath.Join(t.TempDir(), "absent")
 	a := &app{dataDir: root}
@@ -362,20 +364,21 @@ func TestMCPSetupDryRunUsesConditionalWording(t *testing.T) {
 func TestParseClientSelection(t *testing.T) {
 	t.Parallel()
 	for name, tc := range map[string]struct {
-		value                   string
-		code, desktop, explicit bool
-		wantErr                 bool
+		value   string
+		want    clientSelection
+		wantErr bool
 	}{
-		"all":            {"all", true, true, false, false},
-		"code":           {"code", true, false, true, false},
-		"desktop":        {"desktop", false, true, true, false},
-		"case insensive": {"Desktop", false, true, true, false},
-		"padded":         {" all ", true, true, false, false},
-		"unknown":        {"cursor", false, false, false, true},
+		"all":            {value: "all", want: clientSelection{code: true, desktop: true, codex: true}},
+		"code":           {value: "code", want: clientSelection{code: true, explicit: true}},
+		"desktop":        {value: "desktop", want: clientSelection{desktop: true, explicit: true}},
+		"codex":          {value: "codex", want: clientSelection{codex: true, explicit: true}},
+		"case insensive": {value: "Codex", want: clientSelection{codex: true, explicit: true}},
+		"padded":         {value: " all ", want: clientSelection{code: true, desktop: true, codex: true}},
+		"unknown":        {value: "cursor", wantErr: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			code, desktop, explicit, err := parseClientSelection(tc.value)
+			got, err := parseClientSelection(tc.value)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("parseClientSelection(%q) succeeded, want an error", tc.value)
@@ -385,12 +388,69 @@ func TestParseClientSelection(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parseClientSelection(%q): %v", tc.value, err)
 			}
-			if code != tc.code || desktop != tc.desktop || explicit != tc.explicit {
-				t.Errorf("got code=%v desktop=%v explicit=%v, want %v/%v/%v",
-					code, desktop, explicit, tc.code, tc.desktop, tc.explicit)
+			if got != tc.want {
+				t.Errorf("parseClientSelection(%q) = %+v, want %+v", tc.value, got, tc.want)
 			}
 		})
 	}
+}
+
+// "all" is the default, so a client Lumi has learned to configure must actually
+// be reached by it — a target added to the package but not to the default
+// selection would silently never run.
+func TestDefaultSetupTargetsCoversEveryClient(t *testing.T) {
+	t.Parallel()
+	sel, err := parseClientSelection("all")
+	if err != nil {
+		t.Fatalf("parseClientSelection: %v", err)
+	}
+	var names []string
+	for _, target := range defaultSetupTargets(sel) {
+		names = append(names, target.Name())
+	}
+	want := []string{"claude-code", "claude-desktop", "codex"}
+	if !slices.Equal(names, want) {
+		t.Errorf("--client all selected %v, want %v", names, want)
+	}
+}
+
+// Reached through "all", an uninstalled client is a visible skip; named
+// explicitly, it is an error. Both halves have to hold for every target.
+func TestDefaultSetupTargetsMarksExplicitClientsRequired(t *testing.T) {
+	t.Parallel()
+	for _, value := range []string{"code", "desktop", "codex"} {
+		sel, err := parseClientSelection(value)
+		if err != nil {
+			t.Fatalf("parseClientSelection(%q): %v", value, err)
+		}
+		targets := defaultSetupTargets(sel)
+		if len(targets) != 1 {
+			t.Fatalf("--client %s selected %d targets, want 1", value, len(targets))
+		}
+		if !requiredOf(t, targets[0]) {
+			t.Errorf("--client %s did not mark %s required", value, targets[0].Name())
+		}
+	}
+
+	sel, err := parseClientSelection("all")
+	if err != nil {
+		t.Fatalf("parseClientSelection: %v", err)
+	}
+	for _, target := range defaultSetupTargets(sel) {
+		if requiredOf(t, target) {
+			t.Errorf("--client all marked %s required", target.Name())
+		}
+	}
+}
+
+// requiredOf reads the Required field off any concrete target.
+func requiredOf(t *testing.T, target mcpsetup.Target) bool {
+	t.Helper()
+	field := reflect.ValueOf(target).Elem().FieldByName("Required")
+	if !field.IsValid() {
+		t.Fatalf("%T has no Required field", target)
+	}
+	return field.Bool()
 }
 
 func TestIsTemporaryBinary(t *testing.T) {

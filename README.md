@@ -77,8 +77,9 @@ You never run the server yourself. The agent spawns `lumi mcp` as a child proces
 ### Automatic setup
 
 ```sh
-./lumi mcp setup                          # Claude Code and Claude Desktop
+./lumi mcp setup                          # Claude Code, Claude Desktop, and Codex CLI
 ./lumi mcp setup --dry-run                # show what would change, write nothing
+./lumi mcp setup --client codex           # one client only: code, desktop, or codex
 ./lumi mcp setup --client desktop --force # replace an entry that already exists
 ```
 
@@ -86,7 +87,8 @@ Setup writes the entry with an absolute binary path and an explicit `--data-dir`
 
 - **Claude Code** is configured at user scope through the `claude` CLI, which is the only supported way to modify `~/.claude.json` — that file is live application state, not just settings.
 - **Claude Desktop** has no CLI, so its `claude_desktop_config.json` is edited in place. Every other key is preserved and a `.lumi-backup` copy is written first, though top-level keys come back in alphabetical order. **Quit Claude Desktop before running setup and reopen it afterwards** — it only reads the config at launch, and quitting also avoids racing its own writes.
-- Clients that are not installed are skipped, and setup prints the JSON to paste for anything it does not cover.
+- **Codex CLI** is configured through the `codex` CLI in both directions: `codex mcp get --json` to see what is already registered, `codex mcp add`/`remove` to change it. That is the only supported writer for `~/.codex/config.toml`, and it preserves the comments and top-level keys a hand-rolled TOML round-trip would drop. Note that `codex` itself rewrites the whole `mcp_servers` table when it adds an entry, so other servers there may come back reformatted — their values are unchanged, and everything outside that table is untouched. There is no scope to choose: `codex mcp add` always writes the user-level file.
+- Clients that are not installed are skipped, and setup prints the snippet to paste — JSON or TOML, whichever that client reads — for anything it does not cover.
 
 It is idempotent: a second run reports `unchanged` and writes nothing. An entry that already exists with *different* settings is never overwritten — setup reports the conflict and exits non-zero, so `--dry-run` doubles as a health check. Use `--force` to replace it, or `--name` to register a second entry pointing at a second data directory.
 

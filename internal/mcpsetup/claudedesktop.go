@@ -68,7 +68,7 @@ func (d *ClaudeDesktop) Apply(_ context.Context, spec Spec, opts Options) (Resul
 	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
 		result.Status = StatusSkipped
 		result.Detail = "Claude Desktop is not installed"
-		result.Manual = ManualSnippet(spec)
+		result.manualJSON(spec)
 		if d.Required {
 			return result, notInstalledErr(claudeDesktopName, result.Detail)
 		}
@@ -98,7 +98,7 @@ func (d *ClaudeDesktop) Apply(_ context.Context, spec Spec, opts Options) (Resul
 		result.Status = StatusConflict
 		result.Detail = "an entry already exists that Lumi cannot read"
 		result.Current = unreadableEntry
-		result.Manual = ManualSnippet(spec)
+		result.manualJSON(spec)
 		return result, conflictErr(claudeDesktopName, spec.Name)
 	case found && existing.matches(spec):
 		result.Status = StatusUnchanged
@@ -108,7 +108,7 @@ func (d *ClaudeDesktop) Apply(_ context.Context, spec Spec, opts Options) (Resul
 		result.Status = StatusConflict
 		result.Detail = "an entry with different settings already exists"
 		result.Current = existing.commandLine()
-		result.Manual = ManualSnippet(spec)
+		result.manualJSON(spec)
 		return result, conflictErr(claudeDesktopName, spec.Name)
 	}
 
