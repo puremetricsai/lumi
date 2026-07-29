@@ -818,6 +818,28 @@ func TestRecorderIndexesSystemAndMicrophoneAudioSeparately(t *testing.T) {
 	if !sources["system"] || !sources["microphone"] {
 		t.Fatalf("expected separately indexed system and microphone audio, got %#v", events)
 	}
+
+	// The two frames of a chunk are stamped with one shared `now`, so their
+	// stored captured_at is byte-identical. store.CollapseAudioTracks groups on
+	// exactly that string, so pin the guarantee here: for at least one chunk a
+	// system and a microphone row must share the RFC3339Nano key. This is
+	// currently only implicit in recorder.go's audioLoop.
+	bySource := map[string]map[string]bool{"system": {}, "microphone": {}}
+	for _, event := range events {
+		if set, ok := bySource[event.AudioSource]; ok {
+			set[event.CapturedAt.UTC().Format(time.RFC3339Nano)] = true
+		}
+	}
+	var shared bool
+	for key := range bySource["system"] {
+		if bySource["microphone"][key] {
+			shared = true
+			break
+		}
+	}
+	if !shared {
+		t.Fatalf("system and microphone rows of a chunk must share a captured_at, got %#v", events)
+	}
 }
 
 func TestRecorderIndexesNativeAudioCompletedAfterCancellation(t *testing.T) {
