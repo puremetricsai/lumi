@@ -16,8 +16,15 @@ import (
 // And an agent launches this process with a bare environment, so path
 // resolution has to work from --data-dir or LUMI_HOME alone; both already do,
 // through the shared openStore.
+//
+// It keeps its own RunE rather than becoming a bare parent like `record`: this
+// command *is* the server, and every existing client config invokes it as
+// `lumi mcp`. Turning it into a help-printing parent would dump text onto the
+// JSON-RPC stream. `setup` is its only subcommand — there is deliberately no
+// `mcp start`, no HTTP transport, and no daemon, because the client owns the
+// server's process lifecycle.
 func (a *app) mcpCommand() *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "mcp",
 		Short: "Serve captured activity to AI agents over MCP (stdio)",
 		Long: "Run a Model Context Protocol server on stdin/stdout, exposing search_events,\n" +
@@ -44,4 +51,6 @@ func (a *app) mcpCommand() *cobra.Command {
 			return nil
 		},
 	}
+	cmd.AddCommand(a.mcpSetupCommand())
+	return cmd
 }
