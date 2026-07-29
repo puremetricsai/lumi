@@ -97,9 +97,14 @@ func (a *app) runMCPSetup(cmd *cobra.Command, f mcpSetupFlags) error {
 		return err
 	}
 	// Create the data directory now, so the path baked into the entry exists by
-	// the time an agent first launches the server.
-	if err := paths.Ensure(); err != nil {
-		return err
+	// the time an agent first launches the server. Not under --dry-run: that
+	// flag promises to write nothing, and creating three directories under a
+	// mistyped --data-dir is exactly the kind of trace a health check must not
+	// leave. The previewed entry still names the root either way.
+	if !f.dryRun {
+		if err := paths.Ensure(); err != nil {
+			return err
+		}
 	}
 
 	exe, err := lumiBinaryPath()

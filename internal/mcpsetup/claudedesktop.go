@@ -80,15 +80,26 @@ func (d *ClaudeDesktop) Apply(_ context.Context, spec Spec, opts Options) (Resul
 		return result, err
 	}
 
+	// An entry that is present but does not decode — a bare string, a wrong
+	// field type — is still the user's entry. Treating a decode failure as
+	// "absent" would replace it with no --force and no backup, which is the
+	// one thing setup must never do.
 	var existing entry
-	found := false
+	found, readable := false, true
 	if raw, ok := servers[spec.Name]; ok {
-		if err := json.Unmarshal(raw, &existing); err == nil {
-			found = true
+		found = true
+		if err := json.Unmarshal(raw, &existing); err != nil {
+			readable = false
 		}
 	}
 
 	switch {
+	case found && !readable && !opts.Force:
+		result.Status = StatusConflict
+		result.Detail = "an entry already exists that Lumi cannot read"
+		result.Current = unreadableEntry
+		result.Manual = ManualSnippet(spec)
+		return result, conflictErr(claudeDesktopName, spec.Name)
 	case found && existing.matches(spec):
 		result.Status = StatusUnchanged
 		result.Detail = "already configured"
@@ -178,6 +189,13 @@ func readDesktopConfig(path string) (root, servers map[string]json.RawMessage, m
 		// preferences and everything else the user has accumulated.
 		return nil, nil, 0, false, fmt.Errorf(
 			"%s: %s is not valid JSON (%w); fix or remove it, then re-run", claudeDesktopName, path, err)
+	}
+	// A file holding literal `null` is valid JSON that decodes to a nil map,
+	// and assigning into a nil map panics. It is the one malformed shape that
+	// can be treated as empty rather than refused, because there is nothing in
+	// it to discard — and the pre-write backup preserves the original anyway.
+	if root == nil {
+		root = map[string]json.RawMessage{}
 	}
 
 	raw, ok := root["mcpServers"]

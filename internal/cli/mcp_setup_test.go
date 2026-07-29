@@ -304,6 +304,47 @@ func TestMCPSetupResultsGoToStdoutAndDiagnosticsToStderr(t *testing.T) {
 }
 
 // A dry run must read as a preview, not as a claim that something happened.
+// --dry-run is documented as a health check, so it must not create the data
+// directory it would otherwise bake into the entry.
+func TestMCPSetupDryRunCreatesNoDirectories(t *testing.T) {
+	target := &fakeTarget{name: "claude-code", result: mcpsetup.Result{
+		Status: mcpsetup.StatusAdded, Detail: "…"}}
+	swap(t, &resolveLumiBinary, func() (string, error) { return "/usr/local/bin/lumi", nil })
+	swap(t, &verifyLumiBinary, func(context.Context, string) error { return nil })
+	swap(t, &newSetupTargets, func(_, _, _ bool) []mcpsetup.Target { return []mcpsetup.Target{target} })
+
+	root := filepath.Join(t.TempDir(), "absent")
+	a := &app{dataDir: root}
+	run := func(args ...string) error {
+		cmd := a.mcpSetupCommand()
+		cmd.SetOut(&bytes.Buffer{})
+		cmd.SetErr(&bytes.Buffer{})
+		cmd.SetArgs(args)
+		cmd.SilenceUsage = true
+		cmd.SilenceErrors = true
+		return cmd.ExecuteContext(context.Background())
+	}
+
+	if err := run("--dry-run"); err != nil {
+		t.Fatalf("setup --dry-run: %v", err)
+	}
+	if _, err := os.Stat(root); !os.IsNotExist(err) {
+		t.Errorf("--dry-run created %s", root)
+	}
+	// The entry it previews still has to name the real root.
+	if !slices.Contains(target.spec.Args, root) {
+		t.Errorf("args = %v, want --data-dir %s", target.spec.Args, root)
+	}
+
+	// A real run does create it, so the path is there when an agent launches.
+	if err := run(); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	if info, err := os.Stat(root); err != nil || !info.IsDir() {
+		t.Errorf("a real run did not create %s: %v", root, err)
+	}
+}
+
 func TestMCPSetupDryRunUsesConditionalWording(t *testing.T) {
 	target := &fakeTarget{name: "fake", result: mcpsetup.Result{
 		Status: mcpsetup.StatusAdded, Detail: "/usr/local/bin/lumi mcp"}}

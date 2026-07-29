@@ -140,6 +140,11 @@ func (e entry) matches(spec Spec) bool {
 	return e.Command == spec.Command && slices.Equal(e.Args, spec.Args)
 }
 
+// unreadableEntry stands in for Result.Current when a client holds an entry
+// under Lumi's name that does not decode into entry. There is no command line
+// to render, but the conflict still has to say what is in the way.
+const unreadableEntry = "(an entry Lumi cannot read)"
+
 // commandLine renders an existing entry for the conflict diff.
 func (e entry) commandLine() string {
 	return strings.Join(append([]string{e.Command}, e.Args...), " ")
@@ -154,17 +159,24 @@ func newEntry(spec Spec) entry {
 // installed, or a conflict it will not overwrite — and it is what makes this
 // command useful for clients Lumi does not know about, such as Cursor or Codex.
 func ManualSnippet(spec Spec) string {
+	return entrySnippet(spec.Name, newEntry(spec))
+}
+
+// entrySnippet renders any entry as a paste-able mcpServers fragment. It backs
+// ManualSnippet and the rollback error that has to hand back an entry Lumi
+// removed but could not restore.
+func entrySnippet(entryName string, e entry) string {
 	// A key-and-value fragment, not a whole object: it is shown under a "add
 	// this under mcpServers" line, so braces of its own would be wrong.
 	//
 	// Marshalling rather than formatting keeps names and paths containing
 	// quotes or backslashes correct; a hand-built string would emit invalid
 	// JSON for them.
-	name, err := json.Marshal(spec.Name)
+	name, err := json.Marshal(entryName)
 	if err != nil {
 		return fmt.Sprintf("  (could not render snippet: %v)", err)
 	}
-	value, err := json.MarshalIndent(newEntry(spec), "  ", "  ")
+	value, err := json.MarshalIndent(e, "  ", "  ")
 	if err != nil {
 		// entry holds only strings and maps of strings, so this is unreachable;
 		// returning the error text beats panicking in a helper whose whole job

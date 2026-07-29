@@ -17,10 +17,17 @@ type fakeRunner struct {
 	calls [][]string
 	err   error
 	out   string
+	// failCall, when non-nil, decides per invocation instead of err, so a test
+	// can fail exactly one of a remove/add/restore sequence.
+	failCall func(call []string) error
 }
 
 func (f *fakeRunner) Run(_ context.Context, name string, args ...string) (string, error) {
-	f.calls = append(f.calls, append([]string{name}, args...))
+	call := append([]string{name}, args...)
+	f.calls = append(f.calls, call)
+	if f.failCall != nil {
+		return f.out, f.failCall(call)
+	}
 	return f.out, f.err
 }
 
@@ -163,6 +170,98 @@ func TestClaudeCodeForceRemovesThenAdds(t *testing.T) {
 	}
 }
 
+// --force removes before it adds, so a failing add is the one path that can
+// destroy a registration the user already had. The old entry must come back.
+func TestClaudeCodeRestoresTheOldEntryWhenTheForcedAddFails(t *testing.T) {
+	t.Parallel()
+	runner := &fakeRunner{}
+	// Fail the add that installs the new entry, but let the restoring add
+	// through: that is the sequence where rollback has to work.
+	failed := false
+	runner.failCall = func(call []string) error {
+		if slices.Contains(call, "add") && !failed {
+			failed = true
+			return errors.New("exit status 1")
+		}
+		return nil
+	}
+	target := newClaudeCode(
+		writeState(t, `{"mcpServers":{"lumi":{"command":"/old/lumi","args":["mcp","--data-dir","/old"]}}}`),
+		runner)
+
+	_, err := target.Apply(context.Background(), testSpec(), Options{Force: true})
+	if err == nil {
+		t.Fatal("Apply returned nil despite a failing add")
+	}
+	if !strings.Contains(err.Error(), "restored") {
+		t.Errorf("error does not report the rollback: %v", err)
+	}
+
+	if len(runner.calls) != 3 {
+		t.Fatalf("got %d invocations, want remove, add, restoring add: %v", len(runner.calls), runner.calls)
+	}
+	wantRestore := []string{
+		"/fake/claude", "mcp", "add", "--scope", "user", "lumi", "--",
+		"/old/lumi", "mcp", "--data-dir", "/old",
+	}
+	if !slices.Equal(runner.calls[2], wantRestore) {
+		t.Errorf("restore call = %v, want %v", runner.calls[2], wantRestore)
+	}
+}
+
+// When the rollback itself fails the user has lost the entry, so the error has
+// to carry enough to put it back by hand.
+func TestClaudeCodeReportsAnUnrestorableEntry(t *testing.T) {
+	t.Parallel()
+	runner := &fakeRunner{failCall: func(call []string) error {
+		if slices.Contains(call, "add") {
+			return errors.New("exit status 1")
+		}
+		return nil
+	}}
+	target := newClaudeCode(
+		writeState(t, `{"mcpServers":{"lumi":{"command":"/old/lumi","args":["mcp"]}}}`), runner)
+
+	_, err := target.Apply(context.Background(), testSpec(), Options{Force: true})
+	if err == nil {
+		t.Fatal("Apply returned nil despite a failing add")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "could not be restored") {
+		t.Errorf("error does not say the entry is gone: %v", err)
+	}
+	if !strings.Contains(msg, "/old/lumi") {
+		t.Errorf("error omits the lost entry, leaving nothing to re-add by hand: %v", err)
+	}
+}
+
+// A restore has to run even when the add failed by exhausting the CLI timeout
+// or because the user interrupted the command; both leave ctx already done.
+func TestClaudeCodeRestoresUnderACancelledContext(t *testing.T) {
+	t.Parallel()
+	runner := &fakeRunner{}
+	failed := false
+	runner.failCall = func(call []string) error {
+		if slices.Contains(call, "add") && !failed {
+			failed = true
+			return context.Canceled
+		}
+		return nil
+	}
+	target := newClaudeCode(
+		writeState(t, `{"mcpServers":{"lumi":{"command":"/old/lumi","args":["mcp"]}}}`), runner)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := target.Apply(ctx, testSpec(), Options{Force: true})
+	if err == nil {
+		t.Fatal("Apply returned nil despite a failing add")
+	}
+	if !strings.Contains(err.Error(), "restored") {
+		t.Errorf("a cancelled context skipped the rollback: %v", err)
+	}
+}
+
 // The invariant: ~/.claude.json is live application state, so Lumi reads it and
 // never writes it. Every path is checked, because the one that regresses will
 // be whichever is not covered.
@@ -200,16 +299,17 @@ func TestClaudeCodeNeverWritesTheStateFile(t *testing.T) {
 	}
 }
 
-// The state file belongs to another application. Anything unreadable about it
-// means "not configured", never a failure that blocks setup.
+// The state file belongs to another application. Anything unreadable about the
+// *file* means "not configured", never a failure that blocks setup. An
+// unreadable entry under Lumi's own name is different — see the conflict test
+// below — because that one is a registration this run would destroy.
 func TestClaudeCodeTreatsUnreadableStateAsUnconfigured(t *testing.T) {
 	t.Parallel()
 	for name, body := range map[string]string{
-		"truncated json":      `{`,
-		"empty object":        `{}`,
-		"null mcpServers":     `{"mcpServers":null}`,
-		"other servers":       `{"mcpServers":{"deepwiki":{"type":"http","url":"https://x"}}}`,
-		"entry not an object": `{"mcpServers":{"lumi":"nonsense"}}`,
+		"truncated json":  `{`,
+		"empty object":    `{}`,
+		"null mcpServers": `{"mcpServers":null}`,
+		"other servers":   `{"mcpServers":{"deepwiki":{"type":"http","url":"https://x"}}}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -227,6 +327,57 @@ func TestClaudeCodeTreatsUnreadableStateAsUnconfigured(t *testing.T) {
 				t.Errorf("ran %v, want one add", runner.calls)
 			}
 		})
+	}
+}
+
+// An entry present under Lumi's name that does not decode is still the user's
+// registration: replacing it needs --force, exactly as a differing one does.
+func TestClaudeCodeConflictsOnAnUnreadableEntry(t *testing.T) {
+	t.Parallel()
+	const body = `{"mcpServers":{"lumi":"nonsense"}}`
+
+	runner := &fakeRunner{}
+	target := newClaudeCode(writeState(t, body), runner)
+	result, err := target.Apply(context.Background(), testSpec(), Options{})
+	if err == nil {
+		t.Fatal("Apply replaced an unreadable entry without --force")
+	}
+	if result.Status != StatusConflict {
+		t.Fatalf("status = %q, want conflict", result.Status)
+	}
+	if len(runner.calls) != 0 {
+		t.Errorf("ran %v, want nothing", runner.calls)
+	}
+
+	forced := &fakeRunner{}
+	target = newClaudeCode(writeState(t, body), forced)
+	result, err = target.Apply(context.Background(), testSpec(), Options{Force: true})
+	if err != nil {
+		t.Fatalf("Apply --force: %v", err)
+	}
+	if result.Status != StatusReplaced || !result.Changed {
+		t.Fatalf("got %+v, want replaced and changed", result)
+	}
+	if len(forced.calls) != 2 {
+		t.Errorf("ran %v, want remove then add", forced.calls)
+	}
+}
+
+// A restored entry has to come back with the transport and env it had, not as
+// a bare stdio command.
+func TestClaudeCodeAddArgsCarryTransportAndEnv(t *testing.T) {
+	t.Parallel()
+	got := addArgs("lumi", entry{
+		Type:    "sse",
+		Command: "https://example.test/mcp",
+		Env:     map[string]string{"B": "2", "A": "1"},
+	})
+	want := []string{
+		"mcp", "add", "--scope", "user", "--transport", "sse",
+		"--env", "A=1", "--env", "B=2", "lumi", "--", "https://example.test/mcp",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("addArgs = %v, want %v", got, want)
 	}
 }
 

@@ -167,6 +167,78 @@ func TestDesktopConflictLeavesTheFileUntouched(t *testing.T) {
 	}
 }
 
+// An entry under Lumi's name that does not decode is still the user's entry.
+// Treating it as absent would overwrite it with no --force and no backup.
+func TestDesktopRefusesToOverwriteAnUnreadableEntry(t *testing.T) {
+	t.Parallel()
+	const body = `{"mcpServers":{"lumi":"not an object"}}`
+	target, path := newDesktop(t, body)
+
+	result, err := target.Apply(context.Background(), testSpec(), Options{})
+	if err == nil {
+		t.Fatal("Apply overwrote an unreadable entry without --force")
+	}
+	if result.Status != StatusConflict {
+		t.Fatalf("status = %q, want conflict", result.Status)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(after) != body {
+		t.Errorf("config changed despite the conflict:\n%s", after)
+	}
+}
+
+// --force is still the way through: the user has said to replace it.
+func TestDesktopForceReplacesAnUnreadableEntry(t *testing.T) {
+	t.Parallel()
+	target, path := newDesktop(t, `{"mcpServers":{"lumi":"not an object"}}`)
+
+	result, err := target.Apply(context.Background(), testSpec(), Options{Force: true})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if result.Status != StatusReplaced || !result.Changed {
+		t.Fatalf("got %+v, want replaced and changed", result)
+	}
+	servers := readJSON(t, path)["mcpServers"].(map[string]any)
+	entry, ok := servers["lumi"].(map[string]any)
+	if !ok {
+		t.Fatalf("lumi entry = %#v, want an object", servers["lumi"])
+	}
+	if entry["command"] != "/abs/lumi" {
+		t.Errorf("command = %v, want the spec's binary", entry["command"])
+	}
+}
+
+// A config file holding literal `null` unmarshals into a nil map. Assigning
+// into it panics, so this pins that the file is handled rather than crashed on.
+func TestDesktopHandlesANullConfigFile(t *testing.T) {
+	t.Parallel()
+	target, path := newDesktop(t, "null\n")
+
+	result, err := target.Apply(context.Background(), testSpec(), Options{})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if result.Status != StatusAdded || !result.Changed {
+		t.Fatalf("got %+v, want added and changed", result)
+	}
+	servers, ok := readJSON(t, path)["mcpServers"].(map[string]any)
+	if !ok || servers["lumi"] == nil {
+		t.Errorf("entry was not written over the null config: %v", readJSON(t, path))
+	}
+	// The original file still had to be preserved before being replaced.
+	backup, err := os.ReadFile(path + backupSuffix)
+	if err != nil {
+		t.Fatalf("read backup: %v", err)
+	}
+	if string(backup) != "null\n" {
+		t.Errorf("backup = %q, want the pre-run file", backup)
+	}
+}
+
 func TestDesktopForceReplacesAndBacksUp(t *testing.T) {
 	t.Parallel()
 	target, path := newDesktop(t, realWorldConfig)
