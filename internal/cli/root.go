@@ -345,6 +345,9 @@ func (a *app) doctorCommand() *cobra.Command {
 				missing = true
 			}
 			fmt.Fprintf(os.Stdout, "data directory\tok\t%s\n", paths.Root)
+			if err := reportAttributionHealth(cmd.Context(), os.Stdout, paths); err != nil {
+				return err
+			}
 			if missing {
 				return errors.New("one or more recording requirements are missing; run `./lumi permissions --request` for macOS capture permissions")
 			}
@@ -353,6 +356,56 @@ func (a *app) doctorCommand() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&speechLocale, "speech-locale", "en-US", "SpeechAnalyzer recognition locale")
 	return cmd
+}
+
+// attributionWindow is how far back doctor measures observed attribution. It is
+// short on purpose: the question is "is capture healthy right now", not "has it
+// ever been".
+const attributionWindow = time.Hour
+
+// reportAttributionHealth reports what the index observed, which is the check a
+// TCC status cannot make: permission is read from this fresh process, while the
+// recorder that has been failing all day is a different one.
+//
+// It deliberately does not use openStore. That would call paths.Ensure and
+// store.Open, so a mistyped --data-dir would be created empty and then reported
+// as healthy. A missing database is a finding, not something to fix by making one.
+//
+// The result is never `missing`: doctor exits non-zero on missing, and a
+// degraded history is a diagnosis, not an unmet requirement.
+func reportAttributionHealth(ctx context.Context, out io.Writer, paths config.Paths) error {
+	if _, err := os.Stat(paths.Database); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintf(out, "attribution\tok\tno screen history at %s\n", paths.Database)
+			return nil
+		}
+		return fmt.Errorf("stat index: %w", err)
+	}
+	s, err := store.Open(ctx, paths.Database)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	report, err := s.AttributionHealth(ctx, time.Now().UTC().Add(-attributionWindow))
+	if err != nil {
+		return err
+	}
+	if report.Total == 0 {
+		fmt.Fprintf(out, "attribution\tok\tno screen events in the last hour\n")
+		return nil
+	}
+	percent := report.Unattributed * 100 / report.Total
+	last := "never"
+	if report.HasLastAttributed {
+		last = report.LastAttributed.Format(time.RFC3339)
+	}
+	state := "ok"
+	if report.Unattributed > 0 {
+		state = "warn"
+	}
+	fmt.Fprintf(out, "attribution\t%s\t%d%% of screen events in the last hour have no app (last attributed %s)\n",
+		state, percent, last)
+	return nil
 }
 
 func (a *app) permissionsCommand() *cobra.Command {

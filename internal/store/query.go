@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strings"
 	"time"
@@ -102,9 +103,63 @@ type AttributionOptions struct {
 	App   *string
 	Since *time.Time
 	Until *time.Time
+	// Kind restricts the rows considered. The zero value spans every kind.
+	// Audio chunks are legitimately unattributed, so any caller reasoning about
+	// how much attribution is *missing* must narrow to KindScreen or the ratio
+	// is meaningless.
+	Kind Kind
 	// Limit caps the returned rows. Zero or less means no limit, matching
 	// Expired's convention; callers that face an agent set their own ceiling.
 	Limit int
+}
+
+// AttributionHealthReport answers "is screen capture still recording which
+// application the user was in". Unattributed counts screen events whose app is
+// empty; LastAttributed is the newest screen event that did carry an app.
+type AttributionHealthReport struct {
+	Total          int64
+	Unattributed   int64
+	LastAttributed time.Time
+	// HasLastAttributed is false when no screen event has ever been attributed,
+	// which is different from "the last one was long ago".
+	HasLastAttributed bool
+}
+
+// AttributionHealth measures observed attribution over a window, which is what
+// diagnoses a live capture problem: TCC can report Accessibility as granted from
+// a fresh process while a long-running recorder has been failing for a day.
+//
+// Only screen events are counted — audio chunks carry no app by design and would
+// otherwise drag the ratio toward "broken" on a healthy index.
+//
+// LastAttributed is deliberately unbounded by `since`. Scoping it to the window
+// would make it unknown exactly when the outage is longer than the window, which
+// is the case this report exists to explain.
+func (s *Store) AttributionHealth(ctx context.Context, since time.Time) (AttributionHealthReport, error) {
+	const query = `
+SELECT COUNT(*),
+       COALESCE(SUM(CASE WHEN app = '' THEN 1 ELSE 0 END), 0),
+       (SELECT MAX(captured_at) FROM events WHERE kind = ? AND app != '')
+FROM events WHERE kind = ? AND captured_at >= ?`
+	var report AttributionHealthReport
+	var lastAttributed sql.NullString
+	// COUNT is 0 over an empty set but SUM and MAX are NULL, so both need a
+	// destination that tolerates it.
+	err := s.db.QueryRowContext(ctx, query, string(KindScreen), string(KindScreen),
+		since.UTC().Format(time.RFC3339Nano)).
+		Scan(&report.Total, &report.Unattributed, &lastAttributed)
+	if err != nil {
+		return AttributionHealthReport{}, fmt.Errorf("read attribution health: %w", err)
+	}
+	if lastAttributed.Valid {
+		parsed, err := time.Parse(time.RFC3339Nano, lastAttributed.String)
+		if err != nil {
+			return AttributionHealthReport{}, fmt.Errorf(
+				"parse attribution timestamp %q: %w", lastAttributed.String, err)
+		}
+		report.LastAttributed, report.HasLastAttributed = parsed, true
+	}
+	return report, nil
 }
 
 // ListAttribution reports which applications (or, within one application, which
@@ -131,6 +186,10 @@ func (s *Store) ListAttribution(ctx context.Context, opts AttributionOptions) ([
 	if opts.Until != nil {
 		where = append(where, "captured_at <= ?")
 		args = append(args, opts.Until.UTC().Format(time.RFC3339Nano))
+	}
+	if opts.Kind != "" {
+		where = append(where, "kind = ?")
+		args = append(args, string(opts.Kind))
 	}
 	query := "SELECT " + group + " AS label, COUNT(*) AS events, MAX(captured_at) AS last_seen FROM events"
 	if len(where) > 0 {

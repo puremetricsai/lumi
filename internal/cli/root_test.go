@@ -1,13 +1,70 @@
 package cli
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 	"unicode/utf8"
 
+	"github.com/puremetricsai/lumi/internal/config"
 	"github.com/puremetricsai/lumi/internal/store"
 )
+
+// A mistyped --data-dir must read as "there is nothing here", not be silently
+// created and then reported as a healthy index.
+func TestReportAttributionHealthDoesNotCreateAnIndex(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "typo")
+	paths, err := config.FromRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out strings.Builder
+	if err := reportAttributionHealth(context.Background(), &out, paths); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "no screen history") {
+		t.Errorf("output = %q, want a no-screen-history notice", out.String())
+	}
+	if _, err := os.Stat(paths.Database); !os.IsNotExist(err) {
+		t.Errorf("doctor created an index at %s", paths.Database)
+	}
+}
+
+func TestReportAttributionHealthWarnsOnUnattributedEvents(t *testing.T) {
+	ctx := context.Background()
+	paths, err := config.FromRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := paths.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(ctx, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	for _, event := range []store.Event{
+		{Kind: store.KindScreen, CapturedAt: now.Add(-time.Minute), App: "Ghostty", MediaPath: "a.jpg"},
+		{Kind: store.KindScreen, CapturedAt: now, MediaPath: "b.jpg"},
+	} {
+		if err := s.Insert(ctx, &event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.Close()
+
+	var out strings.Builder
+	if err := reportAttributionHealth(ctx, &out, paths); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "attribution\twarn\t50%") {
+		t.Errorf("output = %q, want a 50%% warn row", out.String())
+	}
+}
 
 // TestTruncateRunes covers the helper behind `lumi search`'s human-readable
 // output. A byte-indexed cut through multi-byte text is the reason it exists,
