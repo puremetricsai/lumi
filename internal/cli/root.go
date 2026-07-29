@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -62,6 +63,16 @@ func (a *app) paths() (config.Paths, error) {
 		return config.FromRoot(a.dataDir)
 	}
 	return config.DefaultPaths()
+}
+
+// smokeAccessibilityNote reports a degraded Accessibility read without failing
+// the smoke test: attribution succeeded through the fallback, which is the
+// property being asserted, but the operator should still see the cause.
+func smokeAccessibilityNote(accessibilityError string) string {
+	if accessibilityError == "" {
+		return ""
+	}
+	return ", degraded: " + accessibilityError
 }
 
 func (a *app) openStore(ctx context.Context) (*store.Store, config.Paths, error) {
@@ -404,8 +415,18 @@ func (a *app) nativeSmokeCommand() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("run Accessibility smoke test: %w", err)
 			}
+			// snapshot.App alone only proves the NSWorkspace path, which needs
+			// no grant at all. The attribution guarantee is that a title source
+			// is always resolved, degraded or not.
 			if snapshot.App == "" {
 				return errors.New("Accessibility smoke test returned no frontmost application")
+			}
+			if snapshot.TitleSource == "" {
+				return errors.New("Accessibility smoke test resolved no title source")
+			}
+			if snapshot.TitleSource != "none" && snapshot.Window == "" {
+				return fmt.Errorf("Accessibility smoke test reported title source %q with an empty window",
+					snapshot.TitleSource)
 			}
 			audio, err := macosnative.RecordAudio(cmd.Context(), directory, "audio", 0.5)
 			if err != nil {
@@ -425,9 +446,15 @@ func (a *app) nativeSmokeCommand() *cobra.Command {
 			if !sources["system"] || !sources["microphone"] {
 				return fmt.Errorf("native audio smoke test requires system and microphone outputs, got %v", sources)
 			}
+			trusted := "unknown"
+			if snapshot.Trusted != nil {
+				trusted = strconv.FormatBool(*snapshot.Trusted)
+			}
 			fmt.Fprintf(cmd.OutOrStdout(),
-				"native capture ok: %d displays, Accessibility app %q, Vision ok, system audio ok, microphone ok\n",
-				len(frames), snapshot.App)
+				"native capture ok: %d displays, app %q, window %q via %s (AX trusted=%s%s), "+
+					"Vision ok, system audio ok, microphone ok\n",
+				len(frames), snapshot.App, snapshot.Window, snapshot.TitleSource, trusted,
+				smokeAccessibilityNote(snapshot.Error))
 			return nil
 		},
 	}

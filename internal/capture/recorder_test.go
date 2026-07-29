@@ -112,6 +112,42 @@ func (titleOnlyContext) Snapshot(context.Context) (ScreenContext, error) {
 	return ScreenContext{App: "Zed", Window: "lumi — .env", Text: "lumi — .env", DisplayID: 1}, nil
 }
 
+// degradedContext mimics the production failure this fallback exists for: the
+// Accessibility read failed, but NSWorkspace still named the frontmost app and
+// the window list still supplied a title.
+type degradedContext struct{}
+
+func (degradedContext) Snapshot(context.Context) (ScreenContext, error) {
+	trusted := true
+	return ScreenContext{
+		App: "Comet", Window: "Booking — Shashi Hotel", DisplayID: 1,
+		Trusted:            &trusted,
+		TitleSource:        "window_list",
+		AccessibilityError: "read macOS Accessibility tree: read focused Accessibility window (AX error -25204)",
+	}, nil
+}
+
+// degradedWithTextContext is a degraded snapshot that nonetheless carries
+// substantive Accessibility text, pinning that the removed contextErr gate did
+// not take the text path with it.
+type degradedWithTextContext struct{}
+
+func (degradedWithTextContext) Snapshot(context.Context) (ScreenContext, error) {
+	trusted := false
+	return ScreenContext{
+		App: "Notes", Window: "Plan", Text: "Accessibility primary text", DisplayID: 1,
+		Trusted:            &trusted,
+		TitleSource:        "window_list",
+		AccessibilityError: "read macOS Accessibility tree: degraded",
+	}, nil
+}
+
+type failingContext struct{}
+
+func (failingContext) Snapshot(context.Context) (ScreenContext, error) {
+	return ScreenContext{}, errors.New("read macOS Accessibility tree: snapshot unavailable")
+}
+
 type fakeAudio struct{}
 
 func (fakeAudio) Record(ctx context.Context, directory, prefix string, duration time.Duration) ([]AudioFrame, error) {
@@ -543,6 +579,175 @@ func TestRecorderPreservesMediaAfterProcessorFailures(t *testing.T) {
 	if !seen[store.KindScreen] || !seen[store.KindAudio] {
 		t.Fatalf("expected preserved screen and audio events, got %#v", seen)
 	}
+}
+
+// A failed Accessibility read used to erase App and Window even though the
+// frontmost application name never depended on Accessibility at all. Attribution
+// must survive the failure, and the failure must still be recorded.
+func TestRecorderAttributesEventsWhenAccessibilityFails(t *testing.T) {
+	ctx := context.Background()
+	s, paths, logger := newRecorderFixture(t)
+	defer s.Close()
+
+	recorder := Recorder{
+		Store: s, Paths: paths, Screen: &fakeScreen{}, Text: fakeVision{},
+		Context: degradedContext{}, Comparer: &FrameComparer{}, Logger: logger,
+	}
+	recorder.captureScreen(ctx)
+
+	events, err := s.Search(ctx, store.SearchOptions{App: "Comet", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("degraded snapshot lost app attribution: %#v", events)
+	}
+	if events[0].Window != "Booking — Shashi Hotel" {
+		t.Errorf("window title = %q, want the window-list title", events[0].Window)
+	}
+	metadata := unmarshalMetadata(t, events[0].Metadata)
+	if metadata["attribution_source"] != "window_list" {
+		t.Errorf("attribution_source = %v, want window_list", metadata["attribution_source"])
+	}
+	if metadata["accessibility_trusted"] != true {
+		t.Errorf("accessibility_trusted = %v, want true", metadata["accessibility_trusted"])
+	}
+	if _, ok := metadata["accessibility_error"]; !ok {
+		t.Errorf("degraded snapshot dropped accessibility_error: %s", events[0].Metadata)
+	}
+}
+
+// A degraded snapshot is not a failed one: Accessibility text that did arrive
+// must still be preserved in metadata.
+func TestRecorderPreservesAccessibilityTextFromDegradedSnapshot(t *testing.T) {
+	ctx := context.Background()
+	s, paths, logger := newRecorderFixture(t)
+	defer s.Close()
+
+	recorder := Recorder{
+		Store: s, Paths: paths, Screen: &fakeScreen{}, Text: fakeVision{},
+		Context: degradedWithTextContext{}, Comparer: &FrameComparer{}, Logger: logger,
+	}
+	recorder.captureScreen(ctx)
+
+	events, err := s.Search(ctx, store.SearchOptions{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected one event, got %#v", events)
+	}
+	metadata := unmarshalMetadata(t, events[0].Metadata)
+	if metadata["accessibility_text"] != "Accessibility primary text" {
+		t.Errorf("degraded snapshot dropped Accessibility text: %s", events[0].Metadata)
+	}
+	if metadata["accessibility_trusted"] != false {
+		t.Errorf("accessibility_trusted = %v, want false", metadata["accessibility_trusted"])
+	}
+}
+
+// Losing the snapshot entirely must still never lose the frame.
+func TestRecorderPreservesMediaWhenSnapshotFailsOutright(t *testing.T) {
+	ctx := context.Background()
+	s, paths, logger := newRecorderFixture(t)
+	defer s.Close()
+
+	recorder := Recorder{
+		Store: s, Paths: paths, Screen: &fakeScreen{}, Text: fakeVision{},
+		Context: failingContext{}, Comparer: &FrameComparer{}, Logger: logger,
+	}
+	recorder.captureScreen(ctx)
+
+	events, err := s.Search(ctx, store.SearchOptions{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("snapshot failure lost the event: %#v", events)
+	}
+	if _, err := os.Stat(events[0].MediaPath); err != nil {
+		t.Errorf("snapshot failure lost media: %v", err)
+	}
+	if events[0].App != "" {
+		t.Errorf("app = %q, want empty when nothing was resolved", events[0].App)
+	}
+	metadata := unmarshalMetadata(t, events[0].Metadata)
+	if _, ok := metadata["accessibility_error"]; !ok {
+		t.Errorf("snapshot failure omitted accessibility_error: %s", events[0].Metadata)
+	}
+	if _, ok := metadata["accessibility_trusted"]; ok {
+		t.Errorf("unknown trust must not be reported: %s", events[0].Metadata)
+	}
+}
+
+// The escalation is time-based and rate-limited: one loud line per outage, not
+// one per frame, and never a claim about trust the recorder cannot support.
+func TestRecorderEscalatesSustainedAttributionLossOnce(t *testing.T) {
+	start := time.Date(2026, 7, 28, 9, 0, 0, 0, time.UTC)
+	trusted := true
+	degraded := ScreenContext{App: "", AccessibilityError: "AX error -25204", Trusted: &trusted}
+
+	var buffer strings.Builder
+	recorder := Recorder{Logger: slog.New(slog.NewTextHandler(&buffer, nil))}
+	for i := range 40 {
+		recorder.noteAttribution(start.Add(time.Duration(i)*time.Second), degraded, nil)
+	}
+	if got := strings.Count(buffer.String(), "level=ERROR"); got != 1 {
+		t.Errorf("escalations = %d, want exactly 1 across a 40s outage:\n%s", got, buffer.String())
+	}
+	if !strings.Contains(buffer.String(), "window-list fallback") {
+		t.Errorf("trusted-but-failing outage reported the wrong remedy:\n%s", buffer.String())
+	}
+
+	// A recovery re-arms the escalation so a second outage is loud again.
+	recorder.noteAttribution(start.Add(41*time.Second), ScreenContext{App: "Ghostty"}, nil)
+	for i := 42; i < 120; i++ {
+		recorder.noteAttribution(start.Add(time.Duration(i)*time.Second), degraded, nil)
+	}
+	if got := strings.Count(buffer.String(), "level=ERROR"); got != 2 {
+		t.Errorf("escalations after recovery = %d, want 2:\n%s", got, buffer.String())
+	}
+}
+
+func TestRecorderDoesNotClaimRevokedTrustWhenTrustIsUnknown(t *testing.T) {
+	start := time.Date(2026, 7, 28, 9, 0, 0, 0, time.UTC)
+	var buffer strings.Builder
+	recorder := Recorder{Logger: slog.New(slog.NewTextHandler(&buffer, nil))}
+	for i := range 40 {
+		recorder.noteAttribution(start.Add(time.Duration(i)*time.Second),
+			ScreenContext{}, errors.New("snapshot unavailable"))
+	}
+	if strings.Contains(buffer.String(), "re-grant") {
+		t.Errorf("unknown trust was reported as revoked:\n%s", buffer.String())
+	}
+	if !strings.Contains(buffer.String(), "lumi doctor") {
+		t.Errorf("total snapshot failure gave no actionable remedy:\n%s", buffer.String())
+	}
+}
+
+func newRecorderFixture(t *testing.T) (*store.Store, config.Paths, *slog.Logger) {
+	t.Helper()
+	paths, err := config.FromRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := paths.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(context.Background(), paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s, paths, slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func unmarshalMetadata(t *testing.T, raw json.RawMessage) map[string]any {
+	t.Helper()
+	var metadata map[string]any
+	if err := json.Unmarshal(raw, &metadata); err != nil {
+		t.Fatal(err)
+	}
+	return metadata
 }
 
 func TestRecorderIndexesSystemAndMicrophoneAudioSeparately(t *testing.T) {

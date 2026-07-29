@@ -23,6 +23,9 @@ type AccessibilitySnapshot struct {
 	Text        string `json:"text"`
 	DisplayID   uint32 `json:"display_id"`
 	InputActive bool   `json:"input_active"`
+	Trusted     *bool  `json:"trusted,omitempty"`
+	TitleSource string `json:"title_source,omitempty"`
+	Error       string `json:"error,omitempty"`
 }
 
 type Permissions struct {

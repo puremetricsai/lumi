@@ -41,12 +41,23 @@ type ScreenFrame struct {
 	CaptureError string `json:"capture_error,omitempty"`
 }
 
+// AccessibilitySnapshot is total: App and InputActive are read from sources that
+// need no Accessibility grant, so they survive an AX failure. Error is set when
+// the focused-window read failed and the snapshot is therefore degraded — that
+// is a value, not an error return.
+//
+// Trusted is a pointer because a nil-vs-false distinction matters: a decoded
+// snapshot always carries trust, but a zero-valued struct (returned when the
+// snapshot failed outright) must not be mistaken for "trust was revoked".
 type AccessibilitySnapshot struct {
 	App         string `json:"app"`
 	Window      string `json:"window"`
 	Text        string `json:"text"`
 	DisplayID   uint32 `json:"display_id"`
 	InputActive bool   `json:"input_active"`
+	Trusted     *bool  `json:"trusted,omitempty"`
+	TitleSource string `json:"title_source,omitempty"`
+	Error       string `json:"error,omitempty"`
 }
 
 type Permissions struct {
