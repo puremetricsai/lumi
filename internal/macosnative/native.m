@@ -4,6 +4,7 @@
 #import <AudioToolbox/AudioToolbox.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <ImageIO/ImageIO.h>
+#import <IOKit/hidsystem/IOHIDLib.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <Speech/Speech.h>
 #import <Vision/Vision.h>
@@ -404,12 +405,40 @@ static NSString *LumiSpeechAuthorizationName(SFSpeechRecognizerAuthorizationStat
     return @"unknown";
 }
 
+// LumiHIDAccessName maps IOHIDCheckAccess's tri-state to a status string.
+// CGPreflightListenEventAccess wraps the same query in a BOOL and throws the
+// distinction away, but "denied" and "not_determined" need opposite remedies:
+// a denied subject is never re-prompted and can only be fixed in System
+// Settings, while a not-determined one is exactly what `--request` can still
+// resolve. Reporting one string for both leaves no way to tell them apart.
+static NSString *LumiHIDAccessName(IOHIDAccessType access) {
+    switch (access) {
+        case kIOHIDAccessTypeGranted: return @"granted";
+        case kIOHIDAccessTypeDenied: return @"denied";
+        case kIOHIDAccessTypeUnknown: return @"not_determined";
+    }
+    return @"unknown";
+}
+
+// lumi_hid_access_name exposes the mapping above so it can be tested for every
+// state on a machine that sits in only one of them.
+char *lumi_hid_access_name(int access) {
+    @autoreleasepool {
+        return LumiCopyUTF8(LumiHIDAccessName((IOHIDAccessType)access));
+    }
+}
+
 char *lumi_permissions_json(char **error_message) {
     @autoreleasepool {
+        // Screen Recording and Accessibility stay conflated on purpose:
+        // CGPreflightScreenCaptureAccess and AXIsProcessTrusted return a bare
+        // BOOL, and the only ways to split them either need Full Disk Access
+        // (reading TCC.db) or raise a prompt as a side effect of asking
+        // (SCShareableContent) — unacceptable in a read-only status call.
         NSDictionary *permissions = @{
             @"screen_recording": CGPreflightScreenCaptureAccess() ? @"granted" : @"denied_or_not_determined",
             @"accessibility": AXIsProcessTrusted() ? @"granted" : @"denied_or_not_determined",
-            @"input_monitoring": CGPreflightListenEventAccess() ? @"granted" : @"denied_or_not_determined",
+            @"input_monitoring": LumiHIDAccessName(IOHIDCheckAccess(kIOHIDRequestTypeListenEvent)),
             @"microphone": LumiAuthorizationName([AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio]),
             @"speech_recognition": LumiSpeechAuthorizationName([SFSpeechRecognizer authorizationStatus]),
         };

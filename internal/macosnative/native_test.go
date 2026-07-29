@@ -31,6 +31,45 @@ func TestPermissionStatusUsesKnownStates(t *testing.T) {
 	}
 }
 
+// TestInputMonitoringDistinguishesDeniedFromNotDetermined pins the tri-state
+// contract that IOHIDCheckAccess can answer and CGPreflightListenEventAccess
+// cannot. "denied" and "not_determined" need opposite remedies — System
+// Settings versus `permissions --request` — so collapsing them into one string
+// leaves the operator with no way to tell which one they are in.
+//
+// Screen Recording and Accessibility are deliberately absent: CGPreflight-
+// ScreenCaptureAccess and AXIsProcessTrusted return a bare BOOL, so
+// "denied_or_not_determined" is the most precise answer macOS permits.
+func TestInputMonitoringDistinguishesDeniedFromNotDetermined(t *testing.T) {
+	permissions, err := PermissionStatus(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	switch permissions.InputMonitoring {
+	case "granted", "denied", "not_determined":
+	default:
+		t.Errorf("input monitoring reported %q, want a tri-state value; a conflated "+
+			"status cannot tell the operator whether to open System Settings or "+
+			"run `permissions --request`", permissions.InputMonitoring)
+	}
+}
+
+// TestInputMonitoringStateNames pins the mapping itself, independent of this
+// machine's TCC state. The status-from-live-TCC test above can only observe a
+// conflated value on a machine where Input Monitoring is not granted, so it
+// would pass vacuously on a developer box that has already granted it.
+func TestInputMonitoringStateNames(t *testing.T) {
+	for access, want := range map[int]string{
+		hidAccessGranted: "granted",
+		hidAccessDenied:  "denied",
+		hidAccessUnknown: "not_determined",
+	} {
+		if got := hidAccessName(access); got != want {
+			t.Errorf("hidAccessName(%d) = %q, want %q", access, got, want)
+		}
+	}
+}
+
 func TestVisionRecognizesAValidImage(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "blank.jpg")
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o600)

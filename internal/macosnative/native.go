@@ -4,7 +4,7 @@ package macosnative
 
 /*
 #cgo CFLAGS: -fblocks -fobjc-arc
-#cgo LDFLAGS: -framework AppKit -framework ApplicationServices -framework AudioToolbox -framework AVFoundation -framework CoreGraphics -framework CoreMedia -framework CoreVideo -framework Foundation -framework ImageIO -framework ScreenCaptureKit -framework UniformTypeIdentifiers -framework Vision -L${SRCDIR} -llumispeech -framework Speech
+#cgo LDFLAGS: -framework AppKit -framework ApplicationServices -framework AudioToolbox -framework AVFoundation -framework CoreGraphics -framework CoreMedia -framework CoreVideo -framework Foundation -framework ImageIO -framework IOKit -framework ScreenCaptureKit -framework UniformTypeIdentifiers -framework Vision -L${SRCDIR} -llumispeech -framework Speech
 #include <stdlib.h>
 #include <stdbool.h>
 
@@ -12,6 +12,7 @@ char *lumi_capture_screens_json(const char *directory, const char *prefix, char 
 char *lumi_accessibility_snapshot_json(char **error_message);
 char *lumi_vision_recognize(const char *image_path, char **error_message);
 char *lumi_permissions_json(char **error_message);
+char *lumi_hid_access_name(int access);
 char *lumi_request_permissions_json(bool input_monitoring, char **error_message);
 char *lumi_record_audio_json(const char *directory, const char *prefix, double duration_seconds, char **error_message);
 void lumi_os_version(int *major, int *minor, int *patch);
@@ -187,6 +188,23 @@ func nativeTimeout(ctx context.Context, fallback time.Duration) time.Duration {
 		}
 	}
 	return fallback
+}
+
+// IOHIDCheckAccess's tri-state, mirrored so tests can exercise every branch of
+// the mapping on a machine that only ever reports one of them.
+const (
+	hidAccessGranted = 0
+	hidAccessDenied  = 1
+	hidAccessUnknown = 2
+)
+
+func hidAccessName(access int) string {
+	name := C.lumi_hid_access_name(C.int(access))
+	if name == nil {
+		return ""
+	}
+	defer C.free(unsafe.Pointer(name))
+	return C.GoString(name)
 }
 
 func PermissionStatus(ctx context.Context) (Permissions, error) {
