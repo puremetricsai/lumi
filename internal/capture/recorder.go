@@ -299,6 +299,12 @@ func screenMetadata(frame ScreenFrame, textSource, axText string, screenContext 
 	if screenContext.TitleSource != "" {
 		metadata["attribution_source"] = screenContext.TitleSource
 	}
+	// app_source is recorded separately from attribution_source: one says where
+	// the window title came from, the other where the app name did. Merging them
+	// would silently change what attribution_source means for indexed rows.
+	if screenContext.AppSource != "" {
+		metadata["app_source"] = screenContext.AppSource
+	}
 	if screenContext.Trusted != nil {
 		metadata["accessibility_trusted"] = *screenContext.Trusted
 	}
