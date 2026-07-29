@@ -394,18 +394,32 @@ func reportAttributionHealth(ctx context.Context, out io.Writer, paths config.Pa
 		fmt.Fprintf(out, "attribution\tok\tno screen events in the last hour\n")
 		return nil
 	}
-	percent := report.Unattributed * 100 / report.Total
+	if report.Unattributed == 0 {
+		fmt.Fprintf(out, "attribution\tok\tall %d screen events in the last hour have an app\n", report.Total)
+		return nil
+	}
 	last := "never"
 	if report.HasLastAttributed {
 		last = report.LastAttributed.Format(time.RFC3339)
 	}
-	state := "ok"
-	if report.Unattributed > 0 {
-		state = "warn"
-	}
-	fmt.Fprintf(out, "attribution\t%s\t%d%% of screen events in the last hour have no app (last attributed %s)\n",
-		state, percent, last)
+	// Counts lead, and the percentage never rounds a real gap down to zero: at
+	// the default two-second interval an hour holds thousands of events, so
+	// integer division would report "warn 0% have no app" for a genuine outage.
+	fmt.Fprintf(out, "attribution\twarn\t%d of %d screen events in the last hour have no app (%s; last attributed %s)\n",
+		report.Unattributed, report.Total, formatPercent(report.Unattributed, report.Total), last)
 	return nil
+}
+
+// formatPercent renders a non-zero share as at least "<1%", never as "0%".
+func formatPercent(part, total int64) string {
+	if total <= 0 {
+		return "0%"
+	}
+	percent := float64(part) * 100 / float64(total)
+	if percent < 1 {
+		return "<1%"
+	}
+	return fmt.Sprintf("%.0f%%", percent)
 }
 
 func (a *app) permissionsCommand() *cobra.Command {

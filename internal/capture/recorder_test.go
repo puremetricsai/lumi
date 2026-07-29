@@ -709,6 +709,34 @@ func TestRecorderEscalatesSustainedAttributionLossOnce(t *testing.T) {
 	}
 }
 
+// The window-list fallback exists so a failed Accessibility read still yields an
+// app. Escalating that as "indexed without an app" would fire on every routine
+// fallback and contradict the events actually being written.
+func TestRecorderDoesNotReportMissingAppWhenTheFallbackSuppliedOne(t *testing.T) {
+	start := time.Date(2026, 7, 28, 9, 0, 0, 0, time.UTC)
+	trusted := true
+	attributed := ScreenContext{
+		App: "Comet", Window: "Home / X", TitleSource: "window_list",
+		Trusted: &trusted, AccessibilityError: "AX error -25204",
+	}
+
+	var buffer strings.Builder
+	recorder := Recorder{Logger: slog.New(slog.NewTextHandler(&buffer, nil))}
+	for i := range 40 {
+		recorder.noteAttribution(start.Add(time.Duration(i)*time.Second), attributed, nil)
+	}
+	if strings.Contains(buffer.String(), "indexed without an app") {
+		t.Errorf("claimed no app while App=%q:\n%s", attributed.App, buffer.String())
+	}
+	if strings.Contains(buffer.String(), "level=ERROR") {
+		t.Errorf("a covered fallback must not escalate to error:\n%s", buffer.String())
+	}
+	// It is still reported: the Accessibility text is genuinely lost.
+	if !strings.Contains(buffer.String(), "window-list fallback") {
+		t.Errorf("sustained Accessibility failure went unreported:\n%s", buffer.String())
+	}
+}
+
 func TestRecorderDoesNotClaimRevokedTrustWhenTrustIsUnknown(t *testing.T) {
 	start := time.Date(2026, 7, 28, 9, 0, 0, 0, time.UTC)
 	var buffer strings.Builder

@@ -61,8 +61,29 @@ func TestReportAttributionHealthWarnsOnUnattributedEvents(t *testing.T) {
 	if err := reportAttributionHealth(ctx, &out, paths); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), "attribution\twarn\t50%") {
-		t.Errorf("output = %q, want a 50%% warn row", out.String())
+	if !strings.Contains(out.String(), "attribution\twarn\t1 of 2 screen events") {
+		t.Errorf("output = %q, want a warn row counting 1 of 2", out.String())
+	}
+}
+
+// An hour holds thousands of events at the default interval, so a real gap is a
+// fraction of a percent. Integer division reported it as "warn 0% have no app",
+// which reads as "nothing is wrong".
+func TestFormatPercentNeverRoundsARealGapToZero(t *testing.T) {
+	for _, testCase := range []struct {
+		part, total int64
+		want        string
+	}{
+		{part: 5, total: 505, want: "<1%"},
+		{part: 1, total: 3600, want: "<1%"},
+		{part: 1, total: 2, want: "50%"},
+		{part: 3407, total: 3407, want: "100%"},
+		{part: 0, total: 0, want: "0%"},
+	} {
+		if got := formatPercent(testCase.part, testCase.total); got != testCase.want {
+			t.Errorf("formatPercent(%d, %d) = %s, want %s",
+				testCase.part, testCase.total, got, testCase.want)
+		}
 	}
 }
 

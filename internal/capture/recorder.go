@@ -50,9 +50,16 @@ type attributionHealth struct {
 	lastEscalation time.Time
 }
 
-// noteAttribution escalates a sustained loss of app attribution. The previous
-// behaviour — a Warn on every frame — produced tens of lines per minute, which
-// is precisely how a day of unattributed capture went unnoticed.
+// noteAttribution escalates a sustained degradation. The previous behaviour — a
+// Warn on every frame — produced tens of lines per minute, which is precisely
+// how a day of unattributed capture went unnoticed.
+//
+// Two outcomes are reported differently, because they cost different things. An
+// Accessibility failure that the window-list fallback covers loses only the
+// supplementary AX text and warns; one that leaves no application name at all
+// makes the event unfindable by app and is an error. Escalating both as "indexed
+// without an app" would fire on every routine fallback and train the reader to
+// ignore the line — the exact failure this monitor exists to prevent.
 func (r *Recorder) noteAttribution(now time.Time, screenContext ScreenContext, contextErr error) {
 	if contextErr == nil && !screenContext.Degraded() {
 		if !r.attribution.degradedSince.IsZero() {
@@ -61,10 +68,10 @@ func (r *Recorder) noteAttribution(now time.Time, screenContext ScreenContext, c
 		r.attribution = attributionHealth{}
 		return
 	}
-	first := r.attribution.degradedSince.IsZero()
-	if first {
+	unattributed := contextErr != nil || screenContext.Unattributed()
+	if r.attribution.degradedSince.IsZero() {
 		r.attribution.degradedSince = now
-		r.Logger.Warn("app attribution degraded; falling back to full-screen Vision text",
+		r.Logger.Warn("Accessibility read failed", "attributed", !unattributed,
 			"error", attributionCause(screenContext, contextErr))
 		return
 	}
@@ -76,10 +83,19 @@ func (r *Recorder) noteAttribution(now time.Time, screenContext ScreenContext, c
 		return
 	}
 	r.attribution.lastEscalation = now
-	r.Logger.Error("app attribution has been unavailable; screen events are being indexed without an app",
+	arguments := []any{
 		"since", r.attribution.degradedSince.Format(time.RFC3339),
 		"remedy", attributionRemedy(screenContext, contextErr),
-		"error", attributionCause(screenContext, contextErr))
+		"error", attributionCause(screenContext, contextErr),
+	}
+	if unattributed {
+		r.Logger.Error("app attribution has been unavailable; screen events are being indexed without an app",
+			arguments...)
+		return
+	}
+	r.Logger.Warn("Accessibility has been unavailable; app attribution is using the window-list fallback "+
+		"and Accessibility text is not being captured",
+		append(arguments, "app", screenContext.App)...)
 }
 
 // attributionRemedy branches on all three trust states. Reporting "trust was

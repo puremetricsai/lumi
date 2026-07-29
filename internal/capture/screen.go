@@ -39,11 +39,17 @@ type ScreenContext struct {
 	AccessibilityError string
 }
 
-// Degraded reports whether attribution for this tick is incomplete: either the
-// Accessibility read failed, or no application name was resolved at all.
+// Degraded reports whether anything about this tick is incomplete: either the
+// Accessibility read failed, or no application name was resolved at all. A
+// degraded tick is not necessarily an unattributed one — the whole point of the
+// window-list fallback is that App survives a failed Accessibility read.
 func (c ScreenContext) Degraded() bool {
 	return c.AccessibilityError != "" || c.App == ""
 }
+
+// Unattributed reports the failure that actually costs the index something:
+// no application name at all, so the event cannot be found by an app filter.
+func (c ScreenContext) Unattributed() bool { return c.App == "" }
 
 type ScreenSource interface {
 	Capture(context.Context, string, string) ([]ScreenFrame, error)
