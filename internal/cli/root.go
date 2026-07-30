@@ -51,7 +51,7 @@ func newRootCommand() *cobra.Command {
 		},
 	}
 	cmd.PersistentFlags().StringVar(&a.dataDir, "data-dir", "", "data directory (default: $LUMI_HOME or ~/Library/Application Support/Lumi)")
-	cmd.AddCommand(a.recordCommand(), a.searchCommand(), a.pruneCommand(),
+	cmd.AddCommand(a.recordCommand(), a.searchCommand(), a.transcriptCommand(), a.pruneCommand(),
 		a.doctorCommand(), a.permissionsCommand(), a.nativeSmokeCommand(), a.mcpCommand(),
 		a.transcribeCommand())
 	cmd.AddCommand(&cobra.Command{Use: "version", Short: "Print the Lumi version", Run: func(*cobra.Command, []string) {
@@ -591,6 +591,7 @@ func (a *app) nativeSmokeCommand() *cobra.Command {
 				return err
 			}
 			sources := make(map[string]bool)
+			anchors := make([]string, 0, len(audio))
 			for _, frame := range audio {
 				contents, err := os.ReadFile(frame.Path)
 				if err != nil {
@@ -600,6 +601,17 @@ func (a *app) nativeSmokeCommand() *cobra.Command {
 					return fmt.Errorf("%s audio smoke output is not a WAV file", frame.Source)
 				}
 				sources[frame.Source] = true
+				// A track that wrote a file but reported no start anchor leaves
+				// its timings unplaceable against the other track's, so this is
+				// a failure rather than a note. It is also the only place the
+				// ObjC writer change is exercisable by hand.
+				if frame.StartedAtUnixNS == 0 {
+					return fmt.Errorf("%s audio smoke output carries no start anchor", frame.Source)
+				}
+				anchors = append(anchors, fmt.Sprintf("%s started=%s pts=%dns measured=%dms",
+					frame.Source,
+					time.Unix(0, frame.StartedAtUnixNS).UTC().Format(time.RFC3339Nano),
+					frame.SessionStartPTSNS, frame.MeasuredDurationMS))
 			}
 			if !sources["system"] || !sources["microphone"] {
 				return fmt.Errorf("native audio smoke test requires system and microphone outputs, got %v", sources)
@@ -616,13 +628,15 @@ func (a *app) nativeSmokeCommand() *cobra.Command {
 				"native capture ok: %d displays, app %q via %s, window %q via %s (AX trusted=%s%s), "+
 					"Vision ok, system audio ok, microphone ok\n"+
 					"frontmost: Accessibility pid=%d %q | NSWorkspace pid=%d %q | "+
-					"window list pid=%d %q | resolved %q via %s (%s)\n",
+					"window list pid=%d %q | resolved %q via %s (%s)\n"+
+					"audio timing: %s\n",
 				len(frames), snapshot.App, snapshot.AppSource, snapshot.Window, snapshot.TitleSource,
 				trusted, smokeAccessibilityNote(snapshot.Error),
 				frontmost.Accessibility.PID, frontmost.Accessibility.App,
 				frontmost.Workspace.PID, frontmost.Workspace.App,
 				frontmost.WindowList.PID, frontmost.WindowList.App,
-				frontmost.Resolved.App, frontmost.Resolved.AppSource, agreement)
+				frontmost.Resolved.App, frontmost.Resolved.AppSource, agreement,
+				strings.Join(anchors, " | "))
 			return nil
 		},
 	}
