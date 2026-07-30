@@ -64,9 +64,12 @@ Earlier versions also wrote a `config.json` here to hold the provider settings f
 ./lumi search "launch budget" --type audio --since 8h
 ./lumi search --app "Safari" --window "Quarterly Plan" --since 24h
 ./lumi search --type screen --since 2026-07-18T09:00:00-07:00 --json
+./lumi search "standup" --type audio --collapse-audio
 ```
 
 Search terms are safely combined with FTS5 `AND`. With no text argument, Lumi returns the most recent events. `--app` is an exact case-insensitive filter; `--window` is a case-insensitive substring filter. Results include timestamps and paths to the original screenshot or WAV chunk. JSON output also preserves screen-text source, display ID, audio source, and processor diagnostics.
+
+Each audio chunk is recorded twice — once from system output and once from the microphone — so a meeting played through your speakers is transcribed on both tracks. `--collapse-audio` merges that duplicate into one result and reports where the speech came from: `system` (a remote speaker or media), `microphone` (your own voice in the room), `both`, or `silent`. It is opt-in because it changes the shape of `--json` from a bare event array to `{events, audio_chunks}`, where each chunk names the surviving event's origin and the tracks merged into it.
 
 ## Custom vocabulary
 
@@ -144,11 +147,13 @@ Three tools are exposed:
 
 | Tool | Parameters | Returns |
 |---|---|---|
-| `search_events` | `query`, `kind` (`screen`/`audio`), `app`, `window`, `since`, `until`, `limit`, `match` (`all`/`any`), `require_text`, `max_text_chars` — all optional | matching events, ranked by relevance when `query` is set and newest first otherwise, with text capped at 600 characters by default and 20 events per page (500 maximum) |
+| `search_events` | `query`, `kind` (`screen`/`audio`), `app`, `window`, `since`, `until`, `limit`, `match` (`all`/`any`), `require_text`, `max_text_chars`, `collapse_audio_tracks` — all optional | matching events, ranked by relevance when `query` is set and newest first otherwise, with text capped at 600 characters by default and 20 events per page (500 maximum) |
 | `get_event` | `id` | one event with its full untruncated text and processor metadata |
 | `list_apps` | `app`, `since`, `until`, `limit` — all optional | the applications captured, most active first, or the window titles for one application |
 
 `since` and `until` take an RFC3339 timestamp or a duration such as `2h`. When `search_events` truncates an event's text it says so and reports the true length, so an agent can fetch the rest with `get_event`.
+
+Unlike the CLI, `search_events` collapses each audio chunk's microphone/system duplicate by default, so an agent does not read the same meeting twice. The surviving result carries `audio_origin` and, when more than one track was merged, `audio_tracks` listing each track's id, source, text length, and media path — never its text, which `get_event` fetches by id. Pass `collapse_audio_tracks: false` to see both rows unmerged.
 
 Results also come back with a `notice` when the outcome would otherwise be ambiguous: whether an empty page means the index itself is empty (the notice names the database file, so a mistyped `--data-dir` is obvious) or that the filters simply matched nothing, and whether a full page was capped and more results exist.
 
@@ -201,11 +206,12 @@ ScreenCaptureKit system + microphone ─→ WAV ─→ SpeechAnalyzer (in-proces
 - `internal/store`: versioned SQLite migrations, FTS5 triggers, inserts, and filtered search
 - `internal/retention`: age-, size-, and wipe-based event/media pruning
 - `internal/mcp`: the read-only MCP tool surface served over stdio
+- `internal/mcpsetup`: registering `lumi mcp` with installed MCP clients
 - `internal/vocabulary`: the custom vocabulary file's format, cache, and cap
 - `internal/config`: data-directory path resolution
 - `internal/cli`: Cobra commands and lifecycle
 
-Frames use a hash fast path plus a sampled color-histogram comparison with independent state per display; recent user input makes the threshold more sensitive, and a ten-second safety interval prevents capture from going silent. Full-display Vision OCR is the primary screen-text source, so the index reflects the whole screen rather than just the focused window; the Accessibility snapshot supplies focused-app attribution and its window text is kept in event metadata when substantive. If Accessibility, Vision, comparison, or transcription fails after media was captured, Lumi preserves and indexes the event with processor diagnostics instead of silently losing the original data.
+Frames use a hash fast path plus a sampled color-histogram comparison with independent state per display; recent user input makes the threshold more sensitive. Two safety intervals keep capture from going silent: a frame whose bytes changed but scored as a near-duplicate — a video, an advancing slide — is retained at least every ten seconds, while a byte-identical frame is retained every five minutes, so a frozen screen leaves a bounded presence marker instead of re-indexing the same JPEG. Full-display Vision OCR is the primary screen-text source, so the index reflects the whole screen rather than just the focused window; the Accessibility snapshot supplies focused-app attribution and its window text is kept in event metadata when substantive. If Accessibility, Vision, comparison, or transcription fails after media was captured, Lumi preserves and indexes the event with processor diagnostics instead of silently losing the original data.
 
 `lumi permissions --request` invokes Apple's native Screen Recording, Accessibility, Microphone, and Speech Recognition request flows. `lumi doctor` reports their current state with the matching System Settings location. Input Monitoring is informational and is only requested when `--input-monitoring` is explicitly passed; capture does not require an event tap.
 
