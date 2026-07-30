@@ -80,3 +80,22 @@ func TestParseEmptyInput(t *testing.T) {
 		t.Fatalf("Parse(nil) = (%q, %d), want (empty, 0)", terms, dropped)
 	}
 }
+
+func TestParseKeepsTermsAfterAnOverLongLine(t *testing.T) {
+	// bufio.Scanner's default 64KB token limit would stop here and silently
+	// drop every term below the long line.
+	oversized := strings.Repeat("x", 128*1024)
+	input := []byte("Alpha\n" + oversized + "\nBravo\n")
+
+	terms, _ := Parse(input)
+
+	if !slices.Contains(terms, "Alpha") {
+		t.Fatalf("terms = %q, want it to contain Alpha", terms)
+	}
+	if !slices.Contains(terms, "Bravo") {
+		t.Fatalf("terms = %q, want Bravo to survive an over-long preceding line", terms)
+	}
+	if !slices.Contains(terms, oversized) {
+		t.Fatal("the over-long line itself was dropped; it is a valid (if silly) term")
+	}
+}

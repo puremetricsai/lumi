@@ -5,8 +5,6 @@
 package vocabulary
 
 import (
-	"bufio"
-	"bytes"
 	"strings"
 )
 
@@ -25,9 +23,12 @@ const MaxTerms = 100
 // are not drops.
 func Parse(data []byte) (terms []string, dropped int) {
 	seen := make(map[string]struct{})
-	scanner := bufio.NewScanner(bytes.NewReader(data))
-	for scanner.Scan() {
-		term := strings.TrimSpace(scanner.Text())
+	// Splitting beats bufio.Scanner here: the whole file is already in memory,
+	// so scanning buys no streaming, while its 64KB token limit would silently
+	// discard every term after an over-long line — and Parse has no way to
+	// report that.
+	for _, line := range strings.Split(string(data), "\n") {
+		term := strings.TrimSpace(line)
 		if term == "" || strings.HasPrefix(term, "#") {
 			continue
 		}
