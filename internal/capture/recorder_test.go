@@ -196,21 +196,42 @@ func (completionAfterCancelAudio) Record(ctx context.Context, directory, prefix 
 
 type fakeTranscriber struct{}
 
-func (fakeTranscriber) Transcribe(context.Context, string) (string, error) {
-	return "Lumi end to end audio transcript", nil
+func (fakeTranscriber) Transcribe(context.Context, string) (Transcription, error) {
+	return Transcription{Text: "Lumi end to end audio transcript"}, nil
 }
 
 type failingTranscriber struct{}
 
-func (failingTranscriber) Transcribe(context.Context, string) (string, error) {
-	return "", errors.New("transcription failed")
+func (failingTranscriber) Transcribe(context.Context, string) (Transcription, error) {
+	return Transcription{}, errors.New("transcription failed")
 }
 
 type countingTranscriber struct{ calls atomic.Int64 }
 
-func (t *countingTranscriber) Transcribe(context.Context, string) (string, error) {
+func (t *countingTranscriber) Transcribe(context.Context, string) (Transcription, error) {
 	t.calls.Add(1)
-	return "unexpected", nil
+	return Transcription{Text: "unexpected"}, nil
+}
+
+// segmentTranscriber returns timed segments whose text concatenates, with no
+// separator, to exactly the flat transcript — the same relationship the native
+// bridge guarantees, so tests that depend on it are not depending on a fiction.
+type segmentTranscriber struct{}
+
+func (segmentTranscriber) Transcribe(context.Context, string) (Transcription, error) {
+	segments := []TimedSegment{
+		{StartMS: 0, EndMS: 1200, Text: "First phrase.", Confidence: 0.9,
+			Runs: []TimedRun{{StartMS: 0, EndMS: 600, Text: "First", Confidence: 0.9},
+				{StartMS: 600, EndMS: 1200, Text: " phrase.", Confidence: 0.9}}},
+		{StartMS: 1200, EndMS: 2400, Text: " Second phrase.", Confidence: 0.8,
+			Runs: []TimedRun{{StartMS: 1200, EndMS: 1800, Text: " Second", Confidence: 0.8},
+				{StartMS: 1800, EndMS: 2400, Text: " phrase.", Confidence: 0.8}}},
+	}
+	text := ""
+	for _, segment := range segments {
+		text += segment.Text
+	}
+	return Transcription{Text: text, Segments: segments}, nil
 }
 
 func TestRecorderCaptureProcessStoreSearch(t *testing.T) {
@@ -879,5 +900,272 @@ func TestRecorderIndexesNativeAudioCompletedAfterCancellation(t *testing.T) {
 	}
 	if !strings.Contains(string(events[0].Metadata), "transcription skipped after capture stopped") {
 		t.Fatalf("late native audio omitted cancellation provenance: %s", events[0].Metadata)
+	}
+}
+
+// bleedAudio produces a chunk where the microphone re-recorded the machine and
+// the room also spoke, which is the shape a third of real bleed chunks have.
+type bleedTranscriber struct{}
+
+func (bleedTranscriber) Transcribe(_ context.Context, path string) (Transcription, error) {
+	const machine = "The deployment finished with no warnings."
+	if strings.Contains(path, "system") {
+		return Transcription{
+			Text: machine,
+			Segments: []TimedSegment{{StartMS: 0, EndMS: 2000, Text: machine, Confidence: 0.9,
+				Runs: []TimedRun{{StartMS: 0, EndMS: 2000, Text: machine, Confidence: 0.9}}}},
+		}, nil
+	}
+	const heard = machine + " Good, then let us ship it."
+	return Transcription{
+		Text: heard,
+		Segments: []TimedSegment{{StartMS: 30, EndMS: 4000, Text: heard, Confidence: 0.9,
+			Runs: []TimedRun{
+				{StartMS: 30, EndMS: 2030, Text: machine, Confidence: 0.9},
+				{StartMS: 2030, EndMS: 4000, Text: " Good, then let us ship it.", Confidence: 0.9},
+			}}},
+	}, nil
+}
+
+// failingSegments rejects every attribution write.
+type failingSegments struct{ calls atomic.Int64 }
+
+func (f *failingSegments) ReplaceChunkSegments(context.Context, string, []store.Segment) error {
+	f.calls.Add(1)
+	return errors.New("segment write failed")
+}
+
+func recorderPaths(t *testing.T) (config.Paths, *store.Store) {
+	t.Helper()
+	paths, err := config.FromRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := paths.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(context.Background(), paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return paths, s
+}
+
+// TestRecorderStoresAttributionAlongsideTheAudio covers the whole chunk path:
+// both tracks indexed as before, plus segments saying which words the machine
+// produced and which the room did.
+func TestRecorderStoresAttributionAlongsideTheAudio(t *testing.T) {
+	ctx := context.Background()
+	paths, s := recorderPaths(t)
+
+	recorder := Recorder{
+		Store: s, Paths: paths, CaptureAudio: true, AudioChunk: 8 * time.Millisecond,
+		Audio: dualAudio{}, Transcriber: bleedTranscriber{},
+	}
+	recordCtx, cancel := context.WithTimeout(ctx, 40*time.Millisecond)
+	defer cancel()
+	if err := recorder.Run(recordCtx); err != nil {
+		t.Fatal(err)
+	}
+
+	events, err := s.Search(ctx, store.SearchOptions{Kind: store.KindAudio, Limit: 50})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) < 2 {
+		t.Fatalf("got %d audio events, want both tracks", len(events))
+	}
+	// Read every chunk rather than the newest one. Shutdown cancels the final
+	// chunk before transcription, so it is indexed with empty text and produces
+	// only a silence marker — asserting against it would be testing the wrong
+	// thing.
+	segments, err := s.SegmentsBetween(ctx, time.Now().Add(-time.Hour), time.Now().Add(time.Hour), true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segments) == 0 {
+		t.Fatal("chunks were indexed but never attributed")
+	}
+
+	var sawInternal, sawExternal, sawBleed bool
+	for _, segment := range segments {
+		if segment.EventID == 0 {
+			t.Errorf("segment %d is not tied to any event", segment.Seq)
+		}
+		switch {
+		case segment.IsBleed:
+			sawBleed = true
+			if segment.SourceTrack != "microphone" {
+				t.Errorf("bleed came from the %s track", segment.SourceTrack)
+			}
+			if segment.Origin != store.OriginInternal {
+				t.Errorf("bleed labelled %s, want internal", segment.Origin)
+			}
+		case segment.Origin == store.OriginInternal:
+			sawInternal = true
+		case segment.Origin == store.OriginExternal:
+			sawExternal = true
+			if !strings.Contains(segment.Text, "ship it") {
+				t.Errorf("external segment is %q, want the room's own words", segment.Text)
+			}
+		}
+	}
+	if !sawInternal {
+		t.Error("the machine's own track produced no internal segment")
+	}
+	if !sawBleed {
+		t.Error("the microphone's re-recording was not marked as bleed")
+	}
+	if !sawExternal {
+		t.Error("the room's speech was not preserved as external")
+	}
+}
+
+// TestSegmentWriteFailureStillIndexesTheAudio is the invariant test. Captured
+// media and its transcript must survive any downstream failure — attribution is a
+// second opinion about audio that is already safely indexed, and a chunk left
+// unattributed is picked up by the backfill's derived work queue.
+func TestSegmentWriteFailureStillIndexesTheAudio(t *testing.T) {
+	ctx := context.Background()
+	paths, s := recorderPaths(t)
+	segments := &failingSegments{}
+
+	recorder := Recorder{
+		Store: s, Segments: segments, Paths: paths, CaptureAudio: true,
+		AudioChunk: 8 * time.Millisecond,
+		Audio:      dualAudio{}, Transcriber: bleedTranscriber{},
+	}
+	recordCtx, cancel := context.WithTimeout(ctx, 40*time.Millisecond)
+	defer cancel()
+	if err := recorder.Run(recordCtx); err != nil {
+		t.Fatalf("a failing segment write brought down the recorder: %v", err)
+	}
+	if segments.calls.Load() == 0 {
+		t.Fatal("the attribution write was never attempted")
+	}
+
+	events, err := s.Search(ctx, store.SearchOptions{Query: "deployment", Kind: store.KindAudio})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) == 0 {
+		t.Fatal("audio was lost when attribution failed")
+	}
+	for _, event := range events {
+		if event.Text == "" {
+			t.Error("an indexed event lost its transcript")
+		}
+		if _, err := os.Stat(event.MediaPath); err != nil {
+			t.Errorf("captured media went missing: %v", err)
+		}
+	}
+
+	// The chunk must remain in the backfill's queue, which is what makes the
+	// failure recoverable without any retry loop in the recorder.
+	missing, err := s.ChunksMissingSegments(ctx, nil, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(missing) == 0 {
+		t.Error("the unattributed chunk is not queued for backfill")
+	}
+}
+
+// TestMicrophoneOnlyChunkIsAllExternal covers the stated requirement that a
+// microphone chunk with no system counterpart is entirely the room's.
+func TestMicrophoneOnlyChunkIsAllExternal(t *testing.T) {
+	ctx := context.Background()
+	paths, s := recorderPaths(t)
+
+	recorder := Recorder{
+		Store: s, Paths: paths, CaptureAudio: true, AudioChunk: 8 * time.Millisecond,
+		Audio: fakeAudio{}, Transcriber: fakeTranscriber{},
+	}
+	recordCtx, cancel := context.WithTimeout(ctx, 40*time.Millisecond)
+	defer cancel()
+	if err := recorder.Run(recordCtx); err != nil {
+		t.Fatal(err)
+	}
+
+	events, err := s.Search(ctx, store.SearchOptions{Kind: store.KindAudio, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) == 0 {
+		t.Fatal("no audio was indexed")
+	}
+	segments, err := s.SegmentsBetween(ctx, time.Now().Add(-time.Hour), time.Now().Add(time.Hour), true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segments) == 0 {
+		t.Fatal("microphone-only chunks produced no segments")
+	}
+	for _, segment := range segments {
+		if segment.Origin != store.OriginExternal {
+			t.Errorf("segment %q labelled %s, want external", segment.Text, segment.Origin)
+		}
+		if segment.IsBleed {
+			t.Error("a chunk with no machine audio produced bleed")
+		}
+	}
+}
+
+// silentTranscriber is a chunk in which nobody spoke and nothing played: the
+// recognizer returns no words and no error, which is the overwhelmingly common
+// case in a real index.
+type silentTranscriber struct{}
+
+func (silentTranscriber) Transcribe(context.Context, string) (Transcription, error) {
+	return Transcription{}, nil
+}
+
+// TestSilentChunkIsRecordedAsAttributed is the recorder half of the drainable
+// work queue.
+//
+// A chunk holding no words produces no speech to attribute, and used to produce
+// no row either — leaving it indistinguishable from a chunk the recorder never
+// got to. Since silence is the common case, the backfill queue would fill with
+// chunks it could never finish, and coverage would report them as permanent
+// holes in every transcript.
+func TestSilentChunkIsRecordedAsAttributed(t *testing.T) {
+	ctx := context.Background()
+	paths, s := recorderPaths(t)
+
+	recorder := Recorder{
+		Store: s, Paths: paths, CaptureAudio: true, AudioChunk: 8 * time.Millisecond,
+		Audio: dualAudio{}, Transcriber: silentTranscriber{},
+	}
+	recordCtx, cancel := context.WithTimeout(ctx, 40*time.Millisecond)
+	defer cancel()
+	if err := recorder.Run(recordCtx); err != nil {
+		t.Fatal(err)
+	}
+
+	missing, err := s.ChunksMissingSegments(ctx, nil, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(missing) != 0 {
+		t.Errorf("%d silent chunks stayed on the backfill queue: %v", len(missing), missing)
+	}
+	segments, err := s.SegmentsBetween(ctx, time.Now().Add(-time.Hour), time.Now().Add(time.Hour), true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segments) == 0 {
+		t.Fatal("a silent chunk recorded nothing at all")
+	}
+	for _, segment := range segments {
+		if segment.Origin != store.OriginSilent {
+			t.Errorf("silent chunk produced origin %q", segment.Origin)
+		}
+		if segment.Text != "" {
+			t.Errorf("silence marker carries text %q", segment.Text)
+		}
+		if segment.EventID == 0 {
+			t.Error("silence marker is not tied to any event")
+		}
 	}
 }

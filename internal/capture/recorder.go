@@ -13,10 +13,21 @@ import (
 
 	"github.com/puremetricsai/lumi/internal/config"
 	"github.com/puremetricsai/lumi/internal/store"
+	"github.com/puremetricsai/lumi/internal/transcript"
+	"github.com/puremetricsai/lumi/internal/wav"
 )
 
+// SegmentWriter stores one chunk's attributed segments. *store.Store satisfies
+// it; the interface exists as a test seam, so a test can prove that a failed
+// attribution write still leaves the audio indexed.
+type SegmentWriter interface {
+	ReplaceChunkSegments(ctx context.Context, capturedAt string, segments []store.Segment) error
+}
+
 type Recorder struct {
-	Store          *store.Store
+	Store *store.Store
+	// Segments defaults to Store when nil.
+	Segments       SegmentWriter
 	Paths          config.Paths
 	Screen         ScreenSource
 	Text           TextExtractor
@@ -125,13 +136,24 @@ func attributionCause(screenContext ScreenContext, contextErr error) string {
 	}
 }
 
+// SpeechTranscriber returns a chunk's transcript together with its timed
+// segments. Segments may be empty — a silent file produces none — but Text is
+// always the authority for what was said, and is what gets indexed.
+//
+// The segments are deliberately part of this interface rather than an optional
+// capability a caller type-asserts for: everything downstream of the recorder
+// depends on whether they arrived, and an assertion would hide that difference
+// behind a silent fallback.
 type SpeechTranscriber interface {
-	Transcribe(context.Context, string) (string, error)
+	Transcribe(context.Context, string) (Transcription, error)
 }
 
 func (r *Recorder) Run(ctx context.Context) error {
 	if r.Store == nil {
 		return errors.New("recorder store is required")
+	}
+	if r.Segments == nil {
+		r.Segments = r.Store
 	}
 	if !r.CaptureScreen && !r.CaptureAudio {
 		return errors.New("at least one of screen or audio capture must be enabled")
@@ -348,15 +370,16 @@ func (r *Recorder) audioLoop(ctx context.Context) {
 			}
 			continue
 		}
+		results := make([]audioChunkResult, 0, len(frames))
 		for _, frame := range frames {
-			text := ""
+			var transcription Transcription
 			var processErr error
 			if ctx.Err() != nil {
 				processErr = fmt.Errorf("transcription skipped after capture stopped: %w", ctx.Err())
 			} else {
-				text, processErr = r.Transcriber.Transcribe(ctx, frame.Path)
+				transcription, processErr = r.Transcriber.Transcribe(ctx, frame.Path)
 			}
-			event := &store.Event{Kind: store.KindAudio, CapturedAt: now, Text: text, MediaPath: frame.Path,
+			event := &store.Event{Kind: store.KindAudio, CapturedAt: now, Text: transcription.Text, MediaPath: frame.Path,
 				DurationMS: frame.DurationMS, AudioSource: frame.Source,
 				Metadata: audioMetadata(frame.Source, frame.CaptureError, processErr)}
 			storeCtx, cancel := preservationContext(ctx)
@@ -366,12 +389,168 @@ func (r *Recorder) audioLoop(ctx context.Context) {
 				r.Logger.Error("store audio event", "path", frame.Path, "error", err)
 				continue
 			}
-			r.Logger.Info("captured audio", "id", event.ID, "source", frame.Source, "characters", len(text))
+			r.Logger.Info("captured audio", "id", event.ID, "source", frame.Source,
+				"characters", len(transcription.Text), "segments", len(transcription.Segments))
 			if processErr != nil {
 				r.Logger.Warn("transcription failed; audio was still indexed", "source", frame.Source, "error", processErr)
 			}
+			results = append(results, audioChunkResult{frame: frame, transcription: transcription, eventID: event.ID})
+		}
+		r.attributeChunk(ctx, now, results)
+	}
+}
+
+// audioChunkResult is one captured track: what was recorded, what it transcribed
+// to, and which row it became.
+type audioChunkResult struct {
+	frame         AudioFrame
+	transcription Transcription
+	eventID       int64
+}
+
+// envelopeWindowMS is the resolution of the energy measurement used to tell a
+// silent machine from one playing something that did not transcribe. 100ms is
+// short enough to isolate a notification blip, which was measured occupying a
+// single window in an otherwise silent thirty seconds.
+const envelopeWindowMS = 100
+
+// attributeChunk decides where a chunk's audio came from and stores the verdict.
+//
+// It runs only after every track of the chunk is already indexed, and a failure
+// here is logged rather than returned. Captured media is never lost to a
+// downstream failure: the WAVs are on disk and their transcripts are in the index
+// before this is reached, so the worst case is a chunk with no attribution. That
+// needs no retry loop either — `lumi transcript backfill` derives its work queue
+// from exactly the chunks that have no segments, so this chunk is already in it.
+func (r *Recorder) attributeChunk(ctx context.Context, capturedAt time.Time, results []audioChunkResult) {
+	if len(results) == 0 {
+		return
+	}
+	chunk := transcript.Chunk{CapturedAt: capturedAt}
+	eventIDs := make(map[string]int64, len(results))
+	systemPath := ""
+	for _, result := range results {
+		eventIDs[result.frame.Source] = result.eventID
+		switch result.frame.Source {
+		case audioSourceSystem:
+			chunk.System = buildTrack(result)
+			systemPath = result.frame.Path
+		case audioSourceMicrophone:
+			chunk.Microphone = buildTrack(result)
 		}
 	}
+	r.measureInternalEnergy(&chunk, systemPath)
+
+	segments := transcript.Attribute(chunk, transcript.Options{})
+	if len(segments) == 0 {
+		return
+	}
+	rows := make([]store.Segment, 0, len(segments))
+	for _, segment := range segments {
+		eventID, ok := eventIDs[segment.SourceTrack]
+		if !ok {
+			// A segment whose track produced no row cannot be stored against
+			// anything; dropping it is better than orphaning it.
+			continue
+		}
+		rows = append(rows, storeSegment(segment, eventID))
+	}
+	if len(rows) == 0 {
+		return
+	}
+	storeCtx, cancel := preservationContext(ctx)
+	defer cancel()
+	if err := r.Segments.ReplaceChunkSegments(storeCtx, capturedAt.UTC().Format(time.RFC3339Nano), rows); err != nil {
+		r.Logger.Warn("audio attribution was not stored; the audio is still indexed and `lumi transcript backfill` will retry",
+			"error", err)
+		return
+	}
+	if segments[0].Method == transcript.MethodSilent {
+		// A silent chunk still writes its marker, but saying so every thirty
+		// seconds would bury the lines that carry information under the quietest
+		// thing the recorder does.
+		r.Logger.Debug("chunk held no speech", "captured_at", capturedAt)
+		return
+	}
+	r.Logger.Info("attributed audio", "segments", len(rows), "method", string(segments[0].Method))
+}
+
+const (
+	audioSourceSystem     = "system"
+	audioSourceMicrophone = "microphone"
+)
+
+func buildTrack(result audioChunkResult) *transcript.Track {
+	segments := make([]transcript.TimedSegment, 0, len(result.transcription.Segments))
+	for _, segment := range result.transcription.Segments {
+		runs := make([]transcript.TimedRun, 0, len(segment.Runs))
+		for _, run := range segment.Runs {
+			runs = append(runs, transcript.TimedRun{
+				StartMS: run.StartMS, EndMS: run.EndMS, Text: run.Text, Confidence: run.Confidence,
+			})
+		}
+		segments = append(segments, transcript.TimedSegment{
+			StartMS: segment.StartMS, EndMS: segment.EndMS, Text: segment.Text,
+			Confidence: segment.Confidence, Runs: runs,
+		})
+	}
+	return &transcript.Track{
+		Source:    result.frame.Source,
+		StartedAt: result.frame.StartedAt,
+		Text:      result.transcription.Text,
+		Segments:  segments,
+	}
+}
+
+// measureInternalEnergy reads the system track's WAV when its transcript came back
+// empty, which is the overwhelmingly common case.
+//
+// The recognizer returns nothing both for a track that was silent and for one
+// that played audio it could not transcribe, and those need opposite conclusions:
+// silence means the microphone is confidently the room, while unexplained audio
+// means a re-recording of words nobody can see is possible. Only energy separates
+// them. The read is skipped when it could not change any verdict.
+func (r *Recorder) measureInternalEnergy(chunk *transcript.Chunk, systemPath string) {
+	system, mic := chunk.System, chunk.Microphone
+	if system == nil || mic == nil || systemPath == "" {
+		return
+	}
+	if strings.TrimSpace(system.Text) != "" || strings.TrimSpace(mic.Text) == "" {
+		return
+	}
+	samples, info, err := wav.ReadMono16(systemPath)
+	if err != nil {
+		// Without the measurement the microphone stays confidently external,
+		// which is the pre-existing behaviour rather than a new risk.
+		r.Logger.Debug("could not measure system audio energy", "error", err)
+		return
+	}
+	system.Envelope = wav.Envelope(samples, info.SampleRate, envelopeWindowMS)
+	system.EnvelopeWindowMS = envelopeWindowMS
+}
+
+func storeSegment(segment transcript.Segment, eventID int64) store.Segment {
+	row := store.Segment{
+		EventID: eventID, Seq: segment.Seq, Origin: string(segment.Origin),
+		SourceTrack: segment.SourceTrack, Text: segment.Text,
+		StartOffsetMS: segment.StartOffsetMS, EndOffsetMS: segment.EndOffsetMS,
+		IsBleed: segment.IsBleed, Confidence: segment.Confidence,
+		OrderConfidence: string(segment.OrderConfidence), Method: string(segment.Method),
+	}
+	if !segment.StartedAt.IsZero() {
+		started := segment.StartedAt
+		row.StartedAt = &started
+	}
+	if !segment.EndedAt.IsZero() {
+		ended := segment.EndedAt
+		row.EndedAt = &ended
+	}
+	if len(segment.Runs) > 0 {
+		if encoded, err := json.Marshal(segment.Runs); err == nil {
+			row.RunsJSON = encoded
+		}
+	}
+	return row
 }
 
 // preservationContext gives already-written media a short, cancellation-free
