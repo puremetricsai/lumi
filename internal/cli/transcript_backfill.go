@@ -14,6 +14,7 @@ import (
 	"github.com/puremetricsai/lumi/internal/macosnative"
 	"github.com/puremetricsai/lumi/internal/store"
 	"github.com/puremetricsai/lumi/internal/transcript"
+	"github.com/puremetricsai/lumi/internal/vocabulary"
 	"github.com/puremetricsai/lumi/internal/wav"
 )
 
@@ -24,9 +25,21 @@ const backfillEnvelopeWindowMS = 100
 // retranscribeChunk is a package var purely as a test seam. Without it every
 // backfill test would need Speech Recognition granted and real WAVs on disk,
 // which is exactly the coupling that keeps a test suite from running in CI.
-var retranscribeChunk = func(ctx context.Context, path, locale string) (macosnative.Transcription, error) {
-	return macosnative.TranscribeAudioSegments(ctx, path, locale, nil)
+var retranscribeChunk = func(ctx context.Context, path, locale string, terms []string) (macosnative.Transcription, error) {
+	return macosnative.TranscribeAudioSegments(ctx, path, locale, terms)
 }
+
+// minRetranscribeSimilarity is how closely a re-run must agree with the
+// transcript already indexed before its timings may be used.
+//
+// Segments derive from events.text and never the reverse, so a recognition that
+// no longer says what the event says may not become segment text at any
+// confidence: the words would appear in a transcript while being absent from the
+// event and from the FTS index behind `lumi search`. The threshold is not a
+// quality bar on the new recognition — it is the test for "these are the same
+// words, so its word timings describe this transcript". Below it the timings are
+// dropped and the chunk falls back to the text path, which needs no audio at all.
+const minRetranscribeSimilarity = 0.9
 
 func (a *app) transcriptBackfillCommand() *cobra.Command {
 	var (
@@ -78,10 +91,25 @@ func (a *app) transcriptBackfillCommand() *cobra.Command {
 					return err
 				}
 			}
+			// The re-run has to be biased the way the recorder's was, or it
+			// diverges on exactly the terms the list exists to protect and the
+			// similarity guard then throws its timings away. A vocabulary that
+			// cannot be read is advisory here, as everywhere: the text path needs
+			// no terms and a backfill must not fail over an optional file.
+			var terms []string
+			if retranscribe {
+				snapshot := (&vocabulary.Loader{Path: paths.Vocabulary}).Load()
+				if snapshot.Err != nil {
+					fmt.Fprintf(cmd.ErrOrStderr(),
+						"warning: reading %s: %v; re-transcribing without vocabulary\n",
+						paths.Vocabulary, snapshot.Err)
+				}
+				terms = snapshot.Terms
+			}
 			return runBackfill(cmd.Context(), cmd.OutOrStdout(), s, backfillOptions{
 				Since: sinceTime, Until: untilTime, Limit: limit, Force: force, DryRun: dryRun,
 				Explain: explain, Retranscribe: retranscribe, Pace: pace,
-				Locale: speechLocale,
+				Locale: speechLocale, Terms: terms,
 			})
 		},
 	}
@@ -134,6 +162,8 @@ type backfillOptions struct {
 	Retranscribe bool
 	Pace         time.Duration
 	Locale       string
+	// Terms bias a re-transcription the way the recorder's own run was biased.
+	Terms []string
 }
 
 func runBackfill(ctx context.Context, out io.Writer, s *store.Store, opts backfillOptions) error {
@@ -311,7 +341,7 @@ func attributeStoredChunk(ctx context.Context, s *store.Store, key string, opts 
 
 	method := "text"
 	if opts.Retranscribe {
-		if err := loadTimings(ctx, &chunk, paths, opts.Locale); err != nil {
+		if err := loadTimings(ctx, &chunk, paths, opts); err != nil {
 			// A missing or unreadable WAV is expected on an aged-out history, and
 			// the text path still works, so this degrades rather than failing.
 			method = fmt.Sprintf("text (no timings: %v)", err)
@@ -365,7 +395,7 @@ func anyFailedTranscription(events []store.Event) bool {
 	return false
 }
 
-func loadTimings(ctx context.Context, chunk *transcript.Chunk, paths map[string]string, locale string) error {
+func loadTimings(ctx context.Context, chunk *transcript.Chunk, paths map[string]string, opts backfillOptions) error {
 	// Fixed order, not a map range: this returns on the first failure, so with
 	// map ordering which track's error surfaces — and which track kept the
 	// timings loaded before it — would differ between two runs over identical
@@ -376,6 +406,13 @@ func loadTimings(ctx context.Context, chunk *transcript.Chunk, paths map[string]
 	}{{"system", chunk.System}, {"microphone", chunk.Microphone}}
 	for _, entry := range tracks {
 		source, track := entry.source, entry.track
+		// A track with no stored transcript has nothing for timings to be timings
+		// *of*: segments derive from events.text, so recovering words here would
+		// mean writing text no event holds. It is also the common case by a wide
+		// margin, and running the recognizer over an afternoon of silence costs
+		// hours. A track whose recognition *failed* never reaches this function —
+		// attributeStoredChunk declines the whole chunk first — so this skip means
+		// "nothing was said", not "we never found out".
 		if track == nil || track.Text == "" {
 			continue
 		}
@@ -386,9 +423,19 @@ func loadTimings(ctx context.Context, chunk *transcript.Chunk, paths map[string]
 		if _, err := os.Stat(path); err != nil {
 			return fmt.Errorf("%s audio is gone", source)
 		}
-		result, err := retranscribeChunk(ctx, path, locale)
+		result, err := retranscribeChunk(ctx, path, opts.Locale, opts.Terms)
 		if err != nil {
 			return fmt.Errorf("re-transcribe %s: %w", source, err)
+		}
+		// A re-run sees a possibly newer model, and its words may simply differ
+		// from the ones indexed. Its timings are usable only while it is saying
+		// the same thing; past that the honest move is to keep the stored text and
+		// lose the timings, which is exactly the text path.
+		if similarity := transcript.Align(
+			transcript.Tokenize(track.Text), transcript.Tokenize(result.Text),
+		).Similarity(); similarity < minRetranscribeSimilarity {
+			return fmt.Errorf("%s re-transcription differs from the indexed transcript (similarity %.2f)",
+				source, similarity)
 		}
 		segments := make([]transcript.TimedSegment, 0, len(result.Segments))
 		for _, segment := range result.Segments {

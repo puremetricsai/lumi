@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/puremetricsai/lumi/internal/macosnative"
 	"github.com/puremetricsai/lumi/internal/store"
 )
 
@@ -390,5 +392,96 @@ func TestBackfillNeverCallsAFailedTranscriptionSilent(t *testing.T) {
 	}
 	if len(segments) != 0 {
 		t.Errorf("a chunk whose recognition failed was attributed as %q", segments[0].Origin)
+	}
+}
+
+// audioChunkWithWAVs inserts one chunk whose media actually exists on disk, which
+// is what --retranscribe needs before it will read anything.
+func audioChunkWithWAVs(t *testing.T, s *store.Store, at time.Time, systemText, micText string) string {
+	t.Helper()
+	ctx := context.Background()
+	dir := t.TempDir()
+	for _, track := range []struct{ source, text string }{{"system", systemText}, {"microphone", micText}} {
+		path := filepath.Join(dir, track.source+".wav")
+		if err := os.WriteFile(path, []byte("fake-wave"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		event := store.Event{Kind: store.KindAudio, CapturedAt: at, Text: track.text,
+			MediaPath: path, AudioSource: track.source, DurationMS: 30000}
+		if err := s.Insert(ctx, &event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return at.UTC().Format(time.RFC3339Nano)
+}
+
+// TestRetranscribeSuppliesTimingsNeverText is the invariant that keeps segments
+// derived from events.
+//
+// A re-run of recognition is a second opinion about the same audio, not a
+// replacement for the transcript already indexed: it sees a possibly newer model
+// and, until this was fixed, no vocabulary at all. Installing its words as
+// segment text puts phrases in the transcript that are absent from the event and
+// from the search index, so a reader could see a sentence that no query can find.
+func TestRetranscribeSuppliesTimingsNeverText(t *testing.T) {
+	root, s := transcriptRoot(t)
+	ctx := context.Background()
+	at := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	key := audioChunkWithWAVs(t, s, at, "", "the deployment finished")
+
+	const rival = "the department finished"
+	original := retranscribeChunk
+	t.Cleanup(func() { retranscribeChunk = original })
+	retranscribeChunk = func(context.Context, string, string, []string) (macosnative.Transcription, error) {
+		return macosnative.Transcription{
+			Text: rival,
+			Segments: []macosnative.SpeechSegment{{StartMS: 0, EndMS: 2000, Text: rival, Confidence: 0.9,
+				Runs: []macosnative.SpeechRun{{StartMS: 0, EndMS: 2000, Text: rival, Confidence: 0.9}}}},
+		}, nil
+	}
+
+	if _, err := runCLI(t, "--data-dir", root, "transcript", "backfill", "--retranscribe"); err != nil {
+		t.Fatal(err)
+	}
+
+	segments, err := s.SegmentsForChunk(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segments) == 0 {
+		t.Fatal("the chunk gained no segments at all")
+	}
+	for _, segment := range segments {
+		if strings.Contains(segment.Text, "department") {
+			t.Errorf("segment %q carries text the event never held", segment.Text)
+		}
+	}
+}
+
+// TestRetranscribePassesTheVocabulary pins the other half: a re-run that omits
+// the term list the recorder used would diverge on exactly the words the list
+// exists to protect, and would then be rejected by the guard above — turning a
+// missing argument into permanently missing timings.
+func TestRetranscribePassesTheVocabulary(t *testing.T) {
+	root, s := transcriptRoot(t)
+	at := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	audioChunkWithWAVs(t, s, at, "", "kubectl rollout finished")
+
+	if err := os.WriteFile(filepath.Join(root, "vocabulary.txt"), []byte("kubectl\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var seen []string
+	original := retranscribeChunk
+	t.Cleanup(func() { retranscribeChunk = original })
+	retranscribeChunk = func(_ context.Context, _, _ string, terms []string) (macosnative.Transcription, error) {
+		seen = terms
+		return macosnative.Transcription{}, nil
+	}
+
+	if _, err := runCLI(t, "--data-dir", root, "transcript", "backfill", "--retranscribe"); err != nil {
+		t.Fatal(err)
+	}
+	if len(seen) != 1 || seen[0] != "kubectl" {
+		t.Errorf("re-transcription ran with terms %v, want the data directory's vocabulary", seen)
 	}
 }
