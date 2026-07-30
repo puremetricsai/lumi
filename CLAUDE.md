@@ -276,6 +276,20 @@ Support/Lumi`; directories created 0700.
   different answer, and lives in `metadata_json` as `active_audio_output_processes`. Putting one of those
   in `events.app` would fork the column's meaning by row kind, and it cannot hold the answer anyway: it
   is a *set*.
+- **Because audio rows carry an app, every app-shaped query now spans both kinds, and the tools must let a
+  caller say which one they mean.** `Search`'s `app`/`window` filters are unqualified SQL predicates, so
+  `search_events(app: "Zed")` returns whatever the speakers were playing while Zed was focused — with the
+  `window` title of an unrelated document stamped on it. That is the design working as specified, but it
+  is not what "filter by app" reads as, and the results look legitimate. `ListAttribution` therefore takes
+  a `Kind` and `list_apps` exposes it; `search_events` already had `kind`. Summing the two into one count
+  is what makes the conflation invisible: the split is the whole signal. Measured on a live index,
+  `app = "Zed"` over 30 minutes was 30 screen rows and 8 audio rows, and the audio was a podcast.
+- **Neither kind's `app` says where the *content* came from, so no tool description may imply it does.**
+  The tempting shorthand — "`kind: "screen"` shows where the text was read from" — is false twice over:
+  screen text is full-display OCR carrying every visible window, and one focused-window snapshot is
+  stamped onto every display's frame. A single indexed event was measured holding a Gmail inbox under
+  `app = "Calendar"`. Both kinds answer "what was the user working in"; `kind` separates how that app
+  earned its count, never what produced the content.
 - **`active_audio_output_processes` names stream occupancy, not audible sound, and is named for what it
   can prove.** `kAudioProcessPropertyIsRunningOutput` reports "running IO with at least one active output
   stream": a *paused* player still answers yes, while the same app with its document closed does not —
