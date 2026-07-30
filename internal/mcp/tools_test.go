@@ -351,6 +351,83 @@ func TestListAppsReportsAppsThenWindows(t *testing.T) {
 	}
 }
 
+// Since audio chunks began carrying the focused application, one app's entry
+// sums two modalities that answer different questions: which application the
+// screen text was read from, and which one merely happened to be focused while
+// unrelated sound was captured. Without kind an agent cannot tell them apart,
+// and list_apps exists precisely so filter values are not guesses.
+func TestListAppsSeparatesScreenFromAudioByKind(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	base := time.Now().UTC().Truncate(time.Second)
+	insertEvents(t, ctx, s,
+		store.Event{Kind: store.KindScreen, CapturedAt: base, App: "Zed", Window: "notes.md", Text: "a", MediaPath: "/tmp/a.jpg"},
+		store.Event{Kind: store.KindScreen, CapturedAt: base.Add(time.Minute), App: "Zed", Window: "notes.md", Text: "b", MediaPath: "/tmp/b.jpg"},
+		store.Event{Kind: store.KindAudio, CapturedAt: base.Add(2 * time.Minute), App: "Zed", Window: "notes.md", Text: "narration", MediaPath: "/tmp/c.wav"},
+	)
+	h := &handlers{store: s}
+
+	_, out, err := h.listApps(ctx, nil, listAppsInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Entries) != 1 || out.Entries[0].Events != 3 {
+		t.Fatalf("an omitted kind must span both modalities: %#v", out.Entries)
+	}
+
+	_, out, err = h.listApps(ctx, nil, listAppsInput{Kind: "screen"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Entries) != 1 || out.Entries[0].App != "Zed" || out.Entries[0].Events != 2 {
+		t.Fatalf(`kind "screen" must count only screen events: %#v`, out.Entries)
+	}
+
+	_, out, err = h.listApps(ctx, nil, listAppsInput{Kind: "audio"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Entries) != 1 || out.Entries[0].App != "Zed" || out.Entries[0].Events != 1 {
+		t.Fatalf(`kind "audio" must count only audio events: %#v`, out.Entries)
+	}
+
+	// Window mode narrows the same way, so an agent that found an app in the
+	// screen inventory can ask which windows it was actually read from.
+	app := "Zed"
+	_, out, err = h.listApps(ctx, nil, listAppsInput{App: &app, Kind: "screen"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Entries) != 1 || out.Entries[0].Window != "notes.md" || out.Entries[0].Events != 2 {
+		t.Fatalf("kind must narrow window mode too: %#v", out.Entries)
+	}
+
+	if _, _, err := h.listApps(ctx, nil, listAppsInput{Kind: "video"}); err == nil {
+		t.Fatal("an unknown kind must be a tool error, not a silent fall-through to both")
+	}
+}
+
+// A kind that matches nothing must not be explained as a time-range problem:
+// the remedy is to drop the kind, not to widen since/until.
+func TestListAppsNoticeNamesTheKindFilter(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	insertEvents(t, ctx, s, store.Event{Kind: store.KindScreen,
+		CapturedAt: time.Now().UTC().Truncate(time.Second), App: "Zed", Text: "a", MediaPath: "/tmp/a.jpg"})
+	h := &handlers{store: s}
+
+	_, out, err := h.listApps(ctx, nil, listAppsInput{Kind: "audio"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Entries) != 0 {
+		t.Fatalf("expected no entries, got %#v", out.Entries)
+	}
+	if !strings.Contains(out.Notice, "kind") {
+		t.Fatalf("notice = %q, want it to name the kind filter as a cause", out.Notice)
+	}
+}
+
 func TestListAppsHonorsTimeRangeAndRejectsBadTimes(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)

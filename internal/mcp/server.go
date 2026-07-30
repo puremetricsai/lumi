@@ -69,7 +69,12 @@ func newServer(s *store.Store, opts Options) *sdk.Server {
 		Name: "list_apps",
 		Description: "List the applications the user's activity was captured from, most active first, " +
 			"or — with app set — the window titles seen for one application. " +
-			"Call this before filtering by app so the filter values are real ones rather than guesses.",
+			"Call this before filtering by app so the filter values are real ones rather than guesses. " +
+			"Every app named here is what the user was focused on, never what produced the content: " +
+			"screen text is full-display OCR that can include other applications' windows, and an audio " +
+			"chunk's app is whatever was focused while it recorded, not the source of the sound. " +
+			"Counts span both kinds unless kind narrows them; check the split before filtering " +
+			"search_events by an app, since that filter spans both too.",
 	}, h.listApps)
 
 	sdk.AddTool(server, &sdk.Tool{
