@@ -324,14 +324,41 @@ Support/Lumi`; directories created 0700.
   backfill, and be counted as a permanent coverage hole while the transcript advised a backfill that could
   not change it. `silent` is deliberately not `unknown`: unknown *warns* that hidden machine speech may be
   present, which is the opposite claim.
+- **A chunk whose recognition failed is never labelled `silent`, and never drains from the queue.** The
+  recognizer returns an empty transcript both for a quiet room and for a track it never got to, so silence
+  is the one verdict a *failure* can turn into a false claim about the world — and the marker that records
+  it is exactly what makes the claim permanent. Both the recorder (`attributeChunk`) and the backfill
+  (`attributeStoredChunk`) therefore gate on the pair "verdict is silent **and** some track carries
+  `processor_error`", the rule living in `store.FailedTranscription`. The gate is the *verdict*, not the
+  failure: a track that did transcribe is labelled on its own evidence, so a mic failure beside a speaking
+  system track still attributes. These chunks are the one thing the derived queue cannot drain, which is
+  what `store.ChunksFailedTranscription` exists to count — `lumi transcript` and `get_transcript` name them
+  apart from real gaps so neither recommends a backfill that would reach the same dead end.
 - **A transcript filters turns, never the segments it assembles them from.** Removing one origin before
   assembly hides the interjection that separated two replies, so `AssembleTurns` reads them as adjacent and
   merges them — inventing continuity and deleting the boundary. Turns are single-origin by construction, so
   filtering afterwards selects without reshaping.
 - **Coverage counts describe the range the turns reach, not the range requested.** They exist to reveal a
   partial transcript; counting the whole window while the text stopped early makes them corroborate the
-  omission instead. A transcript also never ends mid-chunk, which is what lets `CoveredUntil` be a resume
-  point rather than an estimate.
+  omission instead. A transcript also never ends mid-chunk, which is what lets the boundary be exact rather
+  than an estimate. Both ways a transcript can stop short move that boundary: truncation *and* the turn cap,
+  which is measured from the last retained turn's `LastCapturedAt` — `Turn.CapturedAt` is where a turn
+  *began*, so a turn spanning chunks would bound the page short of text it already printed.
+- **`CoveredUntil` and `ResumeFrom` are separate fields because they need opposite inclusivity.**
+  `SegmentsBetween` is inclusive at both ends, so a caller told to resume at the last chunk covered re-reads
+  that whole chunk and sees its turns twice on every page. `ResumeFrom` is therefore the first chunk *not*
+  covered, and is zero when the transcript is complete. It equals `CoveredUntil` only in the two cases where
+  an overlap is unavoidable rather than accidental: a single chunk too large to return whole, and a cap
+  falling inside a chunk — where skipping the chunk's later turns would be the worse error. `lumi transcript`
+  and `get_transcript` must offer `ResumeFrom`, never `CoveredUntil`.
+- **A re-transcription may contribute timings, never text.** `lumi transcript backfill --retranscribe` runs
+  recognition again over the same WAV, under a possibly newer model, and its words may simply differ from
+  the ones indexed; installing them puts phrases in a transcript that are absent from `events.text` and from
+  the FTS index, so a reader sees a sentence no query can find. The re-run is therefore biased with the same
+  vocabulary the recorder used and its timings are used only while `minRetranscribeSimilarity` says it is
+  saying the same thing — below that the chunk falls back to the text path, which needs no audio at all.
+  The `track.Text == ""` skip in `loadTimings` is a cost gate on genuinely silent tracks and nothing more:
+  a track whose recognition *failed* never reaches it, because the chunk is declined a step earlier.
 - **Turn continuation across a chunk boundary is structural, not gap-based.** There is now no inter-chunk
   dead air at all, and in the index recorded before the stream was held open there was 0.4–2.9 s of it,
   unobservable and overlapping a natural pause. What *is* observable either way is adjacency: 3,028 of
