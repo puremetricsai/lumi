@@ -169,10 +169,28 @@ column and chunk origin moved onto segments. Deferred, gated on measuring whethe
 double-indexing actually hurts ranking. `search_events` gains only a notice
 pointing at `get_transcript`.
 
-**App attribution for audio events.** A 30-second chunk spans many focus changes,
-so one app stamp is a worse lie than an empty field, and `AttributionHealth` is
-screen-only *because* audio carries no app. If ever done it belongs in
-`metadata_json` as `focused_app_at_start`, never in `events.app`.
+**App attribution for audio events.** *Superseded — audio events now carry an
+app.* The original objection was that a 30-second chunk spans many focus changes,
+so one app stamp is a worse lie than an empty field, and that if ever done it
+belonged in `metadata_json`, never in `events.app`.
+
+What changed is that the question split in two. CoreAudio's process objects
+(`kAudioHardwarePropertyProcessObjectList` plus `kAudioProcessPropertyIsRunningOutput`)
+report *which processes held an active audio output stream* as observed fact
+rather than inference, which the original note had no way to obtain. That is
+weaker than "was emitting sound" — a paused player still answers yes — so the
+field is named for what it proves. The set — genuinely a set, and genuinely
+unflattenable to a scalar — went to `metadata_json` as
+`active_audio_output_processes`, exactly where this note said attribution belonged, while
+`events.app`/`events.window` took the focused application, keeping the meaning
+`app` carries everywhere else in the index.
+
+The imprecision the note warned about is real and accepted: one stamp per chunk,
+sampled at close. It is bounded by the fact that both tracks of a chunk get the
+*same* stamp, so `CollapseAudioTracks` cannot make the reported app depend on
+which track happened to transcribe. `AttributionHealth` stays screen-only, but
+now because mixing kinds would measure the screen path badly, not because audio
+has nothing to contribute.
 
 **Cross-correlating the two WAVs.** Measured writer-start lag is 30–70 ms with a
 flat correlation surface. Recording the session-start PTS makes it exact for new

@@ -44,7 +44,7 @@ Data flows one way: `internal/cli` wires concrete processors into a `capture.Rec
 `store.Event` rows, and `search` reads them back. Never the reverse.
 
 **`internal/macosnative`** — cgo/Objective-C bridge to ScreenCaptureKit, Accessibility, Apple Vision,
-AVFoundation WAV writing, and permission preflight. Has a non-macOS stub. `AudioSession` is the one
+AVFoundation WAV writing, CoreAudio process enumeration, and permission preflight. Has a non-macOS stub. `AudioSession` is the one
 exception to the call-and-return shape of everything else here: it holds a live `SCStream` behind a handle
 and is read with `Next`, because the stream has to stay open across chunk boundaries. `RecordAudio` takes
 one chunk from a session and stops, so `native-smoke` and the recorder share a single capture path.
@@ -267,6 +267,43 @@ Support/Lumi`; directories created 0700.
   distinction already. Screen Recording and Accessibility stay `denied_or_not_determined` on purpose —
   splitting them needs Full Disk Access or raises a prompt as a side effect. Over SSH no status call can
   prompt at all, so `--request` is a no-op.
+
+### Audio attribution
+
+- **An audio row's `app`/`window` name the *focused* application, not the one making the sound.** They
+  answer the same question `app` answers for every screen row — "what was the user working in" — sampled
+  once when the chunk closes. Which processes held the audio output is a different question with a
+  different answer, and lives in `metadata_json` as `active_audio_output_processes`. Putting one of those
+  in `events.app` would fork the column's meaning by row kind, and it cannot hold the answer anyway: it
+  is a *set*.
+- **`active_audio_output_processes` names stream occupancy, not audible sound, and is named for what it
+  can prove.** `kAudioProcessPropertyIsRunningOutput` reports "running IO with at least one active output
+  stream": a *paused* player still answers yes, while the same app with its document closed does not —
+  both measured with QuickTime. Calling the field `emitting_processes` claimed audibility the data cannot
+  support, and a field name is the first thing an agent reads. Nothing cheaper is available: the
+  per-process property set is closed (PID, BundleID, Devices, IsRunning, IsRunningInput,
+  IsRunningOutput) and carries no level, so proving real emission needs a process tap. Measured
+  false-positive rate under ordinary use is low — 44 samples over 100s of editor/terminal/browser
+  activity found *no* process holding a stream — but a low rate makes the signal useful, not the name
+  true.
+- **Both tracks of a chunk carry the same stamp.** `CollapseAudioTracks` picks a survivor by
+  `(hasText, isSystem, runeLen, -id)`, so per-track stamps would make the app a search reports depend on
+  which track happened to transcribe. Stamping identically makes the survivor's attribution stable by
+  construction, as the shared `captured_at` already is.
+- **An absent `active_audio_output_processes` means no process held a stream; the `..._error` key means
+  Lumi could not tell.** Writing an empty list would collapse the two, and nothing downstream could
+  separate them afterwards. Same reason `silent` is not `unknown`. Absence carries that meaning only
+  because `internal/cli` always wires `Recorder.AudioOutputs`; leaving it nil makes absence mean "never
+  sampled" instead. That precondition is documented on the field rather than enforced with a marker,
+  since Go's `internal/` rule puts the unwired state out of reach of anything but this module's tests.
+- **The output-process list is read, never tapped, and excludes Lumi's own pid.** `AudioProcesses` reads
+  CoreAudio process objects; creating a tap is what needs a TCC grant, enumerating does not — verified to
+  work identically from the detached `Setsid` daemon, unlike `NSWorkspace.frontmostApplication`. Lumi is
+  filtered because the capture session sets `excludesCurrentProcessAudio`, so listing it would claim
+  provenance for sound the recording cannot contain. Nothing else is filtered: a process macOS cannot name
+  keeps its pid, since dropping it would understate what was audible.
+- **`AttributionHealth` stays screen-only**, now because each chunk contributes two rows and an audio
+  failure would be reported as a screen problem — not because audio carries no app.
 
 ### Audio origin
 
