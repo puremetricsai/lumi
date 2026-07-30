@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/puremetricsai/lumi/internal/macosnative"
 )
@@ -93,11 +94,21 @@ func (NativeScreens) Capture(ctx context.Context, directory, prefix string) ([]S
 // the primary screen-text source, since it cannot see beyond the focused window
 type AccessibilityContext struct{}
 
+// accessibilityMutex serialises the native Accessibility read. Since audio
+// chunks began carrying attribution the snapshot is taken from two goroutines —
+// the screen tick and the close of an audio chunk — and the AX machinery it
+// drives is process-global, so the lock belongs to the package rather than to an
+// instance: AccessibilityContext is a zero-size value that callers construct
+// freshly, and a field would guard nothing shared.
+var accessibilityMutex sync.Mutex
+
 // Snapshot returns an error only when nothing at all could be read. A snapshot
 // whose Accessibility read failed still carries the frontmost application name
 // and, where the window list could supply one, a window title; that arrives as a
 // populated ScreenContext with AccessibilityError set.
 func (AccessibilityContext) Snapshot(ctx context.Context) (ScreenContext, error) {
+	accessibilityMutex.Lock()
+	defer accessibilityMutex.Unlock()
 	snapshot, err := macosnative.Accessibility(ctx)
 	if err != nil {
 		return ScreenContext{}, fmt.Errorf("read macOS Accessibility tree: %w", err)

@@ -89,6 +89,63 @@ type AudioSource interface {
 	Open(ctx context.Context, directory string, chunk time.Duration) (AudioStream, error)
 }
 
+// AudioProcess is one application holding an active audio output stream while a
+// chunk was captured. BundleID and Name are each empty when macOS could not
+// resolve them, which happens for command-line processes owning no bundle: such
+// a process still held a stream, so it is reported with only a PID rather than
+// dropped.
+type AudioProcess struct {
+	PID      int32  `json:"pid"`
+	BundleID string `json:"bundle_id,omitempty"`
+	Name     string `json:"name,omitempty"`
+}
+
+// AudioOutputs lists the processes holding an active audio output stream. It
+// answers the question the WAV cannot: the system track is a mix of the whole
+// output graph and carries no provenance, so without this a recorded call is
+// attributable only to whatever the user happened to have focused.
+//
+// It reports *stream occupancy, not audible sound*, because that is the
+// strongest claim CoreAudio supports without a tap: a paused player that still
+// holds its stream open is reported (measured with QuickTime), while the same
+// app with its document closed is not. Establishing actual emission would need
+// AudioHardwareCreateProcessTap, which this design excludes.
+//
+// It is separate from AudioSource because it is a read of process state rather
+// than a capture, and it is optional on the Recorder for the same reason
+// ContextExtractor is — a recorder with neither still indexes audio.
+type AudioOutputs interface {
+	Active(context.Context) ([]AudioProcess, error)
+}
+
+// NativeAudioOutputs reads CoreAudio's process objects. It opens no tap and
+// captures no audio, so it needs no permission the recorder does not already
+// hold.
+type NativeAudioOutputs struct{}
+
+func (NativeAudioOutputs) Active(ctx context.Context) ([]AudioProcess, error) {
+	processes, err := macosnative.AudioProcesses(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list processes with active audio output: %w", err)
+	}
+	// Lumi's own output is excluded from the capture by the session
+	// (excludesCurrentProcessAudio), so listing it here would claim provenance
+	// for sound the recording cannot contain. Nothing else is filtered:
+	// dropping the processes macOS cannot name would understate what was
+	// audible, which is the failure this list exists to prevent.
+	self := int32(os.Getpid())
+	result := make([]AudioProcess, 0, len(processes))
+	for _, process := range processes {
+		if process.PID == self {
+			continue
+		}
+		result = append(result, AudioProcess{
+			PID: process.PID, BundleID: process.BundleID, Name: process.Name,
+		})
+	}
+	return result, nil
+}
+
 // AudioStream delivers chunks from a capture session that keeps recording
 // between them.
 type AudioStream interface {

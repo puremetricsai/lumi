@@ -27,12 +27,19 @@ type SegmentWriter interface {
 type Recorder struct {
 	Store *store.Store
 	// Segments defaults to Store when nil.
-	Segments       SegmentWriter
-	Paths          config.Paths
-	Screen         ScreenSource
-	Text           TextExtractor
-	Context        ContextExtractor
-	Audio          AudioSource
+	Segments SegmentWriter
+	Paths    config.Paths
+	Screen   ScreenSource
+	Text     TextExtractor
+	Context  ContextExtractor
+	Audio    AudioSource
+	// AudioOutputs is optional, but leaving it nil makes an audio row's absent
+	// active_audio_output_processes mean "never sampled" rather than "no process
+	// held a stream", and nothing downstream can tell those apart. Lumi's own
+	// constructor always wires it, so that ambiguity is confined to tests; a
+	// marker distinguishing them would be runtime state for a state production
+	// cannot reach.
+	AudioOutputs   AudioOutputs
 	Transcriber    SpeechTranscriber
 	Comparer       *FrameComparer
 	ScreenInterval time.Duration
@@ -413,6 +420,7 @@ func (r *Recorder) storeAudioChunk(ctx context.Context, chunk AudioChunk) {
 		capturedAt = time.Now().UTC()
 	}
 	capturedAt = capturedAt.UTC()
+	attribution := r.audioAttribution(ctx)
 	results := make([]audioChunkResult, 0, len(chunk.Frames))
 	for _, frame := range chunk.Frames {
 		var transcription Transcription
@@ -423,8 +431,9 @@ func (r *Recorder) storeAudioChunk(ctx context.Context, chunk AudioChunk) {
 			transcription, processErr = r.Transcriber.Transcribe(ctx, frame.Path)
 		}
 		event := &store.Event{Kind: store.KindAudio, CapturedAt: capturedAt, Text: transcription.Text, MediaPath: frame.Path,
+			App: attribution.screen.App, Window: attribution.screen.Window,
 			DurationMS: frame.DurationMS, AudioSource: frame.Source,
-			Metadata: audioMetadata(frame.Source, frame.CaptureError, processErr)}
+			Metadata: audioMetadata(frame.Source, frame.CaptureError, processErr, attribution)}
 		storeCtx, cancel := preservationContext(ctx)
 		err := r.Store.Insert(storeCtx, event)
 		cancel()
@@ -653,13 +662,81 @@ func preservationContext(ctx context.Context) (context.Context, context.CancelFu
 	return context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 }
 
-func audioMetadata(source, captureError string, processErr error) json.RawMessage {
-	metadata := map[string]string{"audio_source": source}
+// audioAttributionSample is what a chunk could learn about its own provenance:
+// which application the user was working in, and which processes held an active
+// audio output stream. They answer different questions and routinely disagree —
+// a call recorded while the user takes notes elsewhere is the ordinary case — so
+// neither substitutes for the other.
+type audioAttributionSample struct {
+	screen     ScreenContext
+	screenErr  error
+	outputs    []AudioProcess
+	outputsErr error
+}
+
+// audioAttribution samples both attribution sources once per chunk. It is
+// called after the chunk has closed and before its tracks are indexed, so a
+// slow read delays indexing rather than capture — the stream keeps recording
+// throughout.
+//
+// Both reads run under preservationContext, for the same reason the inserts
+// below do: the chunk's audio already exists, and these describe it. Using the
+// cancelled context cost the last chunk of every recording its attribution —
+// the shutdown chunk is finalised and indexed precisely so it is not lost, and
+// a sub-millisecond "what is focused" read has no reason to be the one thing
+// that gives up on it.
+//
+// Neither read can fail the chunk. An error is carried into metadata and the
+// corresponding field is simply left empty, because captured media is never
+// lost to a downstream failure.
+func (r *Recorder) audioAttribution(ctx context.Context) audioAttributionSample {
+	sampleCtx, cancel := preservationContext(ctx)
+	defer cancel()
+	var sample audioAttributionSample
+	if r.Context != nil {
+		sample.screen, sample.screenErr = r.Context.Snapshot(sampleCtx)
+	}
+	if r.AudioOutputs != nil {
+		sample.outputs, sample.outputsErr = r.AudioOutputs.Active(sampleCtx)
+	}
+	return sample
+}
+
+func audioMetadata(source, captureError string, processErr error,
+	attribution audioAttributionSample) json.RawMessage {
+	metadata := map[string]any{"audio_source": source}
 	if captureError != "" {
 		metadata["capture_error"] = captureError
 	}
 	if processErr != nil {
 		metadata["processor_error"] = processErr.Error()
+	}
+	// app_source and attribution_source keep exactly the meanings they carry on
+	// screen rows: which source named the application, and which supplied the
+	// window title. They differ routinely, and merging them would change what
+	// attribution_source means for every row already indexed.
+	if attribution.screen.AppSource != "" {
+		metadata["app_source"] = attribution.screen.AppSource
+	}
+	if attribution.screen.TitleSource != "" {
+		metadata["attribution_source"] = attribution.screen.TitleSource
+	}
+	switch {
+	case attribution.screenErr != nil:
+		metadata["accessibility_error"] = attribution.screenErr.Error()
+	case attribution.screen.AccessibilityError != "":
+		metadata["accessibility_error"] = attribution.screen.AccessibilityError
+	}
+	// An empty list is omitted rather than written as []. Absent means no
+	// process held an output stream, which is a finding;
+	// active_audio_output_processes_error means Lumi could not tell, which is
+	// the opposite one. Absence carries that meaning only because the recorder
+	// is always constructed with an AudioOutputs source; see Recorder.
+	if len(attribution.outputs) > 0 {
+		metadata["active_audio_output_processes"] = attribution.outputs
+	}
+	if attribution.outputsErr != nil {
+		metadata["active_audio_output_processes_error"] = attribution.outputsErr.Error()
 	}
 	data, err := json.Marshal(metadata)
 	if err != nil {
