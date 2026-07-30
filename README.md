@@ -68,6 +68,38 @@ Earlier versions also wrote a `config.json` here to hold the provider settings f
 
 Search terms are safely combined with FTS5 `AND`. With no text argument, Lumi returns the most recent events. `--app` is an exact case-insensitive filter; `--window` is a case-insensitive substring filter. Results include timestamps and paths to the original screenshot or WAV chunk. JSON output also preserves screen-text source, display ID, audio source, and processor diagnostics.
 
+## Custom vocabulary
+
+Apple's on-device transcriber sometimes mishears names and jargon outside its general vocabulary, and a
+misheard term is permanently unsearchable. Drop an optional `vocabulary.txt` in your data directory — one
+term or phrase per line, UTF-8 — to bias recognition toward it:
+
+```text
+# people
+Mostafa
+Lumi
+
+# jargon
+SpeechAnalyzer
+```
+
+Blank lines and lines starting with `#` are ignored, surrounding whitespace is trimmed, and exact duplicate
+terms collapse to their first occurrence. File order is priority order: only the first 100 terms are used,
+and anything past that cap is dropped rather than silently ignored — `lumi doctor` reports how many. An edit
+takes effect on the next audio chunk; no restart needed.
+
+Compare the effect on fixed audio with `lumi transcribe`, which replays one WAV through the same
+transcription path the recorder uses:
+
+```sh
+./lumi transcribe recording.wav --no-vocabulary   # baseline
+./lumi transcribe recording.wav                    # with vocabulary.txt applied
+./lumi transcribe recording.wav --vocabulary other.txt  # a specific list instead
+```
+
+Comparing two live recordings would confound the vocabulary with how the words happened to be spoken;
+replaying the same file isolates the term list as the only variable.
+
 ## Connect an AI agent
 
 `lumi mcp` serves the index to any MCP-capable agent — Claude Desktop, Claude Code, Cursor, Codex — over stdin/stdout. The agent brings its own model; Lumi does no inference.
@@ -161,6 +193,7 @@ ScreenCaptureKit system + microphone ─→ WAV ─→ SpeechAnalyzer (in-proces
 - `internal/store`: versioned SQLite migrations, FTS5 triggers, inserts, and filtered search
 - `internal/retention`: age-, size-, and wipe-based event/media pruning
 - `internal/mcp`: the read-only MCP tool surface served over stdio
+- `internal/vocabulary`: the custom vocabulary file's format, cache, and cap
 - `internal/config`: data-directory path resolution
 - `internal/cli`: Cobra commands and lifecycle
 
