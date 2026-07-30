@@ -223,6 +223,44 @@ func TestEnvelopeIncludesThePartialTail(t *testing.T) {
 	}
 }
 
+// TestReadEnvelopeMatchesDecodingFirst pins the byte-level shortcut against the
+// readable implementation it exists to avoid.
+//
+// ReadEnvelope skips materializing the stream, which is worth ~960KB per chunk on
+// the recorder's per-chunk path — but only while it produces exactly what
+// Envelope would. Without this, the two could drift on window boundaries or the
+// partial tail and every energy verdict would quietly shift, with Envelope's own
+// tests still passing because nothing in production calls it any more.
+func TestReadEnvelopeMatchesDecodingFirst(t *testing.T) {
+	samples := make([]int16, 16000)
+	copy(samples[8000:8800], tone(800, 12000))
+	// A trailing sample count that is not a multiple of the window, so the
+	// partial tail is exercised too.
+	samples = append(samples, tone(750, 9000)...)
+
+	path := filepath.Join(t.TempDir(), "chunk.wav")
+	if err := os.WriteFile(path, lumiLayout(samples), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	direct, info, err := ReadEnvelope(path, 100)
+	if err != nil {
+		t.Fatalf("ReadEnvelope: %v", err)
+	}
+	if info.Samples != len(samples) {
+		t.Errorf("info reports %d samples, want %d", info.Samples, len(samples))
+	}
+	want := Envelope(samples, info.SampleRate, 100)
+	if len(direct) != len(want) {
+		t.Fatalf("got %d windows, want %d", len(direct), len(want))
+	}
+	for i := range want {
+		if direct[i] != want[i] {
+			t.Errorf("window %d: %.6f dBFS, want %.6f", i, direct[i], want[i])
+		}
+	}
+}
+
 // TestReadsRealCapturedFile is the only check that the synthesized fixture above
 // actually matches reality. Real captures live outside the repository, so point
 // it at one:

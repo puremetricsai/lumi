@@ -84,9 +84,44 @@ func ReadMono16(path string) ([]int16, Info, error) {
 	return DecodeMono16(raw)
 }
 
+// ReadEnvelope reads a WAV and reduces it straight to a windowed energy envelope.
+//
+// It exists because that is the only thing either caller of this package wants:
+// both read a chunk's system track, hand the samples to Envelope, and discard
+// them. Going through ReadMono16 would allocate a whole 30-second stream — 960 KB
+// per chunk, on the recorder's per-chunk path and on every chunk a backfill walks
+// — purely to sum it window by window. Info comes back for the same reasons
+// ReadMono16 returns it, minus the samples nobody kept.
+func ReadEnvelope(path string, windowMS int) ([]float64, Info, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, Info{}, err
+	}
+	data, info, err := decodeMono16(raw)
+	if err != nil {
+		return nil, Info{}, err
+	}
+	return envelopeBytes(data, info.SampleRate, windowMS), info, nil
+}
+
 // DecodeMono16 is ReadMono16 over an in-memory file, so tests need no fixtures on
 // disk.
 func DecodeMono16(raw []byte) ([]int16, Info, error) {
+	data, info, err := decodeMono16(raw)
+	if err != nil {
+		return nil, Info{}, err
+	}
+	samples := make([]int16, len(data)/2)
+	for i := range samples {
+		samples[i] = int16(binary.LittleEndian.Uint16(data[i*2 : i*2+2]))
+	}
+	return samples, info, nil
+}
+
+// decodeMono16 validates the header and returns the data chunk's bytes, trimmed
+// to whole samples. It is split out so an envelope can be taken without
+// materializing the stream first.
+func decodeMono16(raw []byte) ([]byte, Info, error) {
 	if len(raw) < 12 || string(raw[0:4]) != "RIFF" || string(raw[8:12]) != "WAVE" {
 		return nil, Info{}, errors.New("not a RIFF/WAVE file")
 	}
@@ -152,13 +187,9 @@ func DecodeMono16(raw []byte) ([]int16, Info, error) {
 
 	// A trailing odd byte cannot form a sample; drop it rather than misalign
 	// every sample after it.
-	usable := len(data) - len(data)%2
-	samples := make([]int16, usable/2)
-	for i := range samples {
-		samples[i] = int16(binary.LittleEndian.Uint16(data[i*2 : i*2+2]))
-	}
-	info.Samples = len(samples)
-	return samples, info, nil
+	data = data[:len(data)-len(data)%2]
+	info.Samples = len(data) / 2
+	return data, info, nil
 }
 
 type format struct {
@@ -242,6 +273,34 @@ func Envelope(samples []int16, sampleRate, windowMS int) []float64 {
 			end = len(samples)
 		}
 		envelope = append(envelope, RMSDBFS(samples[start:end]))
+	}
+	return envelope
+}
+
+// envelopeBytes is Envelope over undecoded little-endian samples, so a file read
+// only for its energy never has to become an []int16. It produces exactly what
+// Envelope would for the same stream.
+func envelopeBytes(data []byte, sampleRate, windowMS int) []float64 {
+	count := len(data) / 2
+	if count == 0 || sampleRate <= 0 || windowMS <= 0 {
+		return nil
+	}
+	window := sampleRate * windowMS / 1000
+	if window <= 0 {
+		window = 1
+	}
+	envelope := make([]float64, 0, (count+window-1)/window)
+	for start := 0; start < count; start += window {
+		end := start + window
+		if end > count {
+			end = count
+		}
+		var sum float64
+		for i := start; i < end; i++ {
+			value := float64(int16(binary.LittleEndian.Uint16(data[i*2 : i*2+2])))
+			sum += value * value
+		}
+		envelope = append(envelope, dbfs(math.Sqrt(sum/float64(end-start))))
 	}
 	return envelope
 }
