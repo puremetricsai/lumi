@@ -1,28 +1,36 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code (claude.ai/code) when working in this repository.
 
 ## What Lumi is
 
-A local-first work-memory CLI for Apple Silicon Macs: continuously capture all displays plus system and microphone audio, extract screen text locally (full-display Apple Vision OCR, with Accessibility for focused-app attribution), transcribe audio with in-process Apple SpeechAnalyzer, store media on disk, index text in SQLite FTS5, and query it. Inspired by screenpipe but deliberately narrower — no GUI, server, or plugins.
+A local-first work-memory CLI for Apple Silicon Macs: continuously capture all displays plus system and
+microphone audio, extract screen text locally (full-display Apple Vision OCR, with Accessibility for
+focused-app attribution), transcribe audio with in-process Apple SpeechAnalyzer, store media on disk, index
+text in SQLite FTS5, and query it. Inspired by screenpipe but deliberately narrower — no GUI, server, or
+plugins.
 
 ## Commands
 
 ```sh
-task build                                  # compiles the Swift bridge (task speech), then go build
+task build                                  # Swift bridge (task speech), then go build
 task test                                   # full suite
 task check                                  # fmt → vet → test; the verification command
-task vet
-task speech && go test ./internal/store -run TestSearch -v   # single test (needs the Swift archive)
+task speech && go test ./internal/store -run TestSearch -v   # single test
 task test:native                            # permission-gated native smoke test
 task mcp                                    # hand-fed MCP handshake smoke test
 ```
 
-`internal/capture/recorder_test.go` runs the whole capture→store→search pipeline with fake `ScreenSource`/`ContextExtractor`/`TextExtractor`/`AudioSource`/`SpeechTranscriber` implementations, so it needs no permissions or external binaries. Prefer extending it over invoking real frameworks. `task test:native` builds the stable `./lumi` binary and runs the explicit, permission-gated integration smoke test.
+Run `task build`/`task test`, never raw `go build`/`go test` — nothing links without `liblumispeech.a`,
+which `task speech` produces.
 
-The CLI itself refuses to run on anything but `darwin/arm64` (`platform.Validate` in `PersistentPreRunE`), and native microphone capture requires macOS 26+. `./lumi doctor` checks platform, capture permissions, speech assets, and the data directory. For a bounded manual smoke test: `./lumi record start --foreground --no-audio --duration 10s`.
+`internal/capture/recorder_test.go` runs the whole capture→store→search pipeline with fake
+`ScreenSource`/`ContextExtractor`/`TextExtractor`/`AudioSource`/`SpeechTranscriber` implementations, needing
+no permissions or external binaries. Prefer extending it over invoking real frameworks.
 
-`task build` compiles the Swift SpeechAnalyzer bridge (`task speech`) before `go build`; run `task build`/`task test` rather than raw `go build`/`go test`, which will not link without `liblumispeech.a`.
+The CLI refuses to run on anything but `darwin/arm64` (`platform.Validate` in `PersistentPreRunE`); native
+microphone capture needs macOS 26+. `./lumi doctor` checks platform, permissions, speech assets, and the
+data directory. Bounded manual smoke test: `./lumi record start --foreground --no-audio --duration 10s`.
 
 ## Architecture
 
@@ -32,27 +40,84 @@ ScreenCaptureKit displays ─→ Vision OCR (full screen) ─┐
 ScreenCaptureKit system + microphone ─→ WAV ─→ SpeechAnalyzer (in-process) ─┘
 ```
 
-Data flows one way: `internal/cli` wires concrete processors into a `capture.Recorder`, the recorder writes `store.Event` rows, and `search` reads them back. There is no dependency in the reverse direction.
+Data flows one way: `internal/cli` wires concrete processors into a `capture.Recorder`, the recorder writes
+`store.Event` rows, and `search` reads them back. Never the reverse.
 
-**`internal/macosnative`** — cgo/Objective-C bridge to ScreenCaptureKit, Accessibility, Apple Vision, AVFoundation WAV writing, and macOS permission preflight. It compiles into the Go binary and has a non-macOS stub for static/test portability.
+**`internal/macosnative`** — cgo/Objective-C bridge to ScreenCaptureKit, Accessibility, Apple Vision,
+AVFoundation WAV writing, and permission preflight. Has a non-macOS stub.
 
-**`internal/capture`** — `Recorder` runs independent screen and audio goroutines until the context is cancelled. Native processors remain behind small interfaces (`ScreenSource`, `ContextExtractor`, `TextExtractor`, `AudioSource`, `SpeechTranscriber`). ScreenCaptureKit enumerates displays on each interval for hotplug; full-display Apple Vision OCR is the primary screen-text source (so the indexed text reflects the entire screen, not just the focused window), the Accessibility snapshot supplies focused-app attribution (App/Window/InputActive) and its focused-window text is preserved in event metadata when substantive, and the comparer maintains independent per-display state. All capture and processing runs in-process through native Apple frameworks; no external subprocess remains.
+**`internal/capture`** — `Recorder` runs independent screen and audio goroutines until the context is
+cancelled, with native processors behind small interfaces. Displays are re-enumerated each interval for
+hotplug. Everything runs in-process — no subprocesses. One focused-window snapshot per tick is stamped onto
+**every** display's frame, so on a multi-display setup an `app` filter returns frames from displays where
+that app was not visible: attribution answers "what was the user working in", not "what is shown in this
+image". Per-display attribution is deliberately not done.
 
-One focused-window snapshot is taken per tick and its App/Window are stamped onto **every** display's frame. On a multi-display setup an `app` filter therefore returns frames from displays where that app was not visible: attribution answers "what was the user working in when this was captured", not "what is shown in this image". Per-display attribution would need a snapshot per display and is deliberately not done.
+`ScreenContext` degrades rather than failing: `Snapshot` errors only when nothing at all could be read, and
+a failed Accessibility read arrives as a *populated* context carrying `AccessibilityError`. `Degraded()`
+("something was lost") and `Unattributed()` ("no app name at all") are different questions — conflating
+them fires warnings on routine operation. `Trusted` is a `*bool` so "revoked" and "never sampled" stay
+distinct. Sustained degradation escalates on **elapsed time**, not tick count, since `--interval` is a flag.
 
-`ScreenContext` degrades rather than failing: `Snapshot` returns an error only when nothing at all could be read, and a failed Accessibility read arrives as a *populated* context carrying `AccessibilityError`. `Degraded()` ("something was lost") and `Unattributed()` ("no app name at all") are different questions and callers must not conflate them — escalating a covered fallback as a missing app fires on routine operation and trains the reader to ignore the line. `Trusted` is a `*bool` because "trust was revoked" and "trust was never sampled" have different remedies; a zero-valued struct must never be read as the former. Sustained degradation escalates on **elapsed time**, not a tick count, since `--interval` is a flag.
+**`internal/store`** — single-file SQLite via `modernc.org/sqlite` (pure Go, no cgo), `MaxOpenConns(1)` plus
+WAL. Schema changes are versioned migrations (`migrations.go`) applied on `Open`, tracked by `user_version`.
+The `events_fts` external-content table is trigger-synced, so writes go only to `events`. Timestamps are
+RFC3339Nano UTC strings compared lexicographically — any new time column must match or range filters break.
 
-**`internal/store`** — single-file SQLite via `modernc.org/sqlite` (pure Go, no cgo). `MaxOpenConns(1)` plus WAL; schema changes are versioned migrations in `internal/store/migrations.go`, applied on every `Open` and tracked by SQLite's `user_version` pragma (each migration runs in its own transaction). The `events_fts` external-content FTS5 table is kept in sync by insert/delete/update triggers, so writes go only to `events`. Timestamps are stored as RFC3339Nano UTC strings and compared lexicographically — any new time column must use the same format or range filters break. Facts about querying belong here rather than in callers: `DefaultSearchLimit`/`MaxSearchLimit` are the numbers `Search` actually clamps to, `HasSearchableTerms` answers "does this query survive FTS5 tokenization" from `ftsExpression` itself, and `HasEvents` answers "is the index empty" with a `SELECT EXISTS` instead of materializing a row. `EventByID` (with the `ErrEventNotFound` sentinel) and `ListAttribution` back the MCP tools. `CollapseAudioTracks` sits beside `HasSearchableTerms` as a store-owned rule the MCP boundary reads: it merges each 30-second chunk's microphone/system duplicate into one survivor (the system row, unconditionally, whenever both carry speech), returning per-survivor `AudioChunk` provenance — an `Origin` (`system`/`microphone`/`both`/`silent`) and every merged `AudioTrack`. It groups on the shared `captured_at` string alone, never id adjacency. `AudioTracksAt` is its companion: it re-reads every audio row at a set of timestamps so `Origin` describes the whole chunk even when a search matched only one track, and `OriginOf` derives that origin from a track set. `AttributionHealth` answers "is capture still recording which app the user was in" for `lumi doctor`; its `LastAttributed` is a scalar subquery over *all* history rather than the asked-about window, because scoping it would blank the field out exactly when the outage is longer than the window — the case the report exists to explain. `SUM` and `MAX` are `NULL` over an empty set, so both need `COALESCE`/`sql.NullString` destinations. The event column list lives in one `eventSelect` const shared by `Expired`, `AllEvents`, and `EventByID`, because a missed copy fails at scan time rather than compile time.
+Facts about querying live here, not in callers: `DefaultSearchLimit` (20) / `MaxSearchLimit` (500),
+`HasSearchableTerms`, `HasEvents`, `EventByID` (with `ErrEventNotFound`), `ListAttribution`.
+`CollapseAudioTracks` merges each chunk's mic/system duplicate into one survivor, returning `AudioChunk`
+provenance (`Origin` of `system`/`microphone`/`both`/`silent` plus every merged `AudioTrack`);
+`AudioTracksAt` re-reads every audio row at a set of timestamps so `Origin` describes the whole chunk even
+when a search matched one track. `AttributionHealth` backs `lumi doctor`; its `LastAttributed` is a scalar
+subquery over *all* history, because scoping it to the window would blank the field exactly when the outage
+exceeds the window. The event column list lives in one `eventSelect` const shared by `Expired`,
+`AllEvents`, and `EventByID`.
 
-**`internal/retention`** — explicit age- and size-based pruning used by `lumi prune`. Age pruning runs before size pruning; size enforcement walks indexed events oldest-first. `Options.All` is a "wipe everything" policy that enumerates every row via `store.AllEvents` (an unbounded `SELECT ... FROM events` with no timestamp cutoff, so a far-future `captured_at` is never skipped the way a bounded cutoff's strict `<` compare would), deletes rows-before-files, then sweeps `Options.MediaDirs` (wired to `Paths.Screenshots`/`Paths.Audio`) to unlink any orphaned media file no row referenced. Only the `All` policy sweeps directories; age/size are unchanged. Dry-run accounting stays equivalent to a real run (orphan bytes/files are reported, the just-removed referenced files are excluded so they aren't double-counted, and nothing is deleted). There is no background scheduler or default retention policy. Rows are deleted in bounded batches before media files are unlinked.
+**`internal/retention`** — age- and size-based pruning behind `lumi prune`. Age runs before size; size walks
+oldest-first. `Options.All` enumerates every row via `store.AllEvents` (unbounded, so a far-future
+`captured_at` is never skipped), deletes rows-before-files, then sweeps `Options.MediaDirs` for orphans.
+Only `All` sweeps directories. No background scheduler.
 
-**`internal/cli`** — Cobra commands (`record start`/`status`/`stop`, `search`, `mcp`, `prune`, `doctor`, `permissions`, `native-smoke`, `transcribe`, `version`). `record` is a parent command: `record start` runs the capture pipeline, detaching to the background by default (`--foreground` keeps it in the terminal); the background worker is a re-exec of `record start --foreground` tracked by a JSON state file and log under the data dir (`internal/cli/record_daemon.go`). `record stop` sends SIGTERM and waits for the graceful-shutdown path. Capture and audio-chunk intervals and transcription settings are flags; native framework implementations are production defaults. `search` exposes exact case-insensitive app filtering and case-insensitive window-substring filtering, plus `--type all|screen|audio`, which defaults to `all`. `permissions --request` invokes native TCC request flows; never add `tccutil reset` as an automatic side effect. `mcp` (`internal/cli/mcp.go`) opens the store through the same `openStore` as every other command — an agent launches it with a bare environment, so `--data-dir`/`LUMI_HOME` must be the whole story — and treats a cancelled context as a clean exit. Unlike `record`, `mcp` keeps its own `RunE` rather than becoming a bare parent that prints help: this command *is* the server, every existing client config invokes it as `lumi mcp`, and a help dump would land on the JSON-RPC stream. `mcp setup` (`internal/cli/mcp_setup.go`) is its only subcommand — there is deliberately no `mcp start`, no HTTP transport, and no daemon, because the client spawns and reaps the server itself. `resolveLumiBinary`, `verifyLumiBinary`, and `newSetupTargets` are package vars purely as test seams; without them a test run would rewrite the developer's own Claude configuration.
+**`internal/cli`** — Cobra commands (`record start`/`status`/`stop`, `search`, `mcp`, `prune`, `doctor`,
+`permissions`, `native-smoke`, `transcribe`, `version`). `record start` detaches to the background by default
+(`--foreground` keeps it inline) as a re-exec tracked by a JSON state file and log under the data dir
+(`record_daemon.go`); `record stop` sends SIGTERM and waits for graceful shutdown. `search` offers exact
+case-insensitive app filtering, case-insensitive window-substring filtering, `--type all|screen|audio`, and
+`--collapse-audio`. `permissions --request` invokes native TCC flows — never add `tccutil reset` as a side
+effect.
 
-**`internal/mcp`** — a stdio MCP server exposing the index to external agents, built on `github.com/modelcontextprotocol/go-sdk` (pinned at v1.6.1; import it aliased as `sdk`, since our own package is also named `mcp`). `Serve(ctx, *store.Store, Options)` registers three read-only tools — `search_events`, `get_event`, `list_apps` — and runs until stdin closes or the context is cancelled. It depends on `internal/store` and nothing else of Lumi's; `internal/cli` imports it, never the reverse, and `Options` carries only what the transport and its notices need — the advertised name and version, plus the database path named in the "this index is empty" notice — so this package holds no Lumi identity beyond what it must say out loud. `search_events` truncates text per event and always reports `truncated` plus the true `text_length`; `get_event` is the untruncated escape hatch and the only tool returning the metadata blob. `list_apps` backs onto `store.ListAttribution`. `search_events` collapses each audio chunk's microphone/system duplicate by default (`collapse_audio_tracks` is a `*bool`, nil meaning on, matching `max_text_chars`); the survivor carries `audio_origin` and, when the chunk held more than one row, `audio_tracks` (every merged track's `id`/`audio_source`/`text_length`/`media_path` — never its text, which `get_event` reaches by id). The merge stays visible and reversible: `collapse_audio_tracks: false` returns both rows unmerged. Because a chunk yields at most two rows, the handler over-fetches (`min(2*limit, MaxSearchLimit)`) then trims to `limit` so a collapsed page stays full, and the cap notice fires on either the post-collapse page filling `limit` **or** the raw fetch saturating `fetchLimit`. Provenance comes from `store.AudioTracksAt`, not the matched set, so a query that matched only the microphone track of a bleed pair still reports `audio_origin: "both"`; notices compose with `"; "` and the collapse part is added only when something was actually merged. Validation and store failures come back as tool results with `isError`, never JSON-RPC protocol errors, so the agent can read the message and retry.
+`mcp` opens the store through the same `openStore` as every other command (an agent launches it with a bare
+environment, so `--data-dir`/`LUMI_HOME` must be the whole story) and treats a cancelled context as a clean
+exit. It keeps its own `RunE` rather than becoming a bare parent that prints help — this command *is* the
+server, and a help dump would land on the JSON-RPC stream. `mcp setup` is its only subcommand; there is
+deliberately no `mcp start`, HTTP transport, or daemon. `resolveLumiBinary`, `verifyLumiBinary`, and
+`newSetupTargets` are package vars purely as test seams — without them a test run would rewrite the
+developer's own Claude config.
 
-An agent cannot see the shape of the index, so this package is explicit about ambiguity. A `query` that survives `TrimSpace` but has no letters or digits is rejected as a tool error rather than falling through to `Search`'s no-MATCH-clause behavior, which would return recent events an agent could not distinguish from hits. An empty result carries a `notice` saying either that the index holds no events at all (naming `Options.DatabasePath`, so a mistyped `--data-dir` reads as "this file is empty" rather than "you never recorded anything") or that filters matched nothing; a full page carries a distinct notice that results were capped. `search_events` clamps `limit` itself against `store.DefaultSearchLimit`/`MaxSearchLimit` rather than relying on the store's clamp, because the number it reports in that notice must be the one enforced — and the schema descriptions, which cannot interpolate constants, are pinned to those constants by tests.
+**`internal/mcp`** — stdio MCP server on `github.com/modelcontextprotocol/go-sdk` (pinned v1.6.1; import
+aliased as `sdk`, since our package is also named `mcp`). `Serve(ctx, *store.Store, Options)` registers
+three read-only tools — `search_events`, `get_event`, `list_apps` — and runs until stdin closes or the
+context is cancelled. It depends on `internal/store` and nothing else of Lumi's. `search_events` truncates
+text per event and reports `truncated` plus true `text_length`, collapses audio duplicates by default
+(`collapse_audio_tracks` is a `*bool`, nil meaning on), and over-fetches (`min(2*limit, MaxSearchLimit)`)
+then trims so a collapsed page stays full; `get_event` is the untruncated escape hatch and the only tool
+returning metadata. Validation and store failures come back as tool results with `isError`, never JSON-RPC
+protocol errors.
 
-**`internal/mcpsetup`** — registers `lumi mcp` with the MCP clients installed on the machine, backing `lumi mcp setup`. It owns what Lumi knows about three foreign config formats and nothing else: `Spec` carries a name, a binary path, and an argv, so the package has no opinion about `--data-dir`, `os.Executable`, or `config.Paths` — `internal/cli` supplies all three. It depends on nothing else of Lumi's; `internal/cli` imports it, never the reverse. It also has no native dependencies and no third-party ones, so `go test ./internal/mcpsetup` runs without `liblumispeech.a`. The three targets are deliberately asymmetric, because what each client is willing to tell us differs: Claude Code is *read* from `~/.claude.json` for detection and *written* only by shelling out to `claude mcp add`/`remove`; Claude Desktop has no CLI and is read-modify-written in place; Codex CLI is mediated by `codex mcp get --json` / `add` / `remove` in *both* directions, so `~/.codex/config.toml` is never touched by Lumi at all. Every external command goes through the `Runner` seam and every path is an injectable struct field, so the tests need none of `claude`, `codex`, or Claude Desktop present. `Result.Manual` and `Result.ManualHint` are set together by `manualJSON`/`manualTOML` — the paste-by-hand instruction has to match the syntax it introduces, and one hardcoded "add this under `mcpServers`" in the CLI would hand a Codex user JSON advice about a TOML file.
+An agent cannot see the shape of the index, so this package is explicit about ambiguity: a `query` with no
+letters or digits is a tool error rather than a fall-through to `Search`'s no-MATCH behavior, an empty
+result says whether the index itself is empty (naming `Options.DatabasePath`) or the filters matched
+nothing, a full page says results were capped, and `search_events` clamps `limit` itself so the number it
+reports is the one enforced.
+
+**`internal/mcpsetup`** — registers `lumi mcp` with installed MCP clients, backing `lumi mcp setup`. `Spec`
+carries a name, binary path, and argv; `internal/cli` supplies all three. It has no native or third-party
+dependencies. The three targets are asymmetric because what each client will tell us differs: Claude Code is
+*read* from `~/.claude.json` and *written* only via `claude mcp add`/`remove`; Claude Desktop has no CLI and
+is read-modify-written in place; Codex is mediated by `codex mcp get --json`/`add`/`remove` in both
+directions, so `~/.codex/config.toml` is never touched. Every external command goes through the `Runner`
+seam and every path is an injectable field, so tests need no client present.
 
 **`internal/vocabulary`** — owns the custom vocabulary file's format, cache, and cap, for the same reason
 `HasSearchableTerms` lives in `internal/store`: a caller that needs the rule reads it rather than restating
@@ -63,13 +128,28 @@ Accessibility read rather than failing outright. `MaxTerms` (100) caps the list 
 are dropped and counted in `Snapshot.Dropped`, never silently truncated. No native or third-party
 dependency, so every rule is testable without permissions or `liblumispeech.a`.
 
-**`internal/config`** — resolves `Paths` from `--data-dir`, else `LUMI_HOME`, else `~/Library/Application Support/Lumi`; directories are created 0700.
+**`internal/config`** — resolves `Paths` from `--data-dir`, else `LUMI_HOME`, else `~/Library/Application
+Support/Lumi`; directories created 0700.
 
 ## Invariants worth preserving
 
-- **Never lose captured media.** If Accessibility, Vision, comparison, or transcription fails after a file was written, preserve and index the event with diagnostic metadata. Don't convert downstream processor failures into early returns that drop the file.
-- **Deduplicate per display, not globally.** `FrameComparer` uses SHA-256 as an exact fast path and a sampled RGB histogram for near-duplicates. Active input raises sensitivity. A frame is still periodically retained, but on two deadlines, because a byte-identical frame carries no information a near-duplicate does: `MaxSilence` (ten seconds) forces a retained frame when the bytes *changed* but scored as similar — subtitles, video, an advancing slide — while the longer `ExactSilence` (five minutes) applies when the bytes are identical, so a frozen screen leaves a bounded presence marker instead of re-indexing the same JPEG every ten seconds. `ExactSilence` is clamped up to `MaxSilence`, so an unchanged frame is never retained more eagerly than a changed one.
-- **Preserve provenance.** `text_source`, `display_id`, and `audio_source` are first-class event columns introduced by append-only migration 3 and are included in JSON exports. In event metadata, `app_source` and `attribution_source` (from `ScreenContext.TitleSource`) answer different questions — which source named the *app*, and which supplied the *window title* — and routinely differ, the common case being an app named by the window list whose title was read over Accessibility. Merging them would silently change what `attribution_source` means for every already-indexed row.
+### Capture
+
+- **Never lose captured media.** If Accessibility, Vision, comparison, or transcription fails after a file
+  was written, preserve and index the event with diagnostic metadata. Don't convert downstream failures
+  into early returns that drop the file.
+- **Deduplicate per display, not globally.** `FrameComparer` uses SHA-256 as an exact fast path and a
+  sampled RGB histogram for near-duplicates; active input raises sensitivity. Two retention deadlines:
+  `MaxSilence` (10s) when bytes *changed* but scored similar (video, advancing slides), and `ExactSilence`
+  (5min) when bytes are identical, so a frozen screen leaves a bounded presence marker instead of
+  re-indexing the same JPEG. `ExactSilence` is clamped up to `MaxSilence`.
+- **Capture retries without discarding completed work.** Screen failures retry on the next interval; audio
+  failures retry after one second. Media returned during cancellation gets a short cancellation-free window
+  for insertion.
+- **Preserve provenance.** `text_source`, `display_id`, and `audio_source` are first-class event columns
+  (migration 3) and appear in JSON exports. In metadata, `app_source` and `attribution_source` answer
+  different questions — which source named the *app*, and which supplied the *window title* — and routinely
+  differ. Merging them would change what `attribution_source` means for every indexed row.
 
 ### Speech vocabulary
 
@@ -87,29 +167,145 @@ dependency, so every rule is testable without permissions or `liblumispeech.a`.
 - **`MaxTerms` is a real cap, not hygiene**: contextual biasing is a budget, and an oversized list dilutes
   every term while inviting false substitutions.
 
-- **The frontmost pid is resolved Accessibility → window list → `NSWorkspace`, and `NSWorkspace` coming last is the point.** `frontmostApplication` is backed by activation state maintained through notification delivery on a run loop. The recorder is a detached daemon (`record_daemon.go` sets `Setsid`) that never runs one, so the value freezes at whichever app was frontmost when the process started — the terminal that launched it. Every event then named that terminal while the window title, read live against its stale pid, kept advancing; a live-looking title is therefore no evidence the app is right, and this cost a full run of events their true app. Measured over a minute of real focus changes, `frontmostApplication` never moved off its start value and `runningApplications`/`isActive` froze identically, so neither may lead. `LumiActivationPID` leads because it answers *activation* rather than *visibility* — an app whose windows are all closed or minimized is still what the user is working in, and attribution is defined as "what was the user working in", not "what is shown in this image". It has two stages. System-wide AX `kAXFocusedApplicationAttribute` is tried first and is unreliable per-focused-application, returning `kAXErrorNotImplemented` for some apps while succeeding for others in the same session — measured failing in 10 of 45 samples. **Retrying is not the remedy**: three attempts 30ms apart return byte-identical errors. So `LumiFrontmostValidatedPID` follows, walking window-list owners front-to-back and asking each, over *per-application* AX, whether it is itself frontmost (`kAXFrontmostAttribute`) — which answered in 45 of 45 samples, including every system-wide failure. This is what fixed the residual ~8% misattribution concentrated at app-switch boundaries, where the top layer-0 window is still the previous app (or already the next one) while activation has moved: events 28603 and 28609 were stamped `Comet` from its Gmail tab while the menu bar in their own OCR read `Screen Sharing` and `Messages`. Per-application AX keeps working when the system-wide element does not — those very events recorded `attribution_source: accessibility` against the wrong pid, proving it. Candidate eligibility is `LumiFrontmostCandidates`, which is pure and exposed through `lumi_frontmost_candidates_json`: on-screen window owners front-to-back (bounded to 8, so the common case is one round-trip), then dock-visible applications from `NSWorkspace.runningApplications` that own no window at all. That second pass exists because an application with every window minimized or closed has no window-list entry and could otherwise never be *asked* — the resolver would return 0 and fall back to whatever is visible, which is the activation-versus-visibility failure this subsystem exists to prevent. **It must stay filtered to `NSApplicationActivationPolicyRegular`**: widening it to every running application is the obvious generalisation and is wrong, because background agents answer `kAXFrontmost` affirmatively and an unfiltered walk was measured attributing frames to Notification Center. Filtered, no spurious claimant appeared in any sample and a simulated windowless active application was recovered in 19 of 20. Only *membership* is read from `runningApplications`, never `isActive`, which freezes exactly like `frontmostApplication`. The walk short-circuits on the first yes. `app_source` distinguishes the two stages (`accessibility` vs `accessibility_frontmost`) because their reliability differs. The window list is next: `CGWindowListCopyWindowInfo` front-to-back, first layer-0 window whose owner is neither 0 nor this process, copied fresh per call so it cannot go stale, and needing only Screen Recording, which is definitionally granted whenever there is a frame to attribute. A name is borrowed from `NSWorkspace` **only** when both sources mean the same pid: borrowing across differing pids would name one app while reading another's title, which is the original bug. `LumiResolveFrontmost` is pure — no CoreGraphics, no AX, no `NSWorkspace` — and is exposed through `lumi_resolve_frontmost_json` for the same reason `lumi_hid_access_name` is: asserting the live resolution passes vacuously in any foreground process, so it would fail only in the daemon, where nothing is asserting.
-- **Never assert one native frontmost read against another.** `Accessibility` and `FrontmostDiagnostic` are separate native calls, so a focus change between them makes them differ for an entirely legitimate reason. `native-smoke` reports the diagnostic and never compares it to the snapshot; a test that compared them would fail intermittently while proving nothing, since sharing a resolver is already guaranteed by construction.
-- **Never lose attribution to a permission failure.** `lumi_accessibility_snapshot_json` gathers everything that needs no Accessibility grant — the frontmost application name, input activity, and `AXIsProcessTrusted()` — *before* the first AX call, and falls back to `CGWindowListCopyWindowInfo` for the window title when the focused-window read fails. Returning `NULL` there once cost 7,705 of 12,104 events their app, because the name was already in hand and was thrown away. `NULL` is reserved for a genuine total failure — *both* sources failing to name a pid or an app, never just one. Where the window list names a pid nothing can name an app for, `LumiResolveFrontmostLive` falls back to the `NSWorkspace` pair **wholesale, pid included**: a stale-but-consistent pair beats naming one process while reading another's title. Trust is sampled per tick, not once at startup: TCC reports Accessibility as granted from a *fresh* process while a long-running recorder has been failing for a day, so `doctor` reports observed attribution from the index alongside the permission status, and never opens the store through `openStore` — that would create a mistyped `--data-dir` and then call the empty result healthy.
-- **Report a permission as `denied` separately from `not_determined` wherever macOS lets you.** The two need opposite remedies — a denied subject is never re-prompted and is only fixable in System Settings, while a not-determined one is exactly what `permissions --request` can still resolve — so a single conflated status tells the operator nothing actionable. Input Monitoring reads `IOHIDCheckAccess(kIOHIDRequestTypeListenEvent)`, whose tri-state `CGPreflightListenEventAccess` discards by wrapping it in a `BOOL`; Microphone and Speech Recognition already carry the distinction through `AVAuthorizationStatus`/`SFSpeechRecognizerAuthorizationStatus`. Screen Recording and Accessibility stay `denied_or_not_determined` on purpose: `CGPreflightScreenCaptureAccess` and `AXIsProcessTrusted` return a bare `BOOL`, and the only ways to split them need Full Disk Access (reading `TCC.db`) or raise a prompt as a side effect of asking (`SCShareableContent`) — neither is acceptable in a read-only status call. `lumi_hid_access_name` exists so every branch of the mapping is testable on a machine that only ever sits in one of them; asserting the live status instead would pass vacuously wherever the permission is already granted. Note that no status call can prompt at all over SSH: TCC has no GUI session to draw into, so every permission reads as undecided and `--request` is silently a no-op.
-- **FTS input must go through `ftsExpression`** (`internal/store/query.go`). It quotes each term and joins with `AND` or `OR` depending on `SearchOptions.Match`; the quoting is what keeps raw user text from being interpreted as FTS5 syntax, and it applies to both joiners. `MatchAll` is the zero value, so `lumi search` keeps its conjunctive semantics without opting in. Terms with no letters or digits are dropped, and an expression that comes back empty means "run no FTS query at all" — an empty MATCH is a syntax error, not a zero-result search.
-- **`store.MatchAny`, `SearchOptions.RequireText`, and the `bm25(events_fts, 1.0, 0.4, 0.4)` column weights are reached only through `lumi mcp`.** They are its `match: "any"` and `require_text` tool parameters, and no CLI command sets them — `lumi search` stays conjunctive and unweighted. The weights encode a finding worth keeping: without them a one-word `app` or `window` hit outranks a page of relevant screen text. `internal/store` tests cover `MatchAny` and `RequireText` independently of any command, and `internal/mcp` covers them again through the tool boundary.
-- **A rule about the store lives in the store.** When a caller needs to know what `Search` will do — which terms tokenize away, what limit is enforced, whether the index is empty — export the answer from `internal/store` and read it, rather than restating it. `store.HasSearchableTerms` exists because `internal/mcp` had reimplemented the unexported drop rule: a copy is correct only until the original moves, and the drift is invisible to both packages' tests.
-- **Schema changes go through `internal/store/migrations.go`.** Append a new `migration` with the next version number; never edit shipped SQL. The applied version lives in SQLite's `user_version` pragma.
-- **Pruning deletes rows before files.** Orphaned files are recoverable; rows pointing at missing media are not. `lumi prune` is the only code path permitted to delete media. Keep dry-run accounting equivalent to a real combined age-then-size run, and keep large deletes batched below SQLite's variable limit. `lumi prune --all` wipes everything and is irreversible, so it requires an interactive `yes` confirmation (`confirmPruneAll` in `internal/cli/root.go`); only `--yes` (scripts) or `--dry-run` (deletes nothing) may skip the prompt — keep that guard. `--all` enumerates every row with an unbounded query (never a far-future cutoff) and, after deleting rows and their files, additionally sweeps `Paths.Screenshots`/`Paths.Audio` to unlink orphaned media no row referenced — this makes the wipe a real privacy guarantee. Only `--all` sweeps directories; age/size policies must never remove orphans.
-- **Capture retries without discarding completed work.** Screen failures naturally retry on the next interval; audio failures retry after a one-second delay. Media returned during cancellation gets a short cancellation-free preservation window for diagnostics and insertion.
-- **Nothing may write to stdout in the `lumi mcp` path except JSON-RPC protocol frames.** The stdio transport owns that stream; a stray `fmt.Println`, a default `slog` handler, or a cobra usage dump silently corrupts the session and the user only sees the agent lose Lumi with no error text. `mcpCommand` sets `SilenceUsage`/`SilenceErrors` explicitly rather than inheriting them, every diagnostic goes to stderr, and `TestServeWritesOnlyJSONRPCFramesToStdout` pins it by swapping the real `os.Stdout` for a pipe.
-- **MCP tools return text and metadata only — screenshots and WAVs are never returned to a client.** An MCP client is usually a hosted agent, so anything a tool returns leaves the machine. `media_path` is a string the user can open themselves; no tool, flag, or future resource reads those bytes. There is no `read_media`. This is not asserted by a test — no reasonable test could prove a negative like "no code path reads this file" — it is enforced by the shape of `EventRecord` (a string field, never a byte slice) and by there being no filesystem-reading call anywhere in `internal/mcp`. Keep it that way: reading `media_path`'s contents anywhere in this package would be the regression.
-- **Never hand-write `~/.claude.json`.** It is not a settings file; it is ~150KB of live Claude Code state — caches, session data, machine identity — rewritten by a running application, so a read-modify-write against it can silently drop whatever the app wrote in the interim. Lumi may *read* it to detect an existing entry, because reading cannot corrupt it and is the only way to compare structurally (`claude mcp get` prints for humans and cannot answer "does this differ"). The only supported writer is `claude mcp add --scope user <name> -- <command> [args...]`, plus `claude mcp remove … --scope user` under `--force`. **The `--` separator is load-bearing**: without it `claude`'s own parser consumes `--data-dir` and the server silently points at the default index. `TestClaudeCodeNeverWritesTheStateFile` pins the read-only half by comparing bytes across every code path; `TestClaudeCodeAddPassesArgsAfterASeparator` pins the separator. Because `--force` removes before it adds, a failed `add` would otherwise leave the user with no entry and nothing to recover from — the CLI takes no backup — so the add failure triggers a rollback that re-adds the original (transport and env included) on a fresh timeout detached from cancellation, since the add may have failed by exhausting the shared one. If the rollback also fails, the error carries the lost entry as paste-able JSON.
-- **Preserve every key in `claude_desktop_config.json` that Lumi did not write.** Decode to `map[string]json.RawMessage` at both the top level and inside `mcpServers`, replace only `mcpServers[<name>]`, and write via temp-file-plus-rename so a running Claude Desktop can never read a torn file. `coworkUserFilesPath` and `preferences` are the concrete sibling keys; other servers' `env` blocks are the concrete nested case. Invalid JSON is an error, never something to repair by rewriting — the repair would discard the user's preferences. Detection is on the *directory*, and setup never creates it: littering Claude Desktop's support directory on a machine without Claude Desktop is indistinguishable from a broken install.
-- **Never hand-write `~/.codex/config.toml` either, and never create `~/.codex`.** Unlike `~/.claude.json` this one *is* a settings file, which is exactly why Lumi must not round-trip it: a real one carries comments, `[features]`, `[shell_environment_policy.set]`, and ~37 `[projects."…"]` tables, and no Go TOML encoder preserves comments. `codex mcp add`/`remove` edit it through `toml_edit`, so they are the only supported writers. Measured, an `add` leaves everything outside `mcp_servers` byte-identical — all 37 project tables survived — but it *does* normalize the whole `mcp_servers` table rather than only Lumi's entry: a sibling server's `args = []` was dropped, its `startup_timeout_sec = 120` became `120.0`, and its `env` keys came back sorted. Semantics were preserved and every server still parsed, but this is the client's own behaviour, not something Lumi can narrow — one more reason the file is the CLI's to write and not ours. Codex is also the one target whose *read* goes through the CLI — `codex mcp get <name> --json` returns a structured, comparable entry, which is the thing `claude mcp get` could not do, so there is no reason to parse the file. **The `--` separator is load-bearing here too**: `codex mcp add [OPTIONS] <NAME> -- <COMMAND>...`, and without it clap eats `--data-dir` exactly as `claude`'s parser does; `TestCodexAddPassesArgsAfterASeparator` pins it. There is no `--scope` to pass — `add` always writes `$CODEX_HOME/config.toml`. Detection is the `codex` binary on PATH and nothing else: `~/.codex/` is created and populated by the ChatGPT desktop app too, so its presence is no evidence the CLI is installed and its absence is no evidence it is not. Two consequences worth keeping: `codex mcp get`/`list` also surface *plugin*-provided servers that are not in `config.toml`, so neither is proof of what the file says; and an entry that is not a plain stdio command cannot be re-added through `add`'s stdio form, so a lost one is handed back as its raw `--json` description rather than as a TOML snippet that would not round-trip.
-- **`--dry-run` may read, but only Codex has to, and a read it cannot trust is fatal.** `Options.DryRun` promises no *writes*, not no subprocesses: `codex mcp get` is the only way to know what a dry run would do, and it cannot modify anything. The two Claude targets still return before any subprocess. `Changed` stays false in every case, which is what keeps the "restart Claude Desktop" reminder honest. `codex mcp get` exits 1 both for a name it has never heard of and for a config it cannot parse, so a failure is followed by `codex mcp list --json` as a pure health probe — it prints `[]` and exits 0 on an empty-but-valid config, and fails with the same diagnostic on a broken one. Without that split, a broken `config.toml` read as "not configured" and `--dry-run` printed `would add` and exited 0 on a machine where a real run could not get that far; the real run's later `add` failure does not rescue the dry run, which is the whole point of outcome parity. The result is `StatusFailed`, deliberately **not** `StatusConflict`: nothing is in the way, and offering `--force` for it would be advice that cannot work.
-- **A disabled Codex entry is a difference, not a match.** `codex mcp get --json` reports `enabled`, and an entry with Lumi's exact command and args but `enabled = false` is one codex will not launch. Comparing only command and args reported `unchanged` and told the user setup had succeeded while the agent silently never saw Lumi — the quiet-failure mode this subsystem exists to prevent. It is a *difference* rather than something unreadable, so `--force` fixes it, and `Result.Current` appends `(disabled)` because current and desired otherwise print identically and the conflict reads as a bug. The decoded field is a `*bool`: codex writes no `enabled` key for a server that is on, so absent and `false` must not collapse. The same fact blocks rollback — `codex mcp add` has no flag to re-add an entry disabled, so restoring one would hand back a server the user deliberately switched off and call it a restore; `codexEntry.restorable()` refuses, and the error carries the raw `--json` description instead.
-- **`lumi mcp setup` bakes an absolute binary path and an absolute `--data-dir` into the generated argv** — always, even at the default root. Same bare-environment reason as `lumi mcp` itself, plus it makes the desired entry a pure function of (binary, root), which is what lets the "already configured?" check be an exact comparison rather than a normalization problem. It deliberately does not `filepath.EvalSymlinks`: a packaged install is reached through a stable symlink whose target moves on every version bump, so resolving it writes an entry that breaks at the next upgrade.
-- **Setup never overwrites an entry it did not write.** A differing entry is a conflict that prints current against desired and exits non-zero; only `--force` replaces it, and only after a `.lumi-backup`. Silently overwriting destroys a hand-tuned entry with no trace, and warning-but-exiting-zero leaves the agent pointed at the wrong index — which is this subsystem's worst failure mode, the one where the agent quietly loses Lumi and the user sees nothing. An entry that exists under Lumi's name but does not *decode* — a bare string, a wrong field type — is a conflict too, in all three targets — for Codex that also covers an entry `codex mcp get` describes as something other than a plain stdio command: a decode failure that fell through to "absent" would replace the user's registration with neither `--force` nor a backup. This is the one entry-level exception to `ClaudeCode.existingEntry`'s otherwise total "anything unreadable means unconfigured" rule, which still holds for the file itself.
-- **`--dry-run` writes nothing at all, including directories.** It is documented as a health check, so `runMCPSetup` skips `Paths.Ensure` under it — otherwise previewing a mistyped `--data-dir` would silently create the root, `screenshots`, and `audio` beneath it. A real run still creates them before writing the entry, so the baked path exists by the time an agent first launches the server. Outcome parity is otherwise total, including the non-zero conflict exit.
-- **Truncation lives at the MCP boundary, never in the store.** `search_events` caps `text` in the handler, after `Search` returns, counting runes so multi-byte text is never split, and always sets `truncated` and the true `text_length`. Pushing `max_text_chars` into the SQL `SELECT` is the obvious "optimization" and would corrupt `lumi search --json`, which must stay a faithful export.
-- **Audio collapse: system outranks the microphone on every duplicate, but never outranks a non-empty transcript with silence.** `store.CollapseAudioTracks` orders survivors by `(hasText, isSystem, runeLen, -id)`, and the ordering of the first two keys *is* the rule: `hasText` above `isSystem` means a silent row never wins (that would delete a transcript, not deduplicate one); `isSystem` above `runeLen` means the system track wins even over a longer microphone transcript (the mic is re-recording the speakers, so the system track is the cleaner original). Inverting either key is a silent data-loss bug — `TestSystemAudioWinsEveryDuplicate` pins it. The two rows of a chunk share one `captured_at` **by construction** — they come from one `Audio.Record` call stamped with one `now` (`recorder.go` audioLoop; `recorder_test.go` pins it) — so collapse groups on the timestamp string alone and never on id adjacency (a screen row can sit between the pair's ids). The collapse runs over *matched* rows in the handler and must **never** become a SQL pre-filter: an FTS query landing in only the microphone transcript (e.g. an ASR digit-spelling) matches just that row, and a `NOT EXISTS` filter consulting the non-matching system row would judge it "better" and drop the only hit. Provenance therefore comes from a second lookup (`AudioTracksAt`) that reads the whole chunk, so `audio_origin` stays truthful — the one path where the survivor is *not* the system row despite `origin: "both"`. A collapse must never destroy which track carried the speech: `audio_origin` is the only thing separating a remote speaker or media (`system`) from the user's own voice in the room (`microphone`), and on a bleed chunk the dropped mic track survives only as its `id`/`text_length` in `audio_tracks`. On the CLI, collapse is opt-in (`lumi search --collapse-audio`) so the default `--json` stays a faithful bare `[]store.Event` export; only the flag switches it to the `{events, audio_chunks}` view.
+### Attribution
+
+- **The frontmost pid resolves Accessibility → window list → `NSWorkspace`, and `NSWorkspace` coming last is
+  the point.** `frontmostApplication` is backed by activation state maintained through run-loop
+  notifications. The recorder is a detached daemon (`Setsid`) that runs no loop, so the value freezes at
+  whatever was frontmost at start — the launching terminal — while the window title, read against that
+  stale pid, keeps advancing. `runningApplications`/`isActive` freeze identically; neither may lead.
+- **`LumiActivationPID` leads because it answers *activation*, not visibility.** An app with every window
+  minimized is still what the user is working in. Two stages: system-wide AX
+  `kAXFocusedApplicationAttribute` first (unreliable per-app, and retrying is *not* the remedy — identical
+  errors), then `LumiFrontmostValidatedPID`, which walks window-list owners front-to-back asking each over
+  *per-application* AX whether it is frontmost (`kAXFrontmostAttribute`). The second stage fixed
+  misattribution at app-switch boundaries, where the top layer-0 window is still the previous app while
+  activation has moved. `app_source` distinguishes the stages (`accessibility` vs `accessibility_frontmost`).
+- **Candidate eligibility must stay filtered to `NSApplicationActivationPolicyRegular`.**
+  `LumiFrontmostCandidates` lists on-screen window owners front-to-back (bounded to 8), then dock-visible
+  `NSWorkspace.runningApplications` owning no window — the windowless-app case that would otherwise be
+  unaskable. Widening the filter to every running application is the obvious generalisation and is wrong:
+  background agents answer `kAXFrontmost` affirmatively, and an unfiltered walk was measured attributing
+  frames to Notification Center. Only *membership* is read from `runningApplications`, never `isActive`.
+- **A name is borrowed from `NSWorkspace` only when both sources mean the same pid.** Borrowing across
+  differing pids names one app while reading another's title — the original bug. Where the window list
+  names a pid nothing can name an app for, `LumiResolveFrontmostLive` falls back to the `NSWorkspace` pair
+  **wholesale, pid included**: a stale-but-consistent pair beats a mismatched one.
+- **Never lose attribution to a permission failure.** `lumi_accessibility_snapshot_json` gathers everything
+  needing no AX grant — frontmost app name, input activity, `AXIsProcessTrusted()` — *before* the first AX
+  call, and falls back to `CGWindowListCopyWindowInfo` for the title. Returning `NULL` there once cost 7,705
+  of 12,104 events their app; it is reserved for genuine total failure, *both* sources failing, never one.
+  Trust is sampled per tick, not at startup, so `doctor` reports observed attribution from the index
+  alongside permission status — and never opens the store through `openStore`, which would create a
+  mistyped `--data-dir` and call the empty result healthy.
+- **Never assert one native frontmost read against another.** `Accessibility` and `FrontmostDiagnostic` are
+  separate calls; a focus change between them makes them differ legitimately, so `native-smoke` reports the
+  diagnostic and never compares it. Relatedly, pure resolvers are exposed as `*_json` entry points (as is
+  `lumi_hid_access_name`) because asserting the live resolution passes vacuously in any foreground process,
+  so it would fail only in the daemon, where nothing is asserting.
+- **Report `denied` separately from `not_determined` wherever macOS lets you**, since they need opposite
+  remedies. Input Monitoring uses `IOHIDCheckAccess`; Microphone and Speech Recognition carry the
+  distinction already. Screen Recording and Accessibility stay `denied_or_not_determined` on purpose —
+  splitting them needs Full Disk Access or raises a prompt as a side effect. Over SSH no status call can
+  prompt at all, so `--request` is a no-op.
+
+### Store and search
+
+- **FTS input must go through `ftsExpression`** (`internal/store/query.go`). It quotes each term and joins
+  with `AND`/`OR` per `SearchOptions.Match`; the quoting is what stops raw user text being read as FTS5
+  syntax. `MatchAll` is the zero value, so `lumi search` stays conjunctive. Terms with no letters or digits
+  are dropped; an empty expression means "run no FTS query at all" — an empty MATCH is a syntax error, not
+  a zero-result search.
+- **`store.MatchAny`, `SearchOptions.RequireText`, and the `bm25(events_fts, 1.0, 0.4, 0.4)` weights are
+  reached only through `lumi mcp`** (its `match: "any"` and `require_text` parameters). No CLI command sets
+  them. The weights matter: without them a one-word `app` or `window` hit outranks a page of screen text.
+- **A rule about the store lives in the store.** When a caller needs to know what `Search` will do, export
+  the answer and read it rather than restating it. `HasSearchableTerms` exists because `internal/mcp` had
+  reimplemented the unexported drop rule — a copy is correct only until the original moves, and the drift
+  is invisible to both test suites.
+- **Schema changes go through `internal/store/migrations.go`.** Append a new `migration` with the next
+  version; never edit shipped SQL.
+- **Pruning deletes rows before files.** Orphaned files are recoverable; rows pointing at missing media are
+  not. `lumi prune` is the only path permitted to delete media. Keep dry-run accounting equivalent to a real
+  age-then-size run, and keep deletes batched below SQLite's variable limit. `--all` is irreversible and
+  requires an interactive `yes` (`confirmPruneAll`); only `--yes` or `--dry-run` may skip it. `--all` also
+  sweeps `Paths.Screenshots`/`Paths.Audio` for orphans — that is what makes the wipe a real privacy
+  guarantee. Age/size policies must never remove orphans.
+
+### MCP server
+
+- **Nothing may write to stdout in the `lumi mcp` path except JSON-RPC frames.** A stray `fmt.Println`,
+  default `slog` handler, or cobra usage dump silently corrupts the session and the user just sees the agent
+  lose Lumi. `mcpCommand` sets `SilenceUsage`/`SilenceErrors` explicitly; every diagnostic goes to stderr;
+  `TestServeWritesOnlyJSONRPCFramesToStdout` pins it.
+- **MCP tools return text and metadata only — screenshots and WAVs never leave the machine.** `media_path`
+  is a string the user can open themselves. There is no `read_media`, and no filesystem-reading call
+  anywhere in `internal/mcp`. No test can prove this negative; keep it true by construction.
+- **Truncation lives at the MCP boundary, never in the store.** `search_events` caps `text` in the handler
+  after `Search` returns, counting runes so multi-byte text is never split. Pushing `max_text_chars` into
+  the SQL `SELECT` would corrupt `lumi search --json`, a faithful export.
+- **Audio collapse: system outranks the microphone on every duplicate, but never outranks a non-empty
+  transcript with silence.** `CollapseAudioTracks` orders survivors by `(hasText, isSystem, runeLen, -id)`,
+  and the first two keys *are* the rule — `hasText` above `isSystem` so a silent row never deletes a
+  transcript; `isSystem` above `runeLen` because the mic is re-recording the speakers, so the system track
+  is the cleaner original. Inverting either is silent data loss (`TestSystemAudioWinsEveryDuplicate`). The
+  pair shares one `captured_at` by construction (one `Audio.Record` call, one `now`), so collapse groups on
+  the timestamp, never id adjacency.
+- **Collapse must never become a SQL pre-filter.** An FTS query landing only in the microphone transcript
+  matches just that row, and a `NOT EXISTS` filter consulting the non-matching system row would drop the
+  only hit. Provenance therefore comes from `AudioTracksAt` reading the whole chunk, so `audio_origin` stays
+  truthful even where the survivor is not the system row. `audio_origin` is the only thing separating a
+  remote speaker or media (`system`) from the user's own voice (`microphone`). On the CLI collapse is opt-in
+  (`--collapse-audio`) so the default `--json` stays a bare `[]store.Event`.
+
+### MCP client setup
+
+- **Never hand-write `~/.claude.json`.** It is ~150KB of live Claude Code state rewritten by a running app,
+  so a read-modify-write can drop whatever the app wrote in the interim. Lumi may *read* it to detect an
+  entry (reading cannot corrupt, and `claude mcp get` can't answer "does this differ"). The only supported
+  writers are `claude mcp add --scope user <name> -- <command> [args…]` and `claude mcp remove`. **The `--`
+  separator is load-bearing** — without it `claude`'s parser eats `--data-dir` and the server silently
+  points at the default index. Because `--force` removes before it adds, a failed `add` triggers a rollback
+  re-adding the original on a fresh timeout detached from cancellation; if that also fails, the error
+  carries the lost entry as paste-able JSON.
+- **Preserve every key in `claude_desktop_config.json` that Lumi did not write.** Decode to
+  `map[string]json.RawMessage` at both levels, replace only `mcpServers[<name>]`, write via
+  temp-file-plus-rename so a running app can't read a torn file. Invalid JSON is an error, never something
+  to repair — the repair would discard the user's preferences. Detection is on the *directory*, and setup
+  never creates it.
+- **Never hand-write `~/.codex/config.toml`, and never create `~/.codex`.** It *is* a settings file —
+  comments, `[features]`, dozens of `[projects."…"]` tables — and no Go TOML encoder preserves comments.
+  `codex mcp add`/`remove` are the only supported writers; they normalize the whole `mcp_servers` table
+  (dropping a sibling's `args = []`, floating its timeout, sorting its `env`), which is the client's own
+  behaviour and not something Lumi can narrow. Reads go through `codex mcp get <name> --json`, the
+  structured comparison `claude mcp get` couldn't give. **The `--` separator is load-bearing here too**
+  (`TestCodexAddPassesArgsAfterASeparator`). Detection is the `codex` binary on PATH and nothing else —
+  `~/.codex/` is created by the ChatGPT desktop app too.
+- **A disabled Codex entry is a difference, not a match.** An entry with Lumi's exact command and args but
+  `enabled = false` is one codex will not launch; comparing only command and args reported `unchanged` while
+  the agent silently never saw Lumi. It is a difference, so `--force` fixes it, and `Result.Current` appends
+  `(disabled)`. The decoded field is a `*bool` — codex writes no key for an enabled server, so absent and
+  `false` must not collapse. It also blocks rollback: `codex mcp add` cannot re-add an entry disabled, so
+  `codexEntry.restorable()` refuses and the error carries the raw JSON.
+- **Setup never overwrites an entry it did not write.** A differing entry is a conflict that prints current
+  against desired and exits non-zero; only `--force` replaces it, and only after a `.lumi-backup`. Silently
+  overwriting destroys a hand-tuned entry; warning but exiting zero leaves the agent pointed at the wrong
+  index — the worst failure mode. An entry under Lumi's name that does not *decode* is a conflict too, in
+  all three targets.
+- **`--dry-run` writes nothing at all, including directories.** `runMCPSetup` skips `Paths.Ensure` under it,
+  so previewing a mistyped `--data-dir` doesn't create the root. It may still *read*: `codex mcp get` is the
+  only way to know what a dry run would do. That command exits 1 both for an unknown name and an unparseable
+  config, so a failure is followed by `codex mcp list --json` as a health probe. A read it cannot trust is
+  `StatusFailed`, deliberately not `StatusConflict` — nothing is in the way, and offering `--force` would be
+  advice that cannot work. `Changed` stays false in every dry run.
+- **`lumi mcp setup` bakes an absolute binary path and absolute `--data-dir` into the argv** — always, even
+  at the default root. Same bare-environment reason as `lumi mcp`, plus it makes the desired entry a pure
+  function of (binary, root), which is what lets the "already configured?" check be an exact comparison. It
+  deliberately does not `EvalSymlinks`: a packaged install is reached through a stable symlink whose target
+  moves every version bump.
 
 ## External dependencies
 
-Xcode Command Line Tools plus a Swift toolchain are required to build the native cgo bridge (`swiftc` compiles the SpeechAnalyzer bridge into `liblumispeech.a`, linked by cgo). Capture and processing are fully native — no external binaries, and no network calls of its own beyond Apple's on-device speech-asset download. Lumi performs no inference.
+Xcode Command Line Tools plus a Swift toolchain, to build the native cgo bridge (`swiftc` compiles the
+SpeechAnalyzer bridge into `liblumispeech.a`). Capture and processing are fully native — no external
+binaries, and no network calls beyond Apple's on-device speech-asset download. Lumi performs no inference.
