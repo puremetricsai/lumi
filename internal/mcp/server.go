@@ -87,8 +87,10 @@ func newServer(s *store.Store, opts Options) *sdk.Server {
 			"position was measured, \"sequence\" means the order is reliable but absolute times are not " +
 			"known, and \"approximate\" means the position was inferred. " +
 			"Turns may overlap in time when both parties spoke at once; those are marked overlaps. " +
-			"A range holding more audio than one call can return says so in its notice and names the " +
-			"timestamp to resume from, so a long window is read in passes rather than silently cut short. " +
+			"A transcript that stops short — because the range held more audio than one call returns, " +
+			"or because max_turns capped it — says so in its notice and returns resume_from: pass that " +
+			"as since to read the next page. Continue from resume_from and not from the last turn's " +
+			"time, which would repeat turns you already have. " +
 			"Use event_ids with get_event to read either track's raw, undeduplicated transcript.",
 	}, h.getTranscript)
 

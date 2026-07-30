@@ -56,8 +56,13 @@ type TranscriptTurnRecord struct {
 }
 
 type getTranscriptOutput struct {
-	Turns  []TranscriptTurnRecord `json:"turns"`
-	Notice string                 `json:"notice,omitempty"`
+	Turns []TranscriptTurnRecord `json:"turns"`
+	// ResumeFrom is what to pass as since to continue past a transcript that
+	// stopped short, and is absent when there is nothing left to read. It is
+	// given as a value rather than left to the notice's prose because an agent
+	// paging through a long range should not have to parse a sentence to do it.
+	ResumeFrom string `json:"resume_from,omitempty"`
+	Notice     string `json:"notice,omitempty"`
 }
 
 // parseOrigin maps the tool's origin parameter onto a stored origin value.
@@ -135,6 +140,9 @@ func (h *handlers) getTranscript(ctx context.Context, _ *sdk.CallToolRequest, in
 		maxChars = *in.MaxTextChars
 	}
 	out := getTranscriptOutput{Turns: make([]TranscriptTurnRecord, 0, len(result.Turns))}
+	if !result.ResumeFrom.IsZero() {
+		out.ResumeFrom = result.ResumeFrom.UTC().Format(time.RFC3339Nano)
+	}
 	for _, turn := range result.Turns {
 		text, truncated, length := truncateText(turn.Text, maxChars)
 		record := TranscriptTurnRecord{
@@ -172,11 +180,18 @@ func (h *handlers) transcriptNotice(ctx context.Context, opts store.TranscriptOp
 		// range that is fully attributed sends it to run a backfill that cannot
 		// change anything.
 		filtered := "no attributed audio in this range"
+		missing := result.Chunks - result.AttributedChunks
 		switch {
-		case result.Chunks > 0 && result.AttributedChunks < result.Chunks:
+		case result.Chunks > 0 && missing > 0 && missing == result.FailedChunks:
+			// Every hole here is one no backfill can fill, so naming the command
+			// would be an instruction to watch nothing happen.
+			filtered = fmt.Sprintf("this range holds %d audio chunks and none could be transcribed, "+
+				"so there is nothing to attribute; their audio is still on disk",
+				result.Chunks)
+		case result.Chunks > 0 && missing > 0:
 			filtered = fmt.Sprintf("this range holds %d audio chunks and %d of them have not been "+
 				"attributed yet; run `lumi transcript backfill` to attribute them",
-				result.Chunks, result.Chunks-result.AttributedChunks)
+				result.Chunks, missing)
 		case result.Chunks > 0 && filtersNarrowed(opts):
 			filtered = fmt.Sprintf("all %d audio chunks in this range are attributed, but no turn "+
 				"matched the filters; drop origin or lower min_confidence to see what is there",
@@ -192,23 +207,43 @@ func (h *handlers) transcriptNotice(ctx context.Context, opts store.TranscriptOp
 		return notice, nil
 	}
 
+	// Both notices point at ResumeFrom rather than CoveredUntil. The two differ by
+	// design: coverage ends inclusively at the last chunk the turns reach, and the
+	// segment read is inclusive too, so resuming at that value would serve the
+	// same chunk's turns again on every page.
+	resume := ""
+	if !result.ResumeFrom.IsZero() {
+		resume = result.ResumeFrom.UTC().Format(time.RFC3339Nano)
+	}
 	if result.Truncated {
 		parts = append(parts, fmt.Sprintf(
 			"this range holds more audio than one call returns, so the transcript stops at %s "+
 				"rather than at until; request since=%s to continue from there",
-			result.CoveredUntil.Local().Format(time.RFC3339),
-			result.CoveredUntil.UTC().Format(time.RFC3339)))
+			result.CoveredUntil.Local().Format(time.RFC3339), resume))
 	}
 	if result.Capped {
 		parts = append(parts, fmt.Sprintf(
-			"results were capped at %d turns; narrow the range or raise max_turns", len(result.Turns)))
+			"results were capped at %d turns; request since=%s to continue from there, "+
+				"or raise max_turns", len(result.Turns), resume))
 	}
 	// A transcript with holes is worse than a short one, because nothing in the
 	// turns themselves reveals the gap.
 	if missing := result.Chunks - result.AttributedChunks; missing > 0 {
-		parts = append(parts, fmt.Sprintf(
-			"%d of %d audio chunks in this range are not attributed yet, so this transcript has gaps; "+
-				"run `lumi transcript backfill` to fill them", missing, result.Chunks))
+		gap := fmt.Sprintf(
+			"%d of %d audio chunks in this range are not attributed yet, so this transcript has gaps",
+			missing, result.Chunks)
+		// Chunks whose recognition failed stay unattributed permanently, so the
+		// backfill is named only for the ones it can actually move. Recommending
+		// it for the rest is an instruction to run a command and watch nothing
+		// change, which is worse than reporting an unfixable hole.
+		if result.FailedChunks > 0 {
+			gap += fmt.Sprintf("; %d of them could not be transcribed and no backfill can recover them",
+				result.FailedChunks)
+		}
+		if missing > result.FailedChunks {
+			gap += "; run `lumi transcript backfill` to fill the rest"
+		}
+		parts = append(parts, gap)
 	}
 	return strings.Join(parts, "; "), nil
 }

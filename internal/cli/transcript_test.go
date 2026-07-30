@@ -395,6 +395,27 @@ func TestBackfillNeverCallsAFailedTranscriptionSilent(t *testing.T) {
 	}
 }
 
+// TestTranscriptNamesChunksNoBackfillCanRecover keeps the reader's advice honest.
+//
+// A failed chunk sits on the work queue permanently, so the plain "run a
+// backfill" notice would point at an action that cannot change the number it is
+// complaining about — the same dead end the silence marker was introduced to
+// close.
+func TestTranscriptNamesChunksNoBackfillCanRecover(t *testing.T) {
+	root, s := transcriptRoot(t)
+	at := time.Now().UTC().Add(-time.Hour)
+	audioChunkWithMetadata(t, s, at,
+		`{"audio_source":"microphone","processor_error":"transcribe: recognizer unavailable"}`)
+
+	out, err := runCLI(t, "--data-dir", root, "transcript", "--since", "2h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "could not be transcribed") {
+		t.Errorf("the transcript does not name the chunk a backfill cannot recover: %s", out)
+	}
+}
+
 // audioChunkWithWAVs inserts one chunk whose media actually exists on disk, which
 // is what --retranscribe needs before it will read anything.
 func audioChunkWithWAVs(t *testing.T, s *store.Store, at time.Time, systemText, micText string) string {
@@ -483,5 +504,42 @@ func TestRetranscribePassesTheVocabulary(t *testing.T) {
 	}
 	if len(seen) != 1 || seen[0] != "kubectl" {
 		t.Errorf("re-transcription ran with terms %v, want the data directory's vocabulary", seen)
+	}
+}
+
+// TestCappedTranscriptPrintsWhereToContinue is the CLI half of paging: a page cut
+// by --limit must say where the rest starts, or the dropped turns are simply
+// gone as far as the reader is concerned.
+func TestCappedTranscriptPrintsWhereToContinue(t *testing.T) {
+	root, s := transcriptRoot(t)
+	ctx := context.Background()
+	base := time.Now().UTC().Add(-10 * time.Hour).Truncate(time.Second)
+	for c := range 6 {
+		at := base.Add(time.Duration(c) * time.Hour)
+		key := audioChunkWithText(t, s, at, "", "room speech")
+		events, err := s.AudioEventsAt(ctx, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.ReplaceChunkSegments(ctx, key, []store.Segment{{
+			EventID: events[0].ID, Seq: 0, Origin: store.OriginExternal,
+			SourceTrack: "microphone", Text: "phrase", Confidence: 0.9,
+			OrderConfidence: "sequence"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	out, err := runCLI(t, "--data-dir", root, "transcript", "--since", "11h", "--limit", "2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "Stopped at 2 turns") {
+		t.Fatalf("the transcript was not capped: %s", out)
+	}
+	// The offered value must be the third chunk — the first turn the cap dropped —
+	// and not the second, which the page already printed.
+	resume := "--since " + base.Add(2*time.Hour).Format(time.RFC3339Nano)
+	if !strings.Contains(out, resume) {
+		t.Errorf("a capped transcript does not point at the first dropped turn (%s): %s", resume, out)
 	}
 }

@@ -816,3 +816,145 @@ func TestChunksFailedTranscriptionCountsOnlyWhatCannotBeAttributed(t *testing.T)
 		t.Errorf("ChunksFailedTranscription outside the failure's window = %d, want 0", count)
 	}
 }
+
+// TestCappedTranscriptCoversOnlyTheTurnsItReturned is a regression test for a
+// coverage claim that outran its own transcript.
+//
+// The cap drops turns from the tail after assembly, but the coverage boundary was
+// fixed before it — so a capped page counted every chunk in the requested window
+// as attributed, vouching for ground its text never reached. That is the same
+// defect truncation already had, arriving by the other door.
+func TestCappedTranscriptCoversOnlyTheTurnsItReturned(t *testing.T) {
+	ctx := context.Background()
+	s, _ := segmentStore(t)
+	base := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+
+	// Chunks far enough apart that no two turns merge, so the cap lands on a
+	// chunk boundary and the arithmetic is unambiguous.
+	const chunks = 10
+	for c := range chunks {
+		at := base.Add(time.Duration(c) * time.Hour)
+		event := &Event{Kind: KindAudio, CapturedAt: at, Text: "x",
+			MediaPath: "/tmp/microphone.wav", AudioSource: "microphone"}
+		if err := s.Insert(ctx, event); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.ReplaceChunkSegments(ctx, formatTime(at), []Segment{{
+			EventID: event.ID, Seq: 0, Origin: OriginExternal, SourceTrack: "microphone",
+			Text: "phrase", Confidence: 0.9, OrderConfidence: "sequence"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	until := base.Add(24 * time.Hour)
+	result, err := s.Transcript(ctx, TranscriptOptions{
+		Since: base.Add(-time.Hour), Until: until, MaxTurns: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Capped {
+		t.Fatalf("%d turns came back uncapped at a limit of 3", len(result.Turns))
+	}
+	if result.CoveredUntil.After(base.Add(2 * time.Hour)) {
+		t.Errorf("covered_until %s runs past the last returned turn", result.CoveredUntil)
+	}
+	if result.Chunks != 3 {
+		t.Errorf("coverage counts %d chunks for a transcript holding 3 turns", result.Chunks)
+	}
+	// And it must name where to continue, or the capped turns are simply lost.
+	if result.ResumeFrom.IsZero() {
+		t.Fatal("a capped transcript offers no resume point, so its dropped turns are unreachable")
+	}
+	next, err := s.Transcript(ctx, TranscriptOptions{
+		Since: result.ResumeFrom, Until: until, MaxTurns: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(next.Turns) == 0 {
+		t.Fatal("resuming a capped transcript returned nothing")
+	}
+	if next.Turns[0].CapturedAt.Equal(result.Turns[len(result.Turns)-1].CapturedAt) {
+		t.Errorf("the page after the cap repeats the turn at %s", next.Turns[0].CapturedAt)
+	}
+	if !next.Turns[0].CapturedAt.Equal(base.Add(3 * time.Hour)) {
+		t.Errorf("resuming skipped to %s, want the first dropped turn at %s",
+			next.Turns[0].CapturedAt, base.Add(3*time.Hour))
+	}
+}
+
+// TestTruncatedTranscriptResumesWithoutRepeatingAChunk pins the other half of
+// paging.
+//
+// CoveredUntil is the last chunk the turns reach, and SegmentsBetween is
+// inclusive at both ends — so a caller told to resume from it re-reads that whole
+// chunk and sees its turns twice. The resume point has to be the first chunk
+// *not* covered.
+func TestTruncatedTranscriptResumesWithoutRepeatingAChunk(t *testing.T) {
+	ctx := context.Background()
+	s, _ := segmentStore(t)
+	base := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+
+	const chunks = 700
+	const perChunk = 30
+	for c := range chunks {
+		at := base.Add(time.Duration(c) * 30 * time.Second)
+		event := &Event{Kind: KindAudio, CapturedAt: at, Text: "x",
+			MediaPath: "/tmp/microphone.wav", AudioSource: "microphone"}
+		if err := s.Insert(ctx, event); err != nil {
+			t.Fatal(err)
+		}
+		rows := make([]Segment, 0, perChunk)
+		for i := range perChunk {
+			rows = append(rows, Segment{EventID: event.ID, Seq: i, Origin: OriginExternal,
+				SourceTrack: "microphone", Text: "word", Confidence: 0.9, OrderConfidence: "sequence"})
+		}
+		if err := s.ReplaceChunkSegments(ctx, formatTime(at), rows); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	result, err := s.Transcript(ctx, TranscriptOptions{
+		Since: base.Add(-time.Hour), Until: base.Add(24 * time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Truncated {
+		t.Fatal("the transcript was not truncated, so the test proves nothing")
+	}
+	if !result.ResumeFrom.After(result.CoveredUntil) {
+		t.Errorf("resume_from %s does not start after covered_until %s, so the last chunk repeats",
+			result.ResumeFrom, result.CoveredUntil)
+	}
+	// Nothing may be skipped either: the resume point must be the very next chunk.
+	segments, err := s.SegmentsBetween(ctx, result.CoveredUntil, result.ResumeFrom, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segments) != 2*perChunk {
+		t.Errorf("covered_until and resume_from span %d segments, want two adjacent chunks (%d)",
+			len(segments), 2*perChunk)
+	}
+}
+
+// TestCompleteTranscriptOffersNoResumePoint keeps the field from reading as
+// "there is more" when there is not.
+func TestCompleteTranscriptOffersNoResumePoint(t *testing.T) {
+	ctx := context.Background()
+	s, _ := segmentStore(t)
+	at := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+	systemID, _, key := audioChunk(t, s, at)
+	if err := s.ReplaceChunkSegments(ctx, key, []Segment{
+		{EventID: systemID, Seq: 0, Origin: OriginInternal, SourceTrack: "system",
+			Text: "Just the one phrase.", Confidence: 0.9, OrderConfidence: "sequence"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Transcript(ctx, TranscriptOptions{
+		Since: at.Add(-time.Hour), Until: at.Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.ResumeFrom.IsZero() {
+		t.Errorf("a complete transcript names a resume point at %s", result.ResumeFrom)
+	}
+}

@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -315,5 +316,87 @@ func TestGetTranscriptEmptyRangeDistinguishesFiltersFromMissingAttribution(t *te
 	}
 	if !strings.Contains(out.Notice, "filters") {
 		t.Errorf("the notice does not name the filter that emptied the result: %s", out.Notice)
+	}
+}
+
+// TestGetTranscriptNoticeSeparatesUnrecoverableChunks keeps the agent from being
+// sent on an errand that cannot succeed.
+//
+// A chunk whose recognition failed never gains segments — labelling it would mean
+// calling it silent — so it sits on the derived work queue permanently. Telling
+// an agent to run a backfill for it produces a loop: the tool reports a gap, the
+// agent runs the command, the number does not move.
+func TestGetTranscriptNoticeSeparatesUnrecoverableChunks(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	base := time.Now().UTC().Add(-20 * time.Minute).Truncate(time.Second)
+
+	attributedChunk(t, ctx, s, base,
+		store.Segment{Origin: store.OriginExternal, SourceTrack: "microphone",
+			Text: "this chunk was attributed", Confidence: 0.9, OrderConfidence: "sequence"})
+	failed := store.Event{Kind: store.KindAudio, CapturedAt: base.Add(time.Minute),
+		MediaPath: "/tmp/x.wav", AudioSource: "microphone",
+		Metadata: json.RawMessage(`{"processor_error":"transcribe: recognizer unavailable"}`)}
+	if err := s.Insert(ctx, &failed); err != nil {
+		t.Fatal(err)
+	}
+	h := &handlers{store: s}
+
+	out := callTranscript(t, ctx, h, getTranscriptInput{Since: "1h"})
+	if !strings.Contains(out.Notice, "could not be transcribed") {
+		t.Errorf("notice does not name the chunk no backfill can recover: %q", out.Notice)
+	}
+	if strings.Contains(out.Notice, "backfill` to fill them") {
+		t.Errorf("notice still advises a backfill that cannot help: %q", out.Notice)
+	}
+}
+
+// TestGetTranscriptResumePointDoesNotRepeatTheLastTurn is the paging contract an
+// agent has no way to discover for itself.
+//
+// The notice tells it what to pass as since next time, and the segment read is
+// inclusive at both ends — so naming the last covered chunk would hand back that
+// chunk's turns again on every continuation, and an agent stitching pages
+// together would duplicate speech that was said once.
+func TestGetTranscriptResumePointDoesNotRepeatTheLastTurn(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	base := time.Now().UTC().Add(-10 * time.Hour).Truncate(time.Second)
+
+	// Distinct text per chunk: turns carry no absolute time on the text path, so
+	// the words are the only way to tell one page's turns from another's.
+	for c := range 6 {
+		attributedChunk(t, ctx, s, base.Add(time.Duration(c)*time.Hour),
+			store.Segment{Origin: store.OriginExternal, SourceTrack: "microphone",
+				Text: fmt.Sprintf("phrase %d", c), Confidence: 0.9, OrderConfidence: "sequence"})
+	}
+	h := &handlers{store: s}
+
+	out := callTranscript(t, ctx, h, getTranscriptInput{Since: "11h", MaxTurns: 2})
+	if len(out.Turns) != 2 {
+		t.Fatalf("got %d turns, want the capped 2", len(out.Turns))
+	}
+	if out.ResumeFrom == "" {
+		t.Fatal("a capped transcript names no resume point, so its dropped turns are unreachable")
+	}
+	if !strings.Contains(out.Notice, out.ResumeFrom) {
+		t.Errorf("the notice does not tell the agent where to continue: %q", out.Notice)
+	}
+
+	next := callTranscript(t, ctx, h, getTranscriptInput{Since: out.ResumeFrom, MaxTurns: 2})
+	if len(next.Turns) == 0 {
+		t.Fatal("resuming returned nothing")
+	}
+	seen := map[string]bool{}
+	for _, turn := range out.Turns {
+		seen[turn.Text] = true
+	}
+	if seen[next.Turns[0].Text] {
+		t.Errorf("the page after the cap repeats %q", next.Turns[0].Text)
+	}
+	// Nor may it skip: the continuation starts at the first turn the cap dropped.
+	if next.Turns[0].Text != "phrase 2" {
+		t.Errorf("resuming began at %q, want the first dropped turn %q",
+			next.Turns[0].Text, "phrase 2")
 	}
 }

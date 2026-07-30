@@ -151,21 +151,36 @@ func printTranscript(out io.Writer, result store.TranscriptResult) {
 	// transcript with holes looks complete: nothing in the turns reveals the gap.
 	if missing := result.Chunks - result.AttributedChunks; missing > 0 {
 		fmt.Fprintf(out, "\n%d of %d audio chunks in this range are not attributed yet, so this "+
-			"transcript has gaps.\nRun `lumi transcript backfill` to fill them.\n",
-			missing, result.Chunks)
+			"transcript has gaps.\n", missing, result.Chunks)
+		// Chunks whose recognition failed are named separately, because the
+		// backfill will keep declining to label them: advising it for those would
+		// point at a command that cannot change the number above.
+		if result.FailedChunks > 0 {
+			fmt.Fprintf(out, "%d of them could not be transcribed and no backfill can recover them; "+
+				"their audio is still on disk.\n", result.FailedChunks)
+		}
+		if missing > result.FailedChunks {
+			fmt.Fprintln(out, "Run `lumi transcript backfill` to fill the rest.")
+		}
 	}
 	// Truncation is reported before capping because it is the worse fact: a
 	// capped page ends where the reader asked it to, while a truncated one stops
 	// short of the requested range with nothing in the turns to show it.
+	// Both notices offer ResumeFrom, never CoveredUntil: coverage ends inclusively
+	// at the last chunk the turns reach and the segment read is inclusive too, so
+	// re-running with that value would print the same chunk's turns again.
+	resume := ""
+	if !result.ResumeFrom.IsZero() {
+		resume = result.ResumeFrom.UTC().Format(time.RFC3339Nano)
+	}
 	if result.Truncated {
 		fmt.Fprintf(out, "\nThis range holds more audio than one read returns, so the transcript stops at %s.\n"+
 			"Re-run with --since %s to continue from there.\n",
-			result.CoveredUntil.Local().Format(time.RFC3339),
-			result.CoveredUntil.UTC().Format(time.RFC3339))
+			result.CoveredUntil.Local().Format(time.RFC3339), resume)
 	}
 	if result.Capped {
-		fmt.Fprintf(out, "\nStopped at %d turns; narrow --since/--until or raise --limit for more.\n",
-			len(result.Turns))
+		fmt.Fprintf(out, "\nStopped at %d turns; re-run with --since %s to continue from there, "+
+			"or raise --limit.\n", len(result.Turns), resume)
 	}
 	if len(result.Turns) == 0 && result.Chunks == 0 {
 		fmt.Fprintln(out, "No audio was captured in this range.")

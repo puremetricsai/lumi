@@ -62,6 +62,11 @@ type TranscriptResult struct {
 	// two hours in would corroborate exactly the illusion they exist to prevent.
 	Chunks           int64 `json:"chunks"`
 	AttributedChunks int64 `json:"attributed_chunks"`
+	// FailedChunks counts how many of the unattributed chunks hold no transcript
+	// because recognition failed. They are a subset of Chunks-AttributedChunks
+	// that no backfill can ever move, so a caller that reports the gap without
+	// them ends up recommending a command that cannot change the number.
+	FailedChunks int64 `json:"failed_chunks,omitempty"`
 	// Capped reports that turns were dropped from the tail to satisfy MaxTurns.
 	Capped bool `json:"capped,omitempty"`
 	// Truncated reports that the window held more segments than one call reads,
@@ -74,9 +79,22 @@ type TranscriptResult struct {
 	// turn off mid-sentence with nothing marking the wound.
 	Truncated bool `json:"truncated,omitempty"`
 	// CoveredUntil is the last capture time the turns reach. It equals the
-	// requested Until unless Truncated, where it is where a follow-up request
-	// should resume from.
+	// requested Until unless the transcript stopped short, either because the
+	// window held more segments than one call reads or because the turn cap
+	// dropped the tail.
 	CoveredUntil time.Time `json:"covered_until"`
+	// ResumeFrom is what a follow-up request should pass as Since; it is zero
+	// when the transcript is complete.
+	//
+	// It is a separate field from CoveredUntil because the two need opposite
+	// inclusivity and one value cannot be both. Coverage is measured over
+	// [Since, CoveredUntil] and the segment read is inclusive at both ends, so a
+	// caller resuming at CoveredUntil re-reads that whole chunk and sees its
+	// turns a second time. ResumeFrom is the first chunk the transcript did not
+	// cover — except where a single chunk is itself too large to return whole, or
+	// where the turn cap fell inside one, in which case it names that chunk and
+	// the overlap is unavoidable rather than accidental.
+	ResumeFrom time.Time `json:"resume_from,omitempty"`
 }
 
 // Order confidence tiers, re-exported from internal/transcript so a caller can
@@ -120,10 +138,10 @@ func (s *Store) Transcript(ctx context.Context, opts TranscriptOptions) (Transcr
 	if err != nil {
 		return TranscriptResult{}, err
 	}
-	segments, truncated := trimToWholeChunks(segments)
-	coveredUntil := opts.Until
+	segments, truncated, nextChunk := trimToWholeChunks(segments)
+	coveredUntil, resumeFrom := opts.Until, time.Time{}
 	if truncated && len(segments) > 0 {
-		coveredUntil = segments[len(segments)-1].CapturedAt
+		coveredUntil, resumeFrom = segments[len(segments)-1].CapturedAt, nextChunk
 	}
 
 	assembled := make([]transcript.TurnSegment, 0, len(segments))
@@ -151,9 +169,11 @@ func (s *Store) Transcript(ctx context.Context, opts TranscriptOptions) (Transcr
 	// construction, so filtering afterwards selects turns without reshaping them.
 	turns := transcript.AssembleTurns(assembled, transcript.TurnOptions{})
 
-	result := TranscriptResult{
-		Turns: make([]TranscriptTurn, 0, len(turns)), Truncated: truncated, CoveredUntil: coveredUntil,
-	}
+	result := TranscriptResult{Turns: make([]TranscriptTurn, 0, len(turns)), Truncated: truncated}
+	// The turns behind the rows, kept in step with them: the cap is applied to
+	// the filtered list, and the boundary it leaves can only be read off the
+	// assembled turn, which knows the chunk it ended in.
+	kept := make([]transcript.Turn, 0, len(turns))
 	for _, turn := range turns {
 		if opts.Origin != "" && string(turn.Origin) != opts.Origin {
 			continue
@@ -178,11 +198,22 @@ func (s *Store) Transcript(ctx context.Context, opts TranscriptOptions) (Transcr
 			row.EndedAt = &ended
 		}
 		result.Turns = append(result.Turns, row)
+		kept = append(kept, turn)
 	}
 	if len(result.Turns) > limit {
-		result.Turns = result.Turns[:limit]
-		result.Capped = true
+		result.Turns, result.Capped = result.Turns[:limit], true
+		// The cap stops the transcript earlier than truncation did, so both the
+		// coverage bound and the resume point move back to it. Leaving them where
+		// truncation put them would count chunks past the last returned turn and
+		// send a follow-up request beyond the turns that were dropped — the cap
+		// would silently delete them instead of paginating them.
+		coveredUntil = kept[limit-1].LastCapturedAt
+		// The first dropped turn's own chunk, which may be the chunk the last kept
+		// turn ended in: a chunk holding turns on both sides of the cap has to be
+		// re-read, since the alternative is skipping its later turns.
+		resumeFrom = kept[limit].CapturedAt
 	}
+	result.CoveredUntil, result.ResumeFrom = coveredUntil, resumeFrom
 
 	// Coverage is measured over what the turns reach, not over what was asked
 	// for; see TranscriptResult.Chunks.
@@ -191,20 +222,31 @@ func (s *Store) Transcript(ctx context.Context, opts TranscriptOptions) (Transcr
 		return TranscriptResult{}, err
 	}
 	result.Chunks, result.AttributedChunks = chunks, attributed
+	if chunks > attributed {
+		// Only asked when there is a gap to explain, so a complete transcript
+		// costs nothing.
+		failed, err := s.ChunksFailedTranscription(ctx, opts.Since, coveredUntil)
+		if err != nil {
+			return TranscriptResult{}, err
+		}
+		result.FailedChunks = failed
+	}
 	return result, nil
 }
 
 // trimToWholeChunks drops the tail of an over-fetched segment read so a
-// transcript never ends inside a chunk, and reports whether anything was cut.
+// transcript never ends inside a chunk. It reports whether anything was cut and
+// the capture time of the first chunk left out.
 //
 // The last chunk of an over-long read is the one chunk we know we hold only part
 // of, and half a chunk is worse than none of it: its final turn would end
 // mid-sentence with nothing in the output saying so, which is precisely the
-// silent-incompleteness this function exists to prevent. Dropping it whole makes
-// CoveredUntil a boundary a follow-up request can resume from exactly.
-func trimToWholeChunks(segments []Segment) ([]Segment, bool) {
+// silent-incompleteness this function exists to prevent. Dropping it whole is
+// what makes the omitted boundary exact, so a follow-up request resumes at a
+// chunk rather than somewhere inside one.
+func trimToWholeChunks(segments []Segment) (kept []Segment, truncated bool, nextChunk time.Time) {
 	if len(segments) <= maxTranscriptSegments {
-		return segments, false
+		return segments, false, time.Time{}
 	}
 	last := segments[len(segments)-1].CapturedAt
 	cut := len(segments)
@@ -213,8 +255,12 @@ func trimToWholeChunks(segments []Segment) ([]Segment, bool) {
 	}
 	if cut == 0 {
 		// One chunk alone exceeds the ceiling. Keeping its prefix beats returning
-		// nothing, and Truncated still says the transcript is short.
-		return segments[:maxTranscriptSegments], true
+		// nothing, and Truncated still says the transcript is short. There is no
+		// later chunk to resume from, so the resume point is this chunk itself and
+		// the repeat is the price of reading the rest of it.
+		return segments[:maxTranscriptSegments], true, last
 	}
-	return segments[:cut], true
+	// Everything sharing `last` was dropped, so `last` is exactly the first chunk
+	// this transcript does not cover.
+	return segments[:cut], true, last
 }

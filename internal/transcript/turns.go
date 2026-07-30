@@ -32,6 +32,12 @@ type Turn struct {
 	Text   string
 	// CapturedAt is the chunk the turn began in.
 	CapturedAt time.Time
+	// LastCapturedAt is the chunk it ended in, which is a different chunk
+	// whenever a turn continued across a boundary. A caller bounding a page of
+	// turns needs how far they reached, and CapturedAt answers where they
+	// started — using it as the bound would exclude chunks the text already
+	// covers.
+	LastCapturedAt time.Time
 	// StartedAt and EndedAt are zero when no constituent segment carried times.
 	StartedAt, EndedAt time.Time
 	// Confidence is the least confident constituent's, and OrderConfidence the
@@ -133,11 +139,13 @@ func AssembleTurns(segments []TurnSegment, opts TurnOptions) []Turn {
 		if current == nil {
 			current = &Turn{
 				Origin: segment.Origin, CapturedAt: segment.CapturedAt,
-				StartedAt: segment.StartedAt, EndedAt: segment.EndedAt,
+				LastCapturedAt: segment.CapturedAt,
+				StartedAt:      segment.StartedAt, EndedAt: segment.EndedAt,
 				Confidence: segment.Confidence, OrderConfidence: segment.OrderConfidence,
 			}
 			parts = nil
 		} else {
+			current.LastCapturedAt = segment.CapturedAt
 			if current.StartedAt.IsZero() && !segment.StartedAt.IsZero() {
 				current.StartedAt = segment.StartedAt
 			}
