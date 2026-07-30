@@ -199,6 +199,28 @@ func TestLoadReportsDropped(t *testing.T) {
 	}
 }
 
+func TestLoadReturnsTermsTheCallerCannotCorrupt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vocabulary.txt")
+	writeVocabulary(t, path, "Alpha\nBravo\n")
+	loader := &Loader{Path: path}
+
+	first := loader.Load()
+	if len(first.Terms) != 2 {
+		t.Fatalf("Terms = %q, want two terms", first.Terms)
+	}
+
+	// A caller mutating what it was handed must not reach the cache.
+	first.Terms[0] = "CORRUPTED"
+
+	second := loader.Load()
+	if !slices.Equal(second.Terms, []string{"Alpha", "Bravo"}) {
+		t.Fatalf("Terms = %q after a caller mutated an earlier result, want [Alpha Bravo]", second.Terms)
+	}
+	if second.Changed {
+		t.Fatal("Changed = true, want false: the file did not change, only a caller's private copy did")
+	}
+}
+
 // touch advances the file's mtime so a reload is detectable regardless of
 // filesystem timestamp granularity.
 func touch(t *testing.T, path string) {

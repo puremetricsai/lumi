@@ -68,8 +68,20 @@ func (l *Loader) Load() Snapshot {
 	defer l.mu.Unlock()
 
 	snapshot := l.observe()
+	// Hand out a private copy. observe() may return the cached snapshot, whose
+	// Terms slice shares a backing array with l.cached; a caller that sorted or
+	// wrote into it in place would silently corrupt every later Load(). Cloning
+	// is free at MaxTerms and makes the read-only guarantee structural rather
+	// than a doc comment nobody reads.
+	snapshot.Terms = slices.Clone(snapshot.Terms)
 	snapshot.Changed = !l.havePrevious || !equivalent(l.previous, snapshot)
 	l.previous = snapshot
+	// l.previous must not alias the slice just handed to the caller either:
+	// assigning the struct above copies the slice header, not the backing
+	// array, so without this second clone a caller mutating its returned
+	// Terms would also mutate what the next Load() compares against in
+	// equivalent(), reporting a spurious Changed.
+	l.previous.Terms = slices.Clone(snapshot.Terms)
 	l.havePrevious = true
 	return snapshot
 }
