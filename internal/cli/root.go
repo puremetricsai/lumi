@@ -52,7 +52,8 @@ func newRootCommand() *cobra.Command {
 	}
 	cmd.PersistentFlags().StringVar(&a.dataDir, "data-dir", "", "data directory (default: $LUMI_HOME or ~/Library/Application Support/Lumi)")
 	cmd.AddCommand(a.recordCommand(), a.searchCommand(), a.pruneCommand(),
-		a.doctorCommand(), a.permissionsCommand(), a.nativeSmokeCommand(), a.mcpCommand())
+		a.doctorCommand(), a.permissionsCommand(), a.nativeSmokeCommand(), a.mcpCommand(),
+		a.transcribeCommand())
 	cmd.AddCommand(&cobra.Command{Use: "version", Short: "Print the Lumi version", Run: func(*cobra.Command, []string) {
 		fmt.Fprintln(os.Stdout, version)
 	}})
