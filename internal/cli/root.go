@@ -77,6 +77,31 @@ func smokeAccessibilityNote(accessibilityError string) string {
 	return ", degraded: " + accessibilityError
 }
 
+// smokeAudioOutputNote renders the processes holding an active audio output
+// stream. "none" and a failed read are kept distinct: the first says no process
+// held a stream, the second says Lumi cannot tell — and only the second is a
+// reason to distrust the audio attribution the recorder will write.
+func smokeAudioOutputNote(processes []macosnative.AudioProcess, err error) string {
+	if err != nil {
+		return "unavailable: " + err.Error()
+	}
+	if len(processes) == 0 {
+		return "none"
+	}
+	named := make([]string, 0, len(processes))
+	for _, process := range processes {
+		name := process.Name
+		if name == "" {
+			name = process.BundleID
+		}
+		if name == "" {
+			name = "unnamed"
+		}
+		named = append(named, fmt.Sprintf("%s (pid=%d)", name, process.PID))
+	}
+	return strings.Join(named, ", ")
+}
+
 func (a *app) openStore(ctx context.Context) (*store.Store, config.Paths, error) {
 	paths, err := a.paths()
 	if err != nil {
@@ -155,10 +180,11 @@ func (a *app) runForeground(cmd *cobra.Command, f recordFlags) error {
 	recorder := capture.Recorder{
 		Store: s, Paths: paths, ScreenInterval: f.interval, AudioChunk: f.audioChunk,
 		CaptureScreen: !f.noScreen, CaptureAudio: !f.noAudio, Logger: logger,
-		Screen:  capture.NativeScreens{},
-		Text:    capture.VisionText{},
-		Context: capture.AccessibilityContext{},
-		Audio:   capture.NativeAudio{},
+		Screen:       capture.NativeScreens{},
+		Text:         capture.VisionText{},
+		Context:      capture.AccessibilityContext{},
+		Audio:        capture.NativeAudio{},
+		AudioOutputs: capture.NativeAudioOutputs{},
 		Transcriber: capture.NativeSpeech{
 			Locale:     f.speechLocale,
 			Vocabulary: &vocabulary.Loader{Path: paths.Vocabulary},
@@ -624,19 +650,27 @@ func (a *app) nativeSmokeCommand() *cobra.Command {
 			if frontmost.Agree {
 				agreement = "agree"
 			}
+			// The output-stream list is reported and never asserted. An empty set
+			// is the correct answer when nothing holds a stream, so failing on it
+			// would make the smoke test depend on whether the operator happened to
+			// have audio running — the same reasoning that keeps the frontmost
+			// diagnostic above reported rather than compared.
+			audioOutputs, audioOutputsErr := macosnative.AudioProcesses(cmd.Context())
 			fmt.Fprintf(cmd.OutOrStdout(),
 				"native capture ok: %d displays, app %q via %s, window %q via %s (AX trusted=%s%s), "+
 					"Vision ok, system audio ok, microphone ok\n"+
 					"frontmost: Accessibility pid=%d %q | NSWorkspace pid=%d %q | "+
 					"window list pid=%d %q | resolved %q via %s (%s)\n"+
-					"audio timing: %s\n",
+					"audio timing: %s\n"+
+					"active audio output: %s\n",
 				len(frames), snapshot.App, snapshot.AppSource, snapshot.Window, snapshot.TitleSource,
 				trusted, smokeAccessibilityNote(snapshot.Error),
 				frontmost.Accessibility.PID, frontmost.Accessibility.App,
 				frontmost.Workspace.PID, frontmost.Workspace.App,
 				frontmost.WindowList.PID, frontmost.WindowList.App,
 				frontmost.Resolved.App, frontmost.Resolved.AppSource, agreement,
-				strings.Join(anchors, " | "))
+				strings.Join(anchors, " | "),
+				smokeAudioOutputNote(audioOutputs, audioOutputsErr))
 			return nil
 		},
 	}
