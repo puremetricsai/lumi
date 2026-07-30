@@ -67,6 +67,12 @@ type AudioFrame struct {
 	MeasuredDurationMS int64  `json:"measured_duration_ms,omitempty"`
 }
 
+type AudioProcess struct {
+	PID      int32  `json:"pid"`
+	BundleID string `json:"bundle_id,omitempty"`
+	Name     string `json:"name,omitempty"`
+}
+
 type SpeechRun struct {
 	StartMS    int64   `json:"start_ms"`
 	EndMS      int64   `json:"end_ms"`
@@ -118,6 +124,10 @@ func RequestPermissions(context.Context, bool) (Permissions, error) {
 }
 
 func RecordAudio(context.Context, string, string, float64) ([]AudioFrame, error) {
+	return nil, errUnsupported
+}
+
+func AudioProcesses(context.Context) ([]AudioProcess, error) {
 	return nil, errUnsupported
 }
 

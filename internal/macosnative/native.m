@@ -2,6 +2,7 @@
 #import <ApplicationServices/ApplicationServices.h>
 #import <AVFoundation/AVFoundation.h>
 #import <AudioToolbox/AudioToolbox.h>
+#import <CoreAudio/CoreAudio.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <ImageIO/ImageIO.h>
 #import <IOKit/hidsystem/IOHIDLib.h>
@@ -858,6 +859,143 @@ char *lumi_request_permissions_json(bool input_monitoring, char **error_message)
             dispatch_semaphore_wait(speechReady, DISPATCH_TIME_FOREVER);
         }
         return lumi_permissions_json(error_message);
+    }
+}
+
+// LumiAudioProcessFlag reads one boolean process property, treating an
+// unreadable property as false. A process that will not answer is not evidence
+// that it is playing, and the caller has no better remedy than skipping it.
+static BOOL LumiAudioProcessFlag(AudioObjectID process, AudioObjectPropertySelector selector) {
+    AudioObjectPropertyAddress address = {
+        .mSelector = selector,
+        .mScope = kAudioObjectPropertyScopeGlobal,
+        .mElement = kAudioObjectPropertyElementMain,
+    };
+    UInt32 value = 0;
+    UInt32 size = sizeof(value);
+    if (AudioObjectGetPropertyData(process, &address, 0, NULL, &size, &value) != noErr) {
+        return NO;
+    }
+    return value != 0;
+}
+
+static pid_t LumiAudioProcessPID(AudioObjectID process) {
+    AudioObjectPropertyAddress address = {
+        .mSelector = kAudioProcessPropertyPID,
+        .mScope = kAudioObjectPropertyScopeGlobal,
+        .mElement = kAudioObjectPropertyElementMain,
+    };
+    pid_t pid = 0;
+    UInt32 size = sizeof(pid);
+    if (AudioObjectGetPropertyData(process, &address, 0, NULL, &size, &pid) != noErr) {
+        return 0;
+    }
+    return pid;
+}
+
+static NSString *LumiAudioProcessBundleID(AudioObjectID process) {
+    AudioObjectPropertyAddress address = {
+        .mSelector = kAudioProcessPropertyBundleID,
+        .mScope = kAudioObjectPropertyScopeGlobal,
+        .mElement = kAudioObjectPropertyElementMain,
+    };
+    CFStringRef bundleID = NULL;
+    UInt32 size = sizeof(bundleID);
+    if (AudioObjectGetPropertyData(process, &address, 0, NULL, &size, &bundleID) != noErr ||
+        bundleID == NULL) {
+        return nil;
+    }
+    NSString *value = (__bridge_transfer NSString *)bundleID;
+    return value.length == 0 ? nil : value;
+}
+
+// lumi_audio_processes_json lists the processes holding an active audio output
+// stream. It is what lets a system-track recording name the application that
+// produced it, which no other source can answer: the WAV holds the mixed output
+// graph and carries no provenance of its own.
+//
+// kAudioProcessPropertyIsRunningOutput reports *stream occupancy, not audible
+// sound* — a paused player that still holds its stream open answers yes
+// (measured with QuickTime; the same app with its document closed answers no).
+// That is the strongest claim available here, and the caller's field names say
+// so. The per-process property set is closed — PID, BundleID, Devices,
+// IsRunning, IsRunningInput, IsRunningOutput — and none of it carries level, so
+// establishing real emission would need AudioHardwareCreateProcessTap.
+//
+// This is a *read* of CoreAudio's process objects, never a tap. Nothing here
+// captures audio, which is the distinction that matters for permissions —
+// creating a process tap requires a TCC grant, enumerating the objects does not.
+//
+// Every field but the pid is optional and omitted when absent, matching the
+// audio frame dictionaries. A process with neither a bundle id nor a resolvable
+// name is still reported: it genuinely held a stream, and dropping it would
+// understate what was audible. Filtering belongs to the caller.
+char *lumi_audio_processes_json(char **error_message) {
+    @autoreleasepool {
+        AudioObjectPropertyAddress listAddress = {
+            .mSelector = kAudioHardwarePropertyProcessObjectList,
+            .mScope = kAudioObjectPropertyScopeGlobal,
+            .mElement = kAudioObjectPropertyElementMain,
+        };
+        UInt32 dataSize = 0;
+        OSStatus status = AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &listAddress,
+                                                         0, NULL, &dataSize);
+        if (status != noErr) {
+            if (error_message != NULL) {
+                *error_message = LumiCopyUTF8([NSString stringWithFormat:
+                    @"size CoreAudio process object list: status %d", (int)status]);
+            }
+            return NULL;
+        }
+        NSMutableArray *processes = [NSMutableArray array];
+        UInt32 count = dataSize / (UInt32)sizeof(AudioObjectID);
+        if (count > 0) {
+            AudioObjectID *objects = calloc(count, sizeof(AudioObjectID));
+            if (objects == NULL) {
+                if (error_message != NULL) {
+                    *error_message = LumiCopyUTF8(@"allocate CoreAudio process object list");
+                }
+                return NULL;
+            }
+            status = AudioObjectGetPropertyData(kAudioObjectSystemObject, &listAddress, 0, NULL,
+                                                &dataSize, objects);
+            if (status != noErr) {
+                free(objects);
+                if (error_message != NULL) {
+                    *error_message = LumiCopyUTF8([NSString stringWithFormat:
+                        @"read CoreAudio process object list: status %d", (int)status]);
+                }
+                return NULL;
+            }
+            count = dataSize / (UInt32)sizeof(AudioObjectID);
+            for (UInt32 index = 0; index < count; index++) {
+                AudioObjectID process = objects[index];
+                if (!LumiAudioProcessFlag(process, kAudioProcessPropertyIsRunningOutput)) {
+                    continue;
+                }
+                pid_t pid = LumiAudioProcessPID(process);
+                NSMutableDictionary *entry = [@{@"pid": @(pid)} mutableCopy];
+                NSString *bundleID = LumiAudioProcessBundleID(process);
+                if (bundleID != nil) {
+                    entry[@"bundle_id"] = bundleID;
+                }
+                NSRunningApplication *application =
+                    [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+                NSString *name = application.localizedName;
+                if (name.length > 0) {
+                    entry[@"name"] = name;
+                }
+                [processes addObject:entry];
+            }
+            free(objects);
+        }
+        NSError *jsonError = nil;
+        NSString *json = LumiJSONString(processes, &jsonError);
+        if (json == nil) {
+            if (error_message != NULL) *error_message = LumiCopyError(jsonError);
+            return NULL;
+        }
+        return LumiCopyUTF8(json);
     }
 }
 

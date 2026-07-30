@@ -4,7 +4,7 @@ package macosnative
 
 /*
 #cgo CFLAGS: -fblocks -fobjc-arc
-#cgo LDFLAGS: -framework AppKit -framework ApplicationServices -framework AudioToolbox -framework AVFoundation -framework CoreGraphics -framework CoreMedia -framework CoreVideo -framework Foundation -framework ImageIO -framework IOKit -framework ScreenCaptureKit -framework UniformTypeIdentifiers -framework Vision -L${SRCDIR} -llumispeech -framework Speech
+#cgo LDFLAGS: -framework AppKit -framework ApplicationServices -framework AudioToolbox -framework AVFoundation -framework CoreAudio -framework CoreGraphics -framework CoreMedia -framework CoreVideo -framework Foundation -framework ImageIO -framework IOKit -framework ScreenCaptureKit -framework UniformTypeIdentifiers -framework Vision -L${SRCDIR} -llumispeech -framework Speech
 #include <stdlib.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -21,6 +21,7 @@ char *lumi_vision_recognize(const char *image_path, char **error_message);
 char *lumi_permissions_json(char **error_message);
 char *lumi_hid_access_name(int access);
 char *lumi_request_permissions_json(bool input_monitoring, char **error_message);
+char *lumi_audio_processes_json(char **error_message);
 int64_t lumi_audio_session_start(const char *directory, const char *prefix, double chunk_seconds, char **error_message);
 char *lumi_audio_session_next_json(int64_t handle, double timeout_seconds, char **error_message);
 void lumi_audio_session_stop(int64_t handle);
@@ -131,6 +132,44 @@ type AudioFrame struct {
 	// MeasuredDurationMS is the span actually written, from the first sample
 	// buffer to the last. Zero means the native side reported none.
 	MeasuredDurationMS int64 `json:"measured_duration_ms,omitempty"`
+}
+
+// AudioProcess is one application holding an active audio output stream.
+// BundleID and Name are omitted by the native side when they could not be
+// resolved, so a process with only a PID is a real answer rather than a
+// malformed one — it still held a stream.
+type AudioProcess struct {
+	PID      int32  `json:"pid"`
+	BundleID string `json:"bundle_id,omitempty"`
+	Name     string `json:"name,omitempty"`
+}
+
+// AudioProcesses lists the processes holding an active audio output stream at
+// this instant. An empty slice means none did, which is an answer and not a
+// failure.
+//
+// It reports stream occupancy rather than audible sound: a paused player still
+// answers yes. CoreAudio exposes no per-process level, so nothing stronger is
+// available without a tap.
+//
+// This reads CoreAudio's process objects; it never opens a tap, so it captures
+// no audio and needs no grant beyond what the process already holds. Callers
+// filter it — notably of their own pid, which the audio session excludes from
+// the recording anyway.
+func AudioProcesses(ctx context.Context) ([]AudioProcess, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var nativeErr *C.char
+	result, err := nativeJSON(C.lumi_audio_processes_json(&nativeErr), nativeErr)
+	if err != nil {
+		return nil, err
+	}
+	var processes []AudioProcess
+	if err := json.Unmarshal(result, &processes); err != nil {
+		return nil, fmt.Errorf("decode audio process list: %w", err)
+	}
+	return processes, nil
 }
 
 func CaptureScreens(ctx context.Context, directory, prefix string) ([]ScreenFrame, error) {
