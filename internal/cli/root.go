@@ -23,6 +23,7 @@ import (
 	"github.com/puremetricsai/lumi/internal/platform"
 	"github.com/puremetricsai/lumi/internal/retention"
 	"github.com/puremetricsai/lumi/internal/store"
+	"github.com/puremetricsai/lumi/internal/vocabulary"
 	"github.com/spf13/cobra"
 )
 
@@ -51,7 +52,8 @@ func newRootCommand() *cobra.Command {
 	}
 	cmd.PersistentFlags().StringVar(&a.dataDir, "data-dir", "", "data directory (default: $LUMI_HOME or ~/Library/Application Support/Lumi)")
 	cmd.AddCommand(a.recordCommand(), a.searchCommand(), a.pruneCommand(),
-		a.doctorCommand(), a.permissionsCommand(), a.nativeSmokeCommand(), a.mcpCommand())
+		a.doctorCommand(), a.permissionsCommand(), a.nativeSmokeCommand(), a.mcpCommand(),
+		a.transcribeCommand())
 	cmd.AddCommand(&cobra.Command{Use: "version", Short: "Print the Lumi version", Run: func(*cobra.Command, []string) {
 		fmt.Fprintln(os.Stdout, version)
 	}})
@@ -153,11 +155,15 @@ func (a *app) runForeground(cmd *cobra.Command, f recordFlags) error {
 	recorder := capture.Recorder{
 		Store: s, Paths: paths, ScreenInterval: f.interval, AudioChunk: f.audioChunk,
 		CaptureScreen: !f.noScreen, CaptureAudio: !f.noAudio, Logger: logger,
-		Screen:      capture.NativeScreens{},
-		Text:        capture.VisionText{},
-		Context:     capture.AccessibilityContext{},
-		Audio:       capture.NativeAudio{},
-		Transcriber: capture.NativeSpeech{Locale: f.speechLocale},
+		Screen:  capture.NativeScreens{},
+		Text:    capture.VisionText{},
+		Context: capture.AccessibilityContext{},
+		Audio:   capture.NativeAudio{},
+		Transcriber: capture.NativeSpeech{
+			Locale:     f.speechLocale,
+			Vocabulary: &vocabulary.Loader{Path: paths.Vocabulary},
+			Logger:     logger,
+		},
 	}
 	logger.Info("recording started", "database", paths.Database, "screen", !f.noScreen, "audio", !f.noAudio)
 	return recorder.Run(ctx)
@@ -391,6 +397,7 @@ func (a *app) doctorCommand() *cobra.Command {
 				missing = true
 			}
 			fmt.Fprintf(os.Stdout, "data directory\tok\t%s\n", paths.Root)
+			reportVocabulary(os.Stdout, paths)
 			if err := reportAttributionHealth(cmd.Context(), os.Stdout, paths); err != nil {
 				return err
 			}
@@ -466,6 +473,31 @@ func formatPercent(part, total int64) string {
 		return "<1%"
 	}
 	return fmt.Sprintf("%.0f%%", percent)
+}
+
+// reportVocabulary reports the vocabulary file's state. The three cases are
+// kept distinct because they need different remedies: "no file" and "file I
+// cannot read" have opposite fixes, and collapsing them would send a user
+// looking for a missing file that is actually sitting there unreadable.
+//
+// This never affects doctor's exit status: vocabulary is optional.
+//
+// Like the rest of doctor, it describes what it can observe from this process.
+// A running recorder holds its own cache, so this is the file now, not the
+// daemon's current terms.
+func reportVocabulary(out io.Writer, paths config.Paths) {
+	snapshot := (&vocabulary.Loader{Path: paths.Vocabulary}).Load()
+	switch {
+	case snapshot.Err != nil:
+		fmt.Fprintf(out, "vocabulary\twarn\t%v\n", snapshot.Err)
+	case !snapshot.Exists:
+		fmt.Fprintf(out, "vocabulary\tnone\tno vocabulary file at %s\n", paths.Vocabulary)
+	case snapshot.Dropped > 0:
+		fmt.Fprintf(out, "vocabulary\tok\t%d terms (%d dropped past the %d-term cap)\n",
+			len(snapshot.Terms), snapshot.Dropped, vocabulary.MaxTerms)
+	default:
+		fmt.Fprintf(out, "vocabulary\tok\t%d terms\n", len(snapshot.Terms))
+	}
 }
 
 func (a *app) permissionsCommand() *cobra.Command {

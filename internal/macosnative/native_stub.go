@@ -77,7 +77,9 @@ func FrontmostDiagnostic(context.Context) (FrontmostDiagnosticReport, error) {
 
 func RecognizeText(context.Context, string) (string, error) { return "", errUnsupported }
 
-func TranscribeAudio(context.Context, string, string) (string, error) { return "", errUnsupported }
+func TranscribeAudio(context.Context, string, string, []string) (string, error) {
+	return "", errUnsupported
+}
 
 func EnsureSpeechAssets(context.Context, string) error { return errUnsupported }
 

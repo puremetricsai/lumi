@@ -22,7 +22,7 @@ char *lumi_hid_access_name(int access);
 char *lumi_request_permissions_json(bool input_monitoring, char **error_message);
 char *lumi_record_audio_json(const char *directory, const char *prefix, double duration_seconds, char **error_message);
 void lumi_os_version(int *major, int *minor, int *patch);
-char *lumi_transcribe_audio_string(const char *audio_path, const char *locale, double timeout_seconds, char **error_message);
+char *lumi_transcribe_audio_string(const char *audio_path, const char *locale, const char *vocabulary_json, double timeout_seconds, char **error_message);
 char *lumi_speech_ensure_assets(const char *locale, double timeout_seconds, char **error_message);
 int lumi_speech_assets_installed(const char *locale);
 */
@@ -226,9 +226,15 @@ func RecognizeText(ctx context.Context, imagePath string) (string, error) {
 	return result, nil
 }
 
-// TranscribeAudio transcribes a WAV file with on-device SpeechAnalyzer.
-func TranscribeAudio(ctx context.Context, audioPath, locale string) (string, error) {
+// TranscribeAudio transcribes a WAV file with on-device SpeechAnalyzer. Terms
+// bias recognition toward phrases outside the general lexicon; an empty list
+// applies no context at all, leaving behaviour identical to no vocabulary.
+func TranscribeAudio(ctx context.Context, audioPath, locale string, terms []string) (string, error) {
 	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	vocabularyJSON, err := encodeVocabulary(terms)
+	if err != nil {
 		return "", err
 	}
 	timeout := nativeTimeout(ctx, 2*time.Minute)
@@ -240,11 +246,13 @@ func TranscribeAudio(ctx context.Context, audioPath, locale string) (string, err
 	go func() {
 		pathC := C.CString(audioPath)
 		localeC := C.CString(locale)
+		vocabularyC := C.CString(vocabularyJSON)
 		var nativeErr *C.char
 		result, err := nativeString(
-			C.lumi_transcribe_audio_string(pathC, localeC, C.double(timeout.Seconds()), &nativeErr), nativeErr)
+			C.lumi_transcribe_audio_string(pathC, localeC, vocabularyC, C.double(timeout.Seconds()), &nativeErr), nativeErr)
 		C.free(unsafe.Pointer(pathC))
 		C.free(unsafe.Pointer(localeC))
+		C.free(unsafe.Pointer(vocabularyC))
 		done <- transcription{text: result, err: err}
 	}()
 	select {
@@ -253,6 +261,21 @@ func TranscribeAudio(ctx context.Context, audioPath, locale string) (string, err
 	case r := <-done:
 		return r.text, r.err
 	}
+}
+
+// encodeVocabulary renders terms as a JSON array for the Swift bridge, matching
+// how lumi_resolve_frontmost_json and lumi_frontmost_candidates_json already
+// take JSON arrays across this boundary. An empty list encodes to "" so the
+// Swift side can skip AnalysisContext entirely.
+func encodeVocabulary(terms []string) (string, error) {
+	if len(terms) == 0 {
+		return "", nil
+	}
+	encoded, err := json.Marshal(terms)
+	if err != nil {
+		return "", fmt.Errorf("encode vocabulary terms: %w", err)
+	}
+	return string(encoded), nil
 }
 
 // EnsureSpeechAssets downloads missing SpeechAnalyzer assets for locale.

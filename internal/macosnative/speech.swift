@@ -12,6 +12,16 @@ private func resolveLocaleID(_ locale: UnsafePointer<CChar>?) -> String {
     return requested.isEmpty ? "en-US" : requested
 }
 
+// decodeVocabulary reads the JSON array Go passes across the bridge. It runs
+// synchronously, before any Task is created, so the C pointer is never
+// captured by an async closure and cannot dangle.
+private func decodeVocabulary(_ vocabularyJSON: UnsafePointer<CChar>?) -> [String] {
+    guard let vocabularyJSON = vocabularyJSON else { return [] }
+    let text = String(cString: vocabularyJSON)
+    guard !text.isEmpty, let data = text.data(using: .utf8) else { return [] }
+    return (try? JSONDecoder().decode([String].self, from: data)) ?? []
+}
+
 private func makeTranscriber(localeID: String) -> SpeechTranscriber {
     SpeechTranscriber(
         locale: Locale(identifier: localeID),
@@ -31,6 +41,7 @@ private func ensureAssets(for transcriber: SpeechTranscriber) async throws {
 public func lumi_transcribe_audio_string(
     _ audioPath: UnsafePointer<CChar>?,
     _ locale: UnsafePointer<CChar>?,
+    _ vocabularyJSON: UnsafePointer<CChar>?,
     _ timeoutSeconds: Double,
     _ errorMessage: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
 ) -> UnsafeMutablePointer<CChar>? {
@@ -39,6 +50,7 @@ public func lumi_transcribe_audio_string(
     }
     let path = String(cString: audioPath)
     let localeID = resolveLocaleID(locale)
+    let vocabulary = decodeVocabulary(vocabularyJSON)
     let timeout = timeoutSeconds > 0 ? timeoutSeconds : 120
 
     let semaphore = DispatchSemaphore(value: 0)
@@ -51,6 +63,22 @@ public func lumi_transcribe_audio_string(
             let transcriber = makeTranscriber(localeID: localeID)
             try await ensureAssets(for: transcriber)
             let analyzer = SpeechAnalyzer(modules: [transcriber])
+            if !vocabulary.isEmpty {
+                // A vocabulary problem must cost biasing, never the whole
+                // transcription: this is its own do/catch, separate from the
+                // outer one, so a throwing setContext cannot fail the chunk.
+                // The diagnostic goes to stderr, never stdout, since
+                // lumi_transcribe_audio_string backs `lumi transcribe`, which
+                // prints the transcript itself to stdout.
+                do {
+                    let context = AnalysisContext()
+                    context.contextualStrings = [.general: vocabulary]
+                    try await analyzer.setContext(context)
+                } catch {
+                    let message = "vocabulary: setContext failed, continuing unbiased: \(error.localizedDescription)\n"
+                    FileHandle.standardError.write(Data(message.utf8))
+                }
+            }
             let audioFile = try AVAudioFile(forReading: URL(fileURLWithPath: path))
 
             let collector = Task { () -> String in
