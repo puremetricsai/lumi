@@ -5,6 +5,7 @@ package macosnative
 import (
 	"context"
 	"errors"
+	"time"
 )
 
 var errUnsupported = errors.New("native capture requires Apple Silicon macOS with cgo enabled")
@@ -119,6 +120,27 @@ func RequestPermissions(context.Context, bool) (Permissions, error) {
 func RecordAudio(context.Context, string, string, float64) ([]AudioFrame, error) {
 	return nil, errUnsupported
 }
+
+// AudioChunk mirrors the darwin definition so callers compile everywhere.
+type AudioChunk struct {
+	StartedAtUnixNS int64
+	Frames          []AudioFrame
+	TimedOut        bool
+	Closed          bool
+	CaptureError    string
+}
+
+type AudioSession struct{}
+
+func StartAudioSession(context.Context, string, string, float64) (*AudioSession, error) {
+	return nil, errUnsupported
+}
+
+func (*AudioSession) Next(time.Duration) (AudioChunk, error) { return AudioChunk{}, errUnsupported }
+
+func (*AudioSession) Stop() {}
+
+func (*AudioSession) Close() {}
 
 func OSVersion() (int, int, int, error) { return 0, 0, 0, errUnsupported }
 

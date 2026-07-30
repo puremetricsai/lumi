@@ -58,16 +58,21 @@ const (
 	//
 	// Continuation across a chunk boundary is decided *structurally*, on whether
 	// the chunks are adjacent, and not on how much silence sits between them.
-	// The dead air between chunks is unobservable — the recorder stops the
-	// stream, finalizes both files, and transcribes before starting again — and
-	// measured 0.4 to 2.9 seconds, which straddles the length of a natural pause
-	// between turns. Silence at a boundary therefore carries no information.
+	// The capture stream now stays open across a boundary, so consecutive chunks
+	// abut and there is no dead air to measure at all; in the index recorded
+	// before that fix, the recorder stopped the stream, finalized both files,
+	// and transcribed before starting again, and the resulting hole measured 0.4
+	// to 2.9 seconds — straddling the length of a natural pause. Either way,
+	// silence at a boundary carries no information.
 	//
 	// What does carry information is adjacency: of 3,040 consecutive audio
 	// chunks in a real index, 3,028 were captured 30-33 s apart, and the next
-	// largest gaps were 39 s, 48 s, 91 s, and then overnight stops. 35 s sits in
-	// that empty band, so this separates "the next chunk" from "the recorder was
-	// restarted" — and a turn must never be stitched across a restart.
+	// largest gaps were 39 s, 48 s, 91 s, and then overnight stops. A
+	// continuously open stream lands at the bottom of that band rather than
+	// scattered through it — chunks now sit exactly one chunk duration apart —
+	// so 35 s still sits in the empty space above both, and separates "the next
+	// chunk" from "the recorder was restarted". A turn must never be stitched
+	// across a restart.
 	DefaultMaxChunkGap = 35 * time.Second
 )
 

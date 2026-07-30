@@ -44,11 +44,17 @@ Data flows one way: `internal/cli` wires concrete processors into a `capture.Rec
 `store.Event` rows, and `search` reads them back. Never the reverse.
 
 **`internal/macosnative`** — cgo/Objective-C bridge to ScreenCaptureKit, Accessibility, Apple Vision,
-AVFoundation WAV writing, and permission preflight. Has a non-macOS stub.
+AVFoundation WAV writing, and permission preflight. Has a non-macOS stub. `AudioSession` is the one
+exception to the call-and-return shape of everything else here: it holds a live `SCStream` behind a handle
+and is read with `Next`, because the stream has to stay open across chunk boundaries. `RecordAudio` takes
+one chunk from a session and stops, so `native-smoke` and the recorder share a single capture path.
 
 **`internal/capture`** — `Recorder` runs independent screen and audio goroutines until the context is
 cancelled, with native processors behind small interfaces. Displays are re-enumerated each interval for
-hotplug. Everything runs in-process — no subprocesses. One focused-window snapshot per tick is stamped onto
+hotplug. Screen capture is a per-tick call, but audio is a *stream*: `AudioSource.Open` returns an
+`AudioStream` whose `Next` yields chunks while capture keeps running, so transcription, indexing, and
+attribution all happen alongside the next chunk rather than between two recordings. Everything runs
+in-process — no subprocesses. One focused-window snapshot per tick is stamped onto
 **every** display's frame, so on a multi-display setup an `app` filter returns frames from displays where
 that app was not visible: attribution answers "what was the user working in", not "what is shown in this
 image". Per-display attribution is deliberately not done.
@@ -178,9 +184,27 @@ Support/Lumi`; directories created 0700.
   `MaxSilence` (10s) when bytes *changed* but scored similar (video, advancing slides), and `ExactSilence`
   (5min) when bytes are identical, so a frozen screen leaves a bounded presence marker instead of
   re-indexing the same JPEG. `ExactSilence` is clamped up to `MaxSilence`.
-- **Capture retries without discarding completed work.** Screen failures retry on the next interval; audio
-  failures retry after one second. Media returned during cancellation gets a short cancellation-free window
-  for insertion.
+- **Capture retries without discarding completed work.** Screen failures retry on the next interval; an
+  audio stream that fails is reopened after one second. Media returned during cancellation gets a short
+  cancellation-free window for insertion.
+- **The audio tap never closes between chunks.** One `SCStream` stays open for the whole recording and
+  `LumiAudioSession` rotates the WAV writers on presentation-timestamp boundaries, on the same serial queue
+  the sample buffers arrive on, so the buffer crossing a boundary opens the next chunk whole. Cycling the
+  stream per chunk — start, sleep, stop, finalize, start again — cost 2.0–2.3 s of every 32 s: chunks were
+  exactly 30.000 s but arrived 32.0–32.3 s apart, a 6.5% loss landing mid-sentence, visible as one chunk
+  ending "Instead of running." and the next opening "splits the main task into smaller parts". Roughly
+  1.7 s of that was the native lifecycle and 0.45 s was transcription blocking the loop, so fixing either
+  alone leaves most of the hole. Measured after: consecutive chunk starts exactly one chunk duration apart,
+  each file holding that whole interval to within one sample buffer.
+- **A chunk's `captured_at` is the instant its audio began**, derived by offsetting the session anchor
+  rather than by reading the clock at rotation, so the grid cannot drift and both tracks of a chunk share
+  one timestamp — which is what audio collapse groups on. Reading `time.Now()` between chunks made every
+  timestamp absorb the previous chunk's processing time, which is what let indexed chunks sit 32 s apart
+  while each held 30 s of sound.
+- **Cancellation stops capture but never abandons it.** `Stop` finalizes the chunk in flight and `Next`
+  keeps delivering queued chunks — including that partial one — before reporting `ErrAudioStreamClosed`.
+  The native session has no reader to interrupt, so `Next` polls in short slices; that poll interval, not
+  the chunk duration, bounds shutdown latency.
 - **Preserve provenance.** `text_source`, `display_id`, and `audio_source` are first-class event columns
   (migration 3) and appear in JSON exports. In metadata, `app_source` and `attribution_source` answer
   different questions — which source named the *app*, and which supplied the *window title* — and routinely
@@ -308,10 +332,13 @@ Support/Lumi`; directories created 0700.
   partial transcript; counting the whole window while the text stopped early makes them corroborate the
   omission instead. A transcript also never ends mid-chunk, which is what lets `CoveredUntil` be a resume
   point rather than an estimate.
-- **Turn continuation across a chunk boundary is structural, not gap-based.** Inter-chunk dead air is
-  unobservable and measures 0.4–2.9 s, overlapping a natural pause; what *is* observable is that 3,028 of
-  3,040 consecutive chunks were captured 30–33 s apart, with the next outliers at 39 s, 48 s, and 91 s.
-  35 s separates "the next chunk" from "the recorder stopped", and a turn must never bridge a stop.
+- **Turn continuation across a chunk boundary is structural, not gap-based.** There is now no inter-chunk
+  dead air at all, and in the index recorded before the stream was held open there was 0.4–2.9 s of it,
+  unobservable and overlapping a natural pause. What *is* observable either way is adjacency: 3,028 of
+  3,040 consecutive chunks were captured 30–33 s apart, with the next outliers at 39 s, 48 s, and 91 s,
+  and a continuously open stream lands at exactly 30 s rather than scattered through that band. 35 s still
+  separates "the next chunk" from "the recorder stopped", for old rows and new alike, and a turn must never
+  bridge a stop.
 - **`origin` is TEXT with no `CHECK`**, so distinguishing machine-side participants later is a value
   change rather than a migration. `silent` already uses that room, and is why the column could gain a
   fourth value without touching the schema.

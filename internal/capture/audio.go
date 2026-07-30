@@ -2,8 +2,11 @@ package capture
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/puremetricsai/lumi/internal/macosnative"
@@ -18,10 +21,10 @@ type AudioFrame struct {
 	DurationMS   int64
 	CaptureError string
 	// StartedAt is the wall clock of this track's first sample buffer, and the
-	// only sound anchor for its file-relative segment timings — the recorder's
-	// captured_at is taken before ScreenCaptureKit is even asked for shareable
-	// content. Zero when the native layer reported none, which is the case for
-	// every chunk captured before this field existed.
+	// only sound anchor for its file-relative segment timings. It is per track,
+	// where the chunk's captured_at is shared by both, so the two differ by the
+	// skew between the tracks. Zero when the native layer reported none, which
+	// is the case for every chunk captured before this field existed.
 	StartedAt time.Time
 	// SessionStartPTSNS is the first sample buffer's presentation timestamp.
 	// Both tracks are fed by one ScreenCaptureKit stream, so these share a host
@@ -63,8 +66,38 @@ type Transcription struct {
 	Segments []TimedSegment
 }
 
+// AudioChunk is one recording interval's worth of audio: every track captured
+// across the same span, sharing one start instant. That shared instant is what
+// makes the pair a chunk — collapse groups audio rows by timestamp, so both
+// tracks must be stamped from it and not from two separate clock reads.
+type AudioChunk struct {
+	// StartedAt is when the chunk's audio begins. Zero when the source could
+	// not say, which leaves the caller to fall back to its own clock.
+	StartedAt time.Time
+	Frames    []AudioFrame
+}
+
+// ErrAudioStreamClosed reports that a stream has ended and delivered everything
+// it captured. It is the ordinary end of a cancelled recording, not a failure.
+var ErrAudioStreamClosed = errors.New("audio capture stream closed")
+
+// AudioSource opens a capture stream that stays open across chunks. It is a
+// stream rather than a per-chunk call because the tap has to remain open while a
+// finished chunk is being transcribed: closing and reopening it around each one
+// left roughly two seconds of every thirty uncaptured, mid-sentence.
 type AudioSource interface {
-	Record(context.Context, string, string, time.Duration) ([]AudioFrame, error)
+	Open(ctx context.Context, directory string, chunk time.Duration) (AudioStream, error)
+}
+
+// AudioStream delivers chunks from a capture session that keeps recording
+// between them.
+type AudioStream interface {
+	// Next blocks until the next chunk is complete. Cancelling ctx stops the
+	// capture but never abandons what it already recorded: the chunk in flight
+	// is finalised and every queued chunk is still delivered, after which Next
+	// returns ErrAudioStreamClosed.
+	Next(ctx context.Context) (AudioChunk, error)
+	Close() error
 }
 
 // NativeAudio records system output and the default microphone concurrently
@@ -72,22 +105,75 @@ type AudioSource interface {
 // mono 16 kHz WAV chunks so transcription and source attribution stay clear.
 type NativeAudio struct{}
 
-func (NativeAudio) Record(ctx context.Context, directory, prefix string, duration time.Duration) ([]AudioFrame, error) {
-	frames, err := macosnative.RecordAudio(ctx, directory, prefix, duration.Seconds())
+func (NativeAudio) Open(ctx context.Context, directory string, chunk time.Duration) (AudioStream, error) {
+	session, err := macosnative.StartAudioSession(ctx, directory, fileStamp(time.Now().UTC()), chunk.Seconds())
 	if err != nil {
 		return nil, fmt.Errorf("record system and microphone audio with ScreenCaptureKit: %w", err)
 	}
-	result := make([]AudioFrame, 0, len(frames))
-	for _, frame := range frames {
-		result = append(result, AudioFrame{
-			Path: frame.Path, Source: frame.Source, DurationMS: frame.DurationMS,
+	return &nativeAudioStream{session: session}, nil
+}
+
+// nativeAudioPollInterval bounds how long a Next call sits inside the native
+// layer before returning to check for cancellation. The native side has no way
+// to interrupt a waiting reader, so promptness on shutdown is bought here.
+const nativeAudioPollInterval = 250 * time.Millisecond
+
+type nativeAudioStream struct {
+	session  *macosnative.AudioSession
+	stopping bool
+}
+
+func (s *nativeAudioStream) Next(ctx context.Context) (AudioChunk, error) {
+	for {
+		if ctx.Err() != nil && !s.stopping {
+			s.stopping = true
+			s.session.Stop()
+		}
+		chunk, err := s.session.Next(nativeAudioPollInterval)
+		if err != nil {
+			return AudioChunk{}, fmt.Errorf("read ScreenCaptureKit audio chunk: %w", err)
+		}
+		switch {
+		case len(chunk.Frames) > 0:
+			return s.adopt(chunk), nil
+		case chunk.Closed && chunk.CaptureError != "":
+			return AudioChunk{}, fmt.Errorf("ScreenCaptureKit audio capture stopped: %s", chunk.CaptureError)
+		case chunk.Closed:
+			return AudioChunk{}, ErrAudioStreamClosed
+		}
+	}
+}
+
+func (s *nativeAudioStream) Close() error {
+	s.session.Close()
+	return nil
+}
+
+// adopt gives a chunk's files the timestamped names every previously recorded
+// chunk carries. The session names them by ordinal because it must open them
+// before Go has seen the chunk, and a failed rename keeps the ordinal name
+// rather than costing the recording: the path is only ever an opaque handle to
+// the bytes.
+func (s *nativeAudioStream) adopt(chunk macosnative.AudioChunk) AudioChunk {
+	started := unixNanoTime(chunk.StartedAtUnixNS)
+	result := AudioChunk{StartedAt: started, Frames: make([]AudioFrame, 0, len(chunk.Frames))}
+	for _, frame := range chunk.Frames {
+		path := frame.Path
+		if !started.IsZero() {
+			named := filepath.Join(filepath.Dir(path), fileStamp(started)+"-"+frame.Source+".wav")
+			if named != path && os.Rename(path, named) == nil {
+				path = named
+			}
+		}
+		result.Frames = append(result.Frames, AudioFrame{
+			Path: path, Source: frame.Source, DurationMS: frame.DurationMS,
 			CaptureError:       frame.CaptureError,
 			StartedAt:          unixNanoTime(frame.StartedAtUnixNS),
 			SessionStartPTSNS:  frame.SessionStartPTSNS,
 			MeasuredDurationMS: frame.MeasuredDurationMS,
 		})
 	}
-	return result, nil
+	return result
 }
 
 // unixNanoTime keeps "the native layer reported no anchor" as a zero time.Time

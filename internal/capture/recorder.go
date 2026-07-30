@@ -355,49 +355,91 @@ func screenMetadata(frame ScreenFrame, textSource, axText string, screenContext 
 	return data
 }
 
+// audioLoop keeps a capture stream open and consumes the chunks it produces.
+// The stream is reopened only after a failure: transcription, indexing, and
+// attribution all run while the next chunk is still being recorded, because
+// doing them between two recordings is what used to cost the seconds of audio
+// that fell into the gap.
 func (r *Recorder) audioLoop(ctx context.Context) {
 	for ctx.Err() == nil {
-		now := time.Now().UTC()
-		frames, err := r.Audio.Record(ctx, r.Paths.Audio, fileStamp(now), r.AudioChunk)
+		stream, err := r.Audio.Open(ctx, r.Paths.Audio, r.AudioChunk)
 		if err != nil {
-			if ctx.Err() == nil {
-				r.Logger.Error("audio capture failed", "error", err)
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(time.Second):
-				}
+			if ctx.Err() != nil {
+				return
+			}
+			r.Logger.Error("audio capture failed", "error", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
 			}
 			continue
 		}
-		results := make([]audioChunkResult, 0, len(frames))
-		for _, frame := range frames {
-			var transcription Transcription
-			var processErr error
-			if ctx.Err() != nil {
-				processErr = fmt.Errorf("transcription skipped after capture stopped: %w", ctx.Err())
-			} else {
-				transcription, processErr = r.Transcriber.Transcribe(ctx, frame.Path)
-			}
-			event := &store.Event{Kind: store.KindAudio, CapturedAt: now, Text: transcription.Text, MediaPath: frame.Path,
-				DurationMS: frame.DurationMS, AudioSource: frame.Source,
-				Metadata: audioMetadata(frame.Source, frame.CaptureError, processErr)}
-			storeCtx, cancel := preservationContext(ctx)
-			err := r.Store.Insert(storeCtx, event)
-			cancel()
-			if err != nil {
-				r.Logger.Error("store audio event", "path", frame.Path, "error", err)
-				continue
-			}
-			r.Logger.Info("captured audio", "id", event.ID, "source", frame.Source,
-				"characters", len(transcription.Text), "segments", len(transcription.Segments))
-			if processErr != nil {
-				r.Logger.Warn("transcription failed; audio was still indexed", "source", frame.Source, "error", processErr)
-			}
-			results = append(results, audioChunkResult{frame: frame, transcription: transcription, eventID: event.ID})
-		}
-		r.attributeChunk(ctx, now, results)
+		r.consumeAudio(ctx, stream)
 	}
+}
+
+// consumeAudio drains one stream. It returns so the caller can reopen after a
+// capture failure, and returns without reopening once the stream reports itself
+// closed — which it does only after handing over everything it had recorded.
+func (r *Recorder) consumeAudio(ctx context.Context, stream AudioStream) {
+	defer func() {
+		if err := stream.Close(); err != nil {
+			r.Logger.Error("close audio capture stream", "error", err)
+		}
+	}()
+	for {
+		chunk, err := stream.Next(ctx)
+		if err != nil {
+			if !errors.Is(err, ErrAudioStreamClosed) && ctx.Err() == nil {
+				r.Logger.Error("audio capture failed", "error", err)
+				select {
+				case <-ctx.Done():
+				case <-time.After(time.Second):
+				}
+			}
+			return
+		}
+		r.storeAudioChunk(ctx, chunk)
+	}
+}
+
+// storeAudioChunk transcribes, indexes, and attributes one chunk. Both tracks
+// are stamped with the chunk's own start rather than a fresh clock read, so the
+// pair keeps the single captured_at that audio collapse groups on.
+func (r *Recorder) storeAudioChunk(ctx context.Context, chunk AudioChunk) {
+	capturedAt := chunk.StartedAt
+	if capturedAt.IsZero() {
+		capturedAt = time.Now().UTC()
+	}
+	capturedAt = capturedAt.UTC()
+	results := make([]audioChunkResult, 0, len(chunk.Frames))
+	for _, frame := range chunk.Frames {
+		var transcription Transcription
+		var processErr error
+		if ctx.Err() != nil {
+			processErr = fmt.Errorf("transcription skipped after capture stopped: %w", ctx.Err())
+		} else {
+			transcription, processErr = r.Transcriber.Transcribe(ctx, frame.Path)
+		}
+		event := &store.Event{Kind: store.KindAudio, CapturedAt: capturedAt, Text: transcription.Text, MediaPath: frame.Path,
+			DurationMS: frame.DurationMS, AudioSource: frame.Source,
+			Metadata: audioMetadata(frame.Source, frame.CaptureError, processErr)}
+		storeCtx, cancel := preservationContext(ctx)
+		err := r.Store.Insert(storeCtx, event)
+		cancel()
+		if err != nil {
+			r.Logger.Error("store audio event", "path", frame.Path, "error", err)
+			continue
+		}
+		r.Logger.Info("captured audio", "id", event.ID, "source", frame.Source,
+			"characters", len(transcription.Text), "segments", len(transcription.Segments))
+		if processErr != nil {
+			r.Logger.Warn("transcription failed; audio was still indexed", "source", frame.Source, "error", processErr)
+		}
+		results = append(results, audioChunkResult{frame: frame, transcription: transcription, eventID: event.ID})
+	}
+	r.attributeChunk(ctx, capturedAt, results)
 }
 
 // audioChunkResult is one captured track: what was recorded, what it transcribed

@@ -723,6 +723,70 @@ func TestRecordAudioReportsATimingAnchor(t *testing.T) {
 	}
 }
 
+// TestAudioSessionChunksAreContiguous is the native half of the regression test
+// for the audio that used to fall between chunks. Cycling the stream per chunk
+// cost about two seconds of every thirty — the stream was closed for the
+// teardown, the file finalisation, and the next stream's setup — so consecutive
+// chunks arrived 32s apart while each held 30s of sound, and the missing
+// seconds landed mid-sentence.
+//
+// Two things are asserted, because either alone can be satisfied by a broken
+// implementation: chunk starts sit exactly one chunk apart (the grid never
+// drifts), and each file actually holds that whole interval (the grid is not
+// merely relabelling a recording with holes in it).
+func TestAudioSessionChunksAreContiguous(t *testing.T) {
+	if os.Getenv("LUMI_NATIVE_SMOKE") != "1" {
+		t.Skip("set LUMI_NATIVE_SMOKE=1 after granting Lumi permissions")
+	}
+	const chunkSeconds = 3.0
+	session, err := StartAudioSession(context.Background(), t.TempDir(), "contiguity", chunkSeconds)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	chunks := make([]AudioChunk, 0, 3)
+	deadline := time.Now().Add(30 * time.Second)
+	for len(chunks) < 3 && time.Now().Before(deadline) {
+		chunk, err := session.Next(500 * time.Millisecond)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(chunk.Frames) > 0 {
+			chunks = append(chunks, chunk)
+		}
+		if chunk.Closed {
+			break
+		}
+	}
+	session.Stop()
+	if len(chunks) < 3 {
+		t.Fatalf("captured %d chunks, need 3 to measure the boundary between them", len(chunks))
+	}
+
+	const chunkMS = int64(chunkSeconds * 1000)
+	for i := 1; i < len(chunks); i++ {
+		gap := (chunks[i].StartedAtUnixNS - chunks[i-1].StartedAtUnixNS) / int64(time.Millisecond)
+		if gap != chunkMS {
+			t.Errorf("chunk %d starts %dms after chunk %d, but a chunk covers %dms; "+
+				"the difference is audio no file holds", i, gap, i-1, chunkMS)
+		}
+	}
+	// One sample buffer may land on either side of a boundary, so a file can
+	// fall short of the full interval by that much and no more. The regression
+	// this guards cost whole seconds, so the tolerance separates them cleanly.
+	const bufferToleranceMS = 250
+	for i, chunk := range chunks {
+		for _, frame := range chunk.Frames {
+			t.Logf("chunk %d %s: started=%s measured=%dms", i, frame.Source,
+				time.Unix(0, frame.StartedAtUnixNS).UTC().Format(time.RFC3339Nano), frame.MeasuredDurationMS)
+			if frame.MeasuredDurationMS < chunkMS-bufferToleranceMS {
+				t.Errorf("chunk %d %s holds %dms of a %dms interval; %dms of audio was not captured",
+					i, frame.Source, frame.MeasuredDurationMS, chunkMS, chunkMS-frame.MeasuredDurationMS)
+			}
+		}
+	}
+}
+
 func TestNativeCaptureSmoke(t *testing.T) {
 	if os.Getenv("LUMI_NATIVE_SMOKE") != "1" {
 		t.Skip("set LUMI_NATIVE_SMOKE=1 after granting Lumi permissions")

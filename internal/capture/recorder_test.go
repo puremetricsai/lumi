@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -150,49 +151,98 @@ func (failingContext) Snapshot(context.Context) (ScreenContext, error) {
 	return ScreenContext{}, errors.New("read macOS Accessibility tree: snapshot unavailable")
 }
 
-type fakeAudio struct{}
+// trackStream stands in for the native capture session: it is opened once and
+// keeps producing chunks however long the consumer spends on each one, and every
+// chunk carries the instant its audio began rather than the instant the consumer
+// got round to it.
+type trackStream struct {
+	sources   []string
+	directory string
+	chunk     time.Duration
+	origin    time.Time
+	index     int
+}
 
-func (fakeAudio) Record(ctx context.Context, directory, prefix string, duration time.Duration) ([]AudioFrame, error) {
+func newTrackStream(directory string, chunk time.Duration, sources ...string) *trackStream {
+	return &trackStream{sources: sources, directory: directory, chunk: chunk, origin: time.Now().UTC()}
+}
+
+func (s *trackStream) Next(ctx context.Context) (AudioChunk, error) {
 	select {
 	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-time.After(duration):
+		return AudioChunk{}, ErrAudioStreamClosed
+	case <-time.After(s.chunk):
 	}
-	path := filepath.Join(directory, prefix+"-microphone.wav")
-	err := os.WriteFile(path, []byte("fake-wave"), 0o600)
-	return []AudioFrame{{Path: path, Source: "microphone", DurationMS: duration.Milliseconds()}}, err
+	startedAt := s.origin.Add(time.Duration(s.index) * s.chunk)
+	s.index++
+	frames := make([]AudioFrame, 0, len(s.sources))
+	for _, source := range s.sources {
+		path := filepath.Join(s.directory, fileStamp(startedAt)+"-"+source+".wav")
+		if err := os.WriteFile(path, []byte("fake-wave"), 0o600); err != nil {
+			return AudioChunk{}, err
+		}
+		frames = append(frames, AudioFrame{Path: path, Source: source, DurationMS: s.chunk.Milliseconds()})
+	}
+	return AudioChunk{StartedAt: startedAt, Frames: frames}, nil
+}
+
+func (s *trackStream) Close() error { return nil }
+
+type fakeAudio struct{}
+
+func (fakeAudio) Open(ctx context.Context, directory string, chunk time.Duration) (AudioStream, error) {
+	return newTrackStream(directory, chunk, "microphone"), nil
 }
 
 type dualAudio struct{}
 
-func (dualAudio) Record(ctx context.Context, directory, prefix string, duration time.Duration) ([]AudioFrame, error) {
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-time.After(duration):
-	}
-	frames := []AudioFrame{
-		{Path: filepath.Join(directory, prefix+"-system.wav"), Source: "system", DurationMS: duration.Milliseconds()},
-		{Path: filepath.Join(directory, prefix+"-microphone.wav"), Source: "microphone", DurationMS: duration.Milliseconds()},
-	}
-	for _, frame := range frames {
-		if err := os.WriteFile(frame.Path, []byte("fake-wave"), 0o600); err != nil {
-			return nil, err
-		}
-	}
-	return frames, nil
+func (dualAudio) Open(ctx context.Context, directory string, chunk time.Duration) (AudioStream, error) {
+	return newTrackStream(directory, chunk, "system", "microphone"), nil
 }
 
+// countingAudio reports how many times a stream was opened, which is how the
+// recorder's promise to keep capture running between chunks is checked.
+type countingAudio struct {
+	opens atomic.Int32
+}
+
+func (a *countingAudio) Open(ctx context.Context, directory string, chunk time.Duration) (AudioStream, error) {
+	a.opens.Add(1)
+	return newTrackStream(directory, chunk, "system", "microphone"), nil
+}
+
+// completionAfterCancelAudio finishes nothing until the recording is cancelled,
+// then delivers the chunk the session finalised on the way down — the shape
+// native shutdown has, and audio that must still be indexed.
 type completionAfterCancelAudio struct{}
 
-func (completionAfterCancelAudio) Record(ctx context.Context, directory, prefix string, duration time.Duration) ([]AudioFrame, error) {
-	<-ctx.Done()
-	path := filepath.Join(directory, prefix+"-system.wav")
-	if err := os.WriteFile(path, []byte("late-native-wave"), 0o600); err != nil {
-		return nil, err
-	}
-	return []AudioFrame{{Path: path, Source: "system", DurationMS: duration.Milliseconds()}}, nil
+func (completionAfterCancelAudio) Open(ctx context.Context, directory string, chunk time.Duration) (AudioStream, error) {
+	return &completionAfterCancelStream{directory: directory, chunk: chunk}, nil
 }
+
+type completionAfterCancelStream struct {
+	directory string
+	chunk     time.Duration
+	delivered bool
+}
+
+func (s *completionAfterCancelStream) Next(ctx context.Context) (AudioChunk, error) {
+	<-ctx.Done()
+	if s.delivered {
+		return AudioChunk{}, ErrAudioStreamClosed
+	}
+	s.delivered = true
+	startedAt := time.Now().UTC()
+	path := filepath.Join(s.directory, fileStamp(startedAt)+"-system.wav")
+	if err := os.WriteFile(path, []byte("late-native-wave"), 0o600); err != nil {
+		return AudioChunk{}, err
+	}
+	return AudioChunk{StartedAt: startedAt, Frames: []AudioFrame{
+		{Path: path, Source: "system", DurationMS: s.chunk.Milliseconds()},
+	}}, nil
+}
+
+func (s *completionAfterCancelStream) Close() error { return nil }
 
 type fakeTranscriber struct{}
 
@@ -204,6 +254,18 @@ type failingTranscriber struct{}
 
 func (failingTranscriber) Transcribe(context.Context, string) (Transcription, error) {
 	return Transcription{}, errors.New("transcription failed")
+}
+
+// slowTranscriber takes longer than a chunk lasts, which is the condition that
+// used to push every following chunk's timestamp out.
+type slowTranscriber struct{ delay time.Duration }
+
+func (t slowTranscriber) Transcribe(ctx context.Context, _ string) (Transcription, error) {
+	select {
+	case <-ctx.Done():
+	case <-time.After(t.delay):
+	}
+	return Transcription{Text: "Lumi end to end audio transcript"}, nil
 }
 
 type countingTranscriber struct{ calls atomic.Int64 }
@@ -860,6 +922,93 @@ func TestRecorderIndexesSystemAndMicrophoneAudioSeparately(t *testing.T) {
 	}
 	if !shared {
 		t.Fatalf("system and microphone rows of a chunk must share a captured_at, got %#v", events)
+	}
+}
+
+// TestRecorderKeepsOneAudioStreamOpenAcrossChunks pins the shape of the fix for
+// the audio lost between chunks. Capture used to be a blocking call per chunk,
+// so the tap was closed for the whole of transcription, indexing, attribution,
+// and the next stream's setup — about two seconds in thirty, landing
+// mid-sentence. Reopening per chunk would reintroduce exactly that gap.
+func TestRecorderKeepsOneAudioStreamOpenAcrossChunks(t *testing.T) {
+	ctx := context.Background()
+	paths, err := config.FromRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(ctx, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	audio := &countingAudio{}
+	recorder := Recorder{
+		Store: s, Paths: paths, CaptureAudio: true, AudioChunk: 5 * time.Millisecond,
+		Audio: audio, Transcriber: fakeTranscriber{},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	recordCtx, cancel := context.WithTimeout(ctx, 150*time.Millisecond)
+	defer cancel()
+	if err := recorder.Run(recordCtx); err != nil {
+		t.Fatal(err)
+	}
+	events, err := s.Search(ctx, store.SearchOptions{Limit: store.MaxSearchLimit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) < 4 {
+		t.Fatalf("expected several audio chunks to be indexed, got %d", len(events))
+	}
+	if opens := audio.opens.Load(); opens != 1 {
+		t.Fatalf("capture must stay open across chunks, but the stream was opened %d times", opens)
+	}
+}
+
+// TestRecorderStampsAudioChunksFromTheirOwnStart pins captured_at to the instant
+// a chunk's audio began. Reading the clock between chunks instead made every
+// timestamp absorb however long the previous chunk took to process, which is
+// what let indexed chunks sit 32s apart while each held 30s of sound.
+func TestRecorderStampsAudioChunksFromTheirOwnStart(t *testing.T) {
+	ctx := context.Background()
+	paths, err := config.FromRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(ctx, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	const chunk = 5 * time.Millisecond
+	recorder := Recorder{
+		Store: s, Paths: paths, CaptureAudio: true, AudioChunk: chunk,
+		Audio: dualAudio{}, Transcriber: slowTranscriber{delay: 15 * time.Millisecond},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	recordCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
+	defer cancel()
+	if err := recorder.Run(recordCtx); err != nil {
+		t.Fatal(err)
+	}
+	events, err := s.Search(ctx, store.SearchOptions{Limit: store.MaxSearchLimit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stamps := make([]time.Time, 0, len(events))
+	for _, event := range events {
+		if len(stamps) == 0 || !event.CapturedAt.Equal(stamps[len(stamps)-1]) {
+			stamps = append(stamps, event.CapturedAt)
+		}
+	}
+	if len(stamps) < 3 {
+		t.Fatalf("expected at least three distinct chunk timestamps, got %d", len(stamps))
+	}
+	sort.Slice(stamps, func(i, j int) bool { return stamps[i].Before(stamps[j]) })
+	for i := 1; i < len(stamps); i++ {
+		if gap := stamps[i].Sub(stamps[i-1]); gap != chunk {
+			t.Fatalf("chunk %d is %s after its predecessor, but each chunk covers %s; "+
+				"the difference is audio that was never captured", i, gap, chunk)
+		}
 	}
 }
 
