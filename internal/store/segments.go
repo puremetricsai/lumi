@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/puremetricsai/lumi/internal/transcript"
 )
 
 // Segment is one attributed piece of an audio chunk.
@@ -47,24 +49,117 @@ type Segment struct {
 	Method          string  `json:"method,omitempty"`
 }
 
-// Segment origins. These are stored as text with no CHECK constraint, so adding
-// a value later — distinguishing two machine-side participants, say — is a value
-// change rather than a migration.
+// Segment origins, re-exported from internal/transcript — which produces the
+// values that get stored — so a caller compares against a name rather than
+// retyping the string, exactly as the OrderConfidence tiers are one file over.
+// They are stored as text with no CHECK constraint, so adding a value later —
+// distinguishing two machine-side participants, say — is a value change rather
+// than a migration.
 const (
-	OriginInternal = "internal"
-	OriginExternal = "external"
-	OriginUnknown  = "unknown"
+	OriginInternal = string(transcript.OriginInternal)
+	OriginExternal = string(transcript.OriginExternal)
+	OriginUnknown  = string(transcript.OriginUnknown)
 	// OriginSilent appears only on the wordless marker row written for a chunk
 	// that was attributed and found to hold no speech. It is what keeps the
 	// derived work queue drainable: without a row, "attributed and empty" and
 	// "never attributed" are the same absence. It is not part of the origin
-	// vocabulary a caller may filter on, because it never labels any text.
-	OriginSilent = "silent"
+	// vocabulary a caller may filter on, because it never labels any text — see
+	// ParseOrigin, which owns that distinction.
+	OriginSilent = string(transcript.OriginSilent)
 )
 
-const segmentSelect = `SELECT id, event_id, captured_at, seq, origin, source_track, text,
-started_at, ended_at, start_offset_ms, end_offset_ms, runs_json, is_bleed, confidence,
-order_confidence, method FROM audio_segments`
+// ParseOrigin validates a caller's origin filter, returning the stored value or
+// an error naming the vocabulary. Empty means every origin.
+//
+// It lives here rather than in each caller for the reason HasSearchableTerms
+// does: which origins may be filtered on is a fact about the column, and the
+// schema was deliberately left open to a fourth value. Two copies of the switch
+// would make that value filterable over MCP and rejected as a bad flag on the
+// CLI, or the reverse — and neither test suite could see the difference.
+//
+// The error spells the vocabulary out rather than listing valid strings, because
+// the names are only obvious once you know that Lumi records two audio tracks and
+// that "internal" is about which machine produced the sound rather than who was
+// speaking.
+func ParseOrigin(value string) (string, error) {
+	switch strings.TrimSpace(value) {
+	case "":
+		return "", nil
+	case OriginInternal:
+		return OriginInternal, nil
+	case OriginExternal:
+		return OriginExternal, nil
+	case OriginUnknown:
+		return OriginUnknown, nil
+	}
+	return "", fmt.Errorf(`origin must be "internal" (sound this machine produced, such as the far side `+
+		`of a call, a video, or a notification), "external" (sound the microphone picked up from the room, `+
+		`usually the user), or "unknown" (machine audio was playing but produced no transcript, so the `+
+		`origin could not be determined); got %q`, value)
+}
+
+// SegmentFrom converts an attribution verdict into the row that stores it.
+//
+// One converter rather than one per writer: the recorder and `lumi transcript
+// backfill` both produce these rows and ReplaceChunkSegments promises all three
+// write paths converge on the same ones. Two copies would make a new column a
+// two-package edit, and missing one would silently degrade exactly the rows a
+// --force backfill rewrites.
+func SegmentFrom(segment transcript.Segment, eventID int64) Segment {
+	row := Segment{
+		EventID: eventID, Seq: segment.Seq, Origin: string(segment.Origin),
+		SourceTrack: segment.SourceTrack, Text: segment.Text,
+		StartOffsetMS: segment.StartOffsetMS, EndOffsetMS: segment.EndOffsetMS,
+		IsBleed: segment.IsBleed, Confidence: segment.Confidence,
+		OrderConfidence: string(segment.OrderConfidence), Method: string(segment.Method),
+	}
+	if !segment.StartedAt.IsZero() {
+		started := segment.StartedAt
+		row.StartedAt = &started
+	}
+	if !segment.EndedAt.IsZero() {
+		ended := segment.EndedAt
+		row.EndedAt = &ended
+	}
+	if len(segment.Runs) > 0 {
+		if encoded, err := json.Marshal(segment.Runs); err == nil {
+			row.RunsJSON = encoded
+		}
+	}
+	return row
+}
+
+// SegmentRows converts a chunk's whole verdict, dropping any segment whose track
+// produced no event row: such a segment cannot be stored against anything, and
+// dropping it beats orphaning it.
+func SegmentRows(segments []transcript.Segment, eventIDs map[string]int64) []Segment {
+	rows := make([]Segment, 0, len(segments))
+	for _, segment := range segments {
+		eventID, ok := eventIDs[segment.SourceTrack]
+		if !ok {
+			continue
+		}
+		rows = append(rows, SegmentFrom(segment, eventID))
+	}
+	return rows
+}
+
+// Two projections, differing only in runs_json.
+//
+// The word timings are stored so a later pass can refine a split without
+// re-transcribing, and a chunk read for that purpose wants them. A transcript
+// does not: nothing between SegmentsBetween and an assembled turn touches them,
+// and they were measured averaging 686 bytes a row against 55 bytes of text — so
+// carrying them through the read behind `lumi transcript` and get_transcript
+// costs twelve times the payload of the only column that read uses, over up to
+// maxTranscriptSegments rows.
+const (
+	segmentColumns = `id, event_id, captured_at, seq, origin, source_track, text,
+started_at, ended_at, start_offset_ms, end_offset_ms, is_bleed, confidence,
+order_confidence, method`
+	segmentSelect     = `SELECT ` + segmentColumns + ` FROM audio_segments`
+	segmentSelectRuns = `SELECT ` + segmentColumns + `, runs_json FROM audio_segments`
+)
 
 // ReplaceChunkSegments makes one chunk's segments exactly segs, in a single
 // transaction that deletes whatever was there first.
@@ -142,19 +237,19 @@ func (s *Store) SegmentsBetween(ctx context.Context, since, until time.Time, inc
 		return nil, fmt.Errorf("query segments: %w", err)
 	}
 	defer rows.Close()
-	return scanSegments(rows)
+	return scanSegments(rows, false)
 }
 
 // SegmentsForChunk returns every segment of one chunk, bleed included, in reading
-// order.
+// order, with the word timings each was derived from.
 func (s *Store) SegmentsForChunk(ctx context.Context, capturedAt string) ([]Segment, error) {
 	rows, err := s.db.QueryContext(ctx,
-		segmentSelect+" WHERE captured_at = ? ORDER BY seq ASC", capturedAt)
+		segmentSelectRuns+" WHERE captured_at = ? ORDER BY seq ASC", capturedAt)
 	if err != nil {
 		return nil, fmt.Errorf("query segments at %s: %w", capturedAt, err)
 	}
 	defer rows.Close()
-	return scanSegments(rows)
+	return scanSegments(rows, true)
 }
 
 // ChunksMissingSegments returns audio capture times that have no segments at all,
@@ -236,22 +331,25 @@ func (s *Store) HasSpeechSegments(ctx context.Context, since, until time.Time) (
 	return found != 0, nil
 }
 
-func scanSegments(rows *sql.Rows) ([]Segment, error) {
+// scanSegments reads rows of segmentColumns, plus runs_json when withRuns says
+// the projection carried it.
+func scanSegments(rows *sql.Rows, withRuns bool) ([]Segment, error) {
 	var out []Segment
 	for rows.Next() {
 		var (
-			segment                  Segment
-			capturedAt               string
-			startedAt, endedAt       sql.NullString
-			startOffset, endOffset   sql.NullInt64
-			runs, orderConf, method  string
-			isBleed                  bool
-			confidence               float64
-			origin, source, textBody string
+			segment                Segment
+			capturedAt, runs       string
+			startedAt, endedAt     sql.NullString
+			startOffset, endOffset sql.NullInt64
 		)
-		if err := rows.Scan(&segment.ID, &segment.EventID, &capturedAt, &segment.Seq,
-			&origin, &source, &textBody, &startedAt, &endedAt, &startOffset, &endOffset,
-			&runs, &isBleed, &confidence, &orderConf, &method); err != nil {
+		targets := []any{&segment.ID, &segment.EventID, &capturedAt, &segment.Seq,
+			&segment.Origin, &segment.SourceTrack, &segment.Text, &startedAt, &endedAt,
+			&startOffset, &endOffset, &segment.IsBleed, &segment.Confidence,
+			&segment.OrderConfidence, &segment.Method}
+		if withRuns {
+			targets = append(targets, &runs)
+		}
+		if err := rows.Scan(targets...); err != nil {
 			return nil, err
 		}
 		parsed, err := time.Parse(time.RFC3339Nano, capturedAt)
@@ -259,9 +357,6 @@ func scanSegments(rows *sql.Rows) ([]Segment, error) {
 			return nil, fmt.Errorf("parse segment captured_at %q: %w", capturedAt, err)
 		}
 		segment.CapturedAt = parsed
-		segment.Origin, segment.SourceTrack, segment.Text = origin, source, textBody
-		segment.IsBleed, segment.Confidence = isBleed, confidence
-		segment.OrderConfidence, segment.Method = orderConf, method
 		if runs != "" {
 			segment.RunsJSON = json.RawMessage(runs)
 		}
@@ -351,6 +446,19 @@ func FailedTranscription(event Event) bool {
 	}
 	_, ok := fields[failedTranscriptionKey]
 	return ok
+}
+
+// AnyFailedTranscription reports whether any of a chunk's rows is missing its
+// transcript because recognition did not happen. It is half of the gate that
+// keeps a failed recognition from being recorded as silence — transcript.IsSilent
+// is the other half — and both writers of attribution apply it.
+func AnyFailedTranscription(events []Event) bool {
+	for _, event := range events {
+		if FailedTranscription(event) {
+			return true
+		}
+	}
+	return false
 }
 
 // ChunksFailedTranscription counts the audio chunks in a window that have no

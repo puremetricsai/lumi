@@ -97,6 +97,23 @@ type TranscriptResult struct {
 	ResumeFrom time.Time `json:"resume_from,omitempty"`
 }
 
+// MissingChunks counts the audio chunks the turns cover that carry no attribution
+// at all — the size of the hole nothing in the turns themselves reveals.
+func (r TranscriptResult) MissingChunks() int64 {
+	return r.Chunks - r.AttributedChunks
+}
+
+// RecoverableChunks counts the missing chunks a backfill could still attribute.
+//
+// It is the derivation every reader of a gappy transcript needs and none of them
+// should restate: chunks whose recognition failed are missing permanently, so
+// naming `lumi transcript backfill` for those is an instruction to run a command
+// and watch the number above not change. Zero means the gap is real and nothing
+// can fill it.
+func (r TranscriptResult) RecoverableChunks() int64 {
+	return r.MissingChunks() - r.FailedChunks
+}
+
 // Order confidence tiers, re-exported from internal/transcript so a caller can
 // compare against a name rather than retyping the string. A CLI printing "~" for
 // a guessed position was matching a literal, which is the drift HasSearchableTerms
