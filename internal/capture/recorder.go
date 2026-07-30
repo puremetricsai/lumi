@@ -13,15 +13,33 @@ import (
 
 	"github.com/puremetricsai/lumi/internal/config"
 	"github.com/puremetricsai/lumi/internal/store"
+	"github.com/puremetricsai/lumi/internal/transcript"
+	"github.com/puremetricsai/lumi/internal/wav"
 )
 
+// SegmentWriter stores one chunk's attributed segments. *store.Store satisfies
+// it; the interface exists as a test seam, so a test can prove that a failed
+// attribution write still leaves the audio indexed.
+type SegmentWriter interface {
+	ReplaceChunkSegments(ctx context.Context, capturedAt string, segments []store.Segment) error
+}
+
 type Recorder struct {
-	Store          *store.Store
-	Paths          config.Paths
-	Screen         ScreenSource
-	Text           TextExtractor
-	Context        ContextExtractor
-	Audio          AudioSource
+	Store *store.Store
+	// Segments defaults to Store when nil.
+	Segments SegmentWriter
+	Paths    config.Paths
+	Screen   ScreenSource
+	Text     TextExtractor
+	Context  ContextExtractor
+	Audio    AudioSource
+	// AudioOutputs is optional, but leaving it nil makes an audio row's absent
+	// active_audio_output_processes mean "never sampled" rather than "no process
+	// held a stream", and nothing downstream can tell those apart. Lumi's own
+	// constructor always wires it, so that ambiguity is confined to tests; a
+	// marker distinguishing them would be runtime state for a state production
+	// cannot reach.
+	AudioOutputs   AudioOutputs
 	Transcriber    SpeechTranscriber
 	Comparer       *FrameComparer
 	ScreenInterval time.Duration
@@ -125,13 +143,24 @@ func attributionCause(screenContext ScreenContext, contextErr error) string {
 	}
 }
 
+// SpeechTranscriber returns a chunk's transcript together with its timed
+// segments. Segments may be empty — a silent file produces none — but Text is
+// always the authority for what was said, and is what gets indexed.
+//
+// The segments are deliberately part of this interface rather than an optional
+// capability a caller type-asserts for: everything downstream of the recorder
+// depends on whether they arrived, and an assertion would hide that difference
+// behind a silent fallback.
 type SpeechTranscriber interface {
-	Transcribe(context.Context, string) (string, error)
+	Transcribe(context.Context, string) (Transcription, error)
 }
 
 func (r *Recorder) Run(ctx context.Context) error {
 	if r.Store == nil {
 		return errors.New("recorder store is required")
+	}
+	if r.Segments == nil {
+		r.Segments = r.Store
 	}
 	if !r.CaptureScreen && !r.CaptureAudio {
 		return errors.New("at least one of screen or audio capture must be enabled")
@@ -333,45 +362,220 @@ func screenMetadata(frame ScreenFrame, textSource, axText string, screenContext 
 	return data
 }
 
+// audioLoop keeps a capture stream open and consumes the chunks it produces.
+// The stream is reopened only after a failure: transcription, indexing, and
+// attribution all run while the next chunk is still being recorded, because
+// doing them between two recordings is what used to cost the seconds of audio
+// that fell into the gap.
 func (r *Recorder) audioLoop(ctx context.Context) {
 	for ctx.Err() == nil {
-		now := time.Now().UTC()
-		frames, err := r.Audio.Record(ctx, r.Paths.Audio, fileStamp(now), r.AudioChunk)
+		stream, err := r.Audio.Open(ctx, r.Paths.Audio, r.AudioChunk)
 		if err != nil {
-			if ctx.Err() == nil {
-				r.Logger.Error("audio capture failed", "error", err)
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(time.Second):
-				}
+			if ctx.Err() != nil {
+				return
+			}
+			r.Logger.Error("audio capture failed", "error", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
 			}
 			continue
 		}
-		for _, frame := range frames {
-			text := ""
-			var processErr error
-			if ctx.Err() != nil {
-				processErr = fmt.Errorf("transcription skipped after capture stopped: %w", ctx.Err())
-			} else {
-				text, processErr = r.Transcriber.Transcribe(ctx, frame.Path)
+		r.consumeAudio(ctx, stream)
+	}
+}
+
+// consumeAudio drains one stream. It returns so the caller can reopen after a
+// capture failure, and returns without reopening once the stream reports itself
+// closed — which it does only after handing over everything it had recorded.
+func (r *Recorder) consumeAudio(ctx context.Context, stream AudioStream) {
+	defer func() {
+		if err := stream.Close(); err != nil {
+			r.Logger.Error("close audio capture stream", "error", err)
+		}
+	}()
+	for {
+		chunk, err := stream.Next(ctx)
+		if err != nil {
+			if !errors.Is(err, ErrAudioStreamClosed) && ctx.Err() == nil {
+				r.Logger.Error("audio capture failed", "error", err)
+				select {
+				case <-ctx.Done():
+				case <-time.After(time.Second):
+				}
 			}
-			event := &store.Event{Kind: store.KindAudio, CapturedAt: now, Text: text, MediaPath: frame.Path,
-				DurationMS: frame.DurationMS, AudioSource: frame.Source,
-				Metadata: audioMetadata(frame.Source, frame.CaptureError, processErr)}
-			storeCtx, cancel := preservationContext(ctx)
-			err := r.Store.Insert(storeCtx, event)
-			cancel()
-			if err != nil {
-				r.Logger.Error("store audio event", "path", frame.Path, "error", err)
-				continue
-			}
-			r.Logger.Info("captured audio", "id", event.ID, "source", frame.Source, "characters", len(text))
-			if processErr != nil {
-				r.Logger.Warn("transcription failed; audio was still indexed", "source", frame.Source, "error", processErr)
-			}
+			return
+		}
+		r.storeAudioChunk(ctx, chunk)
+	}
+}
+
+// storeAudioChunk transcribes, indexes, and attributes one chunk. Both tracks
+// are stamped with the chunk's own start rather than a fresh clock read, so the
+// pair keeps the single captured_at that audio collapse groups on.
+func (r *Recorder) storeAudioChunk(ctx context.Context, chunk AudioChunk) {
+	capturedAt := chunk.StartedAt
+	if capturedAt.IsZero() {
+		capturedAt = time.Now().UTC()
+	}
+	capturedAt = capturedAt.UTC()
+	attribution := r.audioAttribution(ctx)
+	results := make([]audioChunkResult, 0, len(chunk.Frames))
+	for _, frame := range chunk.Frames {
+		var transcription Transcription
+		var processErr error
+		if ctx.Err() != nil {
+			processErr = fmt.Errorf("transcription skipped after capture stopped: %w", ctx.Err())
+		} else {
+			transcription, processErr = r.Transcriber.Transcribe(ctx, frame.Path)
+		}
+		event := &store.Event{Kind: store.KindAudio, CapturedAt: capturedAt, Text: transcription.Text, MediaPath: frame.Path,
+			App: attribution.screen.App, Window: attribution.screen.Window,
+			DurationMS: frame.DurationMS, AudioSource: frame.Source,
+			Metadata: audioMetadata(frame.Source, frame.CaptureError, processErr, attribution)}
+		storeCtx, cancel := preservationContext(ctx)
+		err := r.Store.Insert(storeCtx, event)
+		cancel()
+		if err != nil {
+			r.Logger.Error("store audio event", "path", frame.Path, "error", err)
+			continue
+		}
+		r.Logger.Info("captured audio", "id", event.ID, "source", frame.Source,
+			"characters", len(transcription.Text), "segments", len(transcription.Segments))
+		if processErr != nil {
+			r.Logger.Warn("transcription failed; audio was still indexed", "source", frame.Source, "error", processErr)
+		}
+		results = append(results, audioChunkResult{
+			frame: frame, transcription: transcription, eventID: event.ID, failed: processErr != nil})
+	}
+	r.attributeChunk(ctx, capturedAt, results)
+}
+
+// audioChunkResult is one captured track: what was recorded, what it transcribed
+// to, and which row it became.
+type audioChunkResult struct {
+	frame         AudioFrame
+	transcription Transcription
+	eventID       int64
+	// failed records that this track has no transcript because recognition did
+	// not happen, as opposed to happening and finding nothing. The recognizer
+	// reports both as an empty string, and attribution reads that emptiness as
+	// evidence — so which of the two it was has to be carried out of band.
+	failed bool
+}
+
+// attributeChunk decides where a chunk's audio came from and stores the verdict.
+//
+// It runs only after every track of the chunk is already indexed, and a failure
+// here is logged rather than returned. Captured media is never lost to a
+// downstream failure: the WAVs are on disk and their transcripts are in the index
+// before this is reached, so the worst case is a chunk with no attribution. That
+// needs no retry loop either — `lumi transcript backfill` derives its work queue
+// from exactly the chunks that have no segments, so this chunk is already in it.
+//
+// A chunk whose recognition failed is the one case that leaves the queue on
+// purpose undrainable: the backfill applies the same rule and will not label it
+// either, so it sits there until someone reads the WAV. That is the honest
+// state, and `lumi transcript backfill` reports those chunks apart from the ones
+// it can still do something about.
+func (r *Recorder) attributeChunk(ctx context.Context, capturedAt time.Time, results []audioChunkResult) {
+	if len(results) == 0 {
+		return
+	}
+	chunk := transcript.Chunk{CapturedAt: capturedAt}
+	eventIDs := make(map[string]int64, len(results))
+	systemPath := ""
+	for _, result := range results {
+		eventIDs[result.frame.Source] = result.eventID
+		switch result.frame.Source {
+		case transcript.TrackSystem:
+			chunk.System = buildTrack(result)
+			systemPath = result.frame.Path
+		case transcript.TrackMicrophone:
+			chunk.Microphone = buildTrack(result)
 		}
 	}
+	r.measureInternalEnergy(&chunk, systemPath)
+
+	segments := transcript.Attribute(chunk, transcript.Options{})
+	if len(segments) == 0 {
+		return
+	}
+	if transcript.IsSilent(segments) && anyTranscriptionFailed(results) {
+		// Silence is the one verdict read out of an *absence* of words, and a
+		// failed recognizer produces exactly the same absence — so this is the one
+		// verdict a failure can turn into a false claim about the world. Writing
+		// the marker would also make it permanent, since the marker is what drains
+		// the chunk from the work queue.
+		//
+		// The gate is deliberately the verdict rather than the failure alone. A
+		// track that did transcribe is labelled on its own evidence: system audio
+		// is internal unconditionally, and a system track that failed while the
+		// microphone spoke is caught by the energy measurement, which reads the
+		// WAV rather than the transcript.
+		r.Logger.Warn("chunk left unattributed: nothing was transcribed and transcription failed",
+			"captured_at", capturedAt)
+		return
+	}
+	rows := store.SegmentRows(segments, eventIDs)
+	if len(rows) == 0 {
+		return
+	}
+	storeCtx, cancel := preservationContext(ctx)
+	defer cancel()
+	if err := r.Segments.ReplaceChunkSegments(storeCtx, capturedAt.UTC().Format(time.RFC3339Nano), rows); err != nil {
+		r.Logger.Warn("audio attribution was not stored; the audio is still indexed and `lumi transcript backfill` will retry",
+			"error", err)
+		return
+	}
+	if transcript.IsSilent(segments) {
+		// A silent chunk still writes its marker, but saying so every thirty
+		// seconds would bury the lines that carry information under the quietest
+		// thing the recorder does.
+		r.Logger.Debug("chunk held no speech", "captured_at", capturedAt)
+		return
+	}
+	r.Logger.Info("attributed audio", "segments", len(rows), "method", string(segments[0].Method))
+}
+
+// anyTranscriptionFailed reports whether any of the chunk's tracks has no
+// transcript because recognition did not happen.
+func anyTranscriptionFailed(results []audioChunkResult) bool {
+	for _, result := range results {
+		if result.failed {
+			return true
+		}
+	}
+	return false
+}
+
+func buildTrack(result audioChunkResult) *transcript.Track {
+	return &transcript.Track{
+		Source:    result.frame.Source,
+		StartedAt: result.frame.StartedAt,
+		Text:      result.transcription.Text,
+		Segments:  result.transcription.Segments,
+	}
+}
+
+// measureInternalEnergy reads the system track's WAV when the verdict could turn
+// on whether it was silent or merely untranscribable, which is what
+// transcript.NeedsInternalEnergy decides — the rule lives there so this and the
+// backfill skip exactly the same chunks.
+func (r *Recorder) measureInternalEnergy(chunk *transcript.Chunk, systemPath string) {
+	if systemPath == "" || !transcript.NeedsInternalEnergy(*chunk) {
+		return
+	}
+	envelope, _, err := wav.ReadEnvelope(systemPath, transcript.EnvelopeWindowMS)
+	if err != nil {
+		// Without the measurement the microphone stays confidently external,
+		// which is the pre-existing behaviour rather than a new risk.
+		r.Logger.Debug("could not measure system audio energy", "error", err)
+		return
+	}
+	chunk.System.Envelope = envelope
+	chunk.System.EnvelopeWindowMS = transcript.EnvelopeWindowMS
 }
 
 // preservationContext gives already-written media a short, cancellation-free
@@ -386,13 +590,81 @@ func preservationContext(ctx context.Context) (context.Context, context.CancelFu
 	return context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 }
 
-func audioMetadata(source, captureError string, processErr error) json.RawMessage {
-	metadata := map[string]string{"audio_source": source}
+// audioAttributionSample is what a chunk could learn about its own provenance:
+// which application the user was working in, and which processes held an active
+// audio output stream. They answer different questions and routinely disagree —
+// a call recorded while the user takes notes elsewhere is the ordinary case — so
+// neither substitutes for the other.
+type audioAttributionSample struct {
+	screen     ScreenContext
+	screenErr  error
+	outputs    []AudioProcess
+	outputsErr error
+}
+
+// audioAttribution samples both attribution sources once per chunk. It is
+// called after the chunk has closed and before its tracks are indexed, so a
+// slow read delays indexing rather than capture — the stream keeps recording
+// throughout.
+//
+// Both reads run under preservationContext, for the same reason the inserts
+// below do: the chunk's audio already exists, and these describe it. Using the
+// cancelled context cost the last chunk of every recording its attribution —
+// the shutdown chunk is finalised and indexed precisely so it is not lost, and
+// a sub-millisecond "what is focused" read has no reason to be the one thing
+// that gives up on it.
+//
+// Neither read can fail the chunk. An error is carried into metadata and the
+// corresponding field is simply left empty, because captured media is never
+// lost to a downstream failure.
+func (r *Recorder) audioAttribution(ctx context.Context) audioAttributionSample {
+	sampleCtx, cancel := preservationContext(ctx)
+	defer cancel()
+	var sample audioAttributionSample
+	if r.Context != nil {
+		sample.screen, sample.screenErr = r.Context.Snapshot(sampleCtx)
+	}
+	if r.AudioOutputs != nil {
+		sample.outputs, sample.outputsErr = r.AudioOutputs.Active(sampleCtx)
+	}
+	return sample
+}
+
+func audioMetadata(source, captureError string, processErr error,
+	attribution audioAttributionSample) json.RawMessage {
+	metadata := map[string]any{"audio_source": source}
 	if captureError != "" {
 		metadata["capture_error"] = captureError
 	}
 	if processErr != nil {
 		metadata["processor_error"] = processErr.Error()
+	}
+	// app_source and attribution_source keep exactly the meanings they carry on
+	// screen rows: which source named the application, and which supplied the
+	// window title. They differ routinely, and merging them would change what
+	// attribution_source means for every row already indexed.
+	if attribution.screen.AppSource != "" {
+		metadata["app_source"] = attribution.screen.AppSource
+	}
+	if attribution.screen.TitleSource != "" {
+		metadata["attribution_source"] = attribution.screen.TitleSource
+	}
+	switch {
+	case attribution.screenErr != nil:
+		metadata["accessibility_error"] = attribution.screenErr.Error()
+	case attribution.screen.AccessibilityError != "":
+		metadata["accessibility_error"] = attribution.screen.AccessibilityError
+	}
+	// An empty list is omitted rather than written as []. Absent means no
+	// process held an output stream, which is a finding;
+	// active_audio_output_processes_error means Lumi could not tell, which is
+	// the opposite one. Absence carries that meaning only because the recorder
+	// is always constructed with an AudioOutputs source; see Recorder.
+	if len(attribution.outputs) > 0 {
+		metadata["active_audio_output_processes"] = attribution.outputs
+	}
+	if attribution.outputsErr != nil {
+		metadata["active_audio_output_processes_error"] = attribution.outputsErr.Error()
 	}
 	data, err := json.Marshal(metadata)
 	if err != nil {

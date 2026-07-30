@@ -129,8 +129,11 @@ type AttributionHealthReport struct {
 // diagnoses a live capture problem: TCC can report Accessibility as granted from
 // a fresh process while a long-running recorder has been failing for a day.
 //
-// Only screen events are counted — audio chunks carry no app by design and would
-// otherwise drag the ratio toward "broken" on a healthy index.
+// Only screen events are counted. Audio chunks carry an app too, but counting
+// them would measure a different thing badly: each chunk contributes two rows,
+// so a quiet hour of recording would outvote the screen signal, and an audio
+// attribution failure would be reported as a screen capture problem. The
+// remedy this report exists to recommend is about the screen path.
 //
 // LastAttributed is deliberately unbounded by `since`. Scoping it to the window
 // would make it unknown exactly when the outage is longer than the window, which
@@ -168,8 +171,9 @@ FROM events WHERE kind = ? AND captured_at >= ?`
 // filter everything away.
 //
 // Rows with an empty app are grouped under an explicit empty entry rather than
-// dropped: audio chunks and screens Accessibility could not attribute are real
-// captured activity, and a gap in attribution is itself information.
+// dropped: events Accessibility could not attribute — plus audio captured
+// before audio rows carried an app at all — are real captured activity, and a
+// gap in attribution is itself information.
 func (s *Store) ListAttribution(ctx context.Context, opts AttributionOptions) ([]Attribution, error) {
 	group := "app"
 	where := make([]string, 0, 3)

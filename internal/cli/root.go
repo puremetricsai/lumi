@@ -51,7 +51,7 @@ func newRootCommand() *cobra.Command {
 		},
 	}
 	cmd.PersistentFlags().StringVar(&a.dataDir, "data-dir", "", "data directory (default: $LUMI_HOME or ~/Library/Application Support/Lumi)")
-	cmd.AddCommand(a.recordCommand(), a.searchCommand(), a.pruneCommand(),
+	cmd.AddCommand(a.recordCommand(), a.searchCommand(), a.transcriptCommand(), a.pruneCommand(),
 		a.doctorCommand(), a.permissionsCommand(), a.nativeSmokeCommand(), a.mcpCommand(),
 		a.transcribeCommand())
 	cmd.AddCommand(&cobra.Command{Use: "version", Short: "Print the Lumi version", Run: func(*cobra.Command, []string) {
@@ -75,6 +75,31 @@ func smokeAccessibilityNote(accessibilityError string) string {
 		return ""
 	}
 	return ", degraded: " + accessibilityError
+}
+
+// smokeAudioOutputNote renders the processes holding an active audio output
+// stream. "none" and a failed read are kept distinct: the first says no process
+// held a stream, the second says Lumi cannot tell — and only the second is a
+// reason to distrust the audio attribution the recorder will write.
+func smokeAudioOutputNote(processes []macosnative.AudioProcess, err error) string {
+	if err != nil {
+		return "unavailable: " + err.Error()
+	}
+	if len(processes) == 0 {
+		return "none"
+	}
+	named := make([]string, 0, len(processes))
+	for _, process := range processes {
+		name := process.Name
+		if name == "" {
+			name = process.BundleID
+		}
+		if name == "" {
+			name = "unnamed"
+		}
+		named = append(named, fmt.Sprintf("%s (pid=%d)", name, process.PID))
+	}
+	return strings.Join(named, ", ")
 }
 
 func (a *app) openStore(ctx context.Context) (*store.Store, config.Paths, error) {
@@ -155,10 +180,11 @@ func (a *app) runForeground(cmd *cobra.Command, f recordFlags) error {
 	recorder := capture.Recorder{
 		Store: s, Paths: paths, ScreenInterval: f.interval, AudioChunk: f.audioChunk,
 		CaptureScreen: !f.noScreen, CaptureAudio: !f.noAudio, Logger: logger,
-		Screen:  capture.NativeScreens{},
-		Text:    capture.VisionText{},
-		Context: capture.AccessibilityContext{},
-		Audio:   capture.NativeAudio{},
+		Screen:       capture.NativeScreens{},
+		Text:         capture.VisionText{},
+		Context:      capture.AccessibilityContext{},
+		Audio:        capture.NativeAudio{},
+		AudioOutputs: capture.NativeAudioOutputs{},
 		Transcriber: capture.NativeSpeech{
 			Locale:     f.speechLocale,
 			Vocabulary: &vocabulary.Loader{Path: paths.Vocabulary},
@@ -591,6 +617,7 @@ func (a *app) nativeSmokeCommand() *cobra.Command {
 				return err
 			}
 			sources := make(map[string]bool)
+			anchors := make([]string, 0, len(audio))
 			for _, frame := range audio {
 				contents, err := os.ReadFile(frame.Path)
 				if err != nil {
@@ -600,6 +627,17 @@ func (a *app) nativeSmokeCommand() *cobra.Command {
 					return fmt.Errorf("%s audio smoke output is not a WAV file", frame.Source)
 				}
 				sources[frame.Source] = true
+				// A track that wrote a file but reported no start anchor leaves
+				// its timings unplaceable against the other track's, so this is
+				// a failure rather than a note. It is also the only place the
+				// ObjC writer change is exercisable by hand.
+				if frame.StartedAtUnixNS == 0 {
+					return fmt.Errorf("%s audio smoke output carries no start anchor", frame.Source)
+				}
+				anchors = append(anchors, fmt.Sprintf("%s started=%s pts=%dns measured=%dms",
+					frame.Source,
+					time.Unix(0, frame.StartedAtUnixNS).UTC().Format(time.RFC3339Nano),
+					frame.SessionStartPTSNS, frame.MeasuredDurationMS))
 			}
 			if !sources["system"] || !sources["microphone"] {
 				return fmt.Errorf("native audio smoke test requires system and microphone outputs, got %v", sources)
@@ -612,17 +650,27 @@ func (a *app) nativeSmokeCommand() *cobra.Command {
 			if frontmost.Agree {
 				agreement = "agree"
 			}
+			// The output-stream list is reported and never asserted. An empty set
+			// is the correct answer when nothing holds a stream, so failing on it
+			// would make the smoke test depend on whether the operator happened to
+			// have audio running — the same reasoning that keeps the frontmost
+			// diagnostic above reported rather than compared.
+			audioOutputs, audioOutputsErr := macosnative.AudioProcesses(cmd.Context())
 			fmt.Fprintf(cmd.OutOrStdout(),
 				"native capture ok: %d displays, app %q via %s, window %q via %s (AX trusted=%s%s), "+
 					"Vision ok, system audio ok, microphone ok\n"+
 					"frontmost: Accessibility pid=%d %q | NSWorkspace pid=%d %q | "+
-					"window list pid=%d %q | resolved %q via %s (%s)\n",
+					"window list pid=%d %q | resolved %q via %s (%s)\n"+
+					"audio timing: %s\n"+
+					"active audio output: %s\n",
 				len(frames), snapshot.App, snapshot.AppSource, snapshot.Window, snapshot.TitleSource,
 				trusted, smokeAccessibilityNote(snapshot.Error),
 				frontmost.Accessibility.PID, frontmost.Accessibility.App,
 				frontmost.Workspace.PID, frontmost.Workspace.App,
 				frontmost.WindowList.PID, frontmost.WindowList.App,
-				frontmost.Resolved.App, frontmost.Resolved.AppSource, agreement)
+				frontmost.Resolved.App, frontmost.Resolved.AppSource, agreement,
+				strings.Join(anchors, " | "),
+				smokeAudioOutputNote(audioOutputs, audioOutputsErr))
 			return nil
 		},
 	}

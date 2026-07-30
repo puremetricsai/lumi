@@ -261,8 +261,53 @@ func (h *handlers) searchEvents(ctx context.Context, _ *sdk.CallToolRequest, in 
 				"speech in audio_origin, and collapse_audio_tracks: false returns them unmerged",
 			collapsed))
 	}
+	// An audio hit is a 30-second window of one track, which reads poorly as
+	// conversation: the machine's speech still appears in both tracks here, and
+	// a turn spanning two windows arrives as two results. Point at the tool that
+	// answers those, but only when it would actually have something to show.
+	if h.hasAttributedAudio(ctx, events) {
+		parts = append(parts, "some results are audio: get_transcript returns these as one ordered "+
+			"conversation with per-turn origin labels and the machine's own speech deduplicated")
+	}
 	out.Notice = strings.Join(parts, "; ")
 	return nil, out, nil
+}
+
+// hasAttributedAudio reports whether any returned audio event's chunk holds
+// attributed speech, so the transcript hint is never offered for a range where
+// get_transcript would come back empty.
+//
+// It asks for speech rather than for coverage: a chunk of pure silence is
+// attributed — that is what makes the backfill queue drain — but has nothing to
+// show, and pointing an agent at an empty transcript costs it a round trip to
+// learn nothing.
+//
+// It reads the store events rather than the records rendered from them: the
+// timestamps are already time.Time there, and recovering them by re-parsing this
+// package's own output would make the hint quietly depend on how EventRecord
+// happens to format a time.
+//
+// A failure to answer costs the hint, never the search, so there is no error to
+// return: the results are assembled and correct, and it can only come from the
+// database they were just read out of.
+func (h *handlers) hasAttributedAudio(ctx context.Context, events []store.Event) bool {
+	var earliest, latest time.Time
+	for _, event := range events {
+		if event.Kind != store.KindAudio {
+			continue
+		}
+		if earliest.IsZero() || event.CapturedAt.Before(earliest) {
+			earliest = event.CapturedAt
+		}
+		if event.CapturedAt.After(latest) {
+			latest = event.CapturedAt
+		}
+	}
+	if earliest.IsZero() {
+		return false
+	}
+	attributed, err := h.store.HasSpeechSegments(ctx, earliest, latest)
+	return err == nil && attributed
 }
 
 // annotateAudio fills audio_origin and audio_tracks on the collapsed audio
@@ -393,10 +438,18 @@ type AttributionRecord struct {
 }
 
 type listAppsInput struct {
-	App   *string `json:"app,omitempty" jsonschema:"omit to list applications; set it to list the window titles seen for that one application, including \"\" for events with no attribution"`
-	Since string  `json:"since,omitempty" jsonschema:"earliest capture time: an RFC3339 timestamp, or a duration such as 24h meaning that long ago"`
-	Until string  `json:"until,omitempty" jsonschema:"latest capture time, in the same forms as since"`
-	Limit int     `json:"limit,omitempty" jsonschema:"maximum rows to return; defaults to 50 and is capped at 500"`
+	App *string `json:"app,omitempty" jsonschema:"omit to list applications; set it to list the window titles seen for that one application, including \"\" for events with no attribution"`
+	// Kind exists because an app's total sums two modalities whose relationship
+	// to that app differs. Both name the focused application — a screen event's
+	// text is full-display OCR that can carry other applications' windows, and
+	// one focused-window snapshot is stamped onto every display's frame — but an
+	// audio chunk's app is only what happened to be focused when the chunk
+	// closed, which is routinely not what made the sound. Summed, the counts read
+	// as one signal and an agent filtering search_events by an app gets both.
+	Kind  string `json:"kind,omitempty" jsonschema:"restrict the counts to \"screen\" or \"audio\"; omit for both. Both kinds name the focused application rather than the source of the content, so this reveals how much of an app's total is each"`
+	Since string `json:"since,omitempty" jsonschema:"earliest capture time: an RFC3339 timestamp, or a duration such as 24h meaning that long ago"`
+	Until string `json:"until,omitempty" jsonschema:"latest capture time, in the same forms as since"`
+	Limit int    `json:"limit,omitempty" jsonschema:"maximum rows to return; defaults to 50 and is capped at 500"`
 }
 
 type listAppsOutput struct {
@@ -407,10 +460,19 @@ type listAppsOutput struct {
 // listApps reports which applications and window titles the index actually
 // holds. Without it an agent guesses app filter values from the user's wording
 // and silently filters everything away.
+//
+// The kind parameter is what keeps that discovery honest now that audio chunks
+// carry an app: search_events applies its app filter across both kinds, so an
+// app whose total is mostly audio will return sound that the application never
+// produced. Reporting the split is the difference between an agent knowing that
+// and inferring it from results that look legitimate.
 func (h *handlers) listApps(ctx context.Context, _ *sdk.CallToolRequest, in listAppsInput) (*sdk.CallToolResult, listAppsOutput, error) {
 	var empty listAppsOutput
 	opts := store.AttributionOptions{App: in.App, Limit: in.Limit}
 	var err error
+	if opts.Kind, err = parseKind(in.Kind); err != nil {
+		return nil, empty, err
+	}
 	if opts.Since, err = parseTimestamp("since", in.Since); err != nil {
 		return nil, empty, err
 	}
@@ -432,8 +494,15 @@ func (h *handlers) listApps(ctx context.Context, _ *sdk.CallToolRequest, in list
 		})
 	}
 	if len(out.Entries) == 0 {
-		if out.Notice, err = h.noResultNotice(ctx,
-			"no activity in this range; try widening since and until"); err != nil {
+		// A kind that matched nothing needs the opposite remedy from a range that
+		// did, so naming only the range would send the agent to widen a window
+		// that was never the cause.
+		filtered := "no activity in this range; try widening since and until"
+		if opts.Kind != "" {
+			filtered = fmt.Sprintf(
+				"no %s activity in this range; try omitting kind, or widening since and until", opts.Kind)
+		}
+		if out.Notice, err = h.noResultNotice(ctx, filtered); err != nil {
 			return nil, empty, err
 		}
 	}

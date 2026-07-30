@@ -72,6 +72,37 @@ CREATE INDEX IF NOT EXISTS events_display_captured_at_idx
 CREATE INDEX IF NOT EXISTS events_audio_source_captured_at_idx
   ON events(audio_source, captured_at DESC);`,
 	},
+	{
+		Version: 4,
+		SQL: `
+CREATE TABLE IF NOT EXISTS audio_segments (
+  id INTEGER PRIMARY KEY,
+  event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+  captured_at TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  origin TEXT NOT NULL,
+  source_track TEXT NOT NULL,
+  text TEXT NOT NULL DEFAULT '',
+  started_at TEXT,
+  ended_at TEXT,
+  start_offset_ms INTEGER,
+  end_offset_ms INTEGER,
+  runs_json TEXT NOT NULL DEFAULT '',
+  is_bleed INTEGER NOT NULL DEFAULT 0,
+  confidence REAL NOT NULL DEFAULT 0,
+  order_confidence TEXT NOT NULL DEFAULT 'sequence',
+  method TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  UNIQUE (event_id, seq)
+);
+CREATE INDEX IF NOT EXISTS audio_segments_chunk_idx
+  ON audio_segments(captured_at, seq);
+CREATE INDEX IF NOT EXISTS audio_segments_origin_idx
+  ON audio_segments(origin, captured_at);
+CREATE TRIGGER IF NOT EXISTS audio_segments_event_ad AFTER DELETE ON events BEGIN
+  DELETE FROM audio_segments WHERE event_id = old.id;
+END;`,
+	},
 }
 
 // runMigrations applies every migration whose version exceeds the database's

@@ -29,7 +29,7 @@ func connect(t *testing.T, ctx context.Context, s *store.Store) *sdk.ClientSessi
 	return clientSession
 }
 
-func TestServerAdvertisesAllThreeToolsWithSchemas(t *testing.T) {
+func TestServerAdvertisesEveryToolWithSchemas(t *testing.T) {
 	ctx := context.Background()
 	session := connect(t, ctx, testStore(t))
 
@@ -47,7 +47,7 @@ func TestServerAdvertisesAllThreeToolsWithSchemas(t *testing.T) {
 			t.Fatalf("tool %q has no generated input schema", tool.Name)
 		}
 	}
-	for _, want := range []string{"search_events", "get_event", "list_apps"} {
+	for _, want := range []string{"search_events", "get_event", "list_apps", "get_transcript"} {
 		if !found[want] {
 			t.Fatalf("tool %q was not advertised; got %v", want, found)
 		}

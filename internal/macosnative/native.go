@@ -4,9 +4,10 @@ package macosnative
 
 /*
 #cgo CFLAGS: -fblocks -fobjc-arc
-#cgo LDFLAGS: -framework AppKit -framework ApplicationServices -framework AudioToolbox -framework AVFoundation -framework CoreGraphics -framework CoreMedia -framework CoreVideo -framework Foundation -framework ImageIO -framework IOKit -framework ScreenCaptureKit -framework UniformTypeIdentifiers -framework Vision -L${SRCDIR} -llumispeech -framework Speech
+#cgo LDFLAGS: -framework AppKit -framework ApplicationServices -framework AudioToolbox -framework AVFoundation -framework CoreAudio -framework CoreGraphics -framework CoreMedia -framework CoreVideo -framework Foundation -framework ImageIO -framework IOKit -framework ScreenCaptureKit -framework UniformTypeIdentifiers -framework Vision -L${SRCDIR} -llumispeech -framework Speech
 #include <stdlib.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 char *lumi_capture_screens_json(const char *directory, const char *prefix, char **error_message);
 char *lumi_accessibility_snapshot_json(char **error_message);
@@ -20,9 +21,14 @@ char *lumi_vision_recognize(const char *image_path, char **error_message);
 char *lumi_permissions_json(char **error_message);
 char *lumi_hid_access_name(int access);
 char *lumi_request_permissions_json(bool input_monitoring, char **error_message);
-char *lumi_record_audio_json(const char *directory, const char *prefix, double duration_seconds, char **error_message);
+char *lumi_audio_processes_json(char **error_message);
+int64_t lumi_audio_session_start(const char *directory, const char *prefix, double chunk_seconds, char **error_message);
+char *lumi_audio_session_next_json(int64_t handle, double timeout_seconds, char **error_message);
+void lumi_audio_session_stop(int64_t handle);
+void lumi_audio_session_close(int64_t handle);
 void lumi_os_version(int *major, int *minor, int *patch);
 char *lumi_transcribe_audio_string(const char *audio_path, const char *locale, const char *vocabulary_json, double timeout_seconds, char **error_message);
+char *lumi_transcribe_audio_segments_json(const char *audio_path, const char *locale, const char *vocabulary_json, double timeout_seconds, char **error_message);
 char *lumi_speech_ensure_assets(const char *locale, double timeout_seconds, char **error_message);
 int lumi_speech_assets_installed(const char *locale);
 */
@@ -33,6 +39,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 	"unsafe"
 )
@@ -105,10 +112,64 @@ type Permissions struct {
 }
 
 type AudioFrame struct {
-	Path         string `json:"path"`
-	Source       string `json:"source"`
+	Path   string `json:"path"`
+	Source string `json:"source"`
+	// DurationMS is the duration that was *requested*, not the duration
+	// captured. Every indexed row carries it with that meaning; use
+	// MeasuredDurationMS to learn what the file actually holds.
 	DurationMS   int64  `json:"duration_ms"`
 	CaptureError string `json:"capture_error,omitempty"`
+	// StartedAtUnixNS is the wall-clock instant of this track's first sample
+	// buffer, which is the only sound anchor for its file-relative timings. It
+	// is per track, and so sits a track's worth of skew away from the chunk
+	// boundary both tracks share. Zero means the native side reported none.
+	StartedAtUnixNS int64 `json:"started_at_unix_ns,omitempty"`
+	// SessionStartPTSNS is the first sample buffer's presentation timestamp.
+	// Both tracks come from one SCStream, so their PTS values share a host
+	// timebase and the difference between them is the exact skew between the
+	// two files' t=0. Zero means the native side reported none.
+	SessionStartPTSNS int64 `json:"session_start_pts_ns,omitempty"`
+	// MeasuredDurationMS is the span actually written, from the first sample
+	// buffer to the last. Zero means the native side reported none.
+	MeasuredDurationMS int64 `json:"measured_duration_ms,omitempty"`
+}
+
+// AudioProcess is one application holding an active audio output stream.
+// BundleID and Name are omitted by the native side when they could not be
+// resolved, so a process with only a PID is a real answer rather than a
+// malformed one — it still held a stream.
+type AudioProcess struct {
+	PID      int32  `json:"pid"`
+	BundleID string `json:"bundle_id,omitempty"`
+	Name     string `json:"name,omitempty"`
+}
+
+// AudioProcesses lists the processes holding an active audio output stream at
+// this instant. An empty slice means none did, which is an answer and not a
+// failure.
+//
+// It reports stream occupancy rather than audible sound: a paused player still
+// answers yes. CoreAudio exposes no per-process level, so nothing stronger is
+// available without a tap.
+//
+// This reads CoreAudio's process objects; it never opens a tap, so it captures
+// no audio and needs no grant beyond what the process already holds. Callers
+// filter it — notably of their own pid, which the audio session excludes from
+// the recording anyway.
+func AudioProcesses(ctx context.Context) ([]AudioProcess, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var nativeErr *C.char
+	result, err := nativeJSON(C.lumi_audio_processes_json(&nativeErr), nativeErr)
+	if err != nil {
+		return nil, err
+	}
+	var processes []AudioProcess
+	if err := json.Unmarshal(result, &processes); err != nil {
+		return nil, fmt.Errorf("decode audio process list: %w", err)
+	}
+	return processes, nil
 }
 
 func CaptureScreens(ctx context.Context, directory, prefix string) ([]ScreenFrame, error) {
@@ -226,10 +287,79 @@ func RecognizeText(ctx context.Context, imagePath string) (string, error) {
 	return result, nil
 }
 
+// SpeechRun is one timed span inside a segment — in practice a single word. The
+// bridge drops runs whose time range will not resolve, so a segment's runs need
+// not concatenate back to its Text; Text is always the authority.
+type SpeechRun struct {
+	StartMS int64  `json:"start_ms"`
+	EndMS   int64  `json:"end_ms"`
+	Text    string `json:"text"`
+	// Confidence is the recognizer's own per-run score. Zero means it reported
+	// none, which is not the same as low confidence.
+	Confidence float64 `json:"confidence,omitempty"`
+}
+
+// SpeechSegment is one transcriber result: a phrase with a measured span.
+//
+// StartMS/EndMS are the union of the segment's run intervals, deliberately not
+// the transcriber's own result range — that range extends to the finalization
+// boundary and was measured overstating speech extent roughly tenfold, which
+// would attribute overlap to microphone speech that merely sat nearby.
+//
+// A segment with empty Text and no Runs is meaningful rather than noise: it says
+// audio was present across this span but no words resolved.
+type SpeechSegment struct {
+	StartMS    int64       `json:"start_ms"`
+	EndMS      int64       `json:"end_ms"`
+	Text       string      `json:"text"`
+	Confidence float64     `json:"confidence,omitempty"`
+	Runs       []SpeechRun `json:"runs,omitempty"`
+}
+
+// Transcription is a WAV's transcript plus its timed segments. Text is the
+// segments' text concatenated with no separator, byte-identical to what
+// TranscribeAudio returns for the same file — both go through one native path.
+type Transcription struct {
+	Text     string          `json:"text"`
+	Segments []SpeechSegment `json:"segments"`
+}
+
 // TranscribeAudio transcribes a WAV file with on-device SpeechAnalyzer. Terms
 // bias recognition toward phrases outside the general lexicon; an empty list
 // applies no context at all, leaving behaviour identical to no vocabulary.
 func TranscribeAudio(ctx context.Context, audioPath, locale string, terms []string) (string, error) {
+	return transcribeNative(ctx, audioPath, locale, terms,
+		func(pathC, localeC, vocabularyC *C.char, timeout C.double, nativeErr **C.char) *C.char {
+			return C.lumi_transcribe_audio_string(pathC, localeC, vocabularyC, timeout, nativeErr)
+		})
+}
+
+// TranscribeAudioSegments transcribes a WAV file and returns the transcript
+// together with per-phrase spans and per-word timings. It shares the native ASR
+// path with TranscribeAudio, so the transcripts cannot diverge and vocabulary
+// biasing applies identically to both.
+func TranscribeAudioSegments(ctx context.Context, audioPath, locale string, terms []string) (Transcription, error) {
+	raw, err := transcribeNative(ctx, audioPath, locale, terms,
+		func(pathC, localeC, vocabularyC *C.char, timeout C.double, nativeErr **C.char) *C.char {
+			return C.lumi_transcribe_audio_segments_json(pathC, localeC, vocabularyC, timeout, nativeErr)
+		})
+	if err != nil {
+		return Transcription{}, err
+	}
+	var result Transcription
+	if err := json.Unmarshal([]byte(raw), &result); err != nil {
+		return Transcription{}, fmt.Errorf("decode native transcription result: %w", err)
+	}
+	return result, nil
+}
+
+// transcribeNative runs one of the two Swift entry points on its own goroutine so
+// a cancelled context returns promptly even though the native call itself cannot
+// be interrupted. Both callers share it to keep cancellation, timeout, and
+// vocabulary encoding identical.
+func transcribeNative(ctx context.Context, audioPath, locale string, terms []string,
+	call func(pathC, localeC, vocabularyC *C.char, timeout C.double, nativeErr **C.char) *C.char,
+) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
@@ -249,7 +379,7 @@ func TranscribeAudio(ctx context.Context, audioPath, locale string, terms []stri
 		vocabularyC := C.CString(vocabularyJSON)
 		var nativeErr *C.char
 		result, err := nativeString(
-			C.lumi_transcribe_audio_string(pathC, localeC, vocabularyC, C.double(timeout.Seconds()), &nativeErr), nativeErr)
+			call(pathC, localeC, vocabularyC, C.double(timeout.Seconds()), &nativeErr), nativeErr)
 		C.free(unsafe.Pointer(pathC))
 		C.free(unsafe.Pointer(localeC))
 		C.free(unsafe.Pointer(vocabularyC))
@@ -362,7 +492,45 @@ func RequestPermissions(ctx context.Context, inputMonitoring bool) (Permissions,
 	return permissions, nil
 }
 
-func RecordAudio(ctx context.Context, directory, prefix string, durationSeconds float64) ([]AudioFrame, error) {
+// AudioChunk is one slice of a continuously running capture session. A read
+// returns a chunk (Frames), nothing yet (neither), or the end of the session
+// (Closed). The native layer also reports a poll timeout, which is decoded away
+// deliberately: "no chunk yet" and "no chunk yet, and the poll expired" call for
+// the same thing from every caller, and a field nobody branches on invites one.
+type AudioChunk struct {
+	// StartedAtUnixNS is the wall clock of this chunk's boundary, derived by
+	// offsetting the session anchor rather than by reading the clock at
+	// rotation, so consecutive chunks are exactly one chunk duration apart and
+	// the grid cannot drift over a recording of any length.
+	//
+	// Because a sample buffer is never split, the chunk's first sample can sit
+	// up to one buffer (~100ms) before its boundary. That offset is bounded and
+	// does not accumulate, and a caller needing the sample-accurate instant has
+	// each track's own StartedAtUnixNS. The alternative — stamping the chunk
+	// from its first sample — would be exact but jittery, and would give up the
+	// uniform spacing that makes coverage arithmetic exact.
+	StartedAtUnixNS int64        `json:"started_at_unix_ns"`
+	Frames          []AudioFrame `json:"frames"`
+	Closed          bool         `json:"closed"`
+	// CaptureError is set alongside Closed when the stream ended because
+	// ScreenCaptureKit failed rather than because it was stopped.
+	CaptureError string `json:"capture_error,omitempty"`
+}
+
+// AudioSession is one continuously open ScreenCaptureKit audio stream, sliced
+// into chunks by presentation timestamp. Holding the stream open is the whole
+// point: stopping and restarting it per chunk left roughly two seconds of every
+// thirty uncaptured, and the loss landed mid-sentence.
+type AudioSession struct {
+	handle C.int64_t
+
+	mu     sync.Mutex
+	closed bool
+}
+
+// StartAudioSession opens the stream. Files are named by chunk ordinal under
+// prefix, because the session opens them before any caller has seen the chunk.
+func StartAudioSession(ctx context.Context, directory, prefix string, chunkSeconds float64) (*AudioSession, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -371,19 +539,90 @@ func RecordAudio(ctx context.Context, directory, prefix string, durationSeconds 
 	defer C.free(unsafe.Pointer(directoryC))
 	defer C.free(unsafe.Pointer(prefixC))
 	var nativeErr *C.char
-	result, err := nativeJSON(C.lumi_record_audio_json(
-		directoryC, prefixC, C.double(durationSeconds), &nativeErr), nativeErr)
+	handle := C.lumi_audio_session_start(directoryC, prefixC, C.double(chunkSeconds), &nativeErr)
+	if handle == 0 {
+		if err := nativeError(nativeErr); err != nil {
+			return nil, fmt.Errorf("start ScreenCaptureKit audio session: %w", err)
+		}
+		return nil, errors.New("start ScreenCaptureKit audio session")
+	}
+	return &AudioSession{handle: handle}, nil
+}
+
+// Next waits up to timeout for the next finished chunk. It reports queued chunks
+// even after Stop, so cancelling a recording never discards audio that was
+// already captured.
+func (s *AudioSession) Next(timeout time.Duration) (AudioChunk, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return AudioChunk{Closed: true}, nil
+	}
+	var nativeErr *C.char
+	result, err := nativeJSON(
+		C.lumi_audio_session_next_json(s.handle, C.double(timeout.Seconds()), &nativeErr), nativeErr)
+	if err != nil {
+		return AudioChunk{}, err
+	}
+	var chunk AudioChunk
+	if err := json.Unmarshal(result, &chunk); err != nil {
+		return AudioChunk{}, fmt.Errorf("decode native audio chunk: %w", err)
+	}
+	return chunk, nil
+}
+
+// Stop ends capture and finalises the chunk in flight, which then arrives from
+// Next like any other. It is safe to call more than once.
+func (s *AudioSession) Stop() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	C.lumi_audio_session_stop(s.handle)
+}
+
+// Close stops the session and releases it. Chunks still queued are dropped, so
+// callers that care about them drain with Next after Stop first.
+func (s *AudioSession) Close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	s.closed = true
+	C.lumi_audio_session_close(s.handle)
+}
+
+// RecordAudio captures a single chunk and stops, which is what the native smoke
+// test wants. It runs on the same session the recorder uses so there is only one
+// capture path to keep correct.
+func RecordAudio(ctx context.Context, directory, prefix string, durationSeconds float64) ([]AudioFrame, error) {
+	session, err := StartAudioSession(ctx, directory, prefix, durationSeconds)
 	if err != nil {
 		return nil, err
 	}
-	var frames []AudioFrame
-	if err := json.Unmarshal(result, &frames); err != nil {
-		return nil, fmt.Errorf("decode native audio capture result: %w", err)
+	defer session.Close()
+	deadline := time.Now().Add(time.Duration(durationSeconds*float64(time.Second)) + 30*time.Second)
+	for time.Now().Before(deadline) {
+		if ctx.Err() != nil {
+			session.Stop()
+		}
+		chunk, err := session.Next(250 * time.Millisecond)
+		if err != nil {
+			return nil, err
+		}
+		if len(chunk.Frames) > 0 {
+			return chunk.Frames, nil
+		}
+		if chunk.Closed {
+			if chunk.CaptureError != "" {
+				return nil, fmt.Errorf("ScreenCaptureKit audio capture stopped: %s", chunk.CaptureError)
+			}
+			break
+		}
 	}
-	if len(frames) == 0 {
-		return nil, errors.New("ScreenCaptureKit returned no audio")
-	}
-	return frames, nil
+	return nil, errors.New("ScreenCaptureKit returned no audio")
 }
 
 func OSVersion() (major, minor, patch int, err error) {
@@ -414,6 +653,16 @@ func nativeJSON(value, errorMessage *C.char) ([]byte, error) {
 		return nil, err
 	}
 	return []byte(text), nil
+}
+
+// nativeError consumes an error message from a native call that reports failure
+// some way other than by returning NULL, and always frees it.
+func nativeError(errorMessage *C.char) error {
+	if errorMessage == nil {
+		return nil
+	}
+	defer C.free(unsafe.Pointer(errorMessage))
+	return errors.New(C.GoString(errorMessage))
 }
 
 func nativeString(value, errorMessage *C.char) (string, error) {

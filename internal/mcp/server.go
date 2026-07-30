@@ -69,8 +69,35 @@ func newServer(s *store.Store, opts Options) *sdk.Server {
 		Name: "list_apps",
 		Description: "List the applications the user's activity was captured from, most active first, " +
 			"or — with app set — the window titles seen for one application. " +
-			"Call this before filtering by app so the filter values are real ones rather than guesses.",
+			"Call this before filtering by app so the filter values are real ones rather than guesses. " +
+			"Every app named here is what the user was focused on, never what produced the content: " +
+			"screen text is full-display OCR that can include other applications' windows, and an audio " +
+			"chunk's app is whatever was focused while it recorded, not the source of the sound. " +
+			"Counts span both kinds unless kind narrows them; check the split before filtering " +
+			"search_events by an app, since that filter spans both too.",
 	}, h.listApps)
+
+	sdk.AddTool(server, &sdk.Tool{
+		Name: "get_transcript",
+		Description: "Read captured audio as one ordered conversation instead of separate search hits. " +
+			"Lumi records two audio tracks, so this labels every turn by where the sound came from: " +
+			"\"internal\" is sound this machine produced — the far side of a call, a video, music, " +
+			"a notification — and is NOT necessarily a person; \"external\" is sound the microphone " +
+			"picked up from the room, usually the user; \"unknown\" means machine audio was playing " +
+			"but produced no transcript, so the origin could not be determined. " +
+			"Because the machine's audio also bleeds into the microphone, its words are deduplicated here — " +
+			"a phrase the machine played appears once, not twice as in search_events. " +
+			"Turns are chronological, never ranked by relevance. " +
+			"Every turn carries confidence and order_confidence: order_confidence \"exact\" means the " +
+			"position was measured, \"sequence\" means the order is reliable but absolute times are not " +
+			"known, and \"approximate\" means the position was inferred. " +
+			"Turns may overlap in time when both parties spoke at once; those are marked overlaps. " +
+			"A transcript that stops short — because the range held more audio than one call returns, " +
+			"or because max_turns capped it — says so in its notice and returns resume_from: pass that " +
+			"as since to read the next page. Continue from resume_from and not from the last turn's " +
+			"time, which would repeat turns you already have. " +
+			"Use event_ids with get_event to read either track's raw, undeduplicated transcript.",
+	}, h.getTranscript)
 
 	return server
 }

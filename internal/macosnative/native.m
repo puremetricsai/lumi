@@ -2,6 +2,7 @@
 #import <ApplicationServices/ApplicationServices.h>
 #import <AVFoundation/AVFoundation.h>
 #import <AudioToolbox/AudioToolbox.h>
+#import <CoreAudio/CoreAudio.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <ImageIO/ImageIO.h>
 #import <IOKit/hidsystem/IOHIDLib.h>
@@ -861,15 +862,167 @@ char *lumi_request_permissions_json(bool input_monitoring, char **error_message)
     }
 }
 
+// LumiAudioProcessFlag reads one boolean process property, treating an
+// unreadable property as false. A process that will not answer is not evidence
+// that it is playing, and the caller has no better remedy than skipping it.
+static BOOL LumiAudioProcessFlag(AudioObjectID process, AudioObjectPropertySelector selector) {
+    AudioObjectPropertyAddress address = {
+        .mSelector = selector,
+        .mScope = kAudioObjectPropertyScopeGlobal,
+        .mElement = kAudioObjectPropertyElementMain,
+    };
+    UInt32 value = 0;
+    UInt32 size = sizeof(value);
+    if (AudioObjectGetPropertyData(process, &address, 0, NULL, &size, &value) != noErr) {
+        return NO;
+    }
+    return value != 0;
+}
+
+static pid_t LumiAudioProcessPID(AudioObjectID process) {
+    AudioObjectPropertyAddress address = {
+        .mSelector = kAudioProcessPropertyPID,
+        .mScope = kAudioObjectPropertyScopeGlobal,
+        .mElement = kAudioObjectPropertyElementMain,
+    };
+    pid_t pid = 0;
+    UInt32 size = sizeof(pid);
+    if (AudioObjectGetPropertyData(process, &address, 0, NULL, &size, &pid) != noErr) {
+        return 0;
+    }
+    return pid;
+}
+
+static NSString *LumiAudioProcessBundleID(AudioObjectID process) {
+    AudioObjectPropertyAddress address = {
+        .mSelector = kAudioProcessPropertyBundleID,
+        .mScope = kAudioObjectPropertyScopeGlobal,
+        .mElement = kAudioObjectPropertyElementMain,
+    };
+    CFStringRef bundleID = NULL;
+    UInt32 size = sizeof(bundleID);
+    if (AudioObjectGetPropertyData(process, &address, 0, NULL, &size, &bundleID) != noErr ||
+        bundleID == NULL) {
+        return nil;
+    }
+    NSString *value = (__bridge_transfer NSString *)bundleID;
+    return value.length == 0 ? nil : value;
+}
+
+// lumi_audio_processes_json lists the processes holding an active audio output
+// stream. It is what lets a system-track recording name the application that
+// produced it, which no other source can answer: the WAV holds the mixed output
+// graph and carries no provenance of its own.
+//
+// kAudioProcessPropertyIsRunningOutput reports *stream occupancy, not audible
+// sound* — a paused player that still holds its stream open answers yes
+// (measured with QuickTime; the same app with its document closed answers no).
+// That is the strongest claim available here, and the caller's field names say
+// so. The per-process property set is closed — PID, BundleID, Devices,
+// IsRunning, IsRunningInput, IsRunningOutput — and none of it carries level, so
+// establishing real emission would need AudioHardwareCreateProcessTap.
+//
+// This is a *read* of CoreAudio's process objects, never a tap. Nothing here
+// captures audio, which is the distinction that matters for permissions —
+// creating a process tap requires a TCC grant, enumerating the objects does not.
+//
+// Every field but the pid is optional and omitted when absent, matching the
+// audio frame dictionaries. A process with neither a bundle id nor a resolvable
+// name is still reported: it genuinely held a stream, and dropping it would
+// understate what was audible. Filtering belongs to the caller.
+char *lumi_audio_processes_json(char **error_message) {
+    @autoreleasepool {
+        AudioObjectPropertyAddress listAddress = {
+            .mSelector = kAudioHardwarePropertyProcessObjectList,
+            .mScope = kAudioObjectPropertyScopeGlobal,
+            .mElement = kAudioObjectPropertyElementMain,
+        };
+        UInt32 dataSize = 0;
+        OSStatus status = AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &listAddress,
+                                                         0, NULL, &dataSize);
+        if (status != noErr) {
+            if (error_message != NULL) {
+                *error_message = LumiCopyUTF8([NSString stringWithFormat:
+                    @"size CoreAudio process object list: status %d", (int)status]);
+            }
+            return NULL;
+        }
+        NSMutableArray *processes = [NSMutableArray array];
+        UInt32 count = dataSize / (UInt32)sizeof(AudioObjectID);
+        if (count > 0) {
+            AudioObjectID *objects = calloc(count, sizeof(AudioObjectID));
+            if (objects == NULL) {
+                if (error_message != NULL) {
+                    *error_message = LumiCopyUTF8(@"allocate CoreAudio process object list");
+                }
+                return NULL;
+            }
+            status = AudioObjectGetPropertyData(kAudioObjectSystemObject, &listAddress, 0, NULL,
+                                                &dataSize, objects);
+            if (status != noErr) {
+                free(objects);
+                if (error_message != NULL) {
+                    *error_message = LumiCopyUTF8([NSString stringWithFormat:
+                        @"read CoreAudio process object list: status %d", (int)status]);
+                }
+                return NULL;
+            }
+            count = dataSize / (UInt32)sizeof(AudioObjectID);
+            for (UInt32 index = 0; index < count; index++) {
+                AudioObjectID process = objects[index];
+                if (!LumiAudioProcessFlag(process, kAudioProcessPropertyIsRunningOutput)) {
+                    continue;
+                }
+                pid_t pid = LumiAudioProcessPID(process);
+                NSMutableDictionary *entry = [@{@"pid": @(pid)} mutableCopy];
+                NSString *bundleID = LumiAudioProcessBundleID(process);
+                if (bundleID != nil) {
+                    entry[@"bundle_id"] = bundleID;
+                }
+                NSRunningApplication *application =
+                    [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+                NSString *name = application.localizedName;
+                if (name.length > 0) {
+                    entry[@"name"] = name;
+                }
+                [processes addObject:entry];
+            }
+            free(objects);
+        }
+        NSError *jsonError = nil;
+        NSString *json = LumiJSONString(processes, &jsonError);
+        if (json == nil) {
+            if (error_message != NULL) *error_message = LumiCopyError(jsonError);
+            return NULL;
+        }
+        return LumiCopyUTF8(json);
+    }
+}
+
 @interface LumiAudioWriter : NSObject
 @property(nonatomic, strong) AVAssetWriter *writer;
 @property(nonatomic, strong) AVAssetWriterInput *input;
 @property(nonatomic, copy) NSString *path;
 @property(nonatomic, assign) BOOL started;
 @property(nonatomic, strong) NSError *error;
+// sessionStart is the presentation timestamp this writer's session began at.
+// Both tracks are fed from one SCStream, so their PTS values share a host
+// timebase and the difference between these is the exact skew between the two
+// files' t=0 — a value that was previously discarded, leaving cross-track
+// timings incomparable.
+@property(nonatomic, assign) CMTime sessionStart;
+// lastPTSEnd is the end of the most recently appended buffer, so the writer can
+// report the span it actually captured rather than the span that was requested.
+@property(nonatomic, assign) CMTime lastPTSEnd;
+// startedAtUnixNS is the wall clock of the first sample buffer, derived by
+// ageing the host clock rather than by sampling NSDate on arrival, so queue
+// latency does not accumulate into the anchor.
+@property(nonatomic, assign) int64_t startedAtUnixNS;
 - (instancetype)initWithPath:(NSString *)path error:(NSError **)error;
 - (void)appendSampleBuffer:(CMSampleBufferRef)sampleBuffer;
 - (void)finish:(dispatch_group_t)group;
+- (int64_t)measuredDurationMS;
+- (int64_t)sessionStartPTSNS;
 @end
 
 @implementation LumiAudioWriter
@@ -905,17 +1058,50 @@ char *lumi_request_permissions_json(bool input_monitoring, char **error_message)
 
 - (void)appendSampleBuffer:(CMSampleBufferRef)sampleBuffer {
     if (self.error != nil || sampleBuffer == NULL || CMSampleBufferGetNumSamples(sampleBuffer) == 0) return;
+    CMTime pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
     if (!self.started) {
         if (![self.writer startWriting]) {
             self.error = self.writer.error;
             return;
         }
-        [self.writer startSessionAtSourceTime:CMSampleBufferGetPresentationTimeStamp(sampleBuffer)];
+        [self.writer startSessionAtSourceTime:pts];
+        self.sessionStart = pts;
+        // Convert this buffer's PTS to wall clock by measuring how old it
+        // already is against the same host clock it was stamped from, then
+        // subtracting that age from now. Reading NSDate alone would attribute
+        // however long the buffer waited on the capture queue to the audio
+        // itself, and the whole point of this anchor is that it be tight.
+        CMTime hostNow = CMClockGetTime(CMClockGetHostTimeClock());
+        Float64 age = CMTimeGetSeconds(CMTimeSubtract(hostNow, pts));
+        if (!isfinite(age) || age < 0) age = 0;
+        self.startedAtUnixNS = (int64_t)(([[NSDate date] timeIntervalSince1970] - age) * 1e9);
         self.started = YES;
+    }
+    CMTime duration = CMSampleBufferGetDuration(sampleBuffer);
+    CMTime end = CMTIME_IS_NUMERIC(duration) ? CMTimeAdd(pts, duration) : pts;
+    if (!CMTIME_IS_NUMERIC(self.lastPTSEnd) || CMTimeCompare(end, self.lastPTSEnd) > 0) {
+        self.lastPTSEnd = end;
     }
     if (self.input.readyForMoreMediaData && ![self.input appendSampleBuffer:sampleBuffer]) {
         self.error = self.writer.error;
     }
+}
+
+// measuredDurationMS reports the span actually written, or 0 when nothing was.
+- (int64_t)measuredDurationMS {
+    if (!self.started || !CMTIME_IS_NUMERIC(self.sessionStart) || !CMTIME_IS_NUMERIC(self.lastPTSEnd)) return 0;
+    Float64 seconds = CMTimeGetSeconds(CMTimeSubtract(self.lastPTSEnd, self.sessionStart));
+    if (!isfinite(seconds) || seconds <= 0) return 0;
+    return (int64_t)llround(seconds * 1000.0);
+}
+
+// sessionStartPTSNS reports this writer's session start on the shared host
+// timebase, or 0 when nothing was written.
+- (int64_t)sessionStartPTSNS {
+    if (!self.started || !CMTIME_IS_NUMERIC(self.sessionStart)) return 0;
+    Float64 seconds = CMTimeGetSeconds(self.sessionStart);
+    if (!isfinite(seconds)) return 0;
+    return (int64_t)llround(seconds * 1e9);
 }
 
 - (void)finish:(dispatch_group_t)group {
@@ -933,158 +1119,416 @@ char *lumi_request_permissions_json(bool input_monitoring, char **error_message)
 }
 @end
 
-@interface LumiAudioCapture : NSObject <SCStreamOutput, SCStreamDelegate>
+// LumiAudioFrameDictionary renders one track's frame. Beyond the requested
+// duration every row has always carried, it reports the wall clock of the first
+// sample buffer, the session start on the shared host timebase, and the span
+// actually captured — the three values that make one track's file-relative
+// timings comparable with the other's. Each is omitted when the writer never
+// started, so absent and zero stay distinguishable on the Go side.
+static NSMutableDictionary *LumiAudioFrameDictionary(NSString *path, NSString *source,
+                                                     int64_t requestedDurationMS,
+                                                     LumiAudioWriter *writer,
+                                                     NSString *captureError) {
+    NSMutableDictionary *frame = [@{@"path": path, @"source": source,
+                                    @"duration_ms": @(requestedDurationMS)} mutableCopy];
+    if (writer.startedAtUnixNS > 0) frame[@"started_at_unix_ns"] = @(writer.startedAtUnixNS);
+    int64_t sessionStart = [writer sessionStartPTSNS];
+    if (sessionStart != 0) frame[@"session_start_pts_ns"] = @(sessionStart);
+    int64_t measured = [writer measuredDurationMS];
+    if (measured > 0) frame[@"measured_duration_ms"] = @(measured);
+    if (captureError.length > 0) frame[@"capture_error"] = captureError;
+    return frame;
+}
+
+// LumiAudioSession keeps one SCStream open for an entire recording and slices it
+// into chunks by presentation timestamp. Cycling the stream once per chunk —
+// start, sleep, stop, finalise the files, start again — left the tap closed for
+// roughly two of every thirty-two seconds, and that loss landed mid-sentence.
+// Rotation runs on the same serial queue the sample buffers arrive on, so the
+// buffer that crosses a boundary opens the next chunk whole instead of falling
+// into a gap between two streams. Nothing here sleeps for a chunk's duration:
+// the reader collects finished chunks while the stream keeps recording, so a
+// slow transcription can no longer cost captured audio either.
+@interface LumiAudioSession : NSObject <SCStreamOutput, SCStreamDelegate>
+@property(nonatomic, strong) SCStream *stream;
+// audioQueue serialises sample delivery and rotation together, which is exactly
+// what makes a rotation atomic with respect to the buffers crossing it.
+@property(nonatomic, strong) dispatch_queue_t audioQueue;
+// finishQueue runs writer finalisation, so closing one chunk never blocks the
+// next chunk's samples behind an AVAssetWriter flush.
+@property(nonatomic, strong) dispatch_queue_t finishQueue;
+// pending counts chunks whose writers have not finished, so the session can
+// report itself drained only once every one of them has been handed over.
+@property(nonatomic, strong) dispatch_group_t pending;
+@property(nonatomic, copy) NSString *directory;
+@property(nonatomic, copy) NSString *prefix;
+@property(nonatomic, assign) double chunkSeconds;
+@property(nonatomic, assign) CMTime chunkDuration;
 @property(nonatomic, strong) LumiAudioWriter *systemWriter;
 @property(nonatomic, strong) LumiAudioWriter *microphoneWriter;
-@property(nonatomic, strong) NSError *streamError;
+@property(nonatomic, assign) NSUInteger chunkIndex;
+@property(nonatomic, assign) BOOL anchored;
+@property(nonatomic, assign) CMTime sessionStartPTS;
+@property(nonatomic, assign) CMTime nextBoundary;
+@property(nonatomic, assign) int64_t sessionStartUnixNS;
+@property(nonatomic, assign) int64_t chunkStartUnixNS;
+@property(atomic, assign) BOOL stopping;
+@property(nonatomic, strong) NSCondition *readyCondition;
+@property(nonatomic, strong) NSMutableArray *ready;
+@property(nonatomic, assign) BOOL drained;
+@property(atomic, strong) NSError *streamError;
 @end
 
-@implementation LumiAudioCapture
+@implementation LumiAudioSession
+
+- (instancetype)initWithDirectory:(NSString *)directory
+                           prefix:(NSString *)prefix
+                     chunkSeconds:(double)chunkSeconds {
+    self = [super init];
+    if (self == nil) return nil;
+    self.directory = directory;
+    self.prefix = prefix;
+    self.chunkSeconds = MAX(0.1, chunkSeconds);
+    // A rational CMTime keeps the boundary exact across thousands of rotations;
+    // accumulating a Float64 would drift the chunk grid over a long recording.
+    self.chunkDuration = CMTimeMakeWithSeconds(self.chunkSeconds, 90000);
+    self.audioQueue = dispatch_queue_create("ai.puremetrics.lumi.audio", DISPATCH_QUEUE_SERIAL);
+    self.finishQueue = dispatch_queue_create("ai.puremetrics.lumi.audio.finish", DISPATCH_QUEUE_SERIAL);
+    self.pending = dispatch_group_create();
+    self.readyCondition = [[NSCondition alloc] init];
+    self.ready = [NSMutableArray array];
+    return self;
+}
+
+- (BOOL)start:(NSError **)error {
+    if (@available(macOS 15.0, *)) {
+        __block SCShareableContent *content = nil;
+        __block NSError *contentError = nil;
+        dispatch_semaphore_t contentReady = dispatch_semaphore_create(0);
+        [SCShareableContent getShareableContentExcludingDesktopWindows:NO
+                                                  onScreenWindowsOnly:NO
+                                                    completionHandler:^(SCShareableContent *shareable, NSError *failure) {
+            content = shareable;
+            contentError = failure;
+            dispatch_semaphore_signal(contentReady);
+        }];
+        if (!LumiWait(contentReady, 10.0, @"enumerate audio capture content", &contentError) ||
+            content.displays.count == 0) {
+            if (error != NULL) {
+                *error = contentError ?: LumiTimeoutError(@"enumerate audio capture content");
+            }
+            return NO;
+        }
+
+        // The first chunk's writers exist before capture starts, so the very
+        // first sample buffer has somewhere to land.
+        [self openWriters];
+
+        SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:content.displays.firstObject
+                                                     excludingApplications:@[] exceptingWindows:@[]];
+        SCStreamConfiguration *configuration = [[SCStreamConfiguration alloc] init];
+        configuration.width = 2;
+        configuration.height = 2;
+        configuration.minimumFrameInterval = CMTimeMake(1, 1);
+        configuration.capturesAudio = YES;
+        configuration.sampleRate = 16000;
+        configuration.channelCount = 1;
+        configuration.excludesCurrentProcessAudio = YES;
+        configuration.captureMicrophone = YES;
+        self.stream = [[SCStream alloc] initWithFilter:filter configuration:configuration delegate:self];
+        NSError *addError = nil;
+        if (![self.stream addStreamOutput:self type:SCStreamOutputTypeAudio
+                       sampleHandlerQueue:self.audioQueue error:&addError] ||
+            ![self.stream addStreamOutput:self type:SCStreamOutputTypeMicrophone
+                       sampleHandlerQueue:self.audioQueue error:&addError]) {
+            if (error != NULL) *error = addError;
+            return NO;
+        }
+
+        __block NSError *startError = nil;
+        dispatch_semaphore_t started = dispatch_semaphore_create(0);
+        [self.stream startCaptureWithCompletionHandler:^(NSError *failure) {
+            startError = failure;
+            dispatch_semaphore_signal(started);
+        }];
+        if (!LumiWait(started, 10.0, @"start ScreenCaptureKit audio", &startError) || startError != nil) {
+            if (error != NULL) *error = startError ?: LumiTimeoutError(@"start ScreenCaptureKit audio");
+            return NO;
+        }
+        return YES;
+    }
+    if (error != NULL) {
+        *error = [NSError errorWithDomain:@"LumiNative" code:21
+                                 userInfo:@{NSLocalizedDescriptionKey:
+                                                @"native microphone capture requires macOS 15 or newer"}];
+    }
+    return NO;
+}
+
+#pragma mark - Capture
+
 - (void)stream:(SCStream *)stream didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
                                                 ofType:(SCStreamOutputType)type {
+    BOOL microphone = NO;
     if (type == SCStreamOutputTypeAudio) {
-        [self.systemWriter appendSampleBuffer:sampleBuffer];
+        microphone = NO;
     } else if (@available(macOS 15.0, *)) {
-        if (type == SCStreamOutputTypeMicrophone) [self.microphoneWriter appendSampleBuffer:sampleBuffer];
+        if (type != SCStreamOutputTypeMicrophone) return;
+        microphone = YES;
+    } else {
+        return;
     }
+    if (self.stopping || sampleBuffer == NULL || CMSampleBufferGetNumSamples(sampleBuffer) == 0) return;
+    CMTime pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+    if (!CMTIME_IS_NUMERIC(pts)) return;
+    if (!self.anchored) [self anchorAtPTS:pts];
+    // A buffer straddling a boundary opens the next chunk rather than being
+    // split, which puts the boundary within one buffer of exact while keeping
+    // every sample on exactly one side of it.
+    while (CMTimeCompare(pts, self.nextBoundary) >= 0) [self rotate];
+    [(microphone ? self.microphoneWriter : self.systemWriter) appendSampleBuffer:sampleBuffer];
 }
 
 - (void)stream:(SCStream *)stream didStopWithError:(NSError *)error {
-    self.streamError = error;
+    if (error != nil) self.streamError = error;
+    @synchronized(self) {
+        if (self.stopping) return;
+        self.stopping = YES;
+    }
+    // Nothing more will arrive, so close what is open and let the reader see the
+    // failure instead of waiting out its timeout against a dead stream.
+    dispatch_async(self.audioQueue, ^{
+        [self closeCurrentChunk];
+        dispatch_group_notify(self.pending, self.finishQueue, ^{ [self markDrained]; });
+    });
 }
+
+// anchorAtPTS pins the chunk grid to the first buffer that arrives. Wall clock
+// comes from ageing the host clock rather than from reading NSDate on arrival,
+// so queue latency does not accumulate into the anchor every chunk inherits.
+- (void)anchorAtPTS:(CMTime)pts {
+    self.sessionStartPTS = pts;
+    CMTime hostNow = CMClockGetTime(CMClockGetHostTimeClock());
+    Float64 age = CMTimeGetSeconds(CMTimeSubtract(hostNow, pts));
+    if (!isfinite(age) || age < 0) age = 0;
+    self.sessionStartUnixNS = (int64_t)(([[NSDate date] timeIntervalSince1970] - age) * 1e9);
+    self.chunkStartUnixNS = self.sessionStartUnixNS;
+    self.nextBoundary = CMTimeAdd(pts, self.chunkDuration);
+    self.anchored = YES;
+}
+
+// wallClockForPTS places a boundary on the wall clock by offsetting the session
+// anchor, so successive chunks are exactly chunkDuration apart rather than
+// however long the previous rotation happened to take.
+- (int64_t)wallClockForPTS:(CMTime)pts {
+    if (self.sessionStartUnixNS <= 0) return 0;
+    Float64 offset = CMTimeGetSeconds(CMTimeSubtract(pts, self.sessionStartPTS));
+    if (!isfinite(offset)) return self.sessionStartUnixNS;
+    return self.sessionStartUnixNS + (int64_t)llround(offset * 1e9);
+}
+
+- (void)rotate {
+    [self closeCurrentChunk];
+    self.chunkIndex += 1;
+    self.chunkStartUnixNS = [self wallClockForPTS:self.nextBoundary];
+    self.nextBoundary = CMTimeAdd(self.nextBoundary, self.chunkDuration);
+    [self openWriters];
+}
+
+- (NSString *)pathForTrack:(NSString *)track {
+    NSString *name = [NSString stringWithFormat:@"%@-%06lu-%@.wav",
+                                                self.prefix, (unsigned long)self.chunkIndex, track];
+    return [self.directory stringByAppendingPathComponent:name];
+}
+
+- (void)openWriters {
+    NSError *error = nil;
+    self.systemWriter = [[LumiAudioWriter alloc] initWithPath:[self pathForTrack:@"system"] error:&error];
+    if (error != nil) self.streamError = self.streamError ?: error;
+    error = nil;
+    self.microphoneWriter = [[LumiAudioWriter alloc] initWithPath:[self pathForTrack:@"microphone"]
+                                                            error:&error];
+    if (error != nil) self.streamError = self.streamError ?: error;
+}
+
+// closeCurrentChunk hands the open writers off to be finalised and is safe to
+// call twice; the second call finds nothing open.
+- (void)closeCurrentChunk {
+    LumiAudioWriter *system = self.systemWriter;
+    LumiAudioWriter *microphone = self.microphoneWriter;
+    if (system == nil && microphone == nil) return;
+    self.systemWriter = nil;
+    self.microphoneWriter = nil;
+    int64_t startedAtNS = self.chunkStartUnixNS;
+    dispatch_group_enter(self.pending);
+    dispatch_group_t writers = dispatch_group_create();
+    [system finish:writers];
+    [microphone finish:writers];
+    dispatch_group_notify(writers, self.finishQueue, ^{
+        [self enqueueChunkWithSystem:system microphone:microphone startedAtNS:startedAtNS];
+        dispatch_group_leave(self.pending);
+    });
+}
+
+- (void)enqueueChunkWithSystem:(LumiAudioWriter *)system
+                    microphone:(LumiAudioWriter *)microphone
+                   startedAtNS:(int64_t)startedAtNS {
+    NSMutableArray *frames = [NSMutableArray array];
+    NSError *failure = self.streamError ?: system.error ?: microphone.error;
+    NSString *captureError = failure.localizedDescription;
+    int64_t requestedMS = (int64_t)llround(self.chunkSeconds * 1000.0);
+    NSFileManager *files = [NSFileManager defaultManager];
+    if (system != nil && [files fileExistsAtPath:system.path]) {
+        [frames addObject:LumiAudioFrameDictionary(system.path, @"system", requestedMS, system, captureError)];
+    }
+    if (microphone != nil && [files fileExistsAtPath:microphone.path]) {
+        [frames addObject:LumiAudioFrameDictionary(microphone.path, @"microphone", requestedMS,
+                                                   microphone, captureError)];
+    }
+    // A chunk that wrote no file at all has no media to index, and reporting it
+    // would put an empty pair through attribution as though it were silence.
+    if (frames.count == 0) return;
+    NSMutableDictionary *chunk = [@{@"frames": frames} mutableCopy];
+    if (startedAtNS > 0) chunk[@"started_at_unix_ns"] = @(startedAtNS);
+    [self.readyCondition lock];
+    [self.ready addObject:chunk];
+    [self.readyCondition broadcast];
+    [self.readyCondition unlock];
+}
+
+- (void)markDrained {
+    [self.readyCondition lock];
+    self.drained = YES;
+    [self.readyCondition broadcast];
+    [self.readyCondition unlock];
+}
+
+#pragma mark - Reading
+
+// nextChunkWithTimeout always reports a finished chunk if one is queued, even
+// once the session has been stopped: cancellation must not discard audio that
+// was already captured and written.
+- (NSDictionary *)nextChunkWithTimeout:(NSTimeInterval)seconds {
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:seconds];
+    [self.readyCondition lock];
+    while (self.ready.count == 0 && !self.drained) {
+        if (![self.readyCondition waitUntilDate:deadline]) break;
+    }
+    NSDictionary *chunk = nil;
+    if (self.ready.count > 0) {
+        chunk = self.ready.firstObject;
+        [self.ready removeObjectAtIndex:0];
+    }
+    BOOL closed = self.drained && self.ready.count == 0 && chunk == nil;
+    [self.readyCondition unlock];
+    if (chunk != nil) return chunk;
+    if (!closed) return @{@"timeout": @YES};
+    NSMutableDictionary *end = [@{@"closed": @YES} mutableCopy];
+    NSError *failure = self.streamError;
+    if (failure != nil) end[@"capture_error"] = failure.localizedDescription;
+    return end;
+}
+
+- (void)stop {
+    @synchronized(self) {
+        if (self.stopping) return;
+        self.stopping = YES;
+    }
+    dispatch_semaphore_t stopped = dispatch_semaphore_create(0);
+    [self.stream stopCaptureWithCompletionHandler:^(NSError *error) {
+        if (error != nil) self.streamError = error;
+        dispatch_semaphore_signal(stopped);
+    }];
+    NSError *stopTimeout = nil;
+    if (!LumiWait(stopped, 10.0, @"stop ScreenCaptureKit audio", &stopTimeout)) {
+        self.streamError = self.streamError ?: stopTimeout;
+    }
+    // Closing on the sample queue guarantees no buffer is still being appended
+    // to a writer that is already finishing.
+    dispatch_sync(self.audioQueue, ^{ [self closeCurrentChunk]; });
+    dispatch_group_notify(self.pending, self.finishQueue, ^{ [self markDrained]; });
+}
+
 @end
 
-char *lumi_record_audio_json(const char *directory, const char *prefix, double duration_seconds,
-                             char **error_message) {
+static NSMutableDictionary<NSNumber *, LumiAudioSession *> *LumiAudioSessionRegistry(void) {
+    static NSMutableDictionary *registry = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ registry = [NSMutableDictionary dictionary]; });
+    return registry;
+}
+
+static LumiAudioSession *LumiAudioSessionForHandle(int64_t handle) {
+    NSMutableDictionary *registry = LumiAudioSessionRegistry();
+    @synchronized(registry) {
+        return registry[@(handle)];
+    }
+}
+
+// lumi_audio_session_start opens the stream and returns a handle, or 0 with
+// *error_message set. Chunks are collected with lumi_audio_session_next_json
+// while the stream keeps running.
+int64_t lumi_audio_session_start(const char *directory, const char *prefix, double chunk_seconds,
+                                 char **error_message) {
     @autoreleasepool {
-        if (@available(macOS 15.0, *)) {
-            __block SCShareableContent *content = nil;
-            __block NSError *contentError = nil;
-            dispatch_semaphore_t contentReady = dispatch_semaphore_create(0);
-            [SCShareableContent getShareableContentExcludingDesktopWindows:NO
-                                                      onScreenWindowsOnly:NO
-                                                        completionHandler:^(SCShareableContent *shareable, NSError *error) {
-                content = shareable;
-                contentError = error;
-                dispatch_semaphore_signal(contentReady);
-            }];
-            if (!LumiWait(contentReady, 10.0, @"enumerate audio capture content", &contentError)) {
-                if (error_message != NULL) *error_message = LumiCopyError(contentError);
-                return NULL;
-            }
-            if (content.displays.count == 0) {
-                if (error_message != NULL) *error_message = LumiCopyError(contentError);
-                return NULL;
-            }
-
-            NSString *directoryPath = [NSString stringWithUTF8String:directory];
-            NSString *filePrefix = [NSString stringWithUTF8String:prefix];
-            NSString *systemPath = [directoryPath stringByAppendingPathComponent:
-                                    [filePrefix stringByAppendingString:@"-system.wav"]];
-            NSString *microphonePath = [directoryPath stringByAppendingPathComponent:
-                                        [filePrefix stringByAppendingString:@"-microphone.wav"]];
-            NSError *writerError = nil;
-            LumiAudioCapture *output = [[LumiAudioCapture alloc] init];
-            output.systemWriter = [[LumiAudioWriter alloc] initWithPath:systemPath error:&writerError];
-            if (output.systemWriter == nil) {
-                if (error_message != NULL) *error_message = LumiCopyError(writerError);
-                return NULL;
-            }
-            output.microphoneWriter = [[LumiAudioWriter alloc] initWithPath:microphonePath error:&writerError];
-            if (output.microphoneWriter == nil) {
-                if (error_message != NULL) *error_message = LumiCopyError(writerError);
-                return NULL;
-            }
-
-            SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:content.displays.firstObject
-                                                         excludingApplications:@[] exceptingWindows:@[]];
-            SCStreamConfiguration *configuration = [[SCStreamConfiguration alloc] init];
-            configuration.width = 2;
-            configuration.height = 2;
-            configuration.minimumFrameInterval = CMTimeMake(1, 1);
-            configuration.capturesAudio = YES;
-            configuration.sampleRate = 16000;
-            configuration.channelCount = 1;
-            configuration.excludesCurrentProcessAudio = YES;
-            configuration.captureMicrophone = YES;
-            SCStream *stream = [[SCStream alloc] initWithFilter:filter configuration:configuration delegate:output];
-            dispatch_queue_t audioQueue = dispatch_queue_create("ai.puremetrics.lumi.audio", DISPATCH_QUEUE_SERIAL);
-            NSError *addError = nil;
-            if (![stream addStreamOutput:output type:SCStreamOutputTypeAudio sampleHandlerQueue:audioQueue error:&addError] ||
-                ![stream addStreamOutput:output type:SCStreamOutputTypeMicrophone sampleHandlerQueue:audioQueue error:&addError]) {
-                if (error_message != NULL) *error_message = LumiCopyError(addError);
-                return NULL;
-            }
-
-            __block NSError *startError = nil;
-            dispatch_semaphore_t started = dispatch_semaphore_create(0);
-            [stream startCaptureWithCompletionHandler:^(NSError *error) {
-                startError = error;
-                dispatch_semaphore_signal(started);
-            }];
-            if (!LumiWait(started, 10.0, @"start ScreenCaptureKit audio", &startError)) {
-                if (error_message != NULL) *error_message = LumiCopyError(startError);
-                return NULL;
-            }
-            if (startError != nil) {
-                if (error_message != NULL) *error_message = LumiCopyError(startError);
-                return NULL;
-            }
-            [NSThread sleepForTimeInterval:MAX(0.1, duration_seconds)];
-            dispatch_semaphore_t stopped = dispatch_semaphore_create(0);
-            [stream stopCaptureWithCompletionHandler:^(NSError *error) {
-                if (error != nil) output.streamError = error;
-                dispatch_semaphore_signal(stopped);
-            }];
-            NSError *stopTimeout = nil;
-            if (!LumiWait(stopped, 10.0, @"stop ScreenCaptureKit audio", &stopTimeout)) {
-                output.streamError = stopTimeout;
-            }
-            dispatch_semaphore_t audioDrained = dispatch_semaphore_create(0);
-            dispatch_async(audioQueue, ^{ dispatch_semaphore_signal(audioDrained); });
-            NSError *drainTimeout = nil;
-            if (!LumiWait(audioDrained, 5.0, @"drain ScreenCaptureKit audio", &drainTimeout)) {
-                output.streamError = output.streamError ?: drainTimeout;
-            }
-            dispatch_group_t writersFinished = dispatch_group_create();
-            [output.systemWriter finish:writersFinished];
-            [output.microphoneWriter finish:writersFinished];
-            if (dispatch_group_wait(writersFinished,
-                                    dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC)) != 0) {
-                output.streamError = output.streamError ?: LumiTimeoutError(@"finalize native WAV files");
-            }
-
-            NSMutableArray *frames = [NSMutableArray array];
-            int64_t durationMS = (int64_t)llround(MAX(0.1, duration_seconds) * 1000.0);
-            NSError *finalError = output.streamError ?: output.systemWriter.error ?: output.microphoneWriter.error;
-            NSString *captureError = finalError.localizedDescription;
-            if ([[NSFileManager defaultManager] fileExistsAtPath:systemPath]) {
-				NSMutableDictionary *frame = [@{@"path": systemPath, @"source": @"system",
-				                                  @"duration_ms": @(durationMS)} mutableCopy];
-				if (captureError.length > 0) frame[@"capture_error"] = captureError;
-				[frames addObject:frame];
-            }
-            if ([[NSFileManager defaultManager] fileExistsAtPath:microphonePath]) {
-				NSMutableDictionary *frame = [@{@"path": microphonePath, @"source": @"microphone",
-				                                  @"duration_ms": @(durationMS)} mutableCopy];
-				if (captureError.length > 0) frame[@"capture_error"] = captureError;
-				[frames addObject:frame];
-			}
-			if (frames.count == 0 && finalError != nil) {
-				if (error_message != NULL) *error_message = LumiCopyError(finalError);
-				return NULL;
-            }
-            NSError *jsonError = nil;
-            NSString *json = LumiJSONString(frames, &jsonError);
-            if (json == nil) {
-                if (error_message != NULL) *error_message = LumiCopyError(jsonError);
-                return NULL;
-            }
-            return LumiCopyUTF8(json);
+        LumiAudioSession *session =
+            [[LumiAudioSession alloc] initWithDirectory:[NSString stringWithUTF8String:directory]
+                                                 prefix:[NSString stringWithUTF8String:prefix]
+                                           chunkSeconds:chunk_seconds];
+        NSError *error = nil;
+        if (![session start:&error]) {
+            if (error_message != NULL) *error_message = LumiCopyError(error);
+            return 0;
         }
-        if (error_message != NULL) {
-            *error_message = LumiCopyUTF8(@"native microphone capture requires macOS 15 or newer");
+        static int64_t nextHandle = 0;
+        NSMutableDictionary *registry = LumiAudioSessionRegistry();
+        int64_t handle = 0;
+        @synchronized(registry) {
+            handle = ++nextHandle;
+            registry[@(handle)] = session;
         }
-        return NULL;
+        return handle;
+    }
+}
+
+// lumi_audio_session_next_json waits up to timeout_seconds for the next finished
+// chunk. It returns {"frames": [...]} for a chunk, {"timeout": true} when none
+// arrived in time, or {"closed": true} once the session has stopped and every
+// chunk it captured has been handed over.
+char *lumi_audio_session_next_json(int64_t handle, double timeout_seconds, char **error_message) {
+    @autoreleasepool {
+        LumiAudioSession *session = LumiAudioSessionForHandle(handle);
+        if (session == nil) {
+            if (error_message != NULL) *error_message = LumiCopyUTF8(@"audio capture session is not open");
+            return NULL;
+        }
+        NSDictionary *chunk = [session nextChunkWithTimeout:MAX(0.0, timeout_seconds)];
+        NSError *jsonError = nil;
+        NSString *json = LumiJSONString(chunk, &jsonError);
+        if (json == nil) {
+            if (error_message != NULL) *error_message = LumiCopyError(jsonError);
+            return NULL;
+        }
+        return LumiCopyUTF8(json);
+    }
+}
+
+// lumi_audio_session_stop stops capture and finalises the chunk in flight. The
+// chunks already queued stay readable afterwards, which is what lets a cancelled
+// recording keep the audio it had captured up to that instant.
+void lumi_audio_session_stop(int64_t handle) {
+    @autoreleasepool {
+        [LumiAudioSessionForHandle(handle) stop];
+    }
+}
+
+void lumi_audio_session_close(int64_t handle) {
+    @autoreleasepool {
+        LumiAudioSession *session = LumiAudioSessionForHandle(handle);
+        [session stop];
+        NSMutableDictionary *registry = LumiAudioSessionRegistry();
+        @synchronized(registry) {
+            [registry removeObjectForKey:@(handle)];
+        }
     }
 }

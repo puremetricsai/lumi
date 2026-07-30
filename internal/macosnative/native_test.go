@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestPermissionStatusUsesKnownStates(t *testing.T) {
@@ -523,6 +524,44 @@ func TestFrontmostDiagnosticIsInternallyConsistent(t *testing.T) {
 	}
 }
 
+// TestTranscriptionPayloadDecode covers the wire shape without needing Speech
+// Recognition, so CI still catches a Swift-side rename. The absent cases matter:
+// the bridge omits confidence when the recognizer reported none, and omits runs
+// for an empty-text result — and an empty-text result carrying a span is a
+// signal, not noise. It says audio was present here but no words resolved, which
+// is what separates "nothing was playing" from "transcription failed".
+func TestTranscriptionPayloadDecode(t *testing.T) {
+	const payload = `{"text":"Mm-hmm. Yeah.","segments":[
+		{"start_ms":3000,"end_ms":3660,"text":"Mm-hmm.","confidence":0.51,
+		 "runs":[{"start_ms":3000,"end_ms":3660,"text":"Mm-hmm.","confidence":0.51}]},
+		{"start_ms":18660,"end_ms":19680,"text":""},
+		{"start_ms":26280,"end_ms":27720,"text":" Yeah."}
+	]}`
+	var decoded Transcription
+	if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Text != "Mm-hmm. Yeah." {
+		t.Errorf("text = %q", decoded.Text)
+	}
+	if len(decoded.Segments) != 3 {
+		t.Fatalf("decoded %d segments, want 3", len(decoded.Segments))
+	}
+	if got := decoded.Segments[0].Runs[0].Confidence; got != 0.51 {
+		t.Errorf("run confidence = %v, want 0.51", got)
+	}
+	silent := decoded.Segments[1]
+	if silent.Text != "" || len(silent.Runs) != 0 {
+		t.Errorf("expected an empty-text runless segment, got %#v", silent)
+	}
+	if silent.StartMS != 18660 || silent.EndMS != 19680 {
+		t.Errorf("empty-text segment lost its span: %d..%d", silent.StartMS, silent.EndMS)
+	}
+	if got := decoded.Segments[2].Confidence; got != 0 {
+		t.Errorf("absent confidence decoded as %v, want 0 meaning not reported", got)
+	}
+}
+
 func TestTranscribeAudioSmoke(t *testing.T) {
 	if os.Getenv("LUMI_NATIVE_SMOKE") != "1" {
 		t.Skip("set LUMI_NATIVE_SMOKE=1 after granting Speech Recognition and installing en-US assets")
@@ -539,6 +578,212 @@ func TestTranscribeAudioSmoke(t *testing.T) {
 	// A short real recording may be silent, so only require successful analysis.
 	if _, err := TranscribeAudio(ctx, audio[0].Path, "en-US", nil); err != nil {
 		t.Fatalf("SpeechAnalyzer transcription failed: %v", err)
+	}
+}
+
+// TestTranscribeAudioSegmentsAgreesWithTranscribeAudio pins the reason both entry
+// points share one native ASR path. events.text for every already-indexed row is
+// the recognizer's results concatenated with no separator; if the segments path
+// ever joined them differently — with a space, say — new rows would stop matching
+// old ones and the FTS index would shift for reasons unrelated to any feature.
+//
+// It also pins that segments tile forward in time, which the attribution code
+// relies on when it unions run intervals to measure overlap.
+func TestTranscribeAudioSegmentsAgreesWithTranscribeAudio(t *testing.T) {
+	if os.Getenv("LUMI_NATIVE_SMOKE") != "1" {
+		t.Skip("set LUMI_NATIVE_SMOKE=1 after granting Speech Recognition and installing en-US assets")
+	}
+	ctx := context.Background()
+	directory := t.TempDir()
+	audio, err := RecordAudio(ctx, directory, "speech", 2.0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(audio) == 0 {
+		t.Fatal("RecordAudio returned no frames")
+	}
+	path := audio[0].Path
+
+	flat, err := TranscribeAudio(ctx, path, "en-US", nil)
+	if err != nil {
+		t.Fatalf("flat transcription failed: %v", err)
+	}
+	timed, err := TranscribeAudioSegments(ctx, path, "en-US", nil)
+	if err != nil {
+		t.Fatalf("segmented transcription failed: %v", err)
+	}
+	if timed.Text != flat {
+		t.Errorf("segmented text differs from flat text:\n flat=%q\ntimed=%q", flat, timed.Text)
+	}
+	joined := ""
+	for _, segment := range timed.Segments {
+		joined += segment.Text
+	}
+	if joined != timed.Text {
+		t.Errorf("segments joined with no separator = %q, want %q", joined, timed.Text)
+	}
+	previousEnd := int64(-1)
+	for i, segment := range timed.Segments {
+		if segment.EndMS < segment.StartMS {
+			t.Errorf("segment %d ends before it starts: %d..%d", i, segment.StartMS, segment.EndMS)
+		}
+		if segment.StartMS < previousEnd {
+			t.Errorf("segment %d starts at %d, before segment %d ended at %d",
+				i, segment.StartMS, i-1, previousEnd)
+		}
+		previousEnd = segment.EndMS
+		for j, run := range segment.Runs {
+			if run.StartMS < segment.StartMS || run.EndMS > segment.EndMS {
+				t.Errorf("segment %d run %d spans %d..%d, outside its segment %d..%d",
+					i, j, run.StartMS, run.EndMS, segment.StartMS, segment.EndMS)
+			}
+		}
+	}
+}
+
+// TestTranscribeAudioSegmentsOnRealAudio inspects a WAV that actually contains
+// speech, which the smoke tests above cannot guarantee — a freshly recorded
+// second of a quiet room yields zero segments and makes their assertions
+// vacuous. Point it at a captured chunk:
+//
+//	LUMI_SEGMENTS_AUDIO="$HOME/Library/Application Support/Lumi/audio/…-microphone.wav" \
+//	  go test ./internal/macosnative -run RealAudio -v
+//
+// It stays in the suite because threshold calibration needs exactly this: a way
+// to dump real per-word timings for a known chunk.
+func TestTranscribeAudioSegmentsOnRealAudio(t *testing.T) {
+	path := os.Getenv("LUMI_SEGMENTS_AUDIO")
+	if path == "" {
+		t.Skip("set LUMI_SEGMENTS_AUDIO to a WAV containing speech")
+	}
+	result, err := TranscribeAudioSegments(context.Background(), path, "en-US", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Segments) == 0 {
+		t.Fatalf("no segments for %s; is it silent?", path)
+	}
+	words := 0
+	for _, segment := range result.Segments {
+		words += len(segment.Runs)
+	}
+	t.Logf("%d segments, %d timed words, %d chars", len(result.Segments), words, len(result.Text))
+	for i, segment := range result.Segments {
+		t.Logf("  [%02d] %6d..%6d ms conf=%.3f runs=%d %q",
+			i, segment.StartMS, segment.EndMS, segment.Confidence, len(segment.Runs), segment.Text)
+	}
+	if words == 0 {
+		t.Error("segments carried no word-level timings; attribution overlap would fall back to result ranges")
+	}
+}
+
+// TestRecordAudioReportsATimingAnchor covers the ObjC change. Both tracks must
+// report the wall clock of their first sample buffer, because a chunk's
+// captured_at is taken before ScreenCaptureKit is even asked for shareable
+// content and so cannot place the audio. Without this the two tracks' timings
+// are not comparable and the whole timed attribution path degrades.
+func TestRecordAudioReportsATimingAnchor(t *testing.T) {
+	if os.Getenv("LUMI_NATIVE_SMOKE") != "1" {
+		t.Skip("set LUMI_NATIVE_SMOKE=1 after granting Lumi permissions")
+	}
+	ctx := context.Background()
+	before := time.Now().Add(-2 * time.Second).UnixNano()
+	frames, err := RecordAudio(ctx, t.TempDir(), "anchor", 1.0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := time.Now().Add(2 * time.Second).UnixNano()
+	if len(frames) == 0 {
+		t.Fatal("RecordAudio returned no frames")
+	}
+	for _, frame := range frames {
+		if frame.StartedAtUnixNS == 0 {
+			t.Errorf("%s frame reported no started_at_unix_ns", frame.Source)
+			continue
+		}
+		if frame.StartedAtUnixNS < before || frame.StartedAtUnixNS > after {
+			t.Errorf("%s frame started_at %d is outside the recording window %d..%d",
+				frame.Source, frame.StartedAtUnixNS, before, after)
+		}
+		if frame.MeasuredDurationMS <= 0 {
+			t.Errorf("%s frame reported no measured duration", frame.Source)
+		}
+	}
+	if len(frames) == 2 {
+		// Both tracks come from one SCStream, so their session starts share a
+		// host timebase. The skew between them is small but real — it is exactly
+		// what used to be unrecoverable.
+		skew := frames[0].SessionStartPTSNS - frames[1].SessionStartPTSNS
+		if skew < 0 {
+			skew = -skew
+		}
+		if skew > int64(time.Second) {
+			t.Errorf("session starts differ by %v, far more than capture start skew", time.Duration(skew))
+		}
+	}
+}
+
+// TestAudioSessionChunksAreContiguous is the native half of the regression test
+// for the audio that used to fall between chunks. Cycling the stream per chunk
+// cost about two seconds of every thirty — the stream was closed for the
+// teardown, the file finalisation, and the next stream's setup — so consecutive
+// chunks arrived 32s apart while each held 30s of sound, and the missing
+// seconds landed mid-sentence.
+//
+// Two things are asserted, because either alone can be satisfied by a broken
+// implementation: chunk starts sit exactly one chunk apart (the grid never
+// drifts), and each file actually holds that whole interval (the grid is not
+// merely relabelling a recording with holes in it).
+func TestAudioSessionChunksAreContiguous(t *testing.T) {
+	if os.Getenv("LUMI_NATIVE_SMOKE") != "1" {
+		t.Skip("set LUMI_NATIVE_SMOKE=1 after granting Lumi permissions")
+	}
+	const chunkSeconds = 3.0
+	session, err := StartAudioSession(context.Background(), t.TempDir(), "contiguity", chunkSeconds)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	chunks := make([]AudioChunk, 0, 3)
+	deadline := time.Now().Add(30 * time.Second)
+	for len(chunks) < 3 && time.Now().Before(deadline) {
+		chunk, err := session.Next(500 * time.Millisecond)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(chunk.Frames) > 0 {
+			chunks = append(chunks, chunk)
+		}
+		if chunk.Closed {
+			break
+		}
+	}
+	session.Stop()
+	if len(chunks) < 3 {
+		t.Fatalf("captured %d chunks, need 3 to measure the boundary between them", len(chunks))
+	}
+
+	const chunkMS = int64(chunkSeconds * 1000)
+	for i := 1; i < len(chunks); i++ {
+		gap := (chunks[i].StartedAtUnixNS - chunks[i-1].StartedAtUnixNS) / int64(time.Millisecond)
+		if gap != chunkMS {
+			t.Errorf("chunk %d starts %dms after chunk %d, but a chunk covers %dms; "+
+				"the difference is audio no file holds", i, gap, i-1, chunkMS)
+		}
+	}
+	// One sample buffer may land on either side of a boundary, so a file can
+	// fall short of the full interval by that much and no more. The regression
+	// this guards cost whole seconds, so the tolerance separates them cleanly.
+	const bufferToleranceMS = 250
+	for i, chunk := range chunks {
+		for _, frame := range chunk.Frames {
+			t.Logf("chunk %d %s: started=%s measured=%dms", i, frame.Source,
+				time.Unix(0, frame.StartedAtUnixNS).UTC().Format(time.RFC3339Nano), frame.MeasuredDurationMS)
+			if frame.MeasuredDurationMS < chunkMS-bufferToleranceMS {
+				t.Errorf("chunk %d %s holds %dms of a %dms interval; %dms of audio was not captured",
+					i, frame.Source, frame.MeasuredDurationMS, chunkMS, chunkMS-frame.MeasuredDurationMS)
+			}
+		}
 	}
 }
 

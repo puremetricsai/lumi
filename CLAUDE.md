@@ -44,11 +44,17 @@ Data flows one way: `internal/cli` wires concrete processors into a `capture.Rec
 `store.Event` rows, and `search` reads them back. Never the reverse.
 
 **`internal/macosnative`** — cgo/Objective-C bridge to ScreenCaptureKit, Accessibility, Apple Vision,
-AVFoundation WAV writing, and permission preflight. Has a non-macOS stub.
+AVFoundation WAV writing, CoreAudio process enumeration, and permission preflight. Has a non-macOS stub. `AudioSession` is the one
+exception to the call-and-return shape of everything else here: it holds a live `SCStream` behind a handle
+and is read with `Next`, because the stream has to stay open across chunk boundaries. `RecordAudio` takes
+one chunk from a session and stops, so `native-smoke` and the recorder share a single capture path.
 
 **`internal/capture`** — `Recorder` runs independent screen and audio goroutines until the context is
 cancelled, with native processors behind small interfaces. Displays are re-enumerated each interval for
-hotplug. Everything runs in-process — no subprocesses. One focused-window snapshot per tick is stamped onto
+hotplug. Screen capture is a per-tick call, but audio is a *stream*: `AudioSource.Open` returns an
+`AudioStream` whose `Next` yields chunks while capture keeps running, so transcription, indexing, and
+attribution all happen alongside the next chunk rather than between two recordings. Everything runs
+in-process — no subprocesses. One focused-window snapshot per tick is stamped onto
 **every** display's frame, so on a multi-display setup an `app` filter returns frames from displays where
 that app was not visible: attribution answers "what was the user working in", not "what is shown in this
 image". Per-display attribution is deliberately not done.
@@ -69,7 +75,20 @@ Facts about querying live here, not in callers: `DefaultSearchLimit` (20) / `Max
 `CollapseAudioTracks` merges each chunk's mic/system duplicate into one survivor, returning `AudioChunk`
 provenance (`Origin` of `system`/`microphone`/`both`/`silent` plus every merged `AudioTrack`);
 `AudioTracksAt` re-reads every audio row at a set of timestamps so `Origin` describes the whole chunk even
-when a search matched one track. `AttributionHealth` backs `lumi doctor`; its `LastAttributed` is a scalar
+when a search matched one track.
+
+`audio_segments` (migration 4) holds each chunk's origin-attributed pieces, derived from events and never
+the reverse, so re-deriving them is always safe — that is what makes the backfill idempotent.
+`ReplaceChunkSegments` rewrites one chunk in a transaction; `ChunksMissingSegments` is a *derived* work
+queue, so there is no state file to go stale and a failed write needs no retry loop. `Transcript` is the
+only way callers reach turn assembly, and it clamps its own limits so the number `get_transcript`
+documents is the number enforced. It also owns the two ways a transcript can be short — `Capped` (turns
+dropped after assembly) and `Truncated` (segments dropped before it, with `CoveredUntil` naming where to
+resume) — and measures coverage over what the turns reach, never over what was asked for.
+`HasSpeechSegments` answers "is there anything to read", which `SegmentCoverage` deliberately does not:
+a silent chunk is attributed but holds nothing.
+
+`AttributionHealth` backs `lumi doctor`; its `LastAttributed` is a scalar
 subquery over *all* history, because scoping it to the window would blank the field exactly when the outage
 exceeds the window. The event column list lives in one `eventSelect` const shared by `Expired`,
 `AllEvents`, and `EventByID`.
@@ -80,12 +99,14 @@ oldest-first. `Options.All` enumerates every row via `store.AllEvents` (unbounde
 Only `All` sweeps directories. No background scheduler.
 
 **`internal/cli`** — Cobra commands (`record start`/`status`/`stop`, `search`, `mcp`, `prune`, `doctor`,
-`permissions`, `native-smoke`, `transcribe`, `version`). `record start` detaches to the background by default
+`permissions`, `native-smoke`, `transcribe`, `transcript`, `version`). `record start` detaches to the
+background by default
 (`--foreground` keeps it inline) as a re-exec tracked by a JSON state file and log under the data dir
 (`record_daemon.go`); `record stop` sends SIGTERM and waits for graceful shutdown. `search` offers exact
 case-insensitive app filtering, case-insensitive window-substring filtering, `--type all|screen|audio`, and
-`--collapse-audio`. `permissions --request` invokes native TCC flows — never add `tccutil reset` as a side
-effect.
+`--collapse-audio`. `transcript` keeps its own `RunE` for the same reason `mcp` does: reading a transcript
+is the useful thing, and `backfill` is maintenance hanging off it. `permissions --request` invokes native
+TCC flows — never add `tccutil reset` as a side effect.
 
 `mcp` opens the store through the same `openStore` as every other command (an agent launches it with a bare
 environment, so `--data-dir`/`LUMI_HOME` must be the whole story) and treats a cancelled context as a clean
@@ -97,12 +118,16 @@ developer's own Claude config.
 
 **`internal/mcp`** — stdio MCP server on `github.com/modelcontextprotocol/go-sdk` (pinned v1.6.1; import
 aliased as `sdk`, since our package is also named `mcp`). `Serve(ctx, *store.Store, Options)` registers
-three read-only tools — `search_events`, `get_event`, `list_apps` — and runs until stdin closes or the
-context is cancelled. It depends on `internal/store` and nothing else of Lumi's. `search_events` truncates
-text per event and reports `truncated` plus true `text_length`, collapses audio duplicates by default
-(`collapse_audio_tracks` is a `*bool`, nil meaning on), and over-fetches (`min(2*limit, MaxSearchLimit)`)
-then trims so a collapsed page stays full; `get_event` is the untruncated escape hatch and the only tool
-returning metadata. Validation and store failures come back as tool results with `isError`, never JSON-RPC
+four read-only tools — `search_events`, `get_event`, `list_apps`, `get_transcript` — and runs until stdin
+closes or the context is cancelled. It depends on `internal/store` and nothing else of Lumi's.
+`search_events` truncates text per event and reports `truncated` plus true `text_length`, collapses audio
+duplicates by default (`collapse_audio_tracks` is a `*bool`, nil meaning on), and over-fetches
+(`min(2*limit, MaxSearchLimit)`) then trims so a collapsed page stays full; `get_event` is the
+untruncated escape hatch and the only tool returning metadata. `get_transcript` reads audio as one
+ordered conversation with the machine's own speech deduplicated, and its `confidence` and
+`order_confidence` carry no `omitempty` for the same reason `truncated` does not: a doubtful label must
+never be something an agent infers from a missing key.
+Validation and store failures come back as tool results with `isError`, never JSON-RPC
 protocol errors.
 
 An agent cannot see the shape of the index, so this package is explicit about ambiguity: a `query` with no
@@ -128,6 +153,22 @@ Accessibility read rather than failing outright. `MaxTerms` (100) caps the list 
 are dropped and counted in `Snapshot.Dropped`, never silently truncated. No native or third-party
 dependency, so every rule is testable without permissions or `liblumispeech.a`.
 
+**`internal/transcript`** — decides where captured sound came from and assembles it into one ordered
+transcript, backing `lumi transcript` and the `get_transcript` MCP tool. Pure: no database, no cgo, no
+filesystem, so every rule is testable without permissions. `Attribute` never returns an error — missing
+data lowers labels and confidence instead. It has a timed path (word-level overlap plus token alignment)
+and a text-only path for chunks whose WAVs are gone, and `AssembleTurns` merges segments into turns.
+Named for what it produces: nothing here clusters voices, and the labels name provenance rather than
+people. The two `Segment` types — this one and `store.Segment` — shadow each other the way
+`internal/mcp`'s `AttributionRecord` shadows `store.Attribution`; `internal/store` imports this package,
+never the reverse.
+
+**`internal/wav`** — reads the mono 16-bit PCM WAVs Lumi captures and measures their energy. Exists
+because the recognizer returns nothing both for a silent track and for one carrying audio it could not
+transcribe, and those need opposite conclusions. `ReadMono16` walks RIFF chunks generically and accepts
+fmt tag `0xFFFE` with a PCM SubFormat GUID, because Lumi's own writer emits `RIFF/WAVE` → `JUNK` → `fmt `
+→ `FLLR` → `data` — a reader assuming `fmt ` at offset 12 fails on every file Lumi has recorded.
+
 **`internal/config`** — resolves `Paths` from `--data-dir`, else `LUMI_HOME`, else `~/Library/Application
 Support/Lumi`; directories created 0700.
 
@@ -143,9 +184,27 @@ Support/Lumi`; directories created 0700.
   `MaxSilence` (10s) when bytes *changed* but scored similar (video, advancing slides), and `ExactSilence`
   (5min) when bytes are identical, so a frozen screen leaves a bounded presence marker instead of
   re-indexing the same JPEG. `ExactSilence` is clamped up to `MaxSilence`.
-- **Capture retries without discarding completed work.** Screen failures retry on the next interval; audio
-  failures retry after one second. Media returned during cancellation gets a short cancellation-free window
-  for insertion.
+- **Capture retries without discarding completed work.** Screen failures retry on the next interval; an
+  audio stream that fails is reopened after one second. Media returned during cancellation gets a short
+  cancellation-free window for insertion.
+- **The audio tap never closes between chunks.** One `SCStream` stays open for the whole recording and
+  `LumiAudioSession` rotates the WAV writers on presentation-timestamp boundaries, on the same serial queue
+  the sample buffers arrive on, so the buffer crossing a boundary opens the next chunk whole. Cycling the
+  stream per chunk — start, sleep, stop, finalize, start again — cost 2.0–2.3 s of every 32 s: chunks were
+  exactly 30.000 s but arrived 32.0–32.3 s apart, a 6.5% loss landing mid-sentence, visible as one chunk
+  ending "Instead of running." and the next opening "splits the main task into smaller parts". Roughly
+  1.7 s of that was the native lifecycle and 0.45 s was transcription blocking the loop, so fixing either
+  alone leaves most of the hole. Measured after: consecutive chunk starts exactly one chunk duration apart,
+  each file holding that whole interval to within one sample buffer.
+- **A chunk's `captured_at` is the instant its audio began**, derived by offsetting the session anchor
+  rather than by reading the clock at rotation, so the grid cannot drift and both tracks of a chunk share
+  one timestamp — which is what audio collapse groups on. Reading `time.Now()` between chunks made every
+  timestamp absorb the previous chunk's processing time, which is what let indexed chunks sit 32 s apart
+  while each held 30 s of sound.
+- **Cancellation stops capture but never abandons it.** `Stop` finalizes the chunk in flight and `Next`
+  keeps delivering queued chunks — including that partial one — before reporting `ErrAudioStreamClosed`.
+  The native session has no reader to interrupt, so `Next` polls in short slices; that poll interval, not
+  the chunk duration, bounds shutdown latency.
 - **Preserve provenance.** `text_source`, `display_id`, and `audio_source` are first-class event columns
   (migration 3) and appear in JSON exports. In metadata, `app_source` and `attribution_source` answer
   different questions — which source named the *app*, and which supplied the *window title* — and routinely
@@ -208,6 +267,177 @@ Support/Lumi`; directories created 0700.
   distinction already. Screen Recording and Accessibility stay `denied_or_not_determined` on purpose —
   splitting them needs Full Disk Access or raises a prompt as a side effect. Over SSH no status call can
   prompt at all, so `--request` is a no-op.
+
+### Audio attribution
+
+- **An audio row's `app`/`window` name the *focused* application, not the one making the sound.** They
+  answer the same question `app` answers for every screen row — "what was the user working in" — sampled
+  once when the chunk closes. Which processes held the audio output is a different question with a
+  different answer, and lives in `metadata_json` as `active_audio_output_processes`. Putting one of those
+  in `events.app` would fork the column's meaning by row kind, and it cannot hold the answer anyway: it
+  is a *set*.
+- **Because audio rows carry an app, every app-shaped query now spans both kinds, and the tools must let a
+  caller say which one they mean.** `Search`'s `app`/`window` filters are unqualified SQL predicates, so
+  `search_events(app: "Zed")` returns whatever the speakers were playing while Zed was focused — with the
+  `window` title of an unrelated document stamped on it. That is the design working as specified, but it
+  is not what "filter by app" reads as, and the results look legitimate. `ListAttribution` therefore takes
+  a `Kind` and `list_apps` exposes it; `search_events` already had `kind`. Summing the two into one count
+  is what makes the conflation invisible: the split is the whole signal. Measured on a live index,
+  `app = "Zed"` over 30 minutes was 30 screen rows and 8 audio rows, and the audio was a podcast.
+- **Neither kind's `app` says where the *content* came from, so no tool description may imply it does.**
+  The tempting shorthand — "`kind: "screen"` shows where the text was read from" — is false twice over:
+  screen text is full-display OCR carrying every visible window, and one focused-window snapshot is
+  stamped onto every display's frame. A single indexed event was measured holding a Gmail inbox under
+  `app = "Calendar"`. Both kinds answer "what was the user working in"; `kind` separates how that app
+  earned its count, never what produced the content.
+- **`active_audio_output_processes` names stream occupancy, not audible sound, and is named for what it
+  can prove.** `kAudioProcessPropertyIsRunningOutput` reports "running IO with at least one active output
+  stream": a *paused* player still answers yes, while the same app with its document closed does not —
+  both measured with QuickTime. Calling the field `emitting_processes` claimed audibility the data cannot
+  support, and a field name is the first thing an agent reads. Nothing cheaper is available: the
+  per-process property set is closed (PID, BundleID, Devices, IsRunning, IsRunningInput,
+  IsRunningOutput) and carries no level, so proving real emission needs a process tap. Measured
+  false-positive rate under ordinary use is low — 44 samples over 100s of editor/terminal/browser
+  activity found *no* process holding a stream — but a low rate makes the signal useful, not the name
+  true.
+- **Both tracks of a chunk carry the same stamp.** `CollapseAudioTracks` picks a survivor by
+  `(hasText, isSystem, runeLen, -id)`, so per-track stamps would make the app a search reports depend on
+  which track happened to transcribe. Stamping identically makes the survivor's attribution stable by
+  construction, as the shared `captured_at` already is.
+- **An absent `active_audio_output_processes` means no process held a stream; the `..._error` key means
+  Lumi could not tell.** Writing an empty list would collapse the two, and nothing downstream could
+  separate them afterwards. Same reason `silent` is not `unknown`. Absence carries that meaning only
+  because `internal/cli` always wires `Recorder.AudioOutputs`; leaving it nil makes absence mean "never
+  sampled" instead. That precondition is documented on the field rather than enforced with a marker,
+  since Go's `internal/` rule puts the unwired state out of reach of anything but this module's tests.
+- **The output-process list is read, never tapped, and excludes Lumi's own pid.** `AudioProcesses` reads
+  CoreAudio process objects; creating a tap is what needs a TCC grant, enumerating does not — verified to
+  work identically from the detached `Setsid` daemon, unlike `NSWorkspace.frontmostApplication`. Lumi is
+  filtered because the capture session sets `excludesCurrentProcessAudio`, so listing it would claim
+  provenance for sound the recording cannot contain. Nothing else is filtered: a process macOS cannot name
+  keeps its pid, since dropping it would understate what was audible.
+- **`AttributionHealth` stays screen-only**, now because each chunk contributes two rows and an audio
+  failure would be reported as a screen problem — not because audio carries no app.
+
+### Audio origin
+
+- **Origin is `internal`/`external`, naming provenance rather than identity.** `internal` is sound this
+  machine produced — the far side of a call, a video, music, a notification — and is *not necessarily a
+  person*; `external` is sound the microphone picked up from the room. Labelling these `remote`/`self`
+  would assert an identity the data cannot support, since a video is not a conversation partner. Keep the
+  physical track names (`system`/`microphone`) separate: they say which WAV a segment was read from, which
+  differs from its origin exactly when bleed was found.
+- **Bleed is one-directional, so internal-track content needs no verification.** The system track is a tap
+  on the audio output graph; room sound has no acoustic path into it. Measured across ten chunks of
+  continuous user speech, the system track held *exactly zero samples* in nine. So every system-track
+  segment is `internal` unconditionally, and the entire problem reduces to which external-track spans are
+  re-recordings. The only possible error is failing to detect bleed, whose fallback is `unknown`.
+  Deliberate loopback routing (BlackHole, Loopback.app) breaks this; that is a stated limitation, not
+  something to detect.
+- **Bleed must never be *assumed* to exist.** With headphones there is none, so the overlap and similarity
+  tests stay even though the internal direction is certain.
+- **The energy gate is a presence test, never a loudness test, and it reads an envelope not a whole-file
+  RMS.** The recognizer returns nothing both for a silent track and for one carrying untranscribable
+  audio, and only energy separates them. Absolute dBFS is not portable across sessions — clear speech
+  measured −26 dBFS in one recording and −68 dBFS in another — but a digital output tap reads *exactly
+  zero* when nothing plays, so presence is unmistakable. Whole-file RMS would let one notification blip,
+  measured occupying a single 100 ms window in thirty seconds, mark the whole chunk ambiguous.
+- **A silent internal track and an untranscribed one are different findings**, needing opposite
+  conclusions: silence means the microphone is confidently the room's, audio-without-words means a
+  re-recording of unseen speech is possible and the honest answer is `unknown`.
+- **Overlap comes from word intervals, never `result.range`.** A recognizer result extends to its
+  finalization boundary; one measured reporting 3000–9660 ms held a single word at 3000–3660 ms. The wider
+  span drags neighbouring room speech into an overlap it never had.
+- **The external transcript is the ordered spine; the internal transcript is the labelling oracle.** The
+  microphone WAV holds everything audible in one recognizer pass, so its reading order *is* conversational
+  order. Treating the two as peer tracks to be merged by time is what makes ordering look unrecoverable
+  when it is not — only absolute time is lost without timestamps, never sequence.
+- **`events.text` for an audio row is the recognizer's results concatenated with no separator.** Runs
+  carry their own leading whitespace. Segments derive from it, never the reverse, and joining with a space
+  would silently re-index the corpus.
+- **A segment-write failure never costs an event.** Rows insert first; attribution is a second pass whose
+  retry mechanism is the backfill's derived work queue, so no retry loop belongs in the recorder.
+- **The recorder and the backfill share every rule they both apply, rather than each stating it.**
+  `ReplaceChunkSegments` promises all three write paths converge on the same rows, and a rule copied across
+  a package boundary is correct only until one copy moves — invisibly to both test suites, since neither
+  can see the other writer. So the shared pieces are exported and single-sourced: `store.SegmentFrom` /
+  `SegmentRows` (verdict → row), `transcript.IsSilent` and `store.AnyFailedTranscription` (the silent-and-
+  failed gate), `transcript.TrackSystem` / `TrackMicrophone` (the track vocabulary),
+  `transcript.EnvelopeWindowMS` and `NeedsInternalEnergy` (which chunks are worth measuring, and at what
+  resolution), and `capture.TimedSegmentsFrom` (the bridge's timings). The energy gate is the cautionary
+  case: it was duplicated, and the two copies had already drifted on whitespace-only transcripts — the
+  backfill reading a 960KB WAV for every silent chunk, and the pair reaching different verdicts for the
+  same audio.
+- **Whatever a bleed region emits is exactly what must count as accounted for.** Deriving the emitted text
+  from a region's whole span but coverage from the underlying blocks let the words between blocks be
+  emitted twice — once inside the region and again as unheard machine audio — reintroducing, in the
+  transcript, the duplication this feature exists to remove.
+- **Interpolated speech never merges with anchored speech.** Machine audio the microphone never captured
+  has no position of its own. Folding it into a well-anchored turn both drags a large correctly-positioned
+  passage down to `approximate` and inserts guessed text mid-passage. Confidence still aggregates to the
+  minimum; order confidence is kept separate instead.
+- **Interpolated speech is anchored to an emitted position, never to a region index.** A bleed region emits
+  a variable number of segments, so its index among the regions says nothing about where it sits in the
+  finished transcript. Anchoring on the index put unheard machine audio at seq 1 of 7, four turns ahead of
+  the phrase it followed; `approximate` excuses an imprecise position, not a wrong one.
+- **A chunk holding no words still writes a marker row** (`origin` = `silent`, no text, `MethodSilent`).
+  The work queue is derived, so a verdict that writes nothing is indistinguishable from one never reached —
+  and since silence is the common case, every such chunk would stay queued forever, be re-derived on every
+  backfill, and be counted as a permanent coverage hole while the transcript advised a backfill that could
+  not change it. `silent` is deliberately not `unknown`: unknown *warns* that hidden machine speech may be
+  present, which is the opposite claim.
+- **A chunk whose recognition failed is never labelled `silent`, and never drains from the queue.** The
+  recognizer returns an empty transcript both for a quiet room and for a track it never got to, so silence
+  is the one verdict a *failure* can turn into a false claim about the world — and the marker that records
+  it is exactly what makes the claim permanent. Both the recorder (`attributeChunk`) and the backfill
+  (`attributeStoredChunk`) therefore gate on the pair "verdict is silent **and** some track carries
+  `processor_error`" — `transcript.IsSilent` and `store.AnyFailedTranscription`, each exported so the two
+  writers share the rule rather than restating it. The gate is the *verdict*, not the
+  failure: a track that did transcribe is labelled on its own evidence, so a mic failure beside a speaking
+  system track still attributes. These chunks are the one thing the derived queue cannot drain, which is
+  what `store.ChunksFailedTranscription` exists to count — `lumi transcript` and `get_transcript` name them
+  apart from real gaps so neither recommends a backfill that would reach the same dead end.
+- **A transcript filters turns, never the segments it assembles them from.** Removing one origin before
+  assembly hides the interjection that separated two replies, so `AssembleTurns` reads them as adjacent and
+  merges them — inventing continuity and deleting the boundary. Turns are single-origin by construction, so
+  filtering afterwards selects without reshaping.
+- **Coverage counts describe the range the turns reach, not the range requested.** They exist to reveal a
+  partial transcript; counting the whole window while the text stopped early makes them corroborate the
+  omission instead. A transcript also never ends mid-chunk, which is what lets the boundary be exact rather
+  than an estimate. Both ways a transcript can stop short move that boundary: truncation *and* the turn cap,
+  which is measured from the last retained turn's `LastCapturedAt` — `Turn.CapturedAt` is where a turn
+  *began*, so a turn spanning chunks would bound the page short of text it already printed.
+- **`CoveredUntil` and `ResumeFrom` are separate fields because they need opposite inclusivity.**
+  `SegmentsBetween` is inclusive at both ends, so a caller told to resume at the last chunk covered re-reads
+  that whole chunk and sees its turns twice on every page. `ResumeFrom` is therefore the first chunk *not*
+  covered, and is zero when the transcript is complete. It equals `CoveredUntil` only in the two cases where
+  an overlap is unavoidable rather than accidental: a single chunk too large to return whole, and a cap
+  falling inside a chunk — where skipping the chunk's later turns would be the worse error. `lumi transcript`
+  and `get_transcript` must offer `ResumeFrom`, never `CoveredUntil`.
+- **A re-transcription may contribute timings, never text.** `lumi transcript backfill --retranscribe` runs
+  recognition again over the same WAV, under a possibly newer model, and its words may simply differ from
+  the ones indexed; installing them puts phrases in a transcript that are absent from `events.text` and from
+  the FTS index, so a reader sees a sentence no query can find. The re-run is therefore biased with the same
+  vocabulary the recorder used and its timings are used only while `minRetranscribeSimilarity` says it is
+  saying the same thing — below that the chunk falls back to the text path, which needs no audio at all.
+  The `track.Text == ""` skip in `loadTimings` is a cost gate on genuinely silent tracks and nothing more:
+  a track whose recognition *failed* never reaches it, because the chunk is declined a step earlier.
+- **Turn continuation across a chunk boundary is structural, not gap-based.** There is now no inter-chunk
+  dead air at all, and in the index recorded before the stream was held open there was 0.4–2.9 s of it,
+  unobservable and overlapping a natural pause. What *is* observable either way is adjacency: 3,028 of
+  3,040 consecutive chunks were captured 30–33 s apart, with the next outliers at 39 s, 48 s, and 91 s,
+  and a continuously open stream lands at exactly 30 s rather than scattered through that band. 35 s still
+  separates "the next chunk" from "the recorder stopped", for old rows and new alike, and a turn must never
+  bridge a stop.
+- **`origin` is TEXT with no `CHECK`**, so distinguishing machine-side participants later is a value
+  change rather than a migration. `silent` already uses that room, and is why the column could gain a
+  fourth value without touching the schema.
+- **`audio_segments` dies with its event through a trigger, not only a foreign key**, because
+  `PRAGMA foreign_keys` is per-connection and a replaced pooled connection would silently stop enforcing
+  it.
+- **Real captured conversation never becomes a test fixture.** The calibration and real-pair harnesses
+  read their input from a path in the environment and skip without it. The measured numbers belong in the
+  repository; the words do not.
 
 ### Store and search
 

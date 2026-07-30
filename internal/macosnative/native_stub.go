@@ -5,6 +5,7 @@ package macosnative
 import (
 	"context"
 	"errors"
+	"time"
 )
 
 var errUnsupported = errors.New("native capture requires Apple Silicon macOS with cgo enabled")
@@ -57,10 +58,39 @@ type Permissions struct {
 }
 
 type AudioFrame struct {
-	Path         string `json:"path"`
-	Source       string `json:"source"`
-	DurationMS   int64  `json:"duration_ms"`
-	CaptureError string `json:"capture_error,omitempty"`
+	Path               string `json:"path"`
+	Source             string `json:"source"`
+	DurationMS         int64  `json:"duration_ms"`
+	CaptureError       string `json:"capture_error,omitempty"`
+	StartedAtUnixNS    int64  `json:"started_at_unix_ns,omitempty"`
+	SessionStartPTSNS  int64  `json:"session_start_pts_ns,omitempty"`
+	MeasuredDurationMS int64  `json:"measured_duration_ms,omitempty"`
+}
+
+type AudioProcess struct {
+	PID      int32  `json:"pid"`
+	BundleID string `json:"bundle_id,omitempty"`
+	Name     string `json:"name,omitempty"`
+}
+
+type SpeechRun struct {
+	StartMS    int64   `json:"start_ms"`
+	EndMS      int64   `json:"end_ms"`
+	Text       string  `json:"text"`
+	Confidence float64 `json:"confidence,omitempty"`
+}
+
+type SpeechSegment struct {
+	StartMS    int64       `json:"start_ms"`
+	EndMS      int64       `json:"end_ms"`
+	Text       string      `json:"text"`
+	Confidence float64     `json:"confidence,omitempty"`
+	Runs       []SpeechRun `json:"runs,omitempty"`
+}
+
+type Transcription struct {
+	Text     string          `json:"text"`
+	Segments []SpeechSegment `json:"segments"`
 }
 
 func CaptureScreens(context.Context, string, string) ([]ScreenFrame, error) {
@@ -81,6 +111,10 @@ func TranscribeAudio(context.Context, string, string, []string) (string, error) 
 	return "", errUnsupported
 }
 
+func TranscribeAudioSegments(context.Context, string, string, []string) (Transcription, error) {
+	return Transcription{}, errUnsupported
+}
+
 func EnsureSpeechAssets(context.Context, string) error { return errUnsupported }
 
 func PermissionStatus(context.Context) (Permissions, error) { return Permissions{}, errUnsupported }
@@ -92,6 +126,30 @@ func RequestPermissions(context.Context, bool) (Permissions, error) {
 func RecordAudio(context.Context, string, string, float64) ([]AudioFrame, error) {
 	return nil, errUnsupported
 }
+
+func AudioProcesses(context.Context) ([]AudioProcess, error) {
+	return nil, errUnsupported
+}
+
+// AudioChunk mirrors the darwin definition so callers compile everywhere.
+type AudioChunk struct {
+	StartedAtUnixNS int64
+	Frames          []AudioFrame
+	Closed          bool
+	CaptureError    string
+}
+
+type AudioSession struct{}
+
+func StartAudioSession(context.Context, string, string, float64) (*AudioSession, error) {
+	return nil, errUnsupported
+}
+
+func (*AudioSession) Next(time.Duration) (AudioChunk, error) { return AudioChunk{}, errUnsupported }
+
+func (*AudioSession) Stop() {}
+
+func (*AudioSession) Close() {}
 
 func OSVersion() (int, int, int, error) { return 0, 0, 0, errUnsupported }
 
