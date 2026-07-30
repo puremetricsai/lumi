@@ -45,7 +45,7 @@ type NativeSpeech struct {
 }
 
 func (n NativeSpeech) Transcribe(ctx context.Context, audioPath string) (string, error) {
-	text, err := macosnative.TranscribeAudio(ctx, audioPath, n.Locale)
+	text, err := macosnative.TranscribeAudio(ctx, audioPath, n.Locale, nil)
 	if err != nil {
 		return "", fmt.Errorf("transcribe audio with SpeechAnalyzer: %w", err)
 	}
