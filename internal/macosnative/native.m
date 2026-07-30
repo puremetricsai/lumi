@@ -867,9 +867,24 @@ char *lumi_request_permissions_json(bool input_monitoring, char **error_message)
 @property(nonatomic, copy) NSString *path;
 @property(nonatomic, assign) BOOL started;
 @property(nonatomic, strong) NSError *error;
+// sessionStart is the presentation timestamp this writer's session began at.
+// Both tracks are fed from one SCStream, so their PTS values share a host
+// timebase and the difference between these is the exact skew between the two
+// files' t=0 — a value that was previously discarded, leaving cross-track
+// timings incomparable.
+@property(nonatomic, assign) CMTime sessionStart;
+// lastPTSEnd is the end of the most recently appended buffer, so the writer can
+// report the span it actually captured rather than the span that was requested.
+@property(nonatomic, assign) CMTime lastPTSEnd;
+// startedAtUnixNS is the wall clock of the first sample buffer, derived by
+// ageing the host clock rather than by sampling NSDate on arrival, so queue
+// latency does not accumulate into the anchor.
+@property(nonatomic, assign) int64_t startedAtUnixNS;
 - (instancetype)initWithPath:(NSString *)path error:(NSError **)error;
 - (void)appendSampleBuffer:(CMSampleBufferRef)sampleBuffer;
 - (void)finish:(dispatch_group_t)group;
+- (int64_t)measuredDurationMS;
+- (int64_t)sessionStartPTSNS;
 @end
 
 @implementation LumiAudioWriter
@@ -905,17 +920,50 @@ char *lumi_request_permissions_json(bool input_monitoring, char **error_message)
 
 - (void)appendSampleBuffer:(CMSampleBufferRef)sampleBuffer {
     if (self.error != nil || sampleBuffer == NULL || CMSampleBufferGetNumSamples(sampleBuffer) == 0) return;
+    CMTime pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
     if (!self.started) {
         if (![self.writer startWriting]) {
             self.error = self.writer.error;
             return;
         }
-        [self.writer startSessionAtSourceTime:CMSampleBufferGetPresentationTimeStamp(sampleBuffer)];
+        [self.writer startSessionAtSourceTime:pts];
+        self.sessionStart = pts;
+        // Convert this buffer's PTS to wall clock by measuring how old it
+        // already is against the same host clock it was stamped from, then
+        // subtracting that age from now. Reading NSDate alone would attribute
+        // however long the buffer waited on the capture queue to the audio
+        // itself, and the whole point of this anchor is that it be tight.
+        CMTime hostNow = CMClockGetTime(CMClockGetHostTimeClock());
+        Float64 age = CMTimeGetSeconds(CMTimeSubtract(hostNow, pts));
+        if (!isfinite(age) || age < 0) age = 0;
+        self.startedAtUnixNS = (int64_t)(([[NSDate date] timeIntervalSince1970] - age) * 1e9);
         self.started = YES;
+    }
+    CMTime duration = CMSampleBufferGetDuration(sampleBuffer);
+    CMTime end = CMTIME_IS_NUMERIC(duration) ? CMTimeAdd(pts, duration) : pts;
+    if (!CMTIME_IS_NUMERIC(self.lastPTSEnd) || CMTimeCompare(end, self.lastPTSEnd) > 0) {
+        self.lastPTSEnd = end;
     }
     if (self.input.readyForMoreMediaData && ![self.input appendSampleBuffer:sampleBuffer]) {
         self.error = self.writer.error;
     }
+}
+
+// measuredDurationMS reports the span actually written, or 0 when nothing was.
+- (int64_t)measuredDurationMS {
+    if (!self.started || !CMTIME_IS_NUMERIC(self.sessionStart) || !CMTIME_IS_NUMERIC(self.lastPTSEnd)) return 0;
+    Float64 seconds = CMTimeGetSeconds(CMTimeSubtract(self.lastPTSEnd, self.sessionStart));
+    if (!isfinite(seconds) || seconds <= 0) return 0;
+    return (int64_t)llround(seconds * 1000.0);
+}
+
+// sessionStartPTSNS reports this writer's session start on the shared host
+// timebase, or 0 when nothing was written.
+- (int64_t)sessionStartPTSNS {
+    if (!self.started || !CMTIME_IS_NUMERIC(self.sessionStart)) return 0;
+    Float64 seconds = CMTimeGetSeconds(self.sessionStart);
+    if (!isfinite(seconds)) return 0;
+    return (int64_t)llround(seconds * 1e9);
 }
 
 - (void)finish:(dispatch_group_t)group {
@@ -953,6 +1001,27 @@ char *lumi_request_permissions_json(bool input_monitoring, char **error_message)
     self.streamError = error;
 }
 @end
+
+// LumiAudioFrameDictionary renders one track's frame. Beyond the requested
+// duration every row has always carried, it reports the wall clock of the first
+// sample buffer, the session start on the shared host timebase, and the span
+// actually captured — the three values that make one track's file-relative
+// timings comparable with the other's. Each is omitted when the writer never
+// started, so absent and zero stay distinguishable on the Go side.
+static NSMutableDictionary *LumiAudioFrameDictionary(NSString *path, NSString *source,
+                                                     int64_t requestedDurationMS,
+                                                     LumiAudioWriter *writer,
+                                                     NSString *captureError) {
+    NSMutableDictionary *frame = [@{@"path": path, @"source": source,
+                                    @"duration_ms": @(requestedDurationMS)} mutableCopy];
+    if (writer.startedAtUnixNS > 0) frame[@"started_at_unix_ns"] = @(writer.startedAtUnixNS);
+    int64_t sessionStart = [writer sessionStartPTSNS];
+    if (sessionStart != 0) frame[@"session_start_pts_ns"] = @(sessionStart);
+    int64_t measured = [writer measuredDurationMS];
+    if (measured > 0) frame[@"measured_duration_ms"] = @(measured);
+    if (captureError.length > 0) frame[@"capture_error"] = captureError;
+    return frame;
+}
 
 char *lumi_record_audio_json(const char *directory, const char *prefix, double duration_seconds,
                              char **error_message) {
@@ -1059,16 +1128,12 @@ char *lumi_record_audio_json(const char *directory, const char *prefix, double d
             NSError *finalError = output.streamError ?: output.systemWriter.error ?: output.microphoneWriter.error;
             NSString *captureError = finalError.localizedDescription;
             if ([[NSFileManager defaultManager] fileExistsAtPath:systemPath]) {
-				NSMutableDictionary *frame = [@{@"path": systemPath, @"source": @"system",
-				                                  @"duration_ms": @(durationMS)} mutableCopy];
-				if (captureError.length > 0) frame[@"capture_error"] = captureError;
-				[frames addObject:frame];
+				[frames addObject:LumiAudioFrameDictionary(systemPath, @"system", durationMS,
+				                                           output.systemWriter, captureError)];
             }
             if ([[NSFileManager defaultManager] fileExistsAtPath:microphonePath]) {
-				NSMutableDictionary *frame = [@{@"path": microphonePath, @"source": @"microphone",
-				                                  @"duration_ms": @(durationMS)} mutableCopy];
-				if (captureError.length > 0) frame[@"capture_error"] = captureError;
-				[frames addObject:frame];
+				[frames addObject:LumiAudioFrameDictionary(microphonePath, @"microphone", durationMS,
+				                                           output.microphoneWriter, captureError)];
 			}
 			if (frames.count == 0 && finalError != nil) {
 				if (error_message != NULL) *error_message = LumiCopyError(finalError);
