@@ -55,6 +55,17 @@ const (
 	OriginSilent Origin = "silent"
 )
 
+// Capture track names. These say which WAV a segment was read from, which is a
+// different question from its Origin — they differ exactly where bleed was found.
+// They live here because Track.Source is the field they are assigned to, and
+// because both writers of attribution, the recorder and the backfill, have to
+// name the two tracks identically or a chunk's system track becomes unfindable
+// depending on which path attributed it.
+const (
+	TrackSystem     = "system"
+	TrackMicrophone = "microphone"
+)
+
 // OrderConfidence says how much to trust a segment's position in the transcript.
 type OrderConfidence string
 
@@ -136,6 +147,42 @@ type Track struct {
 // HasEnergyData reports whether the envelope can be consulted.
 func (t *Track) HasEnergyData() bool {
 	return t != nil && len(t.Envelope) > 0 && t.EnvelopeWindowMS > 0
+}
+
+// EnvelopeWindowMS is the resolution an energy measurement must be taken at to be
+// read correctly by internalAudible. 100ms is short enough to isolate a
+// notification blip, which was measured occupying a single window in an otherwise
+// silent thirty seconds; a whole-file RMS would let that one blip mark the chunk
+// ambiguous.
+//
+// It is exported because the measurement itself needs a filesystem and this
+// package has none, so both writers take it elsewhere and have to agree.
+const EnvelopeWindowMS = 100
+
+// NeedsInternalEnergy reports whether measuring the system track's energy could
+// change this chunk's verdict.
+//
+// Only externalOnly consults the envelope, and only for a chunk whose microphone
+// spoke while the system track came back empty — the recognizer returns nothing
+// both for a silent track and for one carrying audio it could not transcribe, and
+// those need opposite conclusions. Every other shape either never reads the
+// envelope or is decided before it would be. The rule lives here rather than in
+// each writer because the recorder and the backfill both have to skip exactly the
+// same chunks: measuring where the recorder does not is wasted file I/O on the
+// common case, and failing to measure where it does is a different verdict for
+// the same audio.
+func NeedsInternalEnergy(chunk Chunk) bool {
+	return chunk.System != nil && !hasSpeech(chunk.System) && hasSpeech(chunk.Microphone)
+}
+
+// IsSilent reports whether attribution concluded the chunk held no speech. The
+// marker is the whole result when it is produced at all, so the first segment
+// decides.
+//
+// It is exported because the verdict is half of the gate that keeps a failed
+// transcription from being recorded as silence, and both writers apply it.
+func IsSilent(segments []Segment) bool {
+	return len(segments) > 0 && segments[0].Method == MethodSilent
 }
 
 // Chunk is one capture window's two tracks. Either may be nil.

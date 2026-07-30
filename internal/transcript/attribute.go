@@ -327,6 +327,17 @@ func textPath(system, mic *Track, chunk Chunk, opts Options) []placed {
 	internal := Tokenize(system.Text)
 	alignment := Align(internal, external)
 
+	// Every segment this path emits shares one confidence: the text path knows
+	// nothing about any individual piece, only that none of it was timed. Stating
+	// the formula once keeps that true.
+	segment := func(origin Origin, source, text string, bleed bool, order OrderConfidence) Segment {
+		return Segment{
+			Origin: origin, SourceTrack: source, Text: text, IsBleed: bleed,
+			Confidence:      opts.DefaultASRConfidence * opts.TextPathPenalty,
+			OrderConfidence: order, Method: MethodText,
+		}
+	}
+
 	regions := bleedRegions(alignment, len(external), len(internal))
 	var out []placed
 	position := 0.0
@@ -341,11 +352,8 @@ func textPath(system, mic *Track, chunk Chunk, opts Options) []placed {
 	for index, region := range regions {
 		if region.textStart > cursor {
 			for _, piece := range splitSentences(sliceTokens(mic.Text, external, cursor, region.textStart)) {
-				out = append(out, placed{order: position, segment: Segment{
-					Origin: OriginExternal, SourceTrack: mic.Source, Text: piece,
-					Confidence:      opts.DefaultASRConfidence * opts.TextPathPenalty,
-					OrderConfidence: OrderSequence, Method: MethodText,
-				}})
+				out = append(out, placed{order: position,
+					segment: segment(OriginExternal, mic.Source, piece, false, OrderSequence)})
 				position++
 			}
 		}
@@ -353,33 +361,22 @@ func textPath(system, mic *Track, chunk Chunk, opts Options) []placed {
 		// Text comes from the system side: it is the original rather than a
 		// re-recording, so it is the cleaner of the two transcriptions.
 		if text := sliceTokens(system.Text, internal, region.patternStart, region.patternEnd); text != "" {
-			out = append(out, placed{order: position, segment: Segment{
-				Origin: OriginInternal, SourceTrack: system.Source, Text: text,
-				Confidence:      opts.DefaultASRConfidence * opts.TextPathPenalty,
-				OrderConfidence: OrderSequence, Method: MethodText,
-			}})
+			out = append(out, placed{order: position,
+				segment: segment(OriginInternal, system.Source, text, false, OrderSequence)})
 			position++
 		}
 		// The microphone's copy is kept too, marked as bleed. Nothing captured is
 		// discarded; it is simply excluded from an assembled transcript.
-		out = append(out, placed{order: position, segment: Segment{
-			Origin: OriginInternal, SourceTrack: mic.Source,
-			Text:            sliceTokens(mic.Text, external, region.textStart, region.textEnd),
-			IsBleed:         true,
-			Confidence:      opts.DefaultASRConfidence * opts.TextPathPenalty,
-			OrderConfidence: OrderSequence, Method: MethodText,
-		}})
+		out = append(out, placed{order: position, segment: segment(OriginInternal, mic.Source,
+			sliceTokens(mic.Text, external, region.textStart, region.textEnd), true, OrderSequence)})
 		position++
 		placements[index].next = position
 		cursor = region.textEnd
 	}
 	if cursor < len(external) {
 		for _, piece := range splitSentences(sliceTokens(mic.Text, external, cursor, len(external))) {
-			out = append(out, placed{order: position, segment: Segment{
-				Origin: OriginExternal, SourceTrack: mic.Source, Text: piece,
-				Confidence:      opts.DefaultASRConfidence * opts.TextPathPenalty,
-				OrderConfidence: OrderSequence, Method: MethodText,
-			}})
+			out = append(out, placed{order: position,
+				segment: segment(OriginExternal, mic.Source, piece, false, OrderSequence)})
 			position++
 		}
 	}
@@ -392,11 +389,8 @@ func textPath(system, mic *Track, chunk Chunk, opts Options) []placed {
 		if strings.TrimSpace(text) == "" {
 			continue
 		}
-		out = append(out, placed{order: gap.order, segment: Segment{
-			Origin: OriginInternal, SourceTrack: system.Source, Text: text,
-			Confidence:      opts.DefaultASRConfidence * opts.TextPathPenalty,
-			OrderConfidence: OrderApproximate, Method: MethodText,
-		}})
+		out = append(out, placed{order: gap.order,
+			segment: segment(OriginInternal, system.Source, text, false, OrderApproximate)})
 	}
 	return out
 }
