@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
@@ -63,6 +64,9 @@ func (a *app) resolveTranscribeVocabulary(path string, disabled, explicit bool) 
 	if disabled {
 		return nil, nil
 	}
+	if explicit && path == "" {
+		return nil, errors.New("--vocabulary requires a path; use --no-vocabulary for a baseline")
+	}
 	if path == "" {
 		paths, err := a.paths()
 		if err != nil {
@@ -80,6 +84,10 @@ func (a *app) resolveTranscribeVocabulary(path string, disabled, explicit bool) 
 	}
 	if explicit && !snapshot.Exists {
 		return nil, fmt.Errorf("vocabulary file %s does not exist", path)
+	}
+	if snapshot.Dropped > 0 {
+		fmt.Fprintf(os.Stderr, "warning: %d terms dropped past the %d-term cap\n",
+			snapshot.Dropped, vocabulary.MaxTerms)
 	}
 	return snapshot.Terms, nil
 }

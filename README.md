@@ -98,7 +98,15 @@ transcription path the recorder uses:
 ```
 
 Comparing two live recordings would confound the vocabulary with how the words happened to be spoken;
-replaying the same file isolates the term list as the only variable.
+replaying the same file isolates the term list as the only variable. `lumi transcribe` also takes
+`--speech-locale` (same default as `record`, `en-US`), for replaying audio in a non-default locale.
+
+An explicit `--vocabulary <path>` that is missing or unreadable is a hard, non-zero error — the behavior
+you're most likely to hit by accident, for example a typo'd path or an unset `--vocabulary="$VOCAB"`. This
+is deliberate: silently falling back would print an ordinary baseline transcript that looks
+vocabulary-assisted, defeating the comparison this command exists to make. The default file (no
+`--vocabulary` given) is different — its absence stays silent, since running with no vocabulary at all is a
+legitimate baseline.
 
 ## Connect an AI agent
 

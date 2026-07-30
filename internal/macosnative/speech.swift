@@ -64,9 +64,20 @@ public func lumi_transcribe_audio_string(
             try await ensureAssets(for: transcriber)
             let analyzer = SpeechAnalyzer(modules: [transcriber])
             if !vocabulary.isEmpty {
-                let context = AnalysisContext()
-                context.contextualStrings = [.general: vocabulary]
-                try await analyzer.setContext(context)
+                // A vocabulary problem must cost biasing, never the whole
+                // transcription: this is its own do/catch, separate from the
+                // outer one, so a throwing setContext cannot fail the chunk.
+                // The diagnostic goes to stderr, never stdout, since
+                // lumi_transcribe_audio_string backs `lumi transcribe`, which
+                // prints the transcript itself to stdout.
+                do {
+                    let context = AnalysisContext()
+                    context.contextualStrings = [.general: vocabulary]
+                    try await analyzer.setContext(context)
+                } catch {
+                    let message = "vocabulary: setContext failed, continuing unbiased: \(error.localizedDescription)\n"
+                    FileHandle.standardError.write(Data(message.utf8))
+                }
             }
             let audioFile = try AVAudioFile(forReading: URL(fileURLWithPath: path))
 

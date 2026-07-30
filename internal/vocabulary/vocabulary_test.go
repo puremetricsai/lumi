@@ -5,6 +5,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestParseAppliesFileFormat(t *testing.T) {
@@ -71,6 +72,29 @@ func TestParseDoesNotCountDuplicatesAsDropped(t *testing.T) {
 	}
 	if dropped != 0 {
 		t.Fatalf("dropped = %d, want 0 (duplicates are not cap drops)", dropped)
+	}
+}
+
+// TestParseStripsLeadingBOM guards against a BOM-prefixed file (common from
+// editors that default to "UTF-8 with BOM") corrupting the first term. U+FEFF
+// is not Unicode whitespace, so strings.TrimSpace alone leaves it attached,
+// producing a term that can never match spoken audio with no diagnostic
+// explaining why.
+func TestParseStripsLeadingBOM(t *testing.T) {
+	input := append([]byte{0xEF, 0xBB, 0xBF}, []byte("Mostafa\nAcme Corp\n")...)
+
+	terms, dropped := Parse(input)
+
+	want := []string{"Mostafa", "Acme Corp"}
+	if !slices.Equal(terms, want) {
+		t.Fatalf("Parse terms = %q, want %q", terms, want)
+	}
+	if dropped != 0 {
+		t.Fatalf("Parse dropped = %d, want 0", dropped)
+	}
+	const bom = rune(0xFEFF)
+	if r, _ := utf8.DecodeRuneInString(terms[0]); r == bom {
+		t.Fatal("first term still carries a leading BOM")
 	}
 }
 

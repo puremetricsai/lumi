@@ -5,8 +5,16 @@
 package vocabulary
 
 import (
+	"bytes"
 	"strings"
 )
+
+// utf8BOM is the byte-order mark (U+FEFF) some editors prepend to UTF-8
+// files, spelled as an explicit byte sequence so the mark itself is not
+// sitting invisibly in this source file. It is not Unicode whitespace, so
+// strings.TrimSpace leaves it attached to whatever term follows it — a term
+// that can then never match spoken audio, with no diagnostic pointing at why.
+var utf8BOM = []byte{0xEF, 0xBB, 0xBF}
 
 // MaxTerms caps how many phrases are handed to contextual biasing. Biasing is
 // a budget, not a dictionary: an oversized list dilutes every term and makes
@@ -22,6 +30,7 @@ const MaxTerms = 100
 // earliest terms and dropped counts only what the cap discarded — duplicates
 // are not drops.
 func Parse(data []byte) (terms []string, dropped int) {
+	data = bytes.TrimPrefix(data, utf8BOM)
 	seen := make(map[string]struct{})
 	// Splitting beats bufio.Scanner here: the whole file is already in memory,
 	// so scanning buys no streaming, while its 64KB token limit would silently

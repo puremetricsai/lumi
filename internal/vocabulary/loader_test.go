@@ -185,6 +185,54 @@ func TestLoadDetectsReplacementWithIdenticalSizeAndMtime(t *testing.T) {
 	}
 }
 
+// TestLoadUsesTheCachedSnapshotOnAnUnchangedFile pins that the cache-hit
+// branch in observe() actually runs. TestLoadReturnsTermsAndCachesUnchangedFile
+// only asserts equality between two Load() calls on a file nobody touched in
+// between, which a correct unconditional re-read would also satisfy —
+// deleting the cache-hit branch entirely would leave that test green. This is
+// the exact inverse of TestLoadDetectsReplacementWithIdenticalSizeAndMtime,
+// which changes the inode via rename to prove identity is checked; here the
+// inode, mtime, size, and mode are all held constant while the content is
+// swapped underneath the cache, so only an actual cache hit — not a re-read —
+// can explain a returned snapshot still reporting the old content.
+func TestLoadUsesTheCachedSnapshotOnAnUnchangedFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vocabulary.txt")
+	writeVocabulary(t, path, "Alpha\n")
+	loader := &Loader{Path: path}
+	first := loader.Load()
+	if !slices.Equal(first.Terms, []string{"Alpha"}) {
+		t.Fatalf("Terms = %q, want [Alpha]", first.Terms)
+	}
+
+	original, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat original: %v", err)
+	}
+
+	// Overwrite in place (same inode, same mode) with same-length content, then
+	// restore the mtime, so every field in the cache key still matches.
+	if err := os.WriteFile(path, []byte("Bravo\n"), 0o600); err != nil {
+		t.Fatalf("overwrite: %v", err)
+	}
+	if err := os.Chtimes(path, original.ModTime(), original.ModTime()); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	current, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat current: %v", err)
+	}
+	if !os.SameFile(original, current) || current.Size() != original.Size() ||
+		!current.ModTime().Equal(original.ModTime()) || current.Mode() != original.Mode() {
+		t.Skip("filesystem did not preserve the cache key across the in-place overwrite; nothing to assert")
+	}
+
+	second := loader.Load()
+	if !slices.Equal(second.Terms, []string{"Alpha"}) {
+		t.Fatalf("Terms = %q, want the stale cached [Alpha] — the cache-hit branch was not exercised", second.Terms)
+	}
+}
+
 func TestLoadReportsDropped(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "vocabulary.txt")
 	content := ""
