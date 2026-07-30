@@ -343,6 +343,17 @@ Support/Lumi`; directories created 0700.
   would silently re-index the corpus.
 - **A segment-write failure never costs an event.** Rows insert first; attribution is a second pass whose
   retry mechanism is the backfill's derived work queue, so no retry loop belongs in the recorder.
+- **The recorder and the backfill share every rule they both apply, rather than each stating it.**
+  `ReplaceChunkSegments` promises all three write paths converge on the same rows, and a rule copied across
+  a package boundary is correct only until one copy moves — invisibly to both test suites, since neither
+  can see the other writer. So the shared pieces are exported and single-sourced: `store.SegmentFrom` /
+  `SegmentRows` (verdict → row), `transcript.IsSilent` and `store.AnyFailedTranscription` (the silent-and-
+  failed gate), `transcript.TrackSystem` / `TrackMicrophone` (the track vocabulary),
+  `transcript.EnvelopeWindowMS` and `NeedsInternalEnergy` (which chunks are worth measuring, and at what
+  resolution), and `capture.TimedSegmentsFrom` (the bridge's timings). The energy gate is the cautionary
+  case: it was duplicated, and the two copies had already drifted on whitespace-only transcripts — the
+  backfill reading a 960KB WAV for every silent chunk, and the pair reaching different verdicts for the
+  same audio.
 - **Whatever a bleed region emits is exactly what must count as accounted for.** Deriving the emitted text
   from a region's whole span but coverage from the underlying blocks let the words between blocks be
   emitted twice — once inside the region and again as unheard machine audio — reintroducing, in the
@@ -366,7 +377,8 @@ Support/Lumi`; directories created 0700.
   is the one verdict a *failure* can turn into a false claim about the world — and the marker that records
   it is exactly what makes the claim permanent. Both the recorder (`attributeChunk`) and the backfill
   (`attributeStoredChunk`) therefore gate on the pair "verdict is silent **and** some track carries
-  `processor_error`", the rule living in `store.FailedTranscription`. The gate is the *verdict*, not the
+  `processor_error`" — `transcript.IsSilent` and `store.AnyFailedTranscription`, each exported so the two
+  writers share the rule rather than restating it. The gate is the *verdict*, not the
   failure: a track that did transcribe is labelled on its own evidence, so a mic failure beside a speaking
   system track still attributes. These chunks are the one thing the derived queue cannot drain, which is
   what `store.ChunksFailedTranscription` exists to count — `lumi transcript` and `get_transcript` name them
