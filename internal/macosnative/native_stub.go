@@ -135,7 +135,6 @@ func AudioProcesses(context.Context) ([]AudioProcess, error) {
 type AudioChunk struct {
 	StartedAtUnixNS int64
 	Frames          []AudioFrame
-	TimedOut        bool
 	Closed          bool
 	CaptureError    string
 }

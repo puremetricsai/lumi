@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -87,20 +86,19 @@ func (a *app) transcriptCommand() *cobra.Command {
 }
 
 // transcriptOptions validates the flags and builds the store query. Origin is
-// checked here rather than left to the store so a typo is reported as a bad flag
-// instead of silently returning nothing.
+// checked before the query rather than left to it so a typo is reported as a bad
+// flag instead of silently returning nothing; which values are valid is
+// store.ParseOrigin's to say, since the column is what they have to be valid for.
 func transcriptOptions(since, until, origin string, minConfidence float64, limit int, includeBleed bool) (store.TranscriptOptions, error) {
 	opts := store.TranscriptOptions{
 		Since: time.Now().Add(-time.Hour), Until: time.Now(),
 		MinConfidence: minConfidence, MaxTurns: limit, IncludeBleed: includeBleed,
 	}
-	switch strings.TrimSpace(origin) {
-	case "":
-	case store.OriginInternal, store.OriginExternal, store.OriginUnknown:
-		opts.Origin = strings.TrimSpace(origin)
-	default:
-		return opts, fmt.Errorf("invalid --origin %q (want internal, external, or unknown)", origin)
+	parsed, err := store.ParseOrigin(origin)
+	if err != nil {
+		return opts, fmt.Errorf("invalid --origin: %w", err)
 	}
+	opts.Origin = parsed
 	if minConfidence < 0 || minConfidence > 1 {
 		return opts, fmt.Errorf("--min-confidence must be between 0 and 1, got %v", minConfidence)
 	}
@@ -149,7 +147,7 @@ func printTranscript(out io.Writer, result store.TranscriptResult) {
 	}
 	// Coverage goes to the same stream as the transcript, after it, because a
 	// transcript with holes looks complete: nothing in the turns reveals the gap.
-	if missing := result.Chunks - result.AttributedChunks; missing > 0 {
+	if missing := result.MissingChunks(); missing > 0 {
 		fmt.Fprintf(out, "\n%d of %d audio chunks in this range are not attributed yet, so this "+
 			"transcript has gaps.\n", missing, result.Chunks)
 		// Chunks whose recognition failed are named separately, because the
@@ -159,7 +157,7 @@ func printTranscript(out io.Writer, result store.TranscriptResult) {
 			fmt.Fprintf(out, "%d of them could not be transcribed and no backfill can recover them; "+
 				"their audio is still on disk.\n", result.FailedChunks)
 		}
-		if missing > result.FailedChunks {
+		if result.RecoverableChunks() > 0 {
 			fmt.Fprintln(out, "Run `lumi transcript backfill` to fill the rest.")
 		}
 	}

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/puremetricsai/lumi/internal/macosnative"
+	"github.com/puremetricsai/lumi/internal/transcript"
 	"github.com/puremetricsai/lumi/internal/vocabulary"
 )
 
@@ -17,7 +18,9 @@ type AudioFrame struct {
 	Path   string
 	Source string
 	// DurationMS is the duration that was requested, which is what every
-	// indexed row means by it. MeasuredDurationMS is what the file holds.
+	// indexed row means by it. What the file actually holds is
+	// macosnative.AudioFrame.MeasuredDurationMS, which the native smoke test
+	// asserts against and nothing on this path needs.
 	DurationMS   int64
 	CaptureError string
 	// StartedAt is the wall clock of this track's first sample buffer, and the
@@ -26,12 +29,6 @@ type AudioFrame struct {
 	// skew between the tracks. Zero when the native layer reported none, which
 	// is the case for every chunk captured before this field existed.
 	StartedAt time.Time
-	// SessionStartPTSNS is the first sample buffer's presentation timestamp.
-	// Both tracks are fed by one ScreenCaptureKit stream, so these share a host
-	// timebase and their difference is the exact skew between the two files'
-	// t=0. Zero when the native layer reported none.
-	SessionStartPTSNS  int64
-	MeasuredDurationMS int64
 }
 
 // TimedSegment is one transcribed phrase with a measured span, relative to the
@@ -41,22 +38,17 @@ type AudioFrame struct {
 //
 // A segment with empty Text and no Runs is a signal rather than noise: audio was
 // present across this span but no words resolved.
-type TimedSegment struct {
-	StartMS    int64
-	EndMS      int64
-	Text       string
-	Confidence float64
-	Runs       []TimedRun
-}
+//
+// It is an alias rather than a twin of transcript.TimedSegment because every
+// value of this type exists to be handed to that package: a distinct struct with
+// identical fields bought nothing but a conversion loop at each hop, and one
+// recognizer field added to the bridge would have needed editing in three places
+// with only the middle one covered by a test.
+type TimedSegment = transcript.TimedSegment
 
 // TimedRun is one word-level span inside a segment. Runs whose timing would not
 // resolve are dropped, so runs need not concatenate back to the segment text.
-type TimedRun struct {
-	StartMS    int64
-	EndMS      int64
-	Text       string
-	Confidence float64
-}
+type TimedRun = transcript.TimedRun
 
 // Transcription is a chunk's transcript and its timed segments. Text is the
 // segments' text concatenated with no separator, matching byte-for-byte what
@@ -224,10 +216,8 @@ func (s *nativeAudioStream) adopt(chunk macosnative.AudioChunk) AudioChunk {
 		}
 		result.Frames = append(result.Frames, AudioFrame{
 			Path: path, Source: frame.Source, DurationMS: frame.DurationMS,
-			CaptureError:       frame.CaptureError,
-			StartedAt:          unixNanoTime(frame.StartedAtUnixNS),
-			SessionStartPTSNS:  frame.SessionStartPTSNS,
-			MeasuredDurationMS: frame.MeasuredDurationMS,
+			CaptureError: frame.CaptureError,
+			StartedAt:    unixNanoTime(frame.StartedAtUnixNS),
 		})
 	}
 	return result
@@ -257,8 +247,19 @@ func (n NativeSpeech) Transcribe(ctx context.Context, audioPath string) (Transcr
 	if err != nil {
 		return Transcription{}, fmt.Errorf("transcribe audio with SpeechAnalyzer: %w", err)
 	}
-	result := Transcription{Text: native.Text, Segments: make([]TimedSegment, 0, len(native.Segments))}
-	for _, segment := range native.Segments {
+	return Transcription{Text: native.Text, Segments: TimedSegmentsFrom(native.Segments)}, nil
+}
+
+// TimedSegmentsFrom carries the bridge's timed segments across the cgo boundary
+// into the attribution types.
+//
+// It is exported because `lumi transcript backfill --retranscribe` re-runs the
+// same recognizer over the same WAVs and has to land on the same values the
+// recorder did: a second copy of this loop is how the two paths start disagreeing
+// about a chunk they both attributed.
+func TimedSegmentsFrom(native []macosnative.SpeechSegment) []TimedSegment {
+	out := make([]TimedSegment, 0, len(native))
+	for _, segment := range native {
 		runs := make([]TimedRun, 0, len(segment.Runs))
 		for _, run := range segment.Runs {
 			runs = append(runs, TimedRun{
@@ -266,12 +267,12 @@ func (n NativeSpeech) Transcribe(ctx context.Context, audioPath string) (Transcr
 				Text: run.Text, Confidence: run.Confidence,
 			})
 		}
-		result.Segments = append(result.Segments, TimedSegment{
+		out = append(out, TimedSegment{
 			StartMS: segment.StartMS, EndMS: segment.EndMS,
 			Text: segment.Text, Confidence: segment.Confidence, Runs: runs,
 		})
 	}
-	return result, nil
+	return out
 }
 
 // vocabularyTerms reads the term list for this chunk. A vocabulary failure is

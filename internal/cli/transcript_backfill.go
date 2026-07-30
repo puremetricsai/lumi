@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -10,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/puremetricsai/lumi/internal/capture"
 	"github.com/puremetricsai/lumi/internal/config"
 	"github.com/puremetricsai/lumi/internal/macosnative"
 	"github.com/puremetricsai/lumi/internal/store"
@@ -17,10 +17,6 @@ import (
 	"github.com/puremetricsai/lumi/internal/vocabulary"
 	"github.com/puremetricsai/lumi/internal/wav"
 )
-
-// backfillEnvelopeWindowMS matches what the recorder measures with, so a chunk
-// attributed by either path reaches the same verdict.
-const backfillEnvelopeWindowMS = 100
 
 // retranscribeChunk is a package var purely as a test seam. Without it every
 // backfill test would need Speech Recognition granted and real WAVs on disk,
@@ -205,7 +201,7 @@ func runBackfill(ctx context.Context, out io.Writer, s *store.Store, opts backfi
 			fmt.Fprintf(out, "  %s  failed: %v\n", key, err)
 			continue
 		}
-		rows, verdict := outcome.rows, outcome.explanation
+		rows := outcome.rows
 		if outcome.untranscribed {
 			// Deliberately left on the queue: labelling it means calling it
 			// silent, and nothing here can tell silence from a recognizer that
@@ -213,7 +209,7 @@ func runBackfill(ctx context.Context, out io.Writer, s *store.Store, opts backfi
 			// so it is reported rather than counted as work still to do.
 			untranscribed++
 			if opts.Explain {
-				fmt.Fprintf(out, "  %s  %s\n", key, verdict)
+				fmt.Fprintf(out, "  %s  %s\n", key, outcome.explanation())
 			}
 			continue
 		}
@@ -224,7 +220,7 @@ func runBackfill(ctx context.Context, out io.Writer, s *store.Store, opts backfi
 		if len(rows) == 0 {
 			skipped++
 			if opts.Explain {
-				fmt.Fprintf(out, "  %s  nothing to attribute (%s)\n", key, verdict)
+				fmt.Fprintf(out, "  %s  nothing to attribute (%s)\n", key, outcome.explanation())
 			}
 			continue
 		}
@@ -233,7 +229,7 @@ func runBackfill(ctx context.Context, out io.Writer, s *store.Store, opts backfi
 			if silent {
 				label = "silent"
 			}
-			fmt.Fprintf(out, "  %s  %s  %s\n", key, label, verdict)
+			fmt.Fprintf(out, "  %s  %s  %s\n", key, label, outcome.explanation())
 		}
 		if !opts.DryRun {
 			if err := s.ReplaceChunkSegments(ctx, key, rows); err != nil {
@@ -303,13 +299,23 @@ func anySpeech(rows []store.Segment) bool {
 
 // chunkOutcome is what re-deriving one chunk concluded.
 type chunkOutcome struct {
-	rows        []store.Segment
-	explanation string
+	rows []store.Segment
+	// explain composes the --explain line on demand rather than eagerly, because
+	// the line re-aligns the two transcripts the attribution path just aligned and
+	// --explain is off by default. Nil when there is nothing to say.
+	explain func() string
 	// untranscribed marks a chunk with no transcript to work from because
 	// recognition failed rather than because there was nothing to hear. It is a
 	// third outcome, not a variety of "nothing to attribute": the chunk stays on
 	// the queue on purpose and no re-run will change that.
 	untranscribed bool
+}
+
+func (o chunkOutcome) explanation() string {
+	if o.explain == nil {
+		return ""
+	}
+	return o.explain()
 }
 
 // attributeStoredChunk re-derives one chunk's segments from what is in the index,
@@ -320,7 +326,7 @@ func attributeStoredChunk(ctx context.Context, s *store.Store, key string, opts 
 		return chunkOutcome{}, err
 	}
 	if len(events) == 0 {
-		return chunkOutcome{explanation: "no rows"}, nil
+		return chunkOutcome{explain: func() string { return "no rows" }}, nil
 	}
 	capturedAt := events[0].CapturedAt
 
@@ -332,9 +338,9 @@ func attributeStoredChunk(ctx context.Context, s *store.Store, key string, opts 
 		eventIDs[event.AudioSource] = event.ID
 		paths[event.AudioSource] = event.MediaPath
 		switch event.AudioSource {
-		case "system":
+		case transcript.TrackSystem:
 			chunk.System = track
-		case "microphone":
+		case transcript.TrackMicrophone:
 			chunk.Microphone = track
 		}
 	}
@@ -349,50 +355,24 @@ func attributeStoredChunk(ctx context.Context, s *store.Store, key string, opts 
 			method = "timed"
 		}
 	}
-	// The energy measurement is what separates a silent machine from one that
-	// played something untranscribable, and it is cheap, so take it whenever the
-	// file is still there.
-	measureBackfillEnergy(&chunk, paths["system"])
+	measureBackfillEnergy(&chunk, paths[transcript.TrackSystem])
 
 	attributed := transcript.Attribute(chunk, transcript.Options{})
-	verdict := backfillVerdict(method, chunk, attributed)
-	if silentVerdict(attributed) && anyFailedTranscription(events) {
+	// Deferred rather than computed: --explain is off by default, and composing
+	// the line costs a second full alignment of the two transcripts the path just
+	// aligned. Nothing below reads it more than once.
+	verdict := func() string { return backfillVerdict(method, chunk, attributed) }
+	if transcript.IsSilent(attributed) && store.AnyFailedTranscription(events) {
 		// The same gate the recorder applies, for the same reason: silence is the
 		// one verdict read out of an absence of words, so it is the one a failed
 		// recognizer can turn into a false claim. Writing the marker here would
 		// also make it permanent, since the marker is what drains the queue.
 		return chunkOutcome{
-			explanation:   "could not be transcribed; left unattributed (" + verdict + ")",
+			explain:       func() string { return "could not be transcribed; left unattributed (" + verdict() + ")" },
 			untranscribed: true,
 		}, nil
 	}
-	rows := make([]store.Segment, 0, len(attributed))
-	for _, segment := range attributed {
-		eventID, ok := eventIDs[segment.SourceTrack]
-		if !ok {
-			continue
-		}
-		rows = append(rows, backfillSegment(segment, eventID))
-	}
-	return chunkOutcome{rows: rows, explanation: verdict}, nil
-}
-
-// silentVerdict reports whether attribution concluded the chunk held no speech.
-// The marker is the whole result when it is produced at all, so the first
-// segment decides.
-func silentVerdict(segments []transcript.Segment) bool {
-	return len(segments) > 0 && segments[0].Method == transcript.MethodSilent
-}
-
-// anyFailedTranscription reports whether any of a chunk's rows is missing its
-// transcript because recognition did not happen.
-func anyFailedTranscription(events []store.Event) bool {
-	for _, event := range events {
-		if store.FailedTranscription(event) {
-			return true
-		}
-	}
-	return false
+	return chunkOutcome{rows: store.SegmentRows(attributed, eventIDs), explain: verdict}, nil
 }
 
 func loadTimings(ctx context.Context, chunk *transcript.Chunk, paths map[string]string, opts backfillOptions) error {
@@ -403,7 +383,7 @@ func loadTimings(ctx context.Context, chunk *transcript.Chunk, paths map[string]
 	tracks := []struct {
 		source string
 		track  *transcript.Track
-	}{{"system", chunk.System}, {"microphone", chunk.Microphone}}
+	}{{transcript.TrackSystem, chunk.System}, {transcript.TrackMicrophone, chunk.Microphone}}
 	for _, entry := range tracks {
 		source, track := entry.source, entry.track
 		// A track with no stored transcript has nothing for timings to be timings
@@ -437,20 +417,9 @@ func loadTimings(ctx context.Context, chunk *transcript.Chunk, paths map[string]
 			return fmt.Errorf("%s re-transcription differs from the indexed transcript (similarity %.2f)",
 				source, similarity)
 		}
-		segments := make([]transcript.TimedSegment, 0, len(result.Segments))
-		for _, segment := range result.Segments {
-			runs := make([]transcript.TimedRun, 0, len(segment.Runs))
-			for _, run := range segment.Runs {
-				runs = append(runs, transcript.TimedRun{
-					StartMS: run.StartMS, EndMS: run.EndMS, Text: run.Text, Confidence: run.Confidence,
-				})
-			}
-			segments = append(segments, transcript.TimedSegment{
-				StartMS: segment.StartMS, EndMS: segment.EndMS, Text: segment.Text,
-				Confidence: segment.Confidence, Runs: runs,
-			})
-		}
-		track.Segments = segments
+		// The same conversion the recorder's own transcription goes through, so a
+		// re-run lands on the values a live capture would have.
+		track.Segments = capture.TimedSegmentsFrom(result.Segments)
 		// StartedAt stays zero: chunks captured before the recorder reported a
 		// first-sample-buffer wall clock have no anchor to recover. Both tracks
 		// then share the chunk's own timestamp as a base, which keeps their
@@ -460,19 +429,24 @@ func loadTimings(ctx context.Context, chunk *transcript.Chunk, paths map[string]
 	return nil
 }
 
+// measureBackfillEnergy takes the reading that separates a silent machine from
+// one that played something untranscribable.
+//
+// Which chunks need it is transcript.NeedsInternalEnergy's rule, not this
+// command's: the recorder asks the same question, and a backfill that measured
+// where the recorder did not would reach a different verdict for the same audio —
+// while reading a 960 KB WAV for every chunk of an afternoon's silence, the
+// common case by a wide margin.
 func measureBackfillEnergy(chunk *transcript.Chunk, systemPath string) {
-	if chunk.System == nil || systemPath == "" {
+	if systemPath == "" || !transcript.NeedsInternalEnergy(*chunk) {
 		return
 	}
-	if chunk.System.Text != "" {
-		return
-	}
-	samples, info, err := wav.ReadMono16(systemPath)
+	envelope, _, err := wav.ReadEnvelope(systemPath, transcript.EnvelopeWindowMS)
 	if err != nil {
 		return
 	}
-	chunk.System.Envelope = wav.Envelope(samples, info.SampleRate, backfillEnvelopeWindowMS)
-	chunk.System.EnvelopeWindowMS = backfillEnvelopeWindowMS
+	chunk.System.Envelope = envelope
+	chunk.System.EnvelopeWindowMS = transcript.EnvelopeWindowMS
 }
 
 // backfillVerdict summarizes why a chunk came out the way it did, for --explain.
@@ -496,28 +470,4 @@ func backfillVerdict(method string, chunk transcript.Chunk, segments []transcrip
 		method, similarity,
 		counts[transcript.OriginInternal], counts[transcript.OriginExternal],
 		counts[transcript.OriginUnknown], bleed)
-}
-
-func backfillSegment(segment transcript.Segment, eventID int64) store.Segment {
-	row := store.Segment{
-		EventID: eventID, Seq: segment.Seq, Origin: string(segment.Origin),
-		SourceTrack: segment.SourceTrack, Text: segment.Text,
-		StartOffsetMS: segment.StartOffsetMS, EndOffsetMS: segment.EndOffsetMS,
-		IsBleed: segment.IsBleed, Confidence: segment.Confidence,
-		OrderConfidence: string(segment.OrderConfidence), Method: string(segment.Method),
-	}
-	if !segment.StartedAt.IsZero() {
-		started := segment.StartedAt
-		row.StartedAt = &started
-	}
-	if !segment.EndedAt.IsZero() {
-		ended := segment.EndedAt
-		row.EndedAt = &ended
-	}
-	if len(segment.Runs) > 0 {
-		if encoded, err := json.Marshal(segment.Runs); err == nil {
-			row.RunsJSON = encoded
-		}
-	}
-	return row
 }

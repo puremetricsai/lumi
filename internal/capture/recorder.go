@@ -465,12 +465,6 @@ type audioChunkResult struct {
 	failed bool
 }
 
-// envelopeWindowMS is the resolution of the energy measurement used to tell a
-// silent machine from one playing something that did not transcribe. 100ms is
-// short enough to isolate a notification blip, which was measured occupying a
-// single window in an otherwise silent thirty seconds.
-const envelopeWindowMS = 100
-
 // attributeChunk decides where a chunk's audio came from and stores the verdict.
 //
 // It runs only after every track of the chunk is already indexed, and a failure
@@ -495,10 +489,10 @@ func (r *Recorder) attributeChunk(ctx context.Context, capturedAt time.Time, res
 	for _, result := range results {
 		eventIDs[result.frame.Source] = result.eventID
 		switch result.frame.Source {
-		case audioSourceSystem:
+		case transcript.TrackSystem:
 			chunk.System = buildTrack(result)
 			systemPath = result.frame.Path
-		case audioSourceMicrophone:
+		case transcript.TrackMicrophone:
 			chunk.Microphone = buildTrack(result)
 		}
 	}
@@ -508,7 +502,7 @@ func (r *Recorder) attributeChunk(ctx context.Context, capturedAt time.Time, res
 	if len(segments) == 0 {
 		return
 	}
-	if silentVerdict(segments) && anyTranscriptionFailed(results) {
+	if transcript.IsSilent(segments) && anyTranscriptionFailed(results) {
 		// Silence is the one verdict read out of an *absence* of words, and a
 		// failed recognizer produces exactly the same absence — so this is the one
 		// verdict a failure can turn into a false claim about the world. Writing
@@ -524,16 +518,7 @@ func (r *Recorder) attributeChunk(ctx context.Context, capturedAt time.Time, res
 			"captured_at", capturedAt)
 		return
 	}
-	rows := make([]store.Segment, 0, len(segments))
-	for _, segment := range segments {
-		eventID, ok := eventIDs[segment.SourceTrack]
-		if !ok {
-			// A segment whose track produced no row cannot be stored against
-			// anything; dropping it is better than orphaning it.
-			continue
-		}
-		rows = append(rows, storeSegment(segment, eventID))
-	}
+	rows := store.SegmentRows(segments, eventIDs)
 	if len(rows) == 0 {
 		return
 	}
@@ -544,7 +529,7 @@ func (r *Recorder) attributeChunk(ctx context.Context, capturedAt time.Time, res
 			"error", err)
 		return
 	}
-	if silentVerdict(segments) {
+	if transcript.IsSilent(segments) {
 		// A silent chunk still writes its marker, but saying so every thirty
 		// seconds would bury the lines that carry information under the quietest
 		// thing the recorder does.
@@ -552,13 +537,6 @@ func (r *Recorder) attributeChunk(ctx context.Context, capturedAt time.Time, res
 		return
 	}
 	r.Logger.Info("attributed audio", "segments", len(rows), "method", string(segments[0].Method))
-}
-
-// silentVerdict reports whether attribution concluded the chunk held no speech.
-// The marker is the whole result when it is produced at all, so the first
-// segment decides.
-func silentVerdict(segments []transcript.Segment) bool {
-	return len(segments) > 0 && segments[0].Method == transcript.MethodSilent
 }
 
 // anyTranscriptionFailed reports whether any of the chunk's tracks has no
@@ -572,82 +550,32 @@ func anyTranscriptionFailed(results []audioChunkResult) bool {
 	return false
 }
 
-const (
-	audioSourceSystem     = "system"
-	audioSourceMicrophone = "microphone"
-)
-
 func buildTrack(result audioChunkResult) *transcript.Track {
-	segments := make([]transcript.TimedSegment, 0, len(result.transcription.Segments))
-	for _, segment := range result.transcription.Segments {
-		runs := make([]transcript.TimedRun, 0, len(segment.Runs))
-		for _, run := range segment.Runs {
-			runs = append(runs, transcript.TimedRun{
-				StartMS: run.StartMS, EndMS: run.EndMS, Text: run.Text, Confidence: run.Confidence,
-			})
-		}
-		segments = append(segments, transcript.TimedSegment{
-			StartMS: segment.StartMS, EndMS: segment.EndMS, Text: segment.Text,
-			Confidence: segment.Confidence, Runs: runs,
-		})
-	}
 	return &transcript.Track{
 		Source:    result.frame.Source,
 		StartedAt: result.frame.StartedAt,
 		Text:      result.transcription.Text,
-		Segments:  segments,
+		Segments:  result.transcription.Segments,
 	}
 }
 
-// measureInternalEnergy reads the system track's WAV when its transcript came back
-// empty, which is the overwhelmingly common case.
-//
-// The recognizer returns nothing both for a track that was silent and for one
-// that played audio it could not transcribe, and those need opposite conclusions:
-// silence means the microphone is confidently the room, while unexplained audio
-// means a re-recording of words nobody can see is possible. Only energy separates
-// them. The read is skipped when it could not change any verdict.
+// measureInternalEnergy reads the system track's WAV when the verdict could turn
+// on whether it was silent or merely untranscribable, which is what
+// transcript.NeedsInternalEnergy decides — the rule lives there so this and the
+// backfill skip exactly the same chunks.
 func (r *Recorder) measureInternalEnergy(chunk *transcript.Chunk, systemPath string) {
-	system, mic := chunk.System, chunk.Microphone
-	if system == nil || mic == nil || systemPath == "" {
+	if systemPath == "" || !transcript.NeedsInternalEnergy(*chunk) {
 		return
 	}
-	if strings.TrimSpace(system.Text) != "" || strings.TrimSpace(mic.Text) == "" {
-		return
-	}
-	samples, info, err := wav.ReadMono16(systemPath)
+	envelope, _, err := wav.ReadEnvelope(systemPath, transcript.EnvelopeWindowMS)
 	if err != nil {
 		// Without the measurement the microphone stays confidently external,
 		// which is the pre-existing behaviour rather than a new risk.
 		r.Logger.Debug("could not measure system audio energy", "error", err)
 		return
 	}
-	system.Envelope = wav.Envelope(samples, info.SampleRate, envelopeWindowMS)
-	system.EnvelopeWindowMS = envelopeWindowMS
-}
-
-func storeSegment(segment transcript.Segment, eventID int64) store.Segment {
-	row := store.Segment{
-		EventID: eventID, Seq: segment.Seq, Origin: string(segment.Origin),
-		SourceTrack: segment.SourceTrack, Text: segment.Text,
-		StartOffsetMS: segment.StartOffsetMS, EndOffsetMS: segment.EndOffsetMS,
-		IsBleed: segment.IsBleed, Confidence: segment.Confidence,
-		OrderConfidence: string(segment.OrderConfidence), Method: string(segment.Method),
-	}
-	if !segment.StartedAt.IsZero() {
-		started := segment.StartedAt
-		row.StartedAt = &started
-	}
-	if !segment.EndedAt.IsZero() {
-		ended := segment.EndedAt
-		row.EndedAt = &ended
-	}
-	if len(segment.Runs) > 0 {
-		if encoded, err := json.Marshal(segment.Runs); err == nil {
-			row.RunsJSON = encoded
-		}
-	}
-	return row
+	chunk.System.Envelope = envelope
+	chunk.System.EnvelopeWindowMS = transcript.EnvelopeWindowMS
 }
 
 // preservationContext gives already-written media a short, cancellation-free

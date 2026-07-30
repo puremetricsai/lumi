@@ -265,16 +265,7 @@ func (h *handlers) searchEvents(ctx context.Context, _ *sdk.CallToolRequest, in 
 	// conversation: the machine's speech still appears in both tracks here, and
 	// a turn spanning two windows arrives as two results. Point at the tool that
 	// answers those, but only when it would actually have something to show.
-	//
-	// A failure to answer that costs the hint, never the search. The results are
-	// already assembled and correct, and losing a page of real hits because an
-	// advisory sentence could not be composed would trade the answer for the
-	// footnote. The error is not reported anywhere because it cannot hide a
-	// problem: it can only come from the same database the results above were
-	// just read out of, so anything real enough to matter fails get_transcript
-	// with a message of its own.
-	attributed, _ := h.hasAttributedAudio(ctx, out.Events)
-	if attributed {
+	if h.hasAttributedAudio(ctx, events) {
 		parts = append(parts, "some results are audio: get_transcript returns these as one ordered "+
 			"conversation with per-turn origin labels and the machine's own speech deduplicated")
 	}
@@ -290,31 +281,33 @@ func (h *handlers) searchEvents(ctx context.Context, _ *sdk.CallToolRequest, in 
 // attributed — that is what makes the backfill queue drain — but has nothing to
 // show, and pointing an agent at an empty transcript costs it a round trip to
 // learn nothing.
-func (h *handlers) hasAttributedAudio(ctx context.Context, events []EventRecord) (bool, error) {
+//
+// It reads the store events rather than the records rendered from them: the
+// timestamps are already time.Time there, and recovering them by re-parsing this
+// package's own output would make the hint quietly depend on how EventRecord
+// happens to format a time.
+//
+// A failure to answer costs the hint, never the search, so there is no error to
+// return: the results are assembled and correct, and it can only come from the
+// database they were just read out of.
+func (h *handlers) hasAttributedAudio(ctx context.Context, events []store.Event) bool {
 	var earliest, latest time.Time
 	for _, event := range events {
-		if event.Kind != string(store.KindAudio) {
+		if event.Kind != store.KindAudio {
 			continue
 		}
-		at, err := time.Parse(time.RFC3339Nano, event.CapturedAt)
-		if err != nil {
-			continue
+		if earliest.IsZero() || event.CapturedAt.Before(earliest) {
+			earliest = event.CapturedAt
 		}
-		if earliest.IsZero() || at.Before(earliest) {
-			earliest = at
-		}
-		if at.After(latest) {
-			latest = at
+		if event.CapturedAt.After(latest) {
+			latest = event.CapturedAt
 		}
 	}
 	if earliest.IsZero() {
-		return false, nil
+		return false
 	}
 	attributed, err := h.store.HasSpeechSegments(ctx, earliest, latest)
-	if err != nil {
-		return false, fmt.Errorf("check audio attribution coverage: %w", err)
-	}
-	return attributed, nil
+	return err == nil && attributed
 }
 
 // annotateAudio fills audio_origin and audio_tracks on the collapsed audio

@@ -492,9 +492,11 @@ func RequestPermissions(ctx context.Context, inputMonitoring bool) (Permissions,
 	return permissions, nil
 }
 
-// AudioChunk is one slice of a continuously running capture session. Exactly one
-// of Frames, TimedOut, and Closed is meaningful per read: a chunk, nothing yet,
-// or the end of the session.
+// AudioChunk is one slice of a continuously running capture session. A read
+// returns a chunk (Frames), nothing yet (neither), or the end of the session
+// (Closed). The native layer also reports a poll timeout, which is decoded away
+// deliberately: "no chunk yet" and "no chunk yet, and the poll expired" call for
+// the same thing from every caller, and a field nobody branches on invites one.
 type AudioChunk struct {
 	// StartedAtUnixNS is the wall clock of this chunk's boundary, derived by
 	// offsetting the session anchor rather than by reading the clock at
@@ -509,7 +511,6 @@ type AudioChunk struct {
 	// uniform spacing that makes coverage arithmetic exact.
 	StartedAtUnixNS int64        `json:"started_at_unix_ns"`
 	Frames          []AudioFrame `json:"frames"`
-	TimedOut        bool         `json:"timeout"`
 	Closed          bool         `json:"closed"`
 	// CaptureError is set alongside Closed when the stream ended because
 	// ScreenCaptureKit failed rather than because it was stopped.

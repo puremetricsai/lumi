@@ -65,29 +65,6 @@ type getTranscriptOutput struct {
 	Notice     string `json:"notice,omitempty"`
 }
 
-// parseOrigin maps the tool's origin parameter onto a stored origin value.
-//
-// The error spells out the vocabulary rather than listing valid strings, because
-// the names are only obvious once you know that Lumi records two audio tracks and
-// that "internal" is about which machine produced the sound rather than who was
-// speaking.
-func parseOrigin(value string) (string, error) {
-	switch strings.TrimSpace(value) {
-	case "":
-		return "", nil
-	case store.OriginInternal:
-		return store.OriginInternal, nil
-	case store.OriginExternal:
-		return store.OriginExternal, nil
-	case store.OriginUnknown:
-		return store.OriginUnknown, nil
-	}
-	return "", fmt.Errorf(`origin must be "internal" (sound this machine produced, such as the far side `+
-		`of a call, a video, or a notification), "external" (sound the microphone picked up from the room, `+
-		`usually the user), or "unknown" (machine audio was playing but produced no transcript, so the `+
-		`origin could not be determined); got %q`, value)
-}
-
 // getTranscript assembles one ordered, attributed transcript for a time range.
 func (h *handlers) getTranscript(ctx context.Context, _ *sdk.CallToolRequest, in getTranscriptInput) (*sdk.CallToolResult, getTranscriptOutput, error) {
 	var empty getTranscriptOutput
@@ -100,7 +77,10 @@ func (h *handlers) getTranscript(ctx context.Context, _ *sdk.CallToolRequest, in
 	if err != nil {
 		return nil, empty, err
 	}
-	origin, err := parseOrigin(in.Origin)
+	// The vocabulary belongs to the column, so the store names it; the error it
+	// composes already spells the meanings out, which is what an agent mid-task
+	// needs from an unrecognized value rather than a schema rejection.
+	origin, err := store.ParseOrigin(in.Origin)
 	if err != nil {
 		return nil, empty, err
 	}
@@ -180,9 +160,9 @@ func (h *handlers) transcriptNotice(ctx context.Context, opts store.TranscriptOp
 		// range that is fully attributed sends it to run a backfill that cannot
 		// change anything.
 		filtered := "no attributed audio in this range"
-		missing := result.Chunks - result.AttributedChunks
+		missing := result.MissingChunks()
 		switch {
-		case result.Chunks > 0 && missing > 0 && missing == result.FailedChunks:
+		case result.Chunks > 0 && missing > 0 && result.RecoverableChunks() == 0:
 			// Every hole here is one no backfill can fill, so naming the command
 			// would be an instruction to watch nothing happen.
 			filtered = fmt.Sprintf("this range holds %d audio chunks and none could be transcribed, "+
@@ -228,7 +208,7 @@ func (h *handlers) transcriptNotice(ctx context.Context, opts store.TranscriptOp
 	}
 	// A transcript with holes is worse than a short one, because nothing in the
 	// turns themselves reveals the gap.
-	if missing := result.Chunks - result.AttributedChunks; missing > 0 {
+	if missing := result.MissingChunks(); missing > 0 {
 		gap := fmt.Sprintf(
 			"%d of %d audio chunks in this range are not attributed yet, so this transcript has gaps",
 			missing, result.Chunks)
@@ -240,7 +220,7 @@ func (h *handlers) transcriptNotice(ctx context.Context, opts store.TranscriptOp
 			gap += fmt.Sprintf("; %d of them could not be transcribed and no backfill can recover them",
 				result.FailedChunks)
 		}
-		if missing > result.FailedChunks {
+		if result.RecoverableChunks() > 0 {
 			gap += "; run `lumi transcript backfill` to fill the rest"
 		}
 		parts = append(parts, gap)
