@@ -23,6 +23,7 @@ import (
 	"github.com/puremetricsai/lumi/internal/platform"
 	"github.com/puremetricsai/lumi/internal/retention"
 	"github.com/puremetricsai/lumi/internal/store"
+	"github.com/puremetricsai/lumi/internal/vocabulary"
 	"github.com/spf13/cobra"
 )
 
@@ -153,11 +154,15 @@ func (a *app) runForeground(cmd *cobra.Command, f recordFlags) error {
 	recorder := capture.Recorder{
 		Store: s, Paths: paths, ScreenInterval: f.interval, AudioChunk: f.audioChunk,
 		CaptureScreen: !f.noScreen, CaptureAudio: !f.noAudio, Logger: logger,
-		Screen:      capture.NativeScreens{},
-		Text:        capture.VisionText{},
-		Context:     capture.AccessibilityContext{},
-		Audio:       capture.NativeAudio{},
-		Transcriber: capture.NativeSpeech{Locale: f.speechLocale},
+		Screen:  capture.NativeScreens{},
+		Text:    capture.VisionText{},
+		Context: capture.AccessibilityContext{},
+		Audio:   capture.NativeAudio{},
+		Transcriber: capture.NativeSpeech{
+			Locale:     f.speechLocale,
+			Vocabulary: &vocabulary.Loader{Path: paths.Vocabulary},
+			Logger:     logger,
+		},
 	}
 	logger.Info("recording started", "database", paths.Database, "screen", !f.noScreen, "audio", !f.noAudio)
 	return recorder.Run(ctx)
