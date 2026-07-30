@@ -24,7 +24,7 @@ func TestExplicitMissingVocabularyPathIsAnError(t *testing.T) {
 	a := &app{dataDir: t.TempDir()}
 	missing := filepath.Join(t.TempDir(), "typo.txt")
 
-	_, err := a.resolveTranscribeVocabulary(missing, false, true)
+	_, err := a.resolveTranscribeVocabulary(io.Discard, missing, false, true)
 	if err == nil {
 		t.Fatal("resolveTranscribeVocabulary returned nil error for an explicit missing path")
 	}
@@ -40,7 +40,7 @@ func TestExplicitUnreadableVocabularyPathIsAnError(t *testing.T) {
 	}
 	a := &app{dataDir: t.TempDir()}
 
-	if _, err := a.resolveTranscribeVocabulary(path, false, true); err == nil {
+	if _, err := a.resolveTranscribeVocabulary(io.Discard, path, false, true); err == nil {
 		t.Fatal("resolveTranscribeVocabulary returned nil error for an explicit unreadable path")
 	}
 }
@@ -48,8 +48,10 @@ func TestExplicitUnreadableVocabularyPathIsAnError(t *testing.T) {
 // TestDefaultUnreadableVocabularyWarnsAndContinues is the counterpart to
 // TestExplicitUnreadableVocabularyPathIsAnError: the same Err-not-nil branch
 // takes the opposite action when the file was never explicitly named. It must
-// warn to stderr and let the run continue baseline rather than fail it, since
-// running with no vocabulary is a legitimate outcome for the default path.
+// warn to the injected writer and let the run continue baseline rather than
+// fail it, since running with no vocabulary is a legitimate outcome for the
+// default path. The warning itself is asserted, not just the non-error return,
+// so a regression that silently swallowed the read error would be caught here.
 func TestDefaultUnreadableVocabularyWarnsAndContinues(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root reads mode-000 files regardless")
@@ -59,13 +61,17 @@ func TestDefaultUnreadableVocabularyWarnsAndContinues(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 	a := &app{dataDir: root}
+	var out bytes.Buffer
 
-	terms, err := a.resolveTranscribeVocabulary("", false, false)
+	terms, err := a.resolveTranscribeVocabulary(&out, "", false, false)
 	if err != nil {
 		t.Fatalf("resolveTranscribeVocabulary with an unreadable default file: %v", err)
 	}
 	if len(terms) != 0 {
 		t.Fatalf("terms = %q, want empty", terms)
+	}
+	if !strings.Contains(out.String(), "warning:") {
+		t.Fatalf("output = %q, want a warning about the unreadable file", out.String())
 	}
 }
 
@@ -78,19 +84,22 @@ func TestDefaultUnreadableVocabularyWarnsAndContinues(t *testing.T) {
 func TestExplicitEmptyVocabularyPathIsAnError(t *testing.T) {
 	a := &app{dataDir: t.TempDir()}
 
-	_, err := a.resolveTranscribeVocabulary("", false, true)
+	_, err := a.resolveTranscribeVocabulary(io.Discard, "", false, true)
 	if err == nil {
 		t.Fatal("resolveTranscribeVocabulary returned nil error for an explicit empty path")
 	}
 }
 
 // TestResolveTranscribeVocabularyCapsAtMaxTerms pins that a file exceeding
-// MaxTerms still returns exactly MaxTerms terms through the resolver. The
-// stderr warning it also emits is not asserted here (awkward to capture
-// through this seam); the durable, testable part is that the cap held.
+// MaxTerms still returns exactly MaxTerms terms through the resolver, and that
+// the dropped-terms warning names both the drop count and the cap. Asserting
+// only len(terms) == MaxTerms would pass even if the warning line were deleted
+// entirely, since vocabulary.Parse enforces the cap on its own; the warning
+// content is what this test exists to pin.
 func TestResolveTranscribeVocabularyCapsAtMaxTerms(t *testing.T) {
+	const extra = 5
 	var lines []string
-	for i := 0; i < vocabulary.MaxTerms+50; i++ {
+	for i := 0; i < vocabulary.MaxTerms+extra; i++ {
 		lines = append(lines, fmt.Sprintf("term-%03d", i))
 	}
 	path := filepath.Join(t.TempDir(), "vocabulary.txt")
@@ -98,20 +107,52 @@ func TestResolveTranscribeVocabularyCapsAtMaxTerms(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 	a := &app{dataDir: t.TempDir()}
+	var out bytes.Buffer
 
-	terms, err := a.resolveTranscribeVocabulary(path, false, true)
+	terms, err := a.resolveTranscribeVocabulary(&out, path, false, true)
 	if err != nil {
 		t.Fatalf("resolveTranscribeVocabulary: %v", err)
 	}
 	if len(terms) != vocabulary.MaxTerms {
 		t.Fatalf("len(terms) = %d, want %d (MaxTerms)", len(terms), vocabulary.MaxTerms)
 	}
+	warning := out.String()
+	if !strings.Contains(warning, fmt.Sprintf("%d", extra)) {
+		t.Fatalf("warning = %q, want it to report %d dropped terms", warning, extra)
+	}
+	if !strings.Contains(warning, fmt.Sprintf("%d", vocabulary.MaxTerms)) {
+		t.Fatalf("warning = %q, want it to mention the %d-term cap", warning, vocabulary.MaxTerms)
+	}
+}
+
+// TestResolveTranscribeVocabularyWarnsOnlyWhenTermsAreDropped is the negative
+// counterpart: a file at or under MaxTerms must produce no diagnostic output
+// at all, so the dropped-terms warning cannot fire spuriously on an ordinary
+// vocabulary file.
+func TestResolveTranscribeVocabularyWarnsOnlyWhenTermsAreDropped(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vocabulary.txt")
+	if err := os.WriteFile(path, []byte("Acme Corp\nMostafa\n"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	a := &app{dataDir: t.TempDir()}
+	var out bytes.Buffer
+
+	terms, err := a.resolveTranscribeVocabulary(&out, path, false, true)
+	if err != nil {
+		t.Fatalf("resolveTranscribeVocabulary: %v", err)
+	}
+	if len(terms) != 2 {
+		t.Fatalf("len(terms) = %d, want 2", len(terms))
+	}
+	if out.String() != "" {
+		t.Fatalf("output = %q, want empty: nothing was dropped", out.String())
+	}
 }
 
 func TestMissingDefaultVocabularyIsNotAnError(t *testing.T) {
 	a := &app{dataDir: t.TempDir()}
 
-	terms, err := a.resolveTranscribeVocabulary("", false, false)
+	terms, err := a.resolveTranscribeVocabulary(io.Discard, "", false, false)
 	if err != nil {
 		t.Fatalf("resolveTranscribeVocabulary with an absent default file: %v", err)
 	}
@@ -127,7 +168,7 @@ func TestExplicitVocabularyPathIsRead(t *testing.T) {
 	}
 	a := &app{dataDir: t.TempDir()}
 
-	terms, err := a.resolveTranscribeVocabulary(path, false, true)
+	terms, err := a.resolveTranscribeVocabulary(io.Discard, path, false, true)
 	if err != nil {
 		t.Fatalf("resolveTranscribeVocabulary: %v", err)
 	}
@@ -142,7 +183,7 @@ func TestNoVocabularySkipsTheFileEntirely(t *testing.T) {
 
 	// disabled must win over the explicit-path guard: --no-vocabulary is how a
 	// baseline run is produced, and it must never fail on a stale path.
-	terms, err := a.resolveTranscribeVocabulary(missing, true, true)
+	terms, err := a.resolveTranscribeVocabulary(io.Discard, missing, true, true)
 	if err != nil {
 		t.Fatalf("resolveTranscribeVocabulary with --no-vocabulary: %v", err)
 	}
@@ -158,7 +199,7 @@ func TestDefaultVocabularyComesFromTheDataDir(t *testing.T) {
 	}
 	a := &app{dataDir: root}
 
-	terms, err := a.resolveTranscribeVocabulary("", false, false)
+	terms, err := a.resolveTranscribeVocabulary(io.Discard, "", false, false)
 	if err != nil {
 		t.Fatalf("resolveTranscribeVocabulary: %v", err)
 	}
@@ -224,9 +265,20 @@ func TestReportVocabularyStates(t *testing.T) {
 // after TranscribeAudio would keep every existing test green while letting a
 // baseline transcript reach stdout ahead of the error — exactly the
 // measurement corruption the ordering exists to prevent. This exercises the
-// real RunE, so it also proves no native call happens on the failing path: the
-// audio path handed in does not exist, and the command must still fail on the
-// vocabulary path before ever touching it.
+// real RunE, so it also proves no native call happens on the failing path.
+//
+// The audio path handed in also does not exist. That is deliberate (a real
+// WAV would invoke the native SpeechAnalyzer path, making the test slow and
+// permission-dependent), but it means a bare "execErr != nil" assertion does
+// not actually pin the ordering: if resolve-then-transcribe were inverted to
+// transcribe-then-resolve, macosnative.TranscribeAudio would fail on the
+// missing audio file first, producing a non-nil error and empty stdout just
+// the same, and this test would stay green through the regression it exists
+// to catch. What discriminates the two orderings is the error's *identity* —
+// which path it names — so the assertion below checks that the error mentions
+// the bogus vocabulary path and does not mention the audio path. If ordering
+// were inverted, the error would name the audio path instead and this
+// assertion would fail.
 func TestTranscribeCommandFailsBeforePrintingOnBadVocabularyPath(t *testing.T) {
 	realStdout := os.Stdout
 	r, w, err := os.Pipe()
@@ -246,9 +298,11 @@ func TestTranscribeCommandFailsBeforePrintingOnBadVocabularyPath(t *testing.T) {
 	cmd := a.transcribeCommand()
 	var stderr bytes.Buffer
 	cmd.SetErr(&stderr)
+	audioPath := filepath.Join(t.TempDir(), "nonexistent.wav")
+	vocabPath := filepath.Join(t.TempDir(), "typo.txt")
 	cmd.SetArgs([]string{
-		filepath.Join(t.TempDir(), "nonexistent.wav"),
-		"--vocabulary", filepath.Join(t.TempDir(), "typo.txt"),
+		audioPath,
+		"--vocabulary", vocabPath,
 	})
 
 	execErr := cmd.ExecuteContext(context.Background())
@@ -259,6 +313,16 @@ func TestTranscribeCommandFailsBeforePrintingOnBadVocabularyPath(t *testing.T) {
 
 	if execErr == nil {
 		t.Fatal("transcribe with a bogus --vocabulary path returned a nil error")
+	}
+	if !strings.Contains(execErr.Error(), vocabPath) {
+		t.Fatalf("execErr = %q, want it to name the bogus vocabulary path %q — "+
+			"a native transcription error about the missing audio file would also be "+
+			"non-nil, so identity, not mere presence, is what pins resolve-before-transcribe",
+			execErr, vocabPath)
+	}
+	if strings.Contains(execErr.Error(), audioPath) {
+		t.Fatalf("execErr = %q, must not name the audio path %q: that would mean "+
+			"TranscribeAudio ran before vocabulary resolution failed", execErr, audioPath)
 	}
 	if out != "" {
 		t.Fatalf("stdout = %q, want empty: vocabulary resolution must fail before transcription runs", out)

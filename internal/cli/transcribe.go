@@ -3,6 +3,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/puremetricsai/lumi/internal/macosnative"
@@ -30,7 +31,7 @@ func (a *app) transcribeCommand() *cobra.Command {
 			// never prints a baseline transcript that looks like a
 			// vocabulary-assisted one.
 			terms, err := a.resolveTranscribeVocabulary(
-				vocabularyPath, noVocabulary, cmd.Flags().Changed("vocabulary"))
+				os.Stderr, vocabularyPath, noVocabulary, cmd.Flags().Changed("vocabulary"))
 			if err != nil {
 				return err
 			}
@@ -50,6 +51,9 @@ func (a *app) transcribeCommand() *cobra.Command {
 }
 
 // resolveTranscribeVocabulary reads the term list for one transcribe run.
+// Diagnostics (warnings that do not fail the run) go to out, following the
+// same injectable-writer precedent as reportVocabulary, so tests can assert
+// on them without capturing the real os.Stderr.
 //
 // An explicitly supplied path must exist and be readable. Checking only for a
 // read error would let the likeliest mistake through: a typo'd or deleted path
@@ -60,7 +64,7 @@ func (a *app) transcribeCommand() *cobra.Command {
 // The default path is different: running with no vocabulary is a legitimate
 // baseline, so its absence stays silent. Only the explicit flag carries an
 // assertion that the file is there.
-func (a *app) resolveTranscribeVocabulary(path string, disabled, explicit bool) ([]string, error) {
+func (a *app) resolveTranscribeVocabulary(out io.Writer, path string, disabled, explicit bool) ([]string, error) {
 	if disabled {
 		return nil, nil
 	}
@@ -79,14 +83,14 @@ func (a *app) resolveTranscribeVocabulary(path string, disabled, explicit bool) 
 		if explicit {
 			return nil, snapshot.Err
 		}
-		fmt.Fprintf(os.Stderr, "warning: %v\n", snapshot.Err)
+		fmt.Fprintf(out, "warning: %v\n", snapshot.Err)
 		return nil, nil
 	}
 	if explicit && !snapshot.Exists {
 		return nil, fmt.Errorf("vocabulary file %s does not exist", path)
 	}
 	if snapshot.Dropped > 0 {
-		fmt.Fprintf(os.Stderr, "warning: %d terms dropped past the %d-term cap\n",
+		fmt.Fprintf(out, "warning: %d terms dropped past the %d-term cap\n",
 			snapshot.Dropped, vocabulary.MaxTerms)
 	}
 	return snapshot.Terms, nil
