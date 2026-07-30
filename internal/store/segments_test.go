@@ -724,3 +724,95 @@ func TestSilentChunkLeavesTheWorkQueue(t *testing.T) {
 		t.Error("a chunk of pure silence reports transcribed speech")
 	}
 }
+
+// TestFailedTranscriptionIsDistinguishedFromSilence pins the rule that separates
+// a chunk nobody could transcribe from one that held nothing to transcribe.
+//
+// The recognizer returns an empty string for both, so the only evidence is the
+// diagnostic the recorder stored beside the row. The rule lives here rather than
+// in the backfill for the same reason HasSearchableTerms does: the SQL that finds
+// these chunks and the Go check that recognises one must not be able to drift.
+func TestFailedTranscriptionIsDistinguishedFromSilence(t *testing.T) {
+	cases := []struct {
+		name  string
+		event Event
+		want  bool
+	}{
+		{"recognition failed", Event{Text: "", Metadata: json.RawMessage(
+			`{"audio_source":"microphone","processor_error":"recognizer unavailable"}`)}, true},
+		{"silence", Event{Text: "", Metadata: json.RawMessage(`{"audio_source":"microphone"}`)}, false},
+		{"blank but not empty", Event{Text: "   ", Metadata: json.RawMessage(
+			`{"processor_error":"recognizer unavailable"}`)}, true},
+		// A recognizer that returned words alongside an error still produced a
+		// transcript, and attribution reads the words, not the error.
+		{"partial transcript", Event{Text: "half a sentence", Metadata: json.RawMessage(
+			`{"processor_error":"recognizer gave up"}`)}, false},
+		{"no metadata", Event{Text: ""}, false},
+		{"unreadable metadata", Event{Text: "", Metadata: json.RawMessage(`not json`)}, false},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			if got := FailedTranscription(test.event); got != test.want {
+				t.Errorf("FailedTranscription = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+// TestChunksFailedTranscriptionCountsOnlyWhatCannotBeAttributed backs the report
+// that keeps `lumi transcript` from advising a backfill that cannot help.
+//
+// A chunk whose recognition failed never gains segments — the recorder and the
+// backfill both refuse to call it silent — so it sits in the work queue forever.
+// Counting those apart is what lets the transcript say "this cannot be recovered"
+// instead of "run a backfill", which is the advice the queue would otherwise
+// imply.
+func TestChunksFailedTranscriptionCountsOnlyWhatCannotBeAttributed(t *testing.T) {
+	ctx := context.Background()
+	s, _ := segmentStore(t)
+	base := time.Date(2026, 7, 30, 9, 0, 0, 0, time.UTC)
+
+	insert := func(at time.Time, text string, metadata string) int64 {
+		t.Helper()
+		event := &Event{Kind: KindAudio, CapturedAt: at, Text: text,
+			MediaPath: "/tmp/microphone.wav", AudioSource: "microphone",
+			Metadata: json.RawMessage(metadata)}
+		if err := s.Insert(ctx, event); err != nil {
+			t.Fatal(err)
+		}
+		return event.ID
+	}
+	const failed = `{"audio_source":"microphone","processor_error":"recognizer unavailable"}`
+	const clean = `{"audio_source":"microphone"}`
+
+	insert(base, "", failed)                        // unattributed failure: counted
+	insert(base.Add(time.Minute), "", clean)        // silence: not a failure
+	insert(base.Add(2*time.Minute), "words", clean) // speech: not a failure
+
+	// A failure that somehow did gain segments is not on the queue, so it is not
+	// something to report as unrecoverable.
+	attributed := insert(base.Add(3*time.Minute), "", failed)
+	if err := s.ReplaceChunkSegments(ctx, formatTime(base.Add(3*time.Minute)), []Segment{
+		{EventID: attributed, Seq: 0, Origin: OriginSilent, SourceTrack: "microphone",
+			OrderConfidence: "sequence", Method: "silent"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	count, err := s.ChunksFailedTranscription(ctx, base.Add(-time.Hour), base.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Errorf("ChunksFailedTranscription = %d, want 1", count)
+	}
+
+	// The window is honoured, so a transcript reports only its own range.
+	count, err = s.ChunksFailedTranscription(ctx, base.Add(time.Minute), base.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Errorf("ChunksFailedTranscription outside the failure's window = %d, want 0", count)
+	}
+}

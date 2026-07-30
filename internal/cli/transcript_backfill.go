@@ -160,7 +160,7 @@ func runBackfill(ctx context.Context, out io.Writer, s *store.Store, opts backfi
 	}
 	fmt.Fprintf(out, "%d chunks to attribute (%s)\n", len(chunks), mode)
 
-	var attributed, silentChunks, skipped, failed, segments int
+	var attributed, silentChunks, skipped, failed, untranscribed, segments int
 	started := time.Now()
 	for i, key := range chunks {
 		if err := ctx.Err(); err != nil {
@@ -169,10 +169,22 @@ func runBackfill(ctx context.Context, out io.Writer, s *store.Store, opts backfi
 			fmt.Fprintf(out, "stopped after %d chunks\n", i)
 			break
 		}
-		rows, verdict, err := attributeStoredChunk(ctx, s, key, opts)
+		outcome, err := attributeStoredChunk(ctx, s, key, opts)
 		if err != nil {
 			failed++
 			fmt.Fprintf(out, "  %s  failed: %v\n", key, err)
+			continue
+		}
+		rows, verdict := outcome.rows, outcome.explanation
+		if outcome.untranscribed {
+			// Deliberately left on the queue: labelling it means calling it
+			// silent, and nothing here can tell silence from a recognizer that
+			// never ran. Re-running this command will reach the same conclusion,
+			// so it is reported rather than counted as work still to do.
+			untranscribed++
+			if opts.Explain {
+				fmt.Fprintf(out, "  %s  %s\n", key, verdict)
+			}
 			continue
 		}
 		// A chunk holding no words still writes its marker row, so it leaves the
@@ -227,12 +239,25 @@ func runBackfill(ctx context.Context, out io.Writer, s *store.Store, opts backfi
 		fmt.Fprintf(out, "dry run: %d chunks would gain %d segments, %d hold no speech, "+
 			"%d had nothing to attribute, %d failed\n",
 			attributed, segments, silentChunks, skipped, failed)
+		reportUntranscribed(out, untranscribed)
 		return nil
 	}
 	fmt.Fprintf(out, "attributed %d chunks (%d segments), %d hold no speech, "+
 		"%d had nothing to attribute, %d failed\n",
 		attributed, segments, silentChunks, skipped, failed)
+	reportUntranscribed(out, untranscribed)
 	return nil
+}
+
+// reportUntranscribed names the chunks this command will keep declining to
+// attribute, so their standing place in the queue reads as a finding rather than
+// as work the next run will get to.
+func reportUntranscribed(out io.Writer, count int) {
+	if count == 0 {
+		return
+	}
+	fmt.Fprintf(out, "%d could not be transcribed, so they stay unattributed; "+
+		"their audio is still on disk and `lumi transcribe <file.wav>` can read it\n", count)
 }
 
 // anySpeech reports whether a chunk's derived rows carry any words, which is
@@ -246,15 +271,26 @@ func anySpeech(rows []store.Segment) bool {
 	return false
 }
 
+// chunkOutcome is what re-deriving one chunk concluded.
+type chunkOutcome struct {
+	rows        []store.Segment
+	explanation string
+	// untranscribed marks a chunk with no transcript to work from because
+	// recognition failed rather than because there was nothing to hear. It is a
+	// third outcome, not a variety of "nothing to attribute": the chunk stays on
+	// the queue on purpose and no re-run will change that.
+	untranscribed bool
+}
+
 // attributeStoredChunk re-derives one chunk's segments from what is in the index,
 // optionally re-reading its audio.
-func attributeStoredChunk(ctx context.Context, s *store.Store, key string, opts backfillOptions) ([]store.Segment, string, error) {
+func attributeStoredChunk(ctx context.Context, s *store.Store, key string, opts backfillOptions) (chunkOutcome, error) {
 	events, err := s.AudioEventsAt(ctx, key)
 	if err != nil {
-		return nil, "", err
+		return chunkOutcome{}, err
 	}
 	if len(events) == 0 {
-		return nil, "no rows", nil
+		return chunkOutcome{explanation: "no rows"}, nil
 	}
 	capturedAt := events[0].CapturedAt
 
@@ -289,6 +325,17 @@ func attributeStoredChunk(ctx context.Context, s *store.Store, key string, opts 
 	measureBackfillEnergy(&chunk, paths["system"])
 
 	attributed := transcript.Attribute(chunk, transcript.Options{})
+	verdict := backfillVerdict(method, chunk, attributed)
+	if silentVerdict(attributed) && anyFailedTranscription(events) {
+		// The same gate the recorder applies, for the same reason: silence is the
+		// one verdict read out of an absence of words, so it is the one a failed
+		// recognizer can turn into a false claim. Writing the marker here would
+		// also make it permanent, since the marker is what drains the queue.
+		return chunkOutcome{
+			explanation:   "could not be transcribed; left unattributed (" + verdict + ")",
+			untranscribed: true,
+		}, nil
+	}
 	rows := make([]store.Segment, 0, len(attributed))
 	for _, segment := range attributed {
 		eventID, ok := eventIDs[segment.SourceTrack]
@@ -297,7 +344,25 @@ func attributeStoredChunk(ctx context.Context, s *store.Store, key string, opts 
 		}
 		rows = append(rows, backfillSegment(segment, eventID))
 	}
-	return rows, backfillVerdict(method, chunk, attributed), nil
+	return chunkOutcome{rows: rows, explanation: verdict}, nil
+}
+
+// silentVerdict reports whether attribution concluded the chunk held no speech.
+// The marker is the whole result when it is produced at all, so the first
+// segment decides.
+func silentVerdict(segments []transcript.Segment) bool {
+	return len(segments) > 0 && segments[0].Method == transcript.MethodSilent
+}
+
+// anyFailedTranscription reports whether any of a chunk's rows is missing its
+// transcript because recognition did not happen.
+func anyFailedTranscription(events []store.Event) bool {
+	for _, event := range events {
+		if store.FailedTranscription(event) {
+			return true
+		}
+	}
+	return false
 }
 
 func loadTimings(ctx context.Context, chunk *transcript.Chunk, paths map[string]string, locale string) error {

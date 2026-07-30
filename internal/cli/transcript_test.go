@@ -344,3 +344,51 @@ func TestTranscriptReportsTruncationWithAResumePoint(t *testing.T) {
 		t.Errorf("the truncation notice offers no way to continue: %s", out)
 	}
 }
+
+// audioChunkWithMetadata inserts one chunk whose tracks carry diagnostics, which
+// is the only way to tell a failed recognition from a quiet room after the fact.
+func audioChunkWithMetadata(t *testing.T, s *store.Store, at time.Time, metadata string) string {
+	t.Helper()
+	ctx := context.Background()
+	for _, source := range []string{"system", "microphone"} {
+		event := store.Event{Kind: store.KindAudio, CapturedAt: at,
+			MediaPath: filepath.Join(t.TempDir(), source+".wav"), AudioSource: source,
+			DurationMS: 30000, Metadata: json.RawMessage(metadata)}
+		if err := s.Insert(ctx, &event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return at.UTC().Format(time.RFC3339Nano)
+}
+
+// TestBackfillNeverCallsAFailedTranscriptionSilent is the backfill half of the
+// silence gate.
+//
+// Fixing only the recorder would move the mislabelling rather than remove it:
+// the chunk stays on the derived queue, the next backfill re-derives the same
+// empty transcripts, and writes the marker the recorder declined to write.
+func TestBackfillNeverCallsAFailedTranscriptionSilent(t *testing.T) {
+	root, s := transcriptRoot(t)
+	at := time.Now().UTC().Add(-time.Hour)
+	key := audioChunkWithMetadata(t, s, at,
+		`{"audio_source":"microphone","processor_error":"transcribe: recognizer unavailable"}`)
+
+	out, err := runCLI(t, "--data-dir", root, "transcript", "backfill")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "1 hold no speech") {
+		t.Errorf("a chunk whose recognition failed was reported as silent: %s", out)
+	}
+	if !strings.Contains(out, "could not be transcribed") {
+		t.Errorf("the backfill does not report the failure it refused to label: %s", out)
+	}
+
+	segments, err := s.SegmentsForChunk(context.Background(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segments) != 0 {
+		t.Errorf("a chunk whose recognition failed was attributed as %q", segments[0].Origin)
+	}
+}

@@ -320,6 +320,64 @@ func HasSegmentText(segment Segment) bool {
 	return strings.TrimSpace(segment.Text) != ""
 }
 
+// failedTranscriptionKey is the metadata key the recorder writes when speech
+// recognition did not complete. The SQL below matches it in its quoted JSON form,
+// which is exact because the metadata is produced by encoding/json and never
+// hand-written.
+const failedTranscriptionKey = "processor_error"
+
+// FailedTranscription reports that an event has no transcript because recognition
+// did not happen — as opposed to happening and finding nothing.
+//
+// The recognizer returns an empty string for both, and the two need opposite
+// conclusions: silence is a fact about the room, a failure is a fact about the
+// recognizer. Attribution reads the empty transcript as evidence, so anything
+// deriving a verdict has to consult this first.
+//
+// An event that carries words is not a failed transcription however loudly its
+// metadata complains: whatever went wrong, there is a transcript to attribute.
+func FailedTranscription(event Event) bool {
+	if strings.TrimSpace(event.Text) != "" {
+		return false
+	}
+	if len(event.Metadata) == 0 {
+		return false
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(event.Metadata, &fields); err != nil {
+		// Metadata we cannot read is not evidence of anything. Guessing "failed"
+		// here would strand chunks on the queue on the strength of a parse error.
+		return false
+	}
+	_, ok := fields[failedTranscriptionKey]
+	return ok
+}
+
+// ChunksFailedTranscription counts the audio chunks in a window that have no
+// attribution and never will, because recognition failed on every track that
+// might have carried words.
+//
+// These are the chunks the derived work queue can never drain: neither the
+// recorder nor the backfill will label them, because labelling them means calling
+// them silent. Counting them apart is what lets a transcript report a hole it
+// cannot fix, instead of advising a backfill that would reach the same dead end.
+func (s *Store) ChunksFailedTranscription(ctx context.Context, since, until time.Time) (int64, error) {
+	var count int64
+	err := s.db.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM (
+  SELECT captured_at FROM events
+  WHERE kind = 'audio' AND captured_at >= ? AND captured_at <= ?
+    AND NOT EXISTS (SELECT 1 FROM audio_segments s WHERE s.captured_at = events.captured_at)
+  GROUP BY captured_at
+  HAVING SUM(CASE WHEN TRIM(text) <> '' THEN 1 ELSE 0 END) = 0
+     AND SUM(CASE WHEN metadata_json LIKE '%"`+failedTranscriptionKey+`"%' THEN 1 ELSE 0 END) > 0
+)`, formatTime(since), formatTime(until)).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count chunks whose transcription failed: %w", err)
+	}
+	return count, nil
+}
+
 // AudioChunkTimes returns every distinct audio capture time, newest first. It
 // backs a forced re-attribution, where the work list is all chunks rather than
 // only the unattributed ones.

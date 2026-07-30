@@ -437,7 +437,8 @@ func (r *Recorder) storeAudioChunk(ctx context.Context, chunk AudioChunk) {
 		if processErr != nil {
 			r.Logger.Warn("transcription failed; audio was still indexed", "source", frame.Source, "error", processErr)
 		}
-		results = append(results, audioChunkResult{frame: frame, transcription: transcription, eventID: event.ID})
+		results = append(results, audioChunkResult{
+			frame: frame, transcription: transcription, eventID: event.ID, failed: processErr != nil})
 	}
 	r.attributeChunk(ctx, capturedAt, results)
 }
@@ -448,6 +449,11 @@ type audioChunkResult struct {
 	frame         AudioFrame
 	transcription Transcription
 	eventID       int64
+	// failed records that this track has no transcript because recognition did
+	// not happen, as opposed to happening and finding nothing. The recognizer
+	// reports both as an empty string, and attribution reads that emptiness as
+	// evidence — so which of the two it was has to be carried out of band.
+	failed bool
 }
 
 // envelopeWindowMS is the resolution of the energy measurement used to tell a
@@ -464,6 +470,12 @@ const envelopeWindowMS = 100
 // before this is reached, so the worst case is a chunk with no attribution. That
 // needs no retry loop either — `lumi transcript backfill` derives its work queue
 // from exactly the chunks that have no segments, so this chunk is already in it.
+//
+// A chunk whose recognition failed is the one case that leaves the queue on
+// purpose undrainable: the backfill applies the same rule and will not label it
+// either, so it sits there until someone reads the WAV. That is the honest
+// state, and `lumi transcript backfill` reports those chunks apart from the ones
+// it can still do something about.
 func (r *Recorder) attributeChunk(ctx context.Context, capturedAt time.Time, results []audioChunkResult) {
 	if len(results) == 0 {
 		return
@@ -487,6 +499,22 @@ func (r *Recorder) attributeChunk(ctx context.Context, capturedAt time.Time, res
 	if len(segments) == 0 {
 		return
 	}
+	if silentVerdict(segments) && anyTranscriptionFailed(results) {
+		// Silence is the one verdict read out of an *absence* of words, and a
+		// failed recognizer produces exactly the same absence — so this is the one
+		// verdict a failure can turn into a false claim about the world. Writing
+		// the marker would also make it permanent, since the marker is what drains
+		// the chunk from the work queue.
+		//
+		// The gate is deliberately the verdict rather than the failure alone. A
+		// track that did transcribe is labelled on its own evidence: system audio
+		// is internal unconditionally, and a system track that failed while the
+		// microphone spoke is caught by the energy measurement, which reads the
+		// WAV rather than the transcript.
+		r.Logger.Warn("chunk left unattributed: nothing was transcribed and transcription failed",
+			"captured_at", capturedAt)
+		return
+	}
 	rows := make([]store.Segment, 0, len(segments))
 	for _, segment := range segments {
 		eventID, ok := eventIDs[segment.SourceTrack]
@@ -507,7 +535,7 @@ func (r *Recorder) attributeChunk(ctx context.Context, capturedAt time.Time, res
 			"error", err)
 		return
 	}
-	if segments[0].Method == transcript.MethodSilent {
+	if silentVerdict(segments) {
 		// A silent chunk still writes its marker, but saying so every thirty
 		// seconds would bury the lines that carry information under the quietest
 		// thing the recorder does.
@@ -515,6 +543,24 @@ func (r *Recorder) attributeChunk(ctx context.Context, capturedAt time.Time, res
 		return
 	}
 	r.Logger.Info("attributed audio", "segments", len(rows), "method", string(segments[0].Method))
+}
+
+// silentVerdict reports whether attribution concluded the chunk held no speech.
+// The marker is the whole result when it is produced at all, so the first
+// segment decides.
+func silentVerdict(segments []transcript.Segment) bool {
+	return len(segments) > 0 && segments[0].Method == transcript.MethodSilent
+}
+
+// anyTranscriptionFailed reports whether any of the chunk's tracks has no
+// transcript because recognition did not happen.
+func anyTranscriptionFailed(results []audioChunkResult) bool {
+	for _, result := range results {
+		if result.failed {
+			return true
+		}
+	}
+	return false
 }
 
 const (

@@ -1318,3 +1318,107 @@ func TestSilentChunkIsRecordedAsAttributed(t *testing.T) {
 		}
 	}
 }
+
+// TestFailedTranscriptionIsNeverRecordedAsSilence is the other half of the
+// silence marker: a recognizer that failed and one that heard nothing return the
+// same empty transcript, and the two need opposite conclusions.
+//
+// Writing the marker for a failure asserts the room was quiet on the strength of
+// evidence that was never gathered, and — because the marker drains the chunk
+// from the derived work queue — makes that assertion permanent. Under streaming
+// capture this is not a rare case: every chunk still queued when the recorder
+// stops takes the "transcription skipped after capture stopped" path.
+func TestFailedTranscriptionIsNeverRecordedAsSilence(t *testing.T) {
+	ctx := context.Background()
+	paths, s := recorderPaths(t)
+
+	recorder := Recorder{
+		Store: s, Paths: paths, CaptureAudio: true, AudioChunk: 8 * time.Millisecond,
+		Audio: dualAudio{}, Transcriber: failingTranscriber{},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	recordCtx, cancel := context.WithTimeout(ctx, 40*time.Millisecond)
+	defer cancel()
+	if err := recorder.Run(recordCtx); err != nil {
+		t.Fatal(err)
+	}
+
+	segments, err := s.SegmentsBetween(ctx, time.Now().Add(-time.Hour), time.Now().Add(time.Hour), true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, segment := range segments {
+		if segment.Origin == store.OriginSilent {
+			t.Errorf("a chunk whose transcription failed was labelled %q", segment.Origin)
+		}
+	}
+	// The audio is still indexed, so the chunk must stay on the queue rather than
+	// leaving it with a verdict nothing ever reached.
+	events, err := s.Search(ctx, store.SearchOptions{Kind: store.KindAudio, Limit: 50})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) == 0 {
+		t.Fatal("no audio was indexed, so the test proves nothing")
+	}
+	missing, err := s.ChunksMissingSegments(ctx, nil, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(missing) == 0 {
+		t.Error("a chunk whose transcription failed drained from the backfill queue")
+	}
+}
+
+// microphoneFailureTranscriber transcribes the machine's audio and fails on the
+// room's, which is the partial failure the silence gate must not swallow.
+type microphoneFailureTranscriber struct{}
+
+func (microphoneFailureTranscriber) Transcribe(_ context.Context, path string) (Transcription, error) {
+	if strings.Contains(path, "system") {
+		const machine = "The deployment finished with no warnings."
+		return Transcription{
+			Text: machine,
+			Segments: []TimedSegment{{StartMS: 0, EndMS: 2000, Text: machine, Confidence: 0.9,
+				Runs: []TimedRun{{StartMS: 0, EndMS: 2000, Text: machine, Confidence: 0.9}}}},
+		}, nil
+	}
+	return Transcription{}, errors.New("transcribe microphone: recognizer unavailable")
+}
+
+// TestOneFailedTrackStillAttributesWhatTranscribed keeps the silence gate narrow.
+//
+// Only the silent verdict reads an empty transcript as evidence about the world;
+// every other path labels what it actually has. A system track that transcribed
+// is machine audio whether or not the microphone's recognizer worked, so
+// refusing to attribute the whole chunk on any failure would throw away a sound
+// verdict and leave the chunk queued for a backfill that would reach the same
+// conclusion.
+func TestOneFailedTrackStillAttributesWhatTranscribed(t *testing.T) {
+	ctx := context.Background()
+	paths, s := recorderPaths(t)
+
+	recorder := Recorder{
+		Store: s, Paths: paths, CaptureAudio: true, AudioChunk: 8 * time.Millisecond,
+		Audio: dualAudio{}, Transcriber: microphoneFailureTranscriber{},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	recordCtx, cancel := context.WithTimeout(ctx, 40*time.Millisecond)
+	defer cancel()
+	if err := recorder.Run(recordCtx); err != nil {
+		t.Fatal(err)
+	}
+
+	segments, err := s.SegmentsBetween(ctx, time.Now().Add(-time.Hour), time.Now().Add(time.Hour), true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segments) == 0 {
+		t.Fatal("a chunk whose system track transcribed produced no attribution")
+	}
+	for _, segment := range segments {
+		if segment.Origin != store.OriginInternal {
+			t.Errorf("segment %q labelled %s, want internal", segment.Text, segment.Origin)
+		}
+	}
+}
