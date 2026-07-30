@@ -1,9 +1,11 @@
 package cli
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -95,4 +97,54 @@ func TestDefaultVocabularyComesFromTheDataDir(t *testing.T) {
 	if !slices.Equal(terms, []string{"Alpha"}) {
 		t.Fatalf("terms = %q, want [Alpha]", terms)
 	}
+}
+
+func TestReportVocabularyStates(t *testing.T) {
+	t.Run("absent file reports none", func(t *testing.T) {
+		paths := testPaths(t)
+		var out bytes.Buffer
+
+		reportVocabulary(&out, paths)
+
+		if !strings.Contains(out.String(), "vocabulary\tnone\t") {
+			t.Fatalf("output = %q, want a none line", out.String())
+		}
+	})
+
+	t.Run("parsed file reports the term count", func(t *testing.T) {
+		paths := testPaths(t)
+		if err := os.MkdirAll(paths.Root, 0o700); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(paths.Vocabulary, []byte("Alpha\nBravo\n"), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		var out bytes.Buffer
+
+		reportVocabulary(&out, paths)
+
+		if !strings.Contains(out.String(), "vocabulary\tok\t2 terms") {
+			t.Fatalf("output = %q, want an ok line with 2 terms", out.String())
+		}
+	})
+
+	t.Run("unreadable file reports warn", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root reads mode-000 files regardless")
+		}
+		paths := testPaths(t)
+		if err := os.MkdirAll(paths.Root, 0o700); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(paths.Vocabulary, []byte("Alpha\n"), 0o000); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		var out bytes.Buffer
+
+		reportVocabulary(&out, paths)
+
+		if !strings.Contains(out.String(), "vocabulary\twarn\t") {
+			t.Fatalf("output = %q, want a warn line", out.String())
+		}
+	})
 }

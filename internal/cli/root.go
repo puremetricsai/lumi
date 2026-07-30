@@ -397,6 +397,7 @@ func (a *app) doctorCommand() *cobra.Command {
 				missing = true
 			}
 			fmt.Fprintf(os.Stdout, "data directory\tok\t%s\n", paths.Root)
+			reportVocabulary(os.Stdout, paths)
 			if err := reportAttributionHealth(cmd.Context(), os.Stdout, paths); err != nil {
 				return err
 			}
@@ -472,6 +473,31 @@ func formatPercent(part, total int64) string {
 		return "<1%"
 	}
 	return fmt.Sprintf("%.0f%%", percent)
+}
+
+// reportVocabulary reports the vocabulary file's state. The three cases are
+// kept distinct because they need different remedies: "no file" and "file I
+// cannot read" have opposite fixes, and collapsing them would send a user
+// looking for a missing file that is actually sitting there unreadable.
+//
+// This never affects doctor's exit status: vocabulary is optional.
+//
+// Like the rest of doctor, it describes what it can observe from this process.
+// A running recorder holds its own cache, so this is the file now, not the
+// daemon's current terms.
+func reportVocabulary(out io.Writer, paths config.Paths) {
+	snapshot := (&vocabulary.Loader{Path: paths.Vocabulary}).Load()
+	switch {
+	case snapshot.Err != nil:
+		fmt.Fprintf(out, "vocabulary\twarn\t%v\n", snapshot.Err)
+	case !snapshot.Exists:
+		fmt.Fprintf(out, "vocabulary\tnone\tno vocabulary file at %s\n", paths.Vocabulary)
+	case snapshot.Dropped > 0:
+		fmt.Fprintf(out, "vocabulary\tok\t%d terms (%d dropped past the %d-term cap)\n",
+			len(snapshot.Terms), snapshot.Dropped, vocabulary.MaxTerms)
+	default:
+		fmt.Fprintf(out, "vocabulary\tok\t%d terms\n", len(snapshot.Terms))
+	}
 }
 
 func (a *app) permissionsCommand() *cobra.Command {
