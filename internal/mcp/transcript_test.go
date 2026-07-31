@@ -192,6 +192,105 @@ func TestGetTranscriptNoticeNamesTheBackfillWhenCoverageIsPartial(t *testing.T) 
 	}
 }
 
+// TestGetTranscriptNoticeReportsWhatMinConfidenceRemoved is the case the notice
+// could not previously reach: a transcript that is not empty, so none of the
+// explanations in the empty branch run, but from which the threshold has deleted
+// one whole side of the conversation.
+//
+// The largest attribution penalties fall on microphone-derived turns, so a
+// single threshold sorts by origin rather than by quality, and what comes back
+// is a plausible, complete-looking transcript with the room removed.
+func TestGetTranscriptNoticeReportsWhatMinConfidenceRemoved(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	at := time.Now().UTC().Add(-10 * time.Minute).Truncate(time.Second)
+
+	attributedChunk(t, ctx, s, at,
+		store.Segment{Origin: store.OriginInternal, SourceTrack: "system",
+			Text: "the far side of the call", Confidence: 0.91, OrderConfidence: "exact"},
+		store.Segment{Origin: store.OriginExternal, SourceTrack: "microphone",
+			Text: "somebody in the room answered", Confidence: 0.36, OrderConfidence: "exact"},
+	)
+	h := &handlers{store: s}
+
+	threshold := 0.6
+	out := callTranscript(t, ctx, h, getTranscriptInput{Since: "1h", MinConfidence: &threshold})
+	if len(out.Turns) != 1 || out.Turns[0].Origin != store.OriginInternal {
+		t.Fatalf("got %+v, want the internal turn alone", out.Turns)
+	}
+	if !strings.Contains(out.Notice, "min_confidence") {
+		t.Errorf("notice does not name the filter that removed the room: %q", out.Notice)
+	}
+	if !strings.Contains(out.Notice, store.OriginExternal) {
+		t.Errorf("notice does not say which origin was removed: %q", out.Notice)
+	}
+	// The exact count, not a loose digit match: "1" alone would be satisfied by
+	// "10 external turns", which is a different fact.
+	if !strings.Contains(out.Notice, "1 external turn") {
+		t.Errorf("notice does not say how many turns were removed: %q", out.Notice)
+	}
+	// An agent acts on values, not prose — the same reason resume_from is a field
+	// rather than a sentence.
+	if out.ConfidenceFiltered[store.OriginExternal] != 1 {
+		t.Errorf("confidence_filtered = %v, want one external turn removed", out.ConfidenceFiltered)
+	}
+
+	// A transcript nothing was removed from must stay quiet, or the notice
+	// becomes noise that a real removal hides inside.
+	quiet := callTranscript(t, ctx, h, getTranscriptInput{Since: "1h"})
+	if strings.Contains(quiet.Notice, "min_confidence") {
+		t.Errorf("an unfiltered transcript warns about min_confidence: %q", quiet.Notice)
+	}
+	if len(quiet.ConfidenceFiltered) != 0 {
+		t.Errorf("an unfiltered transcript reports removals: %v", quiet.ConfidenceFiltered)
+	}
+}
+
+// TestGetTranscriptEmptiedByTheThresholdSaysSoExactly covers the branch the
+// counts could not previously reach.
+//
+// A threshold that removes every turn produces an empty transcript, and every
+// explanation for an empty transcript is chosen before the removal report runs —
+// so the response fell back to "no turn matched the filters" while the exact
+// origins and counts were known and discarded. Worse, when the range also holds
+// unattributed audio, an earlier case wins and the removal goes unmentioned
+// entirely, sending the agent to run a backfill for turns a filter deleted.
+func TestGetTranscriptEmptiedByTheThresholdSaysSoExactly(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	at := time.Now().UTC().Add(-10 * time.Minute).Truncate(time.Second)
+
+	attributedChunk(t, ctx, s, at,
+		store.Segment{Origin: store.OriginExternal, SourceTrack: "microphone",
+			Text: "somebody in the room answered", Confidence: 0.36, OrderConfidence: "exact"})
+	// A second chunk with rows but no segments, so the coverage gap competes with
+	// the filter for the notice.
+	unattributed := store.Event{Kind: store.KindAudio, CapturedAt: at.Add(time.Minute),
+		Text: "never attributed", MediaPath: "/tmp/x.wav", AudioSource: "microphone"}
+	if err := s.Insert(ctx, &unattributed); err != nil {
+		t.Fatal(err)
+	}
+	h := &handlers{store: s}
+
+	threshold := 0.6
+	out := callTranscript(t, ctx, h, getTranscriptInput{Since: "1h", MinConfidence: &threshold})
+	if len(out.Turns) != 0 {
+		t.Fatalf("got %d turns, want the threshold to have emptied the transcript", len(out.Turns))
+	}
+	if !strings.Contains(out.Notice, "1 external turn") {
+		t.Errorf("an emptied transcript does not say what the threshold took: %q", out.Notice)
+	}
+	if out.ConfidenceFiltered[store.OriginExternal] != 1 {
+		t.Errorf("confidence_filtered = %v, want one external turn removed", out.ConfidenceFiltered)
+	}
+	// Naming the filter must not cost the reader the other half of the answer.
+	// The range still holds a chunk a backfill can attribute, and "why is this
+	// empty" and "what can I do about the rest" are two different questions.
+	if !strings.Contains(out.Notice, "backfill") {
+		t.Errorf("the coverage gap lost its backfill guidance to the filter report: %q", out.Notice)
+	}
+}
+
 func TestGetTranscriptEmptyRangeExplainsWhy(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
@@ -314,8 +413,15 @@ func TestGetTranscriptEmptyRangeDistinguishesFiltersFromMissingAttribution(t *te
 	if strings.Contains(out.Notice, "backfill") {
 		t.Errorf("an attributed range was told to run a backfill: %s", out.Notice)
 	}
-	if !strings.Contains(out.Notice, "filters") {
+	if !strings.Contains(out.Notice, "origin") {
 		t.Errorf("the notice does not name the filter that emptied the result: %s", out.Notice)
+	}
+	// And only that filter. Reaching this branch means the removal report found
+	// nothing, so min_confidence provably took no turn — naming it here is advice
+	// to adjust a control that is holding nothing back, competing for attention
+	// with the one that is.
+	if strings.Contains(out.Notice, "min_confidence") {
+		t.Errorf("the notice advises adjusting a threshold that removed nothing: %s", out.Notice)
 	}
 }
 
