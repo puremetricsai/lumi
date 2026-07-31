@@ -6,7 +6,8 @@
 // Two rules hold everywhere in this package. Nothing may write to os.Stdout
 // except JSON-RPC protocol frames — the stdio transport owns that stream, and a
 // stray write silently corrupts the session. And no tool returns screenshot or
-// audio bytes: media_path is a string the user can open themselves.
+// audio bytes: media_dir joined to an event's media_file is a path the user can
+// open themselves.
 package mcp
 
 import (

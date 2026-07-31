@@ -153,7 +153,7 @@ func (h *handlers) getTranscript(ctx context.Context, _ *sdk.CallToolRequest, in
 		return nil, empty, err
 	}
 	out.Notice = notice
-	return nil, out, nil
+	return summary(turnsDigest(out.Turns), out.Notice), out, nil
 }
 
 // transcriptNotice explains what the turns above cannot: that the window holds

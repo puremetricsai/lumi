@@ -18,7 +18,7 @@ type Options struct {
 	// is surfaced only in "this index is empty" tool notices, so a mistyped
 	// --data-dir (which openStore happily creates as a fresh empty database)
 	// reads as "wrong/empty file" rather than "you never recorded anything" —
-	// it leaks nothing new, since every media_path a tool returns already sits
+	// it leaks nothing new, since every media_dir a tool returns already sits
 	// under that same directory. Optional; an empty value falls back to the
 	// generic notice.
 	DatabasePath string
@@ -111,8 +111,9 @@ func newServer(s *store.Store, opts Options) *sdk.Server {
 			"Results are ranked by relevance when query is set, and newest-first otherwise — " +
 			"with a query, result[0] is the best match, not necessarily the most recent. " +
 			"Text is capped per event — when a result says truncated, call get_event for the full text. " +
-			"Returns text and metadata only: screenshots and audio never leave the user's machine, " +
-			"and media_path is a local path the user can open themselves. " +
+			"Returns text and metadata only: screenshots and audio never leave the user's machine. " +
+			"Each event names its capture file in media_file; join that to media_dir's entry for the " +
+			"event's kind for a local path the user can open themselves. " +
 			audioProvenanceContract,
 	}, h.searchEvents)
 
@@ -120,6 +121,7 @@ func newServer(s *store.Store, opts Options) *sdk.Server {
 		Name: "get_event",
 		Description: "Fetch one captured event by id, with its text in full (never truncated) " +
 			"and its processor metadata. Use this after search_events reports truncated text. " +
+			"Join media_dir to the event's media_file for a local path the user can open themselves. " +
 			"An audio event carries foreground_app (what the user had focused), source_app (what was " +
 			"observed producing the sound), and attribution (how that was earned) as three separate " +
 			"fields; see search_events. Microphone content is never attributed to a person or an app.",
