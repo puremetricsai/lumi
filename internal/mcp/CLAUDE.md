@@ -70,3 +70,12 @@ reports is the one enforced.
 - **`get_transcript` reports `ResumeFrom`, never `CoveredUntil`**, and names chunks whose recognition
   failed apart from real coverage gaps so it never recommends a backfill that cannot help
   (`internal/store/CLAUDE.md`).
+- **A notice about what a filter removed must fire on a transcript that is *not* empty.** Every
+  explanation in `transcriptNotice` used to sit inside the `len(result.Turns) == 0` branch, so the one
+  case that needed it most was the one case it could not reach: the largest attribution penalties fall on
+  microphone turns, so `min_confidence` can delete the room, leave the machine, and return a
+  complete-looking conversation with nobody in the room in it — no empty result, no notice, nothing an
+  agent could detect. The counts come from `store.ConfidenceRemovals` rather than being phrased here, and
+  the `min_confidence` schema text states the measured 0.6 cliff, because an agent reads the description
+  before it ever sees a row. `confidence_filtered` is on the wire as well as in the notice, for the reason
+  `resume_from` is: an agent should not have to parse prose to act on a fact.

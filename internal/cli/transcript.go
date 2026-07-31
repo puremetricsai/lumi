@@ -63,6 +63,14 @@ func (a *app) transcriptCommand() *cobra.Command {
 				return err
 			}
 			if asJSON {
+				// The export never learns what a filter took, because it is a bare
+				// array by contract. Saying it on stderr reaches a person reading the
+				// terminal without putting a sentence in a stream something else is
+				// parsing — the alternative is a --json transcript that has had one
+				// side of the conversation removed with nothing anywhere to show it.
+				if warning := confidenceRemovalWarning(result); warning != "" {
+					fmt.Fprintln(cmd.ErrOrStderr(), warning)
+				}
 				encoder := json.NewEncoder(cmd.OutOrStdout())
 				encoder.SetIndent("", "  ")
 				// A bare array, matching `lumi search --json`: the export is the
@@ -78,7 +86,9 @@ func (a *app) transcriptCommand() *cobra.Command {
 	flags.StringVar(&until, "until", "", "latest time (RFC3339); defaults to now")
 	flags.StringVar(&origin, "origin", "", "only turns from this origin: internal, external, or unknown")
 	flags.Float64Var(&minConfidence, "min-confidence", 0,
-		"drop turns below this attribution confidence (0 to 1); defaults to 0 so nothing is hidden")
+		"drop turns below this confidence (0 to 1); defaults to 0 so nothing is hidden. The\n"+
+			"largest attribution penalties apply to microphone turns alone, so a threshold near\n"+
+			"0.6 can remove every external turn and no internal one")
 	flags.IntVar(&limit, "limit", store.DefaultTranscriptTurns, "maximum turns")
 	flags.BoolVar(&asJSON, "json", false, "emit JSON")
 	flags.BoolVar(&includeBleed, "include-bleed", false,
@@ -86,6 +96,20 @@ func (a *app) transcriptCommand() *cobra.Command {
 
 	cmd.AddCommand(a.transcriptBackfillCommand())
 	return cmd
+}
+
+// confidenceRemovalWarning says what --min-confidence removed, and is empty when
+// it removed nothing. Both output paths print it, so the sentence is written
+// once: the printed transcript and the JSON export must not describe the same
+// deletion two ways.
+func confidenceRemovalWarning(result store.TranscriptResult) string {
+	removed := result.ConfidenceRemovals()
+	if removed == "" {
+		return ""
+	}
+	return fmt.Sprintf("--min-confidence removed %s. The largest attribution penalties apply to "+
+		"microphone turns alone, so this may have removed a side of the conversation rather than "+
+		"its least reliable turns.", removed)
 }
 
 // transcriptOptions validates the flags and builds the store query. Origin is
@@ -168,6 +192,15 @@ func printTranscript(out io.Writer, result store.TranscriptResult) {
 	if externalTurns(result) > 0 {
 		fmt.Fprint(out, "\nexternal turns are room audio with no identified speaker: they may be you, "+
 			"other people present, or playback.\nDo not record them as something you said or did.\n")
+	}
+	// What the threshold took, for the same reason coverage is printed below: the
+	// turns that survived it read as a whole conversation. This is the more
+	// deceptive of the two, because the largest attribution penalties fall on
+	// microphone turns, so a threshold can remove the room and leave the machine —
+	// and the caveat above does not print when there are no external turns left to
+	// caveat.
+	if warning := confidenceRemovalWarning(result); warning != "" {
+		fmt.Fprintf(out, "\n%s\n", warning)
 	}
 	// Coverage goes to the same stream as the transcript, after it, because a
 	// transcript with holes looks complete: nothing in the turns reveals the gap.

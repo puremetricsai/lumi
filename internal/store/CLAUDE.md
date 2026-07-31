@@ -126,6 +126,37 @@ and `transcript.Segment` — shadow each other the way `internal/mcp`'s `Attribu
   than an estimate. Both ways a transcript can stop short move that boundary: truncation *and* the turn cap,
   which is measured from the last retained turn's `LastCapturedAt` — `Turn.CapturedAt` is where a turn
   *began*, so a turn spanning chunks would bound the page short of text it already printed.
+- **`MinConfidence` sorts turns by origin at least as much as by quality, so what it removed is
+  reported.** A turn's confidence is the recognizer's own score multiplied by penalties for how uncertain
+  its attribution is. On the timed path `internal/transcript` reaches microphone-derived segments alone —
+  a timed system segment is machine audio unconditionally and is never marked down (`attribute.go`'s
+  crosstalk and ambiguity multipliers). Measured on a live index the two bands do not overlap: internal
+  turns scored 0.682–0.983, external turns 0.331–0.592, so `min_confidence: 0.6` removed 100 % of external
+  turns and 0 % of internal ones and returned a transcript that looked whole. `ConfidenceFiltered`
+  therefore counts removals *by origin* — one total would read as ordinary quality filtering and hide the
+  asymmetry that is the entire signal — and `ConfidenceRemovals` renders it so `lumi transcript` and
+  `get_transcript` cannot phrase it two ways. Turns excluded by `Origin` are deliberately not counted:
+  that omission is one the caller asked for by name. `Turn.Confidence` is the *minimum* over its
+  segments, which compounds all of this, since longer turns score lower and external turns are longer.
+- **A removal count is bounded by `ResumeFrom`, never by `CoveredUntil`, with the chunk on the boundary
+  the single exception.** What it promises is what a page can keep — the turns this page's threshold
+  removed from the ground this page covers — and *not* that summing pages totals each removal once,
+  because pages do not partition that way: where `ResumeFrom` equals `CoveredUntil` the same chunk is
+  deliberately served twice and its turns are returned twice with it.
+  Three ways to get this wrong, all of which were live defects one round apart:
+  bounding on `CoveredUntil` loses a chunk outright, since a chunk between the last turn *returned* and
+  the first turn *deferred* holding nothing but rejected turns is out of range here and never read by the
+  next page; bounding on `ResumeFrom` *unconditionally* drops the boundary chunk in the two cases where
+  the two bounds are equal (a chunk too large to return whole — where it is the entire page — and a cap
+  falling inside a chunk); and accepting the whole page when they are equal counts *later* chunks this
+  page never covered, which the next page then reports as well. The rule that survives all three: count
+  everything strictly before `ResumeFrom`, plus the chunk exactly on it when `ResumeFrom` has not moved
+  past `CoveredUntil`.
+- **The asymmetry is not the whole hazard, so nothing here may claim only microphone turns are
+  penalised.** `TextPathPenalty` applies to every segment the text path emits, system ones included
+  (`attribute.go`'s shared `segment` closure, and the untimed `internalOnly` fallback), so a chunk with no
+  usable timings scores 0.48 on both sides and one threshold cuts the machine away too. This is why the
+  design reports what a filter removed rather than predicting what it will remove.
 - **`CoveredUntil` and `ResumeFrom` are separate fields because they need opposite inclusivity.**
   `SegmentsBetween` is inclusive at both ends, so a caller told to resume at the last chunk covered re-reads
   that whole chunk and sees its turns twice on every page. `ResumeFrom` is therefore the first chunk *not*

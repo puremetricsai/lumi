@@ -29,7 +29,7 @@ type getTranscriptInput struct {
 	// be answered with a sentence explaining the vocabulary, which is more use to
 	// an agent mid-task than a schema rejection.
 	Origin        string   `json:"origin,omitempty" jsonschema:"restrict to one origin: \"internal\" for sound this machine produced, \"external\" for sound its microphone picked up from the room, or \"unknown\"; omit for all"`
-	MinConfidence *float64 `json:"min_confidence,omitempty" jsonschema:"drop turns whose attribution confidence is below this, from 0 to 1; defaults to 0 so every turn is returned and its confidence speaks for itself"`
+	MinConfidence *float64 `json:"min_confidence,omitempty" jsonschema:"drop turns below this confidence, from 0 to 1; defaults to 0 so every turn is returned and its confidence speaks for itself. A turn's confidence combines the recognizer's own score with penalties for how uncertain its attribution is, and the largest of those penalties apply to microphone turns alone, so this threshold does not sort turns by quality alone: measured on a live index, internal turns scored 0.682-0.983 and external turns 0.331-0.592, so 0.6 removed every external turn and no internal one. Whatever it removes is reported back in confidence_filtered and in the notice. Prefer reading each turn's confidence over filtering on it"`
 	MaxTurns      int      `json:"max_turns,omitempty" jsonschema:"maximum turns to return; defaults to 100 and is capped at 1000"`
 	MaxTextChars  *int     `json:"max_text_chars,omitempty" jsonschema:"per-turn character cap on text; defaults to 600, and 0 means no cap"`
 }
@@ -62,7 +62,13 @@ type getTranscriptOutput struct {
 	// given as a value rather than left to the notice's prose because an agent
 	// paging through a long range should not have to parse a sentence to do it.
 	ResumeFrom string `json:"resume_from,omitempty"`
-	Notice     string `json:"notice,omitempty"`
+	// ConfidenceFiltered counts the turns min_confidence removed, keyed by origin,
+	// and is absent when it removed nothing. It is a value for the same reason
+	// ResumeFrom is: the notice explains why the removal matters, but an agent
+	// deciding whether it is holding a whole conversation should not have to parse
+	// a sentence to find out.
+	ConfidenceFiltered map[string]int `json:"confidence_filtered,omitempty"`
+	Notice             string         `json:"notice,omitempty"`
 }
 
 // getTranscript assembles one ordered, attributed transcript for a time range.
@@ -119,7 +125,10 @@ func (h *handlers) getTranscript(ctx context.Context, _ *sdk.CallToolRequest, in
 	if in.MaxTextChars != nil {
 		maxChars = *in.MaxTextChars
 	}
-	out := getTranscriptOutput{Turns: make([]TranscriptTurnRecord, 0, len(result.Turns))}
+	out := getTranscriptOutput{
+		Turns:              make([]TranscriptTurnRecord, 0, len(result.Turns)),
+		ConfidenceFiltered: result.ConfidenceFiltered,
+	}
 	if !result.ResumeFrom.IsZero() {
 		out.ResumeFrom = result.ResumeFrom.UTC().Format(time.RFC3339Nano)
 	}
@@ -161,6 +170,28 @@ func (h *handlers) transcriptNotice(ctx context.Context, opts store.TranscriptOp
 		// change anything.
 		filtered := "no attributed audio in this range"
 		missing := result.MissingChunks()
+		// An exact count of what a filter deleted outranks every explanation below,
+		// and has to be stated even when the range also has holes. Blaming an empty
+		// transcript on unattributed audio when a threshold emptied it sends the
+		// agent to run a backfill for turns that were found, transcribed, and then
+		// filtered out — the one recommendation guaranteed not to help.
+		if removed := result.ConfidenceRemovals(); removed != "" {
+			filtered = fmt.Sprintf("min_confidence %.2f removed %s, leaving nothing to return; "+
+				"lower or drop min_confidence to see them", opts.MinConfidence, removed)
+			// The gap keeps its own guidance rather than being reduced to a count.
+			// "Why is this empty" and "what can I do about the rest" are separate
+			// questions, and answering the first must not consume the second.
+			if gap := coverageGap(result, fmt.Sprintf(
+				"%d of %d audio chunks in this range are also not attributed yet",
+				missing, result.Chunks)); gap != "" {
+				filtered += ". " + gap
+			}
+			notice, err := h.noResultNotice(ctx, filtered)
+			if err != nil {
+				return "", err
+			}
+			return notice, nil
+		}
 		switch {
 		case result.Chunks > 0 && missing > 0 && result.RecoverableChunks() == 0:
 			// Every hole here is one no backfill can fill, so naming the command
@@ -172,10 +203,13 @@ func (h *handlers) transcriptNotice(ctx context.Context, opts store.TranscriptOp
 			filtered = fmt.Sprintf("this range holds %d audio chunks and %d of them have not been "+
 				"attributed yet; run `lumi transcript backfill` to attribute them",
 				result.Chunks, missing)
-		case result.Chunks > 0 && filtersNarrowed(opts):
+		case result.Chunks > 0 && opts.Origin != "":
+			// Only origin is named. Reaching here means the removal report above
+			// found nothing, so min_confidence provably took no turn — advising the
+			// agent to lower it points at a control that is holding nothing back,
+			// and competes for attention with the one that is.
 			filtered = fmt.Sprintf("all %d audio chunks in this range are attributed, but no turn "+
-				"matched the filters; drop origin or lower min_confidence to see what is there",
-				result.Chunks)
+				"has origin %q; drop origin to see what is there", result.Chunks, opts.Origin)
 		case result.Chunks > 0:
 			filtered = fmt.Sprintf("all %d audio chunks in this range are attributed but hold no "+
 				"speech — the machine played nothing and the microphone heard nobody", result.Chunks)
@@ -206,31 +240,48 @@ func (h *handlers) transcriptNotice(ctx context.Context, opts store.TranscriptOp
 			"results were capped at %d turns; request since=%s to continue from there, "+
 				"or raise max_turns", len(result.Turns), resume))
 	}
+	// The removal a non-empty transcript cannot reveal by itself. Every branch
+	// above this point in the empty case explains why nothing came back; there was
+	// nothing to explain a transcript that came back looking whole with one side of
+	// the conversation deleted out of it.
+	if removed := result.ConfidenceRemovals(); removed != "" {
+		parts = append(parts, fmt.Sprintf(
+			"min_confidence %.2f removed %s; a turn's confidence combines the recognizer's "+
+				"score with penalties for how uncertain its attribution is, and the largest of "+
+				"those apply to microphone turns alone — so a threshold sorts by origin as much "+
+				"as by quality, and this one may have removed a whole side of the conversation "+
+				"rather than its least reliable turns",
+			opts.MinConfidence, removed))
+	}
 	// A transcript with holes is worse than a short one, because nothing in the
 	// turns themselves reveals the gap.
-	if missing := result.MissingChunks(); missing > 0 {
-		gap := fmt.Sprintf(
-			"%d of %d audio chunks in this range are not attributed yet, so this transcript has gaps",
-			missing, result.Chunks)
-		// Chunks whose recognition failed stay unattributed permanently, so the
-		// backfill is named only for the ones it can actually move. Recommending
-		// it for the rest is an instruction to run a command and watch nothing
-		// change, which is worse than reporting an unfixable hole.
-		if result.FailedChunks > 0 {
-			gap += fmt.Sprintf("; %d of them could not be transcribed and no backfill can recover them",
-				result.FailedChunks)
-		}
-		if result.RecoverableChunks() > 0 {
-			gap += "; run `lumi transcript backfill` to fill the rest"
-		}
+	if gap := coverageGap(result, fmt.Sprintf(
+		"%d of %d audio chunks in this range are not attributed yet, so this transcript has gaps",
+		result.MissingChunks(), result.Chunks)); gap != "" {
 		parts = append(parts, gap)
 	}
 	return strings.Join(parts, "; "), nil
 }
 
-// filtersNarrowed reports whether the request could have excluded turns of its
-// own accord, so an empty result can name the filter rather than blaming the
-// index for it.
-func filtersNarrowed(opts store.TranscriptOptions) bool {
-	return opts.Origin != "" || opts.MinConfidence > 0
+// coverageGap completes a sentence about unattributed chunks with what can be
+// done about them, and is empty when the range is fully attributed.
+//
+// Chunks whose recognition failed stay unattributed permanently, so the backfill
+// is named only for the ones it can actually move: recommending it for the rest
+// is an instruction to run a command and watch nothing change, which is worse
+// than reporting an unfixable hole. Both the empty and the non-empty notice need
+// that distinction, and it is written once so the two cannot come to disagree
+// about which holes are worth acting on.
+func coverageGap(result store.TranscriptResult, sentence string) string {
+	if result.MissingChunks() <= 0 {
+		return ""
+	}
+	if result.FailedChunks > 0 {
+		sentence += fmt.Sprintf("; %d of them could not be transcribed and no backfill can recover them",
+			result.FailedChunks)
+	}
+	if result.RecoverableChunks() > 0 {
+		sentence += "; run `lumi transcript backfill` to fill the rest"
+	}
+	return sentence
 }
