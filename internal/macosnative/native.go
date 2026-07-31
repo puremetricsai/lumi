@@ -22,6 +22,8 @@ char *lumi_permissions_json(char **error_message);
 char *lumi_hid_access_name(int access);
 char *lumi_request_permissions_json(bool input_monitoring, char **error_message);
 char *lumi_audio_processes_json(char **error_message);
+char *lumi_audio_marker_windows_json(char **error_message);
+char *lumi_audio_marker_windows_in_json(const char *windows_json, char **error_message);
 int64_t lumi_audio_session_start(const char *directory, const char *prefix, double chunk_seconds, char **error_message);
 char *lumi_audio_session_next_json(int64_t handle, double timeout_seconds, char **error_message);
 void lumi_audio_session_stop(int64_t handle);
@@ -170,6 +172,60 @@ func AudioProcesses(ctx context.Context) ([]AudioProcess, error) {
 		return nil, fmt.Errorf("decode audio process list: %w", err)
 	}
 	return processes, nil
+}
+
+// AudioMarkerWindow is one on-screen window whose own title declares it is
+// playing audio. Window carries the title with the marker removed.
+type AudioMarkerWindow struct {
+	PID      int32  `json:"pid"`
+	BundleID string `json:"bundle_id,omitempty"`
+	Name     string `json:"name,omitempty"`
+	Window   string `json:"window,omitempty"`
+}
+
+// AudioMarkerWindows scans every on-screen window for the marker Chromium
+// appends to a title while a tab is playing sound.
+//
+// It is the fallback for when CoreAudio names no emitter, and it deliberately
+// looks past the focused window: the case worth catching is a browser playing in
+// the background while the user works elsewhere, which is precisely the case a
+// focused-window reading gets wrong.
+//
+// An empty slice means no window declared audio. Only windows carrying the
+// marker are returned, and no other window's title leaves the native side.
+func AudioMarkerWindows(ctx context.Context) ([]AudioMarkerWindow, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var nativeErr *C.char
+	result, err := nativeJSON(C.lumi_audio_marker_windows_json(&nativeErr), nativeErr)
+	if err != nil {
+		return nil, err
+	}
+	var windows []AudioMarkerWindow
+	if err := json.Unmarshal(result, &windows); err != nil {
+		return nil, fmt.Errorf("decode audio marker window list: %w", err)
+	}
+	return windows, nil
+}
+
+// AudioMarkerWindowsIn runs the same scan over a supplied window list. It exists
+// for the reason the other *In resolvers do: asserting the live scan would pass
+// vacuously in any process that happens to have nothing playing, so it could only
+// fail where nothing is asserting.
+func AudioMarkerWindowsIn(windowsJSON string) ([]AudioMarkerWindow, error) {
+	cWindows := C.CString(windowsJSON)
+	defer C.free(unsafe.Pointer(cWindows))
+	var nativeErr *C.char
+	result, err := nativeJSON(C.lumi_audio_marker_windows_in_json(cWindows, &nativeErr), nativeErr)
+	if err != nil {
+		return nil, err
+	}
+	var windows []AudioMarkerWindow
+	if err := json.Unmarshal(result, &windows); err != nil {
+		return nil, fmt.Errorf("decode audio marker window list: %w", err)
+	}
+	return windows, nil
 }
 
 func CaptureScreens(ctx context.Context, directory, prefix string) ([]ScreenFrame, error) {
@@ -498,20 +554,43 @@ func RequestPermissions(ctx context.Context, inputMonitoring bool) (Permissions,
 // deliberately: "no chunk yet" and "no chunk yet, and the poll expired" call for
 // the same thing from every caller, and a field nobody branches on invites one.
 type AudioChunk struct {
-	// StartedAtUnixNS is the wall clock of this chunk's boundary, derived by
-	// offsetting the session anchor rather than by reading the clock at
-	// rotation, so consecutive chunks are exactly one chunk duration apart and
-	// the grid cannot drift over a recording of any length.
+	// StartedAtUnixNS is the wall clock of this chunk's boundary, *measured* at
+	// rotation by reading the host clock and ageing it back to the boundary
+	// presentation timestamp.
 	//
-	// Because a sample buffer is never split, the chunk's first sample can sit
-	// up to one buffer (~100ms) before its boundary. That offset is bounded and
-	// does not accumulate, and a caller needing the sample-accurate instant has
-	// each track's own StartedAtUnixNS. The alternative — stamping the chunk
-	// from its first sample — would be exact but jittery, and would give up the
-	// uniform spacing that makes coverage arithmetic exact.
-	StartedAtUnixNS int64        `json:"started_at_unix_ns"`
-	Frames          []AudioFrame `json:"frames"`
-	Closed          bool         `json:"closed"`
+	// It used to be arithmetic on the session anchor — anchor + N×chunkDuration —
+	// which made every audio timestamp in an index share one sub-second fraction.
+	// That is uniform but not observed: clock drift could not be detected, a
+	// dropped chunk renumbered silently instead of leaving a visible hole, and
+	// correlation with screen events degraded over a long session with nothing to
+	// show for it. Ageing the clock rather than reading NSDate on arrival is what
+	// keeps this from being the old "read time.Now() between chunks" bug, which
+	// made every stamp absorb the previous chunk's processing time.
+	//
+	// The uniform grid is not lost, only moved: StreamOffsetNS carries the exact,
+	// drift-free distance from the session anchor, and GridStartedAtUnixNS carries
+	// the grid point itself, so coverage arithmetic stays exact.
+	//
+	// Because a sample buffer is never split, the chunk's first sample can sit up
+	// to one buffer (~100ms) before its boundary. That offset is bounded and does
+	// not accumulate, and a caller needing the sample-accurate instant has each
+	// track's own StartedAtUnixNS.
+	StartedAtUnixNS int64 `json:"started_at_unix_ns"`
+	// GridStartedAtUnixNS is where this chunk sits on the drift-free grid. It is
+	// what StartedAtUnixNS used to be, kept so a measured stamp can be compared
+	// against the arithmetic it replaced. Zero when unreported.
+	GridStartedAtUnixNS int64 `json:"grid_started_at_unix_ns"`
+	// StreamOffsetNS is the boundary's exact distance from the session anchor. It
+	// is a pointer because zero is a real value — every session's first chunk has
+	// it — and must stay distinct from "not reported".
+	StreamOffsetNS *int64 `json:"stream_offset_ns"`
+	// ClockAnomaly reports that the measured read disagreed with the grid by more
+	// than the guard allows, or stepped backwards, so the grid value was used.
+	// A backwards step is guarded because turn continuation across a chunk
+	// boundary requires a strictly positive gap.
+	ClockAnomaly bool         `json:"clock_anomaly"`
+	Frames       []AudioFrame `json:"frames"`
+	Closed       bool         `json:"closed"`
 	// CaptureError is set alongside Closed when the stream ended because
 	// ScreenCaptureKit failed rather than because it was stopped.
 	CaptureError string `json:"capture_error,omitempty"`

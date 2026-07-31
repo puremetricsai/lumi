@@ -131,12 +131,31 @@ func AudioProcesses(context.Context) ([]AudioProcess, error) {
 	return nil, errUnsupported
 }
 
+// AudioMarkerWindow mirrors the darwin definition so callers compile everywhere.
+type AudioMarkerWindow struct {
+	PID      int32  `json:"pid"`
+	BundleID string `json:"bundle_id,omitempty"`
+	Name     string `json:"name,omitempty"`
+	Window   string `json:"window,omitempty"`
+}
+
+func AudioMarkerWindows(context.Context) ([]AudioMarkerWindow, error) {
+	return nil, errUnsupported
+}
+
+func AudioMarkerWindowsIn(string) ([]AudioMarkerWindow, error) {
+	return nil, errUnsupported
+}
+
 // AudioChunk mirrors the darwin definition so callers compile everywhere.
 type AudioChunk struct {
-	StartedAtUnixNS int64
-	Frames          []AudioFrame
-	Closed          bool
-	CaptureError    string
+	StartedAtUnixNS     int64
+	GridStartedAtUnixNS int64
+	StreamOffsetNS      *int64
+	ClockAnomaly        bool
+	Frames              []AudioFrame
+	Closed              bool
+	CaptureError        string
 }
 
 type AudioSession struct{}
