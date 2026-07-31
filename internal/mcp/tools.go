@@ -78,10 +78,11 @@ type EventRecord struct {
 	TextSource     string `json:"text_source,omitempty"`
 	DisplayID      uint32 `json:"display_id,omitempty"`
 	// AudioSource is the capture device this row was read from, "system" or
-	// "microphone". Both tracks of a chunk are returned, each as its own row: a
-	// pair sharing one captured_at may hold the same sound or two different
-	// ones, and only get_transcript can tell those apart — see
-	// audioProvenanceContract in server.go.
+	// "microphone". A chunk's two rows are never merged, but a search returns
+	// only the rows that matched: every filter is a per-row predicate, so one
+	// row of a pair arrives alone routinely and says nothing about its
+	// counterpart. Whether a pair held one sound or two is get_transcript's
+	// question — see audioProvenanceContract in server.go.
 	AudioSource string         `json:"audio_source,omitempty"`
 	Metadata    map[string]any `json:"metadata,omitempty"`
 }

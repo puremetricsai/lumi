@@ -5,9 +5,9 @@ our package is also named `mcp`). `Serve(ctx, *store.Store, Options)` registers 
 `search_events`, `get_event`, `list_apps`, `get_transcript` — and runs until stdin closes or the context is
 cancelled. It depends on `internal/store` and nothing else of Lumi's.
 
-`search_events` truncates text per event and reports `truncated` plus true `text_length`, and returns both
-tracks of an audio chunk as their own rows; `get_event` is the untruncated escape hatch and the only tool
-returning metadata. `get_transcript` reads audio as one ordered conversation
+`search_events` truncates text per event and reports `truncated` plus true `text_length`, and never merges
+an audio chunk's two rows; `get_event` is the untruncated escape hatch and the only tool returning
+metadata. `get_transcript` reads audio as one ordered conversation
 with the machine's own speech deduplicated, and its `confidence` and `order_confidence` carry no `omitempty`
 for the same reason `truncated` does not: a doubtful label must never be something an agent infers from a
 missing key. Validation and store failures come back as tool results with `isError`, never JSON-RPC protocol

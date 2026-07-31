@@ -761,6 +761,11 @@ func TestSearchEventsKeepsBothTracksOfAChunk(t *testing.T) {
 // landing only in the microphone transcript returns that row. It used to be at
 // risk from a collapse consulting the non-matching system row and judging it the
 // better copy, which would drop the only hit.
+//
+// It is also the case audioProvenanceContract must not mis-describe. One row of
+// a pair arriving alone is ordinary, so the description says the pair is never
+// *merged* rather than that both are *returned* — the second reading would let
+// an agent take this single row for the whole chunk.
 func TestSearchEventsMicrophoneOnlyHitIsNotReplaced(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
@@ -780,6 +785,45 @@ func TestSearchEventsMicrophoneOnlyHitIsNotReplaced(t *testing.T) {
 	}
 	if rec.Text != "the mic transcribed 52000000 as digits" {
 		t.Fatalf("microphone text = %q, want it verbatim", rec.Text)
+	}
+}
+
+// TestSearchEventsRequireTextReturnsLoneTracks is the measurement behind the
+// wording of audioProvenanceContract. Every filter search_events applies is a
+// predicate on one row, so require_text keeps a chunk's speaking track and drops
+// its silent one — and a silent system track beside a speaking microphone is the
+// common case, not an edge case. Measured on a live index, a require_text window
+// returned 20 chunks and every one of them as a single row.
+//
+// Nothing may therefore promise that both rows of a pair are returned. The
+// guarantee is that they are never merged.
+func TestSearchEventsRequireTextReturnsLoneTracks(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	base := time.Now().UTC().Truncate(time.Second)
+	for i := 0; i < 3; i++ {
+		// A silent system track beside a speaking microphone: the shape a quiet
+		// room with the speakers idle actually records.
+		audioPair(t, ctx, s, base.Add(time.Duration(i)*time.Second),
+			"", fmt.Sprintf("someone in the room said something %d", i))
+	}
+	h := &handlers{store: s}
+
+	out := callSearch(t, ctx, h, searchEventsInput{Kind: "audio", RequireText: true})
+	if len(out.Events) != 3 {
+		t.Fatalf("expected the three speaking tracks, got %d", len(out.Events))
+	}
+	for _, rec := range out.Events {
+		if rec.AudioSource != "microphone" {
+			t.Errorf("require_text should leave only the speaking track, got %q", rec.AudioSource)
+		}
+	}
+
+	// Same rows, no require_text: the silent counterparts come back too, which
+	// is what makes this a property of the filter rather than of the index.
+	all := callSearch(t, ctx, h, searchEventsInput{Kind: "audio"})
+	if len(all.Events) != 6 {
+		t.Fatalf("without require_text both tracks of each chunk should be present, got %d", len(all.Events))
 	}
 }
 
@@ -913,7 +957,14 @@ func TestToolDescriptionsStateTheMicrophoneCaveat(t *testing.T) {
 		"Audio rows come in PAIRS sharing one captured_at",
 		"not necessarily a sound",
 		"never assume one row of a pair is redundant",
-		"get_transcript answers that question",
+		"get_transcript answers both questions",
+		// And it must not over-correct into promising delivery of both rows.
+		// Filters are per-row, so a lone row is routine — see
+		// TestSearchEventsMicrophoneOnlyHitIsNotReplaced. Claiming both arrive
+		// would rebuild the original defect from the other side, with an agent
+		// reading one row as the whole chunk.
+		"applied per ROW",
+		"is NOT evidence that the chunk held one track",
 	} {
 		if !strings.Contains(search, required) {
 			t.Errorf("search_events description omits %q", required)

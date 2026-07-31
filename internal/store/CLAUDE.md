@@ -44,8 +44,9 @@ lexicographically — any new time column must go through `FormatCapturedAt` or 
 
 Facts about querying live here, not in callers: `DefaultSearchLimit` (20) / `MaxSearchLimit` (500),
 `HasSearchableTerms`, `HasEvents`, `EventByID` (with `ErrEventNotFound`), `ListAttribution`.
-`Search` returns both tracks of an audio chunk as their own rows; nothing here merges them (see the audio
-section below).
+`Search` treats an audio chunk's two tracks as the separate rows they are and never merges them; every
+filter it applies is a per-row predicate, so one track of a chunk is returned alone whenever only it
+matched (see the audio section below).
 
 `audio_segments` (migration 4) holds each chunk's origin-attributed pieces, derived from events and never
 the reverse, so re-deriving them is always safe — that is what makes the backfill idempotent.
@@ -100,9 +101,10 @@ and `transcript.Segment` — shadow each other the way `internal/mcp`'s `Attribu
 ## Audio tracks
 
 - **The two rows of a chunk are never merged, and nothing here may decide they hold the same sound.**
-  `Search` returns both, distinguished by `audio_source`. A shared `captured_at` is a shared 30-second
-  *interval*; the microphone re-records whatever the speakers play, but it also records the room, and the
-  two rows routinely carry different speech. `CollapseAudioTracks` used to merge them on the timestamp
+  They are stored and returned as separate rows, distinguished by `audio_source`; `Search` returns
+  whichever of them matched, since every filter it applies is a per-row predicate. A shared `captured_at`
+  is a shared 30-second *interval*; the microphone re-records whatever the speakers play, but it also
+  records the room, and the two rows routinely carry different speech. `CollapseAudioTracks` used to merge them on the timestamp
   alone, keep the system track, and report an `audio_origin` of `both` that its own comments described as
   speaker bleed — an unverified claim. Reported from a live index: the microphone was carrying an entirely
   separate talk, every word was dropped, and the merged result read as finished. Returning two rows is
