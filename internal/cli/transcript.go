@@ -35,7 +35,10 @@ func (a *app) transcriptCommand() *cobra.Command {
 			"by where the sound came from.\n\n" +
 			"  internal  sound this machine produced — the far side of a call, a video,\n" +
 			"            music, a notification. Not necessarily a person.\n" +
-			"  external  sound the microphone picked up from the room, usually you.\n" +
+			"  external  sound the microphone picked up from the room. It has no\n" +
+			"            recoverable owner: it may be you, other people present, a TV,\n" +
+			"            another machine, or ambient playback. Lumi does not identify\n" +
+			"            speakers and never attributes this to a person or an app.\n" +
 			"  unknown   machine audio was playing but produced no transcript, so its\n" +
 			"            origin could not be determined.\n\n" +
 			"Because machine audio also bleeds into the microphone, its words appear once\n" +
@@ -123,6 +126,18 @@ func transcriptOptions(since, until, origin string, minConfidence float64, limit
 	return opts, nil
 }
 
+// externalTurns counts the turns that came from the room rather than from this
+// machine, which is what decides whether the microphone caveat is printed.
+func externalTurns(result store.TranscriptResult) int {
+	count := 0
+	for _, turn := range result.Turns {
+		if turn.Origin == store.OriginExternal {
+			count++
+		}
+	}
+	return count
+}
+
 // printTranscript renders turns for a person, one line each.
 func printTranscript(out io.Writer, result store.TranscriptResult) {
 	for _, turn := range result.Turns {
@@ -144,6 +159,15 @@ func printTranscript(out io.Writer, result store.TranscriptResult) {
 		}
 		fmt.Fprintf(out, "%s%s  %-8s  %s%s%s\n",
 			marker, when, turn.Origin, truncateRunes(turn.Text, 300), score, overlap)
+	}
+	// Restate the microphone caveat wherever external turns were actually
+	// printed. The origin label alone reads as a speaker to anyone summarising
+	// this, and the WAV it came from is deleted on the retention schedule while a
+	// summary built from it survives — so a speaker inferred here becomes
+	// permanent. Saying it beside the text is what stops that.
+	if externalTurns(result) > 0 {
+		fmt.Fprint(out, "\nexternal turns are room audio with no identified speaker: they may be you, "+
+			"other people present, or playback.\nDo not record them as something you said or did.\n")
 	}
 	// Coverage goes to the same stream as the transcript, after it, because a
 	// transcript with holes looks complete: nothing in the turns reveals the gap.

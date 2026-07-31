@@ -48,7 +48,7 @@ changing anything there** — the rationale lives with the code it constrains, n
 | Package | What it is |
 | --- | --- |
 | `internal/macosnative` | cgo/Objective-C bridge: ScreenCaptureKit, Accessibility, Vision, AVFoundation WAV writing, CoreAudio process enumeration, permission preflight. Non-macOS stub. |
-| `internal/capture` | `Recorder`: independent screen and audio goroutines, native processors behind small interfaces, everything in-process. Owns what an event's `app` means. |
+| `internal/capture` | `Recorder`: independent screen and audio goroutines, native processors behind small interfaces, everything in-process. Owns what an event's `app` means, and what produced an audio row's sound. |
 | `internal/store` | Single-file SQLite (`modernc.org/sqlite`, no cgo), FTS5, versioned migrations, search, audio collapse, `audio_segments`, transcript assembly and coverage. |
 | `internal/transcript` | Pure: decides where captured sound came from (`internal`/`external`) and assembles turns. No database, cgo, or filesystem. |
 | `internal/wav` | Reads Lumi's mono 16-bit PCM WAVs and measures their energy. |
@@ -79,6 +79,12 @@ changing anything there** — the rationale lives with the code it constrains, n
 - **Real captured conversation never becomes a test fixture.** Harnesses that need real audio read a path
   from the environment and skip without it. The measured numbers belong in the repository; the words do
   not.
+- **Microphone audio is never attributed to a person or an application.** It records the room and may be
+  the user, other people present, a TV, or ambient playback. Lumi does not identify speakers and does not
+  try; the requirement is that the ambiguity is *stated* — in the data (`attribution: unattributed`, no
+  `source_app`), in the MCP tool descriptions, and in anything that renders a transcript. Raw audio is
+  deleted on the retention schedule while a summary built from it survives, so a fabricated speaker
+  becomes permanent. → `internal/capture/CLAUDE.md`, `internal/mcp/CLAUDE.md`
 
 ## External dependencies
 

@@ -48,6 +48,11 @@ developer's own Claude config.
   function of (binary, root), which is what lets the "already configured?" check be an exact comparison. It
   deliberately does not `EvalSymlinks`: a packaged install is reached through a stable symlink whose target
   moves every version bump.
-- **`Recorder.AudioOutputs` is always wired here.** Leaving it nil changes what an absent
-  `active_audio_output_processes` key *means* in every row written (`internal/capture/CLAUDE.md`).
+- **`Recorder.AudioOutputs` and `Recorder.AudioMarkers` are always wired here.** Leaving either nil changes
+  what an absent source list *means* in every row written — "no source was found" rather than "no source
+  was looked for" — and nothing downstream can tell those apart (`internal/capture/CLAUDE.md`).
+- **`lumi transcript` restates the microphone caveat wherever external turns were printed.** The origin
+  label alone reads as a speaker to anyone summarising the output, and the WAV it came from is deleted on
+  the retention schedule while a summary built from it survives — so a speaker inferred there becomes
+  permanent. Any future summary or roll-up command must carry the same marker through.
 - **The CLI refuses to run on anything but `darwin/arm64`** (`platform.Validate` in `PersistentPreRunE`).

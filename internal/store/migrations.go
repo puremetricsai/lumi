@@ -103,6 +103,29 @@ CREATE TRIGGER IF NOT EXISTS audio_segments_event_ad AFTER DELETE ON events BEGI
   DELETE FROM audio_segments WHERE event_id = old.id;
 END;`,
 	},
+	{
+		// audio_attribution and source_apps_json promote "which application made
+		// this sound" out of metadata_json and into columns, because an agent
+		// branching on it must not have to parse a blob to tell a fact from a
+		// guess. They stay TEXT with no CHECK for the reason origin does: naming a
+		// further class of source later is then a value change, not a migration.
+		//
+		// stream_offset_ms is nullable with no default on purpose. Zero is a real
+		// value — every session's first chunk has it — so NOT NULL DEFAULT 0 would
+		// make every row recorded before this migration claim to be a session
+		// start. NULL means "not recorded", which is what those rows are.
+		//
+		// events_fts is untouched: it indexes text, app, and window only, and all
+		// three of its sync triggers name those columns, so no new column reaches
+		// it and no reindex is needed.
+		Version: 5,
+		SQL: `
+ALTER TABLE events ADD COLUMN audio_attribution TEXT NOT NULL DEFAULT '';
+ALTER TABLE events ADD COLUMN source_apps_json TEXT NOT NULL DEFAULT '';
+ALTER TABLE events ADD COLUMN stream_offset_ms INTEGER;
+CREATE INDEX IF NOT EXISTS events_audio_attribution_captured_at_idx
+  ON events(audio_attribution, captured_at DESC);`,
+	},
 }
 
 // runMigrations applies every migration whose version exceeds the database's

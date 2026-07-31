@@ -44,7 +44,7 @@ func attributedChunk(t *testing.T, ctx context.Context, s *store.Store, at time.
 		}
 		segments[i].Seq = i
 	}
-	if err := s.ReplaceChunkSegments(ctx, at.UTC().Format(time.RFC3339Nano), segments); err != nil {
+	if err := s.ReplaceChunkSegments(ctx, store.FormatCapturedAt(at), segments); err != nil {
 		t.Fatal(err)
 	}
 	return at

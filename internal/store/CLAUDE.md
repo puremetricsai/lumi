@@ -2,8 +2,44 @@
 
 Single-file SQLite via `modernc.org/sqlite` (pure Go, no cgo), `MaxOpenConns(1)` plus WAL. Schema changes
 are versioned migrations (`migrations.go`) applied on `Open`, tracked by `user_version`. The `events_fts`
-external-content table is trigger-synced, so writes go only to `events`. Timestamps are RFC3339Nano UTC
-strings compared lexicographically — any new time column must match or range filters break.
+external-content table is trigger-synced, so writes go only to `events`. Timestamps are UTC strings compared
+lexicographically — any new time column must go through `FormatCapturedAt` or range filters break.
+
+## Timestamps
+
+- **`FormatCapturedAt` (`time.go`) is the only way to produce a `captured_at` string.** It is what stops
+  `store.Insert` and `capture`'s `ReplaceChunkSegments` key from ever rendering one instant two ways:
+  `ChunksMissingSegments` joins those two columns on equality, so a divergence parks every newly recorded
+  chunk on the backfill queue forever and reports 0 % `SegmentCoverage` — with no error anywhere.
+- **`CapturedAtLayout` is fixed-width because comparison is lexicographic.** `time.RFC3339Nano` trims
+  trailing zeros, so `.12Z` (`.120000000`) sorts *after* `.123456789Z` — byte order disagreeing with time
+  order is a wrong answer at any range boundary. `TestLexicographicOrderMatchesChronologicalOrder` pins it.
+- **A `captured_at` key can never be rebuilt from an instant by picking one layout.** The index holds two
+  renderings: rows written before `CapturedAtLayout` existed carry `RFC3339Nano`'s trimmed form, rows
+  since carry the fixed-width one. `AudioTracksAt` therefore takes `[]time.Time`, offers *both* renderings
+  to its `IN (…)` (`capturedAtKeys`), and keys its result canonically rather than by the bytes it read.
+  Two successive designs of this got it wrong in opposite directions — one truncating, one padding — and
+  both failed the same way: `AudioTracksAt` matches nothing, and `OriginOf` labels a real two-track chunk
+  `silent`. `TestLegacyNanosecondRowsStillResolveTheirAudioTracks` is the guard.
+- **A range bound covers both renderings; an equality key must be exact.**
+  `LowerCapturedAtBound`/`UpperCapturedAtBound` pick the smallest rendering for `>=`/`<` and the largest
+  for `<=`, because a fixed-width upper bound silently excludes a legacy row sitting exactly on it —
+  `.12Z` sorts *above* `.120000000Z` for the same instant. Every `since`/`until` comparison in this package
+  goes through them (`lowerBound`/`upperBound` in `segments.go` delegate); `formatTime` stays exact because
+  it also writes `audio_segments`' own columns. This fixes the boundary case only, not the general
+  prefix-ordering flaw legacy screen rows carry.
+- **`Insert` validates source provenance by *decoding* it, not by checking JSON syntax.** `["Comet"]` is
+  valid JSON and invalid provenance; storing it puts a list in the index that nothing can read, and the MCP
+  boundary drops an undecodable list silently, so the row reads as though it simply had no source. Decoding
+  is also what makes the microphone guard below reachable — a malformed list used to slip past it.
+- **`Insert` enforces the microphone invariant, not just the recorder.** A microphone row may not carry an
+  attribution other than `unattributed` or name any source application. `internal/capture` decides the
+  rule, but a guarantee this size cannot rest on one caller: a second writer would break it silently, and
+  an invented speaker outlives its evidence once the WAV is pruned.
+- **Existing rows are deliberately not rewritten.** A migration rewriting `captured_at` would be an
+  irreversible edit of captured data and would fire the `events_au` FTS trigger once per row, for a
+  boundary flaw that predates this layout and has never been observed to bite. Legacy screen rows keep
+  their trimmed rendering; the ordering caveat above applies to them and only to them.
 
 Facts about querying live here, not in callers: `DefaultSearchLimit` (20) / `MaxSearchLimit` (500),
 `HasSearchableTerms`, `HasEvents`, `EventByID` (with `ErrEventNotFound`), `ListAttribution`.

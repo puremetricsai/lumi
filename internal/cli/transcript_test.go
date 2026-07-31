@@ -39,7 +39,7 @@ func audioChunkWithText(t *testing.T, s *store.Store, at time.Time, systemText, 
 	if err := s.Insert(ctx, &mic); err != nil {
 		t.Fatal(err)
 	}
-	return at.UTC().Format(time.RFC3339Nano)
+	return store.FormatCapturedAt(at)
 }
 
 func runCLI(t *testing.T, args ...string) (string, error) {
@@ -360,7 +360,7 @@ func audioChunkWithMetadata(t *testing.T, s *store.Store, at time.Time, metadata
 			t.Fatal(err)
 		}
 	}
-	return at.UTC().Format(time.RFC3339Nano)
+	return store.FormatCapturedAt(at)
 }
 
 // TestBackfillNeverCallsAFailedTranscriptionSilent is the backfill half of the
@@ -433,7 +433,7 @@ func audioChunkWithWAVs(t *testing.T, s *store.Store, at time.Time, systemText, 
 			t.Fatal(err)
 		}
 	}
-	return at.UTC().Format(time.RFC3339Nano)
+	return store.FormatCapturedAt(at)
 }
 
 // TestRetranscribeSuppliesTimingsNeverText is the invariant that keeps segments

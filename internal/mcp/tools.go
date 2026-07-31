@@ -45,15 +45,39 @@ type EventRecord struct {
 	// an absent truncated would drop out of the generated output schema's
 	// required list while text_length stayed in it, leaving an agent to infer
 	// from a missing key the one thing this pair exists to state outright.
-	Truncated   bool   `json:"truncated"`
-	TextLength  int    `json:"text_length"`
-	App         string `json:"app,omitempty"`
-	Window      string `json:"window,omitempty"`
-	MediaPath   string `json:"media_path,omitempty"`
-	DurationMS  int64  `json:"duration_ms,omitempty"`
-	TextSource  string `json:"text_source,omitempty"`
-	DisplayID   uint32 `json:"display_id,omitempty"`
-	AudioSource string `json:"audio_source,omitempty"`
+	Truncated  bool `json:"truncated"`
+	TextLength int  `json:"text_length"`
+	// App and Window are set on screen rows only. On an audio row the same two
+	// columns are reported as ForegroundApp/ForegroundWindow, because there they
+	// answer a question a reader of "app" does not expect them to: what the user
+	// was working in while the sound recorded, never what produced it. The SQL
+	// column names do not change — FTS5, Search's app filter, and ListAttribution
+	// all depend on them — so the rename lives here, at the boundary an agent
+	// actually reads.
+	App    string `json:"app,omitempty"`
+	Window string `json:"window,omitempty"`
+	// ForegroundApp and ForegroundWindow are the audio-row spelling of the pair
+	// above. They are never the source of the sound.
+	ForegroundApp    string `json:"foreground_app,omitempty"`
+	ForegroundWindow string `json:"foreground_window,omitempty"`
+	// SourceApp lists the applications observed producing sound while this chunk
+	// recorded, ordered by how much of the chunk each was present for. It is a
+	// list because two applications can emit at once and a scalar could not say
+	// so. Always absent on a microphone row.
+	SourceApp []SourceAppRecord `json:"source_app,omitempty"`
+	// Attribution says how source_app was earned: "emitting_process",
+	// "foreground_inferred", or "unattributed". An audio row written since this
+	// field existed always carries one, so an absent attribution means it was
+	// never recorded — never that the sound was unattributable, which
+	// "unattributed" states outright.
+	Attribution string `json:"attribution,omitempty"`
+	// StreamOffsetMS is how far into the capture session this chunk began.
+	StreamOffsetMS *int64 `json:"stream_offset_ms,omitempty"`
+	MediaPath      string `json:"media_path,omitempty"`
+	DurationMS     int64  `json:"duration_ms,omitempty"`
+	TextSource     string `json:"text_source,omitempty"`
+	DisplayID      uint32 `json:"display_id,omitempty"`
+	AudioSource    string `json:"audio_source,omitempty"`
 	// AudioOrigin says which tracks of this 30-second audio chunk carried
 	// speech — "system", "microphone", "both", or "silent" — independent of
 	// which track survived a collapse. "both" is speaker bleed; nothing
@@ -68,6 +92,23 @@ type EventRecord struct {
 	// full transcript through get_event.
 	AudioTracks []AudioTrackRecord `json:"audio_tracks,omitempty"`
 	Metadata    map[string]any     `json:"metadata,omitempty"`
+}
+
+// SourceAppRecord is one application observed producing sound during a chunk.
+//
+// Evidence names what earned it the place: "process" is a CoreAudio process
+// object holding an output stream, "window_marker" is a window whose own title
+// said it was playing audio. Samples out of Observations says how much of the
+// chunk it was present for, so a notification blip and a video that filled the
+// recording do not read alike.
+type SourceAppRecord struct {
+	PID          int32  `json:"pid"`
+	BundleID     string `json:"bundle_id,omitempty"`
+	Name         string `json:"name,omitempty"`
+	Window       string `json:"window,omitempty"`
+	Evidence     string `json:"evidence"`
+	Samples      int    `json:"samples"`
+	Observations int    `json:"observations"`
 }
 
 // AudioTrackRecord is one track of a collapsed audio chunk as a client sees it.
@@ -91,21 +132,47 @@ type AudioTrackRecord struct {
 // comparison stay UTC.
 func newEventRecord(event store.Event, maxTextChars int) EventRecord {
 	text, truncated, length := truncateText(event.Text, maxTextChars)
-	return EventRecord{
+	record := EventRecord{
 		ID:          event.ID,
 		Kind:        string(event.Kind),
 		CapturedAt:  event.CapturedAt.Local().Format(time.RFC3339Nano),
 		Text:        text,
 		Truncated:   truncated,
 		TextLength:  length,
-		App:         event.App,
-		Window:      event.Window,
 		MediaPath:   event.MediaPath,
 		DurationMS:  event.DurationMS,
 		TextSource:  event.TextSource,
 		DisplayID:   event.DisplayID,
 		AudioSource: event.AudioSource,
 	}
+	if event.Kind == store.KindAudio {
+		record.ForegroundApp, record.ForegroundWindow = event.App, event.Window
+		record.Attribution = event.AudioAttribution
+		record.StreamOffsetMS = event.StreamOffsetMS
+		record.SourceApp = sourceAppRecords(event.SourceApps)
+		return record
+	}
+	record.App, record.Window = event.App, event.Window
+	return record
+}
+
+// sourceAppRecords decodes the stored source list for the wire. A list that will
+// not decode is reported as none rather than failing the search: the audio and
+// its attribution value are still worth returning, and Attribution already says
+// whether a source was found at all.
+func sourceAppRecords(raw string) []SourceAppRecord {
+	apps, recorded, err := store.DecodeSourceApps(raw)
+	if err != nil || !recorded || len(apps) == 0 {
+		return nil
+	}
+	out := make([]SourceAppRecord, 0, len(apps))
+	for _, app := range apps {
+		out = append(out, SourceAppRecord{
+			PID: app.PID, BundleID: app.BundleID, Name: app.Name, Window: app.Window,
+			Evidence: app.Evidence, Samples: app.Samples, Observations: app.Observations,
+		})
+	}
+	return out
 }
 
 // decodeMetadata turns the stored metadata blob into an object the tool's
@@ -315,24 +382,27 @@ func (h *handlers) hasAttributedAudio(ctx context.Context, events []store.Event)
 // describes every track of the chunk even when the search matched only one, and
 // audio_tracks is emitted only for chunks that held more than one row.
 func (h *handlers) annotateAudio(ctx context.Context, records []EventRecord, chunks map[int64]store.AudioChunk) error {
-	times := make([]string, 0, len(records))
+	times := make([]time.Time, 0, len(records))
 	seen := make(map[string]bool)
 	recordTime := make(map[int]string, len(records))
 	for i := range records {
 		if records[i].Kind != string(store.KindAudio) {
 			continue
 		}
-		// CapturedAt is rendered local; re-parse to the same UTC RFC3339Nano key
-		// AudioTracksAt and storage use.
+		// CapturedAt is rendered local; re-parse to recover the instant. The
+		// *instant* is what identifies a chunk here, never the rendering — the
+		// index holds captured_at in two layouts and no single one of them would
+		// match both halves. store.AudioTracksAt owns reaching both and keys its
+		// result canonically, so this side only has to canonicalise the same way.
 		parsed, err := time.Parse(time.RFC3339Nano, records[i].CapturedAt)
 		if err != nil {
 			return fmt.Errorf("parse audio timestamp %q: %w", records[i].CapturedAt, err)
 		}
-		key := parsed.UTC().Format(time.RFC3339Nano)
+		key := store.FormatCapturedAt(parsed)
 		recordTime[i] = key
 		if !seen[key] {
 			seen[key] = true
-			times = append(times, key)
+			times = append(times, parsed)
 		}
 	}
 	if len(times) == 0 {

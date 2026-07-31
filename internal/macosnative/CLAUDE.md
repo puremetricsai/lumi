@@ -52,6 +52,20 @@ test`.
   distinction already. Screen Recording and Accessibility stay `denied_or_not_determined` on purpose —
   splitting them needs Full Disk Access or raises a prompt as a side effect. Over SSH no status call can
   prompt at all, so `--request` is a no-op.
+- **`LumiAudioMarkerWindowsIn` scans every on-screen window's title but reports only self-declared
+  emitters.** It looks for the marker Chromium appends while a tab plays sound (`" - Audio playing"`,
+  matched by containment — it sits *before* the browser name, so a suffix test never matches), returns only
+  the windows carrying it with the marker stripped, and discards every other title in-place. It reads the
+  same `CGWindowListCopyWindowInfo` the attribution snapshot already copies, so it needs no permission the
+  recorder does not hold — `kCGWindowName` requires Screen Recording, which is definitionally held wherever
+  there is captured audio to attribute. What it reports is the same class of data `events.window` already
+  indexes, and only for rows whose audio Lumi is recording anyway. Lumi's own pid is excluded for the same
+  reason `AudioProcesses` excludes it.
+- **Chunk timestamps are measured at rotation, not derived from the session anchor.** `wallClockForPTS`
+  survives as the drift-free *grid* reference and as the fallback when a guard rejects a measured read;
+  `measuredWallClockForPTS` ages the host clock back to the boundary. See `internal/capture/CLAUDE.md` for
+  why the guard tolerance is 250 ms and why it comes from the turn-merge headroom rather than the chunk
+  duration.
 - **The output-process list is read, never tapped, and excludes Lumi's own pid.** `AudioProcesses` reads
   CoreAudio process objects; creating a tap is what needs a TCC grant, enumerating does not — verified to
   work identically from the detached `Setsid` daemon, unlike `NSWorkspace.frontmostApplication`. Lumi is

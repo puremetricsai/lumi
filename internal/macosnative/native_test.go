@@ -730,10 +730,18 @@ func TestRecordAudioReportsATimingAnchor(t *testing.T) {
 // chunks arrived 32s apart while each held 30s of sound, and the missing
 // seconds landed mid-sentence.
 //
-// Two things are asserted, because either alone can be satisfied by a broken
-// implementation: chunk starts sit exactly one chunk apart (the grid never
-// drifts), and each file actually holds that whole interval (the grid is not
-// merely relabelling a recording with holes in it).
+// Three things are asserted, because any one alone can be satisfied by a broken
+// implementation: grid points sit exactly one chunk apart (the grid never
+// drifts), each file actually holds that whole interval (the grid is not merely
+// relabelling a recording with holes in it), and the *measured* start tracks its
+// grid point closely (the timestamp is observed, but still names the moment the
+// audio began).
+//
+// The exactness assertion moved from StartedAtUnixNS to GridStartedAtUnixNS when
+// chunk timestamps became measured rather than derived. That is the point of the
+// change — an exact stamp was arithmetic, so clock drift was undetectable and a
+// dropped chunk renumbered silently — and keeping the grid alongside is what lets
+// this test still prove the recording has no holes in it.
 func TestAudioSessionChunksAreContiguous(t *testing.T) {
 	if os.Getenv("LUMI_NATIVE_SMOKE") != "1" {
 		t.Skip("set LUMI_NATIVE_SMOKE=1 after granting Lumi permissions")
@@ -765,10 +773,35 @@ func TestAudioSessionChunksAreContiguous(t *testing.T) {
 
 	const chunkMS = int64(chunkSeconds * 1000)
 	for i := 1; i < len(chunks); i++ {
-		gap := (chunks[i].StartedAtUnixNS - chunks[i-1].StartedAtUnixNS) / int64(time.Millisecond)
+		gap := (chunks[i].GridStartedAtUnixNS - chunks[i-1].GridStartedAtUnixNS) / int64(time.Millisecond)
 		if gap != chunkMS {
-			t.Errorf("chunk %d starts %dms after chunk %d, but a chunk covers %dms; "+
+			t.Errorf("chunk %d's grid point is %dms after chunk %d's, but a chunk covers %dms; "+
 				"the difference is audio no file holds", i, gap, i-1, chunkMS)
+		}
+		// The measured stamp is allowed to jitter — that is why it exists — but a
+		// drift past the native guard would have fallen back to the grid, and a
+		// drift past the turn-merge budget would split a continuous conversation.
+		const measuredToleranceMS = 250
+		drift := (chunks[i].StartedAtUnixNS - chunks[i].GridStartedAtUnixNS) / int64(time.Millisecond)
+		if drift > measuredToleranceMS || drift < -measuredToleranceMS {
+			t.Errorf("chunk %d's measured start is %dms from its grid point, beyond the %dms guard",
+				i, drift, measuredToleranceMS)
+		}
+		// Strictly increasing: turn continuation across a boundary requires a
+		// positive gap, so a non-monotonic stamp silently stops it.
+		if chunks[i].StartedAtUnixNS <= chunks[i-1].StartedAtUnixNS {
+			t.Errorf("chunk %d starts at or before chunk %d", i, i-1)
+		}
+		if chunks[i].StreamOffsetNS == nil || chunks[i-1].StreamOffsetNS == nil {
+			t.Errorf("chunk %d or %d reported no stream offset", i, i-1)
+			continue
+		}
+		// The drift-free arithmetic captured_at gave up now lives here, so it has
+		// to be exact where captured_at no longer is.
+		offsetGap := (*chunks[i].StreamOffsetNS - *chunks[i-1].StreamOffsetNS) / int64(time.Millisecond)
+		if offsetGap != chunkMS {
+			t.Errorf("stream offset advanced %dms between chunks %d and %d, want exactly %dms",
+				offsetGap, i-1, i, chunkMS)
 		}
 	}
 	// One sample buffer may land on either side of a boundary, so a file can
@@ -862,6 +895,93 @@ func TestEncodeVocabularyJSON(t *testing.T) {
 			}
 			if got != tc.want {
 				t.Fatalf("encodeVocabulary(%q) = %q, want %q", tc.terms, got, tc.want)
+			}
+		})
+	}
+}
+
+// titledWindow builds a window entry carrying a title, which the plain window
+// helper deliberately omits.
+func titledWindow(pid int, layer int, owner, title string) map[string]any {
+	entry := window(pid, layer, owner)
+	if title != "" {
+		entry["kCGWindowName"] = title
+	}
+	return entry
+}
+
+// TestAudioMarkerWindowsFindTheBackgroundEmitter is the fallback path for
+// acceptance criterion 1. The emitter it has to find is deliberately *not* the
+// front window: attributing sound to whatever is frontmost is the defect the
+// whole change removes, so a scan that only reached the front window would be
+// worthless here.
+//
+// The fixture titles are the real shape measured on a live index — the marker
+// sits before the browser name, not at the end, so a suffix test never matches.
+func TestAudioMarkerWindowsFindTheBackgroundEmitter(t *testing.T) {
+	const ghostty, comet, music = 8123, 9440, 7100
+	for _, tc := range []struct {
+		name     string
+		windows  string
+		wantPIDs []int32
+		wantText string
+	}{
+		{
+			name: "a background browser tab playing audio is found behind the focused app",
+			windows: windowsJSON(t,
+				titledWindow(ghostty, 0, "Ghostty", "lumi — zsh"),
+				titledWindow(comet, 0, "Comet",
+					"(45) Why Intelligence Always Escapes - YouTube - Audio playing - Comet")),
+			wantPIDs: []int32{comet},
+			wantText: "(45) Why Intelligence Always Escapes - YouTube - Comet",
+		},
+		{
+			name: "a window with no marker is never reported",
+			windows: windowsJSON(t,
+				titledWindow(comet, 0, "Comet", "Best practices for Claude Code - Comet")),
+			wantPIDs: nil,
+		},
+		{
+			name: "two applications may emit at once",
+			windows: windowsJSON(t,
+				titledWindow(comet, 0, "Comet", "YouTube - Audio playing - Comet"),
+				titledWindow(music, 0, "Music", "Music - Audio playing")),
+			wantPIDs: []int32{comet, music},
+		},
+		{
+			name: "one application with several noisy tabs counts once",
+			windows: windowsJSON(t,
+				titledWindow(comet, 0, "Comet", "YouTube - Audio playing - Comet"),
+				titledWindow(comet, 0, "Comet", "Spotify - Audio playing - Comet")),
+			wantPIDs: []int32{comet},
+		},
+		{
+			name: "non-zero layers are menu bar and status items, never emitters",
+			windows: windowsJSON(t,
+				titledWindow(comet, 25, "Comet", "YouTube - Audio playing - Comet")),
+			wantPIDs: nil,
+		},
+		{
+			name:     "a window list that could not be copied yields no markers",
+			windows:  "null",
+			wantPIDs: nil,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := AudioMarkerWindowsIn(tc.windows)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != len(tc.wantPIDs) {
+				t.Fatalf("found %d marker windows, want %d: %#v", len(got), len(tc.wantPIDs), got)
+			}
+			for i, want := range tc.wantPIDs {
+				if got[i].PID != want {
+					t.Fatalf("marker window %d pid = %d, want %d", i, got[i].PID, want)
+				}
+			}
+			if tc.wantText != "" && got[0].Window != tc.wantText {
+				t.Fatalf("marker was not stripped from the title: %q, want %q", got[0].Window, tc.wantText)
 			}
 		})
 	}

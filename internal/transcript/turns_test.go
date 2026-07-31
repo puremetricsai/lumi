@@ -255,3 +255,41 @@ func TestEventIDsAreDeduplicatedPerTurn(t *testing.T) {
 		t.Errorf("event ids = %v, want the two distinct rows", turns[0].EventIDs)
 	}
 }
+
+// TestMeasuredChunkJitterStillContinuesATurn guards the interaction between
+// measured chunk timestamps and the structural continuation rule.
+//
+// Chunk starts used to be exact arithmetic on the session anchor, so a
+// cross-chunk gap was always exactly one chunk duration. They are now measured at
+// rotation and jitter slightly, which is the point — but the jitter budget has to
+// stay far inside the 35s adjacency threshold, or a continuously recorded turn
+// splits mid-sentence. The native guard bounds the drift at 250ms per chunk; this
+// pins that the resulting gaps still merge, and that a gap past the threshold
+// still does not.
+func TestMeasuredChunkJitterStillContinuesATurn(t *testing.T) {
+	for _, drift := range []time.Duration{
+		-250 * time.Millisecond, 0, 250 * time.Millisecond,
+		-2 * time.Second, 2 * time.Second,
+	} {
+		t.Run(drift.String(), func(t *testing.T) {
+			chunkB := chunkA.Add(30*time.Second + drift)
+			turns := AssembleTurns([]TurnSegment{
+				turnSeg(chunkA, 0, OriginExternal, "so what I was getting at is", 28000, 30000),
+				turnSeg(chunkB, 0, OriginExternal, "that we should wait a week.", 0, 2000),
+			}, TurnOptions{})
+			if len(turns) != 1 {
+				t.Fatalf("a %v measured drift split a continuous turn into %d", drift, len(turns))
+			}
+		})
+	}
+	// Just past the threshold must still break, or the rule has stopped
+	// distinguishing "the next chunk" from "the recorder stopped".
+	beyond := chunkA.Add(35*time.Second + time.Millisecond)
+	turns := AssembleTurns([]TurnSegment{
+		turnSeg(chunkA, 0, OriginExternal, "before the stop", 28000, 30000),
+		turnSeg(beyond, 0, OriginExternal, "after the stop", 0, 2000),
+	}, TurnOptions{})
+	if len(turns) != 2 {
+		t.Fatalf("a gap past MaxChunkGap produced %d turns, want 2", len(turns))
+	}
+}

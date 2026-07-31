@@ -73,7 +73,10 @@ func CollapseAudioTracks(events []Event) (kept []Event, chunks map[int64]AudioCh
 			kept = append(kept, event)
 			continue
 		}
-		key := event.CapturedAt.UTC().Format(time.RFC3339Nano)
+		// This key never reaches SQL — it groups the rows already in hand — so it
+		// only has to be consistent within one call, which FormatCapturedAt is by
+		// construction. Both tracks of a chunk hold the same instant.
+		key := FormatCapturedAt(event.CapturedAt)
 		if slot, seen := groupIndex[key]; seen {
 			members[key] = append(members[key], event)
 			// Promote the group's survivor into the slot if this member beats
@@ -183,20 +186,32 @@ func hasText(text string) bool { return strings.TrimSpace(text) != "" }
 
 func isSystem(event Event) bool { return event.AudioSource == "system" }
 
-// AudioTracksAt returns every audio row at each of the given capture times,
-// keyed by the RFC3339Nano timestamp, regardless of what a search matched.
+// AudioTracksAt returns every audio row at each of the given capture instants,
+// keyed by FormatCapturedAt of the instant, regardless of what a search matched.
 //
 // It exists so provenance can describe the whole chunk even when a search
 // matched only one of its tracks: an FTS query landing in only the microphone
 // transcript returns that row alone, but the chunk's origin is still "both". The
 // collapse decides among matched rows; this reports the whole chunk.
-func (s *Store) AudioTracksAt(ctx context.Context, times []string) (map[string][]AudioTrack, error) {
+//
+// It takes instants rather than stored strings, and keys its result by a
+// *canonical* rendering rather than by the bytes it read, because a caller
+// cannot reproduce those bytes. captured_at has been written in two renderings
+// over this schema's life — time.RFC3339Nano's trimmed form before
+// CapturedAtLayout existed, and the fixed-width form since — so a lookup key
+// rebuilt from a parsed instant matches the wrong half of the index whichever
+// single layout it picks. Canonicalising both sides removes the question: see
+// capturedAtKeys for how the lookup still reaches both.
+func (s *Store) AudioTracksAt(ctx context.Context, times []time.Time) (map[string][]AudioTrack, error) {
 	result := make(map[string][]AudioTrack)
 	if len(times) == 0 {
 		return result, nil
 	}
-	for start := 0; start < len(times); start += deleteBatchSize {
-		end := start + deleteBatchSize
+	// Each instant contributes up to two placeholders, so halve the batch to
+	// stay under the same variable ceiling deleteBatchSize was chosen for.
+	batchSize := deleteBatchSize / 2
+	for start := 0; start < len(times); start += batchSize {
+		end := start + batchSize
 		if end > len(times) {
 			end = len(times)
 		}
@@ -207,15 +222,33 @@ func (s *Store) AudioTracksAt(ctx context.Context, times []string) (map[string][
 	return result, nil
 }
 
+// capturedAtKeys renders every string a captured_at column may hold for one
+// instant. Rows written before CapturedAtLayout existed carry RFC3339Nano's
+// trailing-zero-trimmed rendering, which differs from the fixed-width one
+// whenever the fraction has trailing zeros — and for a whole-second instant it
+// omits the fraction entirely. An equality lookup offering only the current
+// layout would silently miss every such row, and a caller reading no tracks for
+// a real two-track chunk labels it "silent".
+func capturedAtKeys(value time.Time) []string {
+	fixed := FormatCapturedAt(value)
+	legacy := value.UTC().Format(time.RFC3339Nano)
+	if legacy == fixed {
+		return []string{fixed}
+	}
+	return []string{fixed, legacy}
+}
+
 // scanAudioTracksBatch reads one bounded IN (…) batch into result. Splitting it
 // out keeps rows.Close scoped to the batch rather than deferred across the whole
 // loop.
-func (s *Store) scanAudioTracksBatch(ctx context.Context, batch []string, result map[string][]AudioTrack) error {
-	placeholders := make([]string, len(batch))
-	args := make([]any, len(batch))
-	for i, t := range batch {
-		placeholders[i] = "?"
-		args[i] = t
+func (s *Store) scanAudioTracksBatch(ctx context.Context, batch []time.Time, result map[string][]AudioTrack) error {
+	placeholders := make([]string, 0, len(batch)*2)
+	args := make([]any, 0, len(batch)*2)
+	for _, t := range batch {
+		for _, key := range capturedAtKeys(t) {
+			placeholders = append(placeholders, "?")
+			args = append(args, key)
+		}
 	}
 	query := `SELECT captured_at, id, audio_source, text, media_path FROM events
 WHERE kind = 'audio' AND captured_at IN (` + strings.Join(placeholders, ",") + `)`
@@ -230,8 +263,13 @@ WHERE kind = 'audio' AND captured_at IN (` + strings.Join(placeholders, ",") + `
 		if err := rows.Scan(&capturedAt, &track.ID, &track.AudioSource, &text, &track.MediaPath); err != nil {
 			return fmt.Errorf("scan audio track: %w", err)
 		}
+		parsed, err := time.Parse(time.RFC3339Nano, capturedAt)
+		if err != nil {
+			return fmt.Errorf("parse audio track timestamp %q: %w", capturedAt, err)
+		}
 		track.TextLength = utf8.RuneCountInString(strings.TrimSpace(text))
-		result[capturedAt] = append(result[capturedAt], track)
+		key := FormatCapturedAt(parsed)
+		result[key] = append(result[key], track)
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("iterate audio tracks: %w", err)

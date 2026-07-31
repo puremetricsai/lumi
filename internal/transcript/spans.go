@@ -13,12 +13,19 @@ type span struct {
 // anchorOf returns the wall clock a track's offsets are measured from, and
 // whether that anchor was measured rather than assumed.
 //
-// A track's own StartedAt is the instant its first sample buffer arrived. The
-// chunk's CapturedAt is not a substitute: it is read before ScreenCaptureKit is
-// even asked for shareable content, so it precedes real audio by an unbounded
-// margin. Falling back to it keeps offsets monotonic and comparable — the bias is
-// shared by both tracks of the chunk — but the absolute clock is then derived
-// rather than observed, which is what the returned flag records.
+// A track's own StartedAt is the instant its first sample buffer arrived, which
+// is the only per-track anchor. The chunk's CapturedAt is a fallback rather than
+// a substitute: it is one stamp shared by both tracks, so it cannot express the
+// skew between them, and a track's offsets measured against it are biased by
+// however far that track's first sample sat from the chunk boundary.
+//
+// It was once far worse than that — CapturedAt used to be read before
+// ScreenCaptureKit was even asked for shareable content, so it preceded real
+// audio by an unbounded margin. It is now measured at rotation and sits within
+// one sample buffer of the chunk's audio, which makes this fallback merely
+// imprecise rather than wrong. Using it still keeps offsets monotonic and
+// comparable, since the bias is shared by both tracks, but the absolute clock is
+// then derived rather than observed — which is what the returned flag records.
 func anchorOf(track *Track, chunk Chunk) (time.Time, bool) {
 	if track != nil && !track.StartedAt.IsZero() {
 		return track.StartedAt, true

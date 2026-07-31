@@ -223,7 +223,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 // path leaves started_at NULL. seq is the only key present on every row.
 func (s *Store) SegmentsBetween(ctx context.Context, since, until time.Time, includeBleed bool, limit int) ([]Segment, error) {
 	query := segmentSelect + " WHERE captured_at >= ? AND captured_at <= ?"
-	args := []any{formatTime(since), formatTime(until)}
+	args := []any{lowerBound(since), upperBound(until)}
 	if !includeBleed {
 		query += " AND is_bleed = 0"
 	}
@@ -266,11 +266,11 @@ WHERE e.kind = 'audio'
 	var args []any
 	if since != nil {
 		query += " AND e.captured_at >= ?"
-		args = append(args, formatTime(*since))
+		args = append(args, lowerBound(*since))
 	}
 	if until != nil {
 		query += " AND e.captured_at <= ?"
-		args = append(args, formatTime(*until))
+		args = append(args, upperBound(*until))
 	}
 	query += " ORDER BY e.captured_at DESC"
 	if limit > 0 {
@@ -303,7 +303,7 @@ SELECT COUNT(*), COALESCE(SUM(has_segments), 0) FROM (
   SELECT EXISTS (SELECT 1 FROM audio_segments s WHERE s.captured_at = e.captured_at) AS has_segments
   FROM (SELECT DISTINCT captured_at FROM events
         WHERE kind = 'audio' AND captured_at >= ? AND captured_at <= ?) e
-)`, formatTime(since), formatTime(until))
+)`, lowerBound(since), upperBound(until))
 	if err := row.Scan(&chunks, &attributed); err != nil {
 		return 0, 0, fmt.Errorf("measure segment coverage: %w", err)
 	}
@@ -324,7 +324,7 @@ func (s *Store) HasSpeechSegments(ctx context.Context, since, until time.Time) (
 	err := s.db.QueryRowContext(ctx, `SELECT EXISTS (
   SELECT 1 FROM audio_segments
   WHERE captured_at >= ? AND captured_at <= ? AND is_bleed = 0 AND TRIM(text) <> ''
-)`, formatTime(since), formatTime(until)).Scan(&found)
+)`, lowerBound(since), upperBound(until)).Scan(&found)
 	if err != nil {
 		return false, fmt.Errorf("check for transcribed segments: %w", err)
 	}
@@ -391,8 +391,15 @@ func scanSegments(rows *sql.Rows, withRuns bool) ([]Segment, error) {
 // is written. Timestamps are compared lexicographically as strings, so any
 // deviation here would silently break range filters.
 func formatTime(value time.Time) string {
-	return value.UTC().Format(time.RFC3339Nano)
+	return FormatCapturedAt(value)
 }
+
+// lowerBound and upperBound render a range endpoint so it covers both renderings
+// captured_at has been stored in. formatTime stays exact because it also writes
+// audio_segments' own columns; only comparisons need the tolerant form. See
+// LowerCapturedAtBound.
+func lowerBound(value time.Time) string { return LowerCapturedAtBound(value) }
+func upperBound(value time.Time) string { return UpperCapturedAtBound(value) }
 
 func nullableTime(value *time.Time) any {
 	if value == nil {
@@ -479,7 +486,7 @@ SELECT COUNT(*) FROM (
   GROUP BY captured_at
   HAVING SUM(CASE WHEN TRIM(text) <> '' THEN 1 ELSE 0 END) = 0
      AND SUM(CASE WHEN metadata_json LIKE '%"`+failedTranscriptionKey+`"%' THEN 1 ELSE 0 END) > 0
-)`, formatTime(since), formatTime(until)).Scan(&count)
+)`, lowerBound(since), upperBound(until)).Scan(&count)
 	if err != nil {
 		return 0, fmt.Errorf("count chunks whose transcription failed: %w", err)
 	}
@@ -494,11 +501,11 @@ func (s *Store) AudioChunkTimes(ctx context.Context, since, until *time.Time, li
 	var args []any
 	if since != nil {
 		query += " AND captured_at >= ?"
-		args = append(args, formatTime(*since))
+		args = append(args, lowerBound(*since))
 	}
 	if until != nil {
 		query += " AND captured_at <= ?"
-		args = append(args, formatTime(*until))
+		args = append(args, upperBound(*until))
 	}
 	query += " ORDER BY captured_at DESC"
 	if limit > 0 {

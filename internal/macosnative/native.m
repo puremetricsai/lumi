@@ -597,6 +597,136 @@ static NSString *LumiWindowListTitleIn(NSArray *windows, pid_t owner, CGDirectDi
     return title;
 }
 
+// LumiAudioPlayingMarker is the suffix Chromium appends to a window title while
+// one of its tabs is playing sound. Measured on a live index: 116 of 117 Comet
+// events captured during playback carried it, e.g.
+// "(45) Why Intelligence Always Escapes … - YouTube - Audio playing - Comet".
+//
+// The test is containment, not suffix: the marker sits *before* the browser name,
+// so a suffix comparison never matches.
+static NSString *const LumiAudioPlayingMarker = @" - Audio playing";
+
+// LumiAudioMarkerWindowsIn reports every on-screen window whose own title says it
+// is playing audio.
+//
+// It exists as a fallback for the case CoreAudio cannot answer, and it scans
+// *all* windows rather than just the frontmost one — which is the entire point.
+// The frontmost window is the one case where the answer is already known to be
+// unreliable: attributing sound to whatever is focused is the defect this whole
+// change removes. What matters is the browser playing a video in the background
+// while the user works somewhere else.
+//
+// Only windows carrying the marker leave this function, and the marker is
+// stripped from what they carry. Every other title read here is discarded
+// in-place: this is not a window-title harvester, it is a test for a
+// self-declared emitter.
+//
+// kCGWindowName is populated only for clients holding Screen Recording, which
+// the recorder holds whenever it has audio to attribute.
+static NSArray<NSDictionary *> *LumiAudioMarkerWindowsIn(NSArray *windows) {
+    NSMutableArray<NSDictionary *> *found = [NSMutableArray array];
+    NSMutableSet<NSNumber *> *seen = [NSMutableSet set];
+    pid_t selfPID = getpid();
+    for (NSDictionary *window in windows) {
+        if (![window isKindOfClass:NSDictionary.class]) continue;
+        NSNumber *layer = window[(__bridge NSString *)kCGWindowLayer];
+        if (layer.intValue != 0) continue;
+        NSString *title = window[(__bridge NSString *)kCGWindowName];
+        if (![title isKindOfClass:NSString.class] || title.length == 0) continue;
+        if ([title rangeOfString:LumiAudioPlayingMarker].location == NSNotFound) continue;
+        NSNumber *owner = window[(__bridge NSString *)kCGWindowOwnerPID];
+        if (owner == nil) continue;
+        pid_t pid = (pid_t)owner.intValue;
+        // Lumi's own output is excluded from the capture session
+        // (excludesCurrentProcessAudio), so naming it would claim provenance for
+        // sound the recording cannot contain — the same reason AudioProcesses
+        // filters it.
+        if (pid == 0 || pid == selfPID) continue;
+        // One entry per application. A browser with three noisy tabs is one
+        // emitter, and counting it three times would weight it above a genuinely
+        // separate application.
+        if ([seen containsObject:owner]) continue;
+        [seen addObject:owner];
+
+        NSString *stripped = [title stringByReplacingOccurrencesOfString:LumiAudioPlayingMarker
+                                                              withString:@""];
+        NSMutableDictionary *entry = [@{@"pid": @(pid), @"window": stripped} mutableCopy];
+        NSString *ownerName = window[(__bridge NSString *)kCGWindowOwnerName];
+        NSRunningApplication *application =
+            [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+        NSString *name = ownerName.length > 0 ? ownerName : application.localizedName;
+        if (name.length > 0) entry[@"name"] = name;
+        if (application.bundleIdentifier.length > 0) {
+            entry[@"bundle_id"] = application.bundleIdentifier;
+        }
+        [found addObject:entry];
+    }
+    return found;
+}
+
+// lumi_audio_marker_windows_json exposes the scan above. It needs no
+// Accessibility grant: the window list is a Screen Recording read, which is
+// already held wherever there is captured audio to attribute.
+char *lumi_audio_marker_windows_json(char **error_message) {
+    @autoreleasepool {
+        CFArrayRef windowList = CGWindowListCopyWindowInfo(
+            kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID);
+        // A window list that could not be copied is a *failure to sample*, not a
+        // finding that nothing is playing. Returning an empty array here would
+        // record "no application was emitting" for a scan that never ran, and the
+        // recorder could not tell the two apart afterwards — the same distinction
+        // an absent source list keeps against its _error sibling.
+        if (windowList == NULL) {
+            if (error_message != NULL) {
+                *error_message = LumiCopyUTF8(@"copy the on-screen window list");
+            }
+            return NULL;
+        }
+        NSArray *windows = (__bridge NSArray *)windowList;
+        NSArray<NSDictionary *> *found = LumiAudioMarkerWindowsIn(windows);
+        CFRelease(windowList);
+        NSError *jsonError = nil;
+        NSString *json = LumiJSONString(found, &jsonError);
+        if (json == nil) {
+            if (error_message != NULL) *error_message = LumiCopyError(jsonError);
+            return NULL;
+        }
+        return LumiCopyUTF8(json);
+    }
+}
+
+// lumi_audio_marker_windows_in_json is the pure resolver behind the live entry
+// point, exposed for the same reason the other *_in_json resolvers are: asserting
+// the live scan passes vacuously in any process that happens to have nothing
+// playing, so it would only ever fail where nothing is asserting.
+char *lumi_audio_marker_windows_in_json(const char *windows_json, char **error_message) {
+    @autoreleasepool {
+        NSArray *windows = nil;
+        if (windows_json != NULL) {
+            NSError *parseError = nil;
+            id decoded = [NSJSONSerialization
+                JSONObjectWithData:[@(windows_json) dataUsingEncoding:NSUTF8StringEncoding]
+                           options:NSJSONReadingAllowFragments
+                             error:&parseError];
+            if (decoded == nil) {
+                if (error_message != NULL) *error_message = LumiCopyError(parseError);
+                return NULL;
+            }
+            // A JSON null decodes to NSNull, not an array: that is the "the window
+            // list could not be copied" case, and it yields no markers rather than
+            // an error.
+            if ([decoded isKindOfClass:NSArray.class]) windows = decoded;
+        }
+        NSError *jsonError = nil;
+        NSString *json = LumiJSONString(LumiAudioMarkerWindowsIn(windows), &jsonError);
+        if (json == nil) {
+            if (error_message != NULL) *error_message = LumiCopyError(jsonError);
+            return NULL;
+        }
+        return LumiCopyUTF8(json);
+    }
+}
+
 // lumi_accessibility_snapshot_json is deliberately total: every field that can be
 // obtained without an Accessibility grant is gathered before the first AX call,
 // and an AX failure degrades the snapshot rather than discarding it. Returning
@@ -1172,6 +1302,12 @@ static NSMutableDictionary *LumiAudioFrameDictionary(NSString *path, NSString *s
 @property(nonatomic, assign) CMTime nextBoundary;
 @property(nonatomic, assign) int64_t sessionStartUnixNS;
 @property(nonatomic, assign) int64_t chunkStartUnixNS;
+// chunkGridStartUnixNS is where the chunk sits on the drift-free grid;
+// chunkStartUnixNS is what was measured at rotation. Keeping both is what lets a
+// reader tell clock drift from a mis-stamped chunk.
+@property(nonatomic, assign) int64_t chunkGridStartUnixNS;
+@property(nonatomic, assign) int64_t chunkStreamOffsetNS;
+@property(nonatomic, assign) BOOL chunkClockAnomaly;
 @property(atomic, assign) BOOL stopping;
 @property(nonatomic, strong) NSCondition *readyCondition;
 @property(nonatomic, strong) NSMutableArray *ready;
@@ -1312,14 +1448,25 @@ static NSMutableDictionary *LumiAudioFrameDictionary(NSString *path, NSString *s
     Float64 age = CMTimeGetSeconds(CMTimeSubtract(hostNow, pts));
     if (!isfinite(age) || age < 0) age = 0;
     self.sessionStartUnixNS = (int64_t)(([[NSDate date] timeIntervalSince1970] - age) * 1e9);
+    // The first chunk needs no measured read: the anchor *is* one, taken the same
+    // way rotation takes its own.
     self.chunkStartUnixNS = self.sessionStartUnixNS;
+    self.chunkGridStartUnixNS = self.sessionStartUnixNS;
+    self.chunkStreamOffsetNS = 0;
+    self.chunkClockAnomaly = NO;
     self.nextBoundary = CMTimeAdd(pts, self.chunkDuration);
     self.anchored = YES;
 }
 
-// wallClockForPTS places a boundary on the wall clock by offsetting the session
-// anchor, so successive chunks are exactly chunkDuration apart rather than
-// however long the previous rotation happened to take.
+// wallClockForPTS places a boundary on the drift-free session grid by offsetting
+// the session anchor, so successive grid points are exactly chunkDuration apart.
+//
+// This used to be the chunk's captured_at, which is why every audio timestamp in
+// an index shared one sub-second fraction: the value was arithmetic on a single
+// anchor, never an observation, so clock drift was invisible and a dropped chunk
+// renumbered silently instead of leaving a hole. It is now the *grid* reference —
+// still exported, because coverage arithmetic wants exactness — and the fallback
+// whenever a measured read fails a guard below.
 - (int64_t)wallClockForPTS:(CMTime)pts {
     if (self.sessionStartUnixNS <= 0) return 0;
     Float64 offset = CMTimeGetSeconds(CMTimeSubtract(pts, self.sessionStartPTS));
@@ -1327,10 +1474,85 @@ static NSMutableDictionary *LumiAudioFrameDictionary(NSString *path, NSString *s
     return self.sessionStartUnixNS + (int64_t)llround(offset * 1e9);
 }
 
+// streamOffsetNSForPTS is the boundary's exact distance from the session anchor.
+// This is the drift-free quantity captured_at used to carry implicitly; it is now
+// stored in its own column so the timestamp can be observed without losing it.
+- (int64_t)streamOffsetNSForPTS:(CMTime)pts {
+    Float64 offset = CMTimeGetSeconds(CMTimeSubtract(pts, self.sessionStartPTS));
+    if (!isfinite(offset) || offset < 0) return 0;
+    return (int64_t)llround(offset * 1e9);
+}
+
+// measuredWallClockForPTS reads the clock at rotation and ages it back to the
+// boundary, rather than offsetting the frozen session anchor.
+//
+// Ageing is what makes this safe. Reading NSDate on arrival — the obvious version
+// — is the bug that made every chunk absorb the previous chunk's processing time,
+// leaving chunks 32 s apart while each held 30 s of sound. Subtracting the
+// buffer's age puts the value back at the instant the audio actually began, so
+// the stamp is genuinely observed while still naming the start of the chunk.
+- (int64_t)measuredWallClockForPTS:(CMTime)pts {
+    CMTime hostNow = CMClockGetTime(CMClockGetHostTimeClock());
+    Float64 age = CMTimeGetSeconds(CMTimeSubtract(hostNow, pts));
+    if (!isfinite(age) || age < 0) return 0;
+    return (int64_t)(([[NSDate date] timeIntervalSince1970] - age) * 1e9);
+}
+
+// LumiMaxMeasuredDriftNS bounds how far a measured chunk start may sit from its
+// grid point before the grid value is used instead.
+//
+// The number comes from the *turn-merge headroom*, not from the chunk duration.
+// Chunks sit one chunk duration apart and internal/transcript merges turns across
+// a boundary only while the gap stays under DefaultMaxChunkGap (35 s) — so at the
+// 30 s default there are just 5 s of slack. A tolerance of half a chunk would
+// admit a forward jump of 5-15 s, push the gap past 35 s, and silently split a
+// continuously recorded turn mid-sentence: exactly the failure the contiguous
+// stream was built to remove. Expected jitter here is sub-millisecond, so 250 ms
+// is hundreds of times looser than the signal and twenty times tighter than the
+// budget.
+static const int64_t LumiMaxMeasuredDriftNS = 250LL * 1000000LL;
+
+// maxMeasuredDriftNS scales the tolerance down for chunk durations shorter than
+// it. A fixed 250ms budget is smaller than the turn-merge headroom at the 30s
+// default, but --audio-chunk is a flag with no lower bound: at a 100ms chunk an
+// accepted 250ms drift exceeds two whole chunks, so a stamp could legitimately
+// overtake its successor. Half a chunk is the ceiling that keeps a measured
+// stamp inside its own interval.
+- (int64_t)maxMeasuredDriftNS {
+    int64_t half = (int64_t)(self.chunkSeconds * 0.5 * 1e9);
+    return half < LumiMaxMeasuredDriftNS ? half : LumiMaxMeasuredDriftNS;
+}
+
 - (void)rotate {
     [self closeCurrentChunk];
     self.chunkIndex += 1;
-    self.chunkStartUnixNS = [self wallClockForPTS:self.nextBoundary];
+    int64_t derived = [self wallClockForPTS:self.nextBoundary];
+    int64_t measured = [self measuredWallClockForPTS:self.nextBoundary];
+    int64_t previous = self.chunkStartUnixNS;
+    self.chunkGridStartUnixNS = derived;
+    self.chunkStreamOffsetNS = [self streamOffsetNSForPTS:self.nextBoundary];
+    self.chunkClockAnomaly = NO;
+    if (measured <= 0) {
+        measured = derived;
+    } else if (measured <= previous) {
+        // A wall-clock step backwards (NTP, sleep/wake) must never place a chunk
+        // at or before its predecessor: turn continuation requires a strictly
+        // positive gap, so this would stop it without reporting anything.
+        measured = derived;
+        self.chunkClockAnomaly = YES;
+    } else if (llabs(measured - derived) > [self maxMeasuredDriftNS]) {
+        measured = derived;
+        self.chunkClockAnomaly = YES;
+    }
+    // The fallback itself can be non-increasing: the previous chunk may have kept
+    // a measured stamp ahead of its own grid point, and this chunk's grid point
+    // sits only one chunk duration later. Falling back is therefore not enough on
+    // its own to preserve the strictly-positive gap the guard exists for.
+    if (measured <= previous) {
+        measured = previous + 1;
+        self.chunkClockAnomaly = YES;
+    }
+    self.chunkStartUnixNS = measured;
     self.nextBoundary = CMTimeAdd(self.nextBoundary, self.chunkDuration);
     [self openWriters];
 }
@@ -1359,20 +1581,33 @@ static NSMutableDictionary *LumiAudioFrameDictionary(NSString *path, NSString *s
     if (system == nil && microphone == nil) return;
     self.systemWriter = nil;
     self.microphoneWriter = nil;
+    // Every stamp is captured before the writers are handed to the async finish
+    // queue, so a slow flush cannot contaminate them.
     int64_t startedAtNS = self.chunkStartUnixNS;
+    int64_t gridStartedAtNS = self.chunkGridStartUnixNS;
+    int64_t streamOffsetNS = self.chunkStreamOffsetNS;
+    BOOL clockAnomaly = self.chunkClockAnomaly;
     dispatch_group_enter(self.pending);
     dispatch_group_t writers = dispatch_group_create();
     [system finish:writers];
     [microphone finish:writers];
     dispatch_group_notify(writers, self.finishQueue, ^{
-        [self enqueueChunkWithSystem:system microphone:microphone startedAtNS:startedAtNS];
+        [self enqueueChunkWithSystem:system
+                          microphone:microphone
+                         startedAtNS:startedAtNS
+                     gridStartedAtNS:gridStartedAtNS
+                      streamOffsetNS:streamOffsetNS
+                        clockAnomaly:clockAnomaly];
         dispatch_group_leave(self.pending);
     });
 }
 
 - (void)enqueueChunkWithSystem:(LumiAudioWriter *)system
                     microphone:(LumiAudioWriter *)microphone
-                   startedAtNS:(int64_t)startedAtNS {
+                   startedAtNS:(int64_t)startedAtNS
+               gridStartedAtNS:(int64_t)gridStartedAtNS
+                streamOffsetNS:(int64_t)streamOffsetNS
+                  clockAnomaly:(BOOL)clockAnomaly {
     NSMutableArray *frames = [NSMutableArray array];
     NSError *failure = self.streamError ?: system.error ?: microphone.error;
     NSString *captureError = failure.localizedDescription;
@@ -1390,6 +1625,12 @@ static NSMutableDictionary *LumiAudioFrameDictionary(NSString *path, NSString *s
     if (frames.count == 0) return;
     NSMutableDictionary *chunk = [@{@"frames": frames} mutableCopy];
     if (startedAtNS > 0) chunk[@"started_at_unix_ns"] = @(startedAtNS);
+    if (gridStartedAtNS > 0) chunk[@"grid_started_at_unix_ns"] = @(gridStartedAtNS);
+    // Written even when zero: the first chunk of every session legitimately has a
+    // zero offset, and omitting it there would make "session start" and "not
+    // reported" the same value.
+    if (self.anchored) chunk[@"stream_offset_ns"] = @(streamOffsetNS);
+    if (clockAnomaly) chunk[@"clock_anomaly"] = @(YES);
     [self.readyCondition lock];
     [self.ready addObject:chunk];
     [self.readyCondition broadcast];
