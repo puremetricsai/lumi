@@ -918,10 +918,11 @@ func TestRecorderIndexesSystemAndMicrophoneAudioSeparately(t *testing.T) {
 	}
 
 	// The two frames of a chunk are stamped with one shared `now`, so their
-	// stored captured_at is byte-identical. store.CollapseAudioTracks groups on
-	// exactly that string, so pin the guarantee here: for at least one chunk a
-	// system and a microphone row must share the RFC3339Nano key. This is
-	// currently only implicit in recorder.go's audioLoop.
+	// stored captured_at is byte-identical. ReplaceChunkSegments keys the
+	// chunk's segments by exactly that string and ChunksMissingSegments joins
+	// events.captured_at against it, so pin the guarantee here: for at least one
+	// chunk a system and a microphone row must share the RFC3339Nano key. This
+	// is currently only implicit in recorder.go's audioLoop.
 	bySource := map[string]map[string]bool{"system": {}, "microphone": {}}
 	for _, event := range events {
 		if set, ok := bySource[event.AudioSource]; ok {
@@ -1530,10 +1531,11 @@ func TestAudioEventsCarryFocusedAppAttribution(t *testing.T) {
 	}
 }
 
-// TestBothAudioTracksShareOneAttribution is the property that keeps collapse
-// stable. CollapseAudioTracks picks a survivor by (hasText, isSystem, runeLen,
-// -id), so if the two tracks of a chunk could carry different apps, which one a
-// search reports would depend on which track happened to transcribe.
+// TestBothAudioTracksShareOneAttribution is the property that keeps a chunk's
+// two rows describing one moment. The tracks are attributed independently, so if
+// they could disagree, which app a search reported for a chunk would depend on
+// which track happened to match — and a transcript's segments, keyed by the
+// chunk, would inherit whichever the caller happened to read.
 func TestBothAudioTracksShareOneAttribution(t *testing.T) {
 	s, paths, logger := newRecorderFixture(t)
 	defer s.Close()
@@ -1570,12 +1572,9 @@ func TestBothAudioTracksShareOneAttribution(t *testing.T) {
 	if pairs == 0 {
 		t.Fatal("expected at least one chunk with both tracks indexed")
 	}
-	// The survivor of a collapse must carry the same attribution as the pair it
-	// stood for, which is what makes the stamp reportable at all.
-	survivors, _ := store.CollapseAudioTracks(events)
-	for _, survivor := range survivors {
-		if survivor.App != "Test App" {
-			t.Errorf("collapsed chunk survivor attributed to %q, want Test App", survivor.App)
+	for _, event := range events {
+		if event.App != "Test App" {
+			t.Errorf("audio row %d attributed to %q, want Test App", event.ID, event.App)
 		}
 	}
 }
@@ -2165,9 +2164,10 @@ func (a jitteredAudio) Open(ctx context.Context, directory string, chunk time.Du
 // TestBothTracksShareOneMeasuredCapturedAt is acceptance criterion 3.
 //
 // A measured timestamp is only safe while both tracks of a chunk still carry the
-// *same* one: CollapseAudioTracks groups on that string, so a per-track stamp
-// would stop the microphone duplicate from ever merging and would make the app a
-// search reports depend on which track happened to transcribe.
+// *same* one: it is the key a chunk's segments are written under, so a per-track
+// stamp would split one chunk across two keys — leaving half of it permanently
+// on the backfill's derived work queue — and would make the app a search reports
+// depend on which track happened to transcribe.
 func TestBothTracksShareOneMeasuredCapturedAt(t *testing.T) {
 	s, paths, logger := newRecorderFixture(t)
 	defer s.Close()

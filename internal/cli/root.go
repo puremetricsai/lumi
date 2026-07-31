@@ -203,7 +203,7 @@ func (a *app) runForeground(cmd *cobra.Command, f recordFlags) error {
 func (a *app) searchCommand() *cobra.Command {
 	var kind, since, until, app, window string
 	var limit int
-	var asJSON, collapseAudio bool
+	var asJSON bool
 	cmd := &cobra.Command{
 		Use:   "search [text]",
 		Short: "Full-text search screen text and audio transcripts",
@@ -226,25 +226,16 @@ func (a *app) searchCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			// Collapse is opt-in on the CLI so `lumi search --json` stays a
-			// faithful bare-array export by default; only --collapse-audio (an
-			// explicitly requested different view) may change the JSON shape.
-			if !collapseAudio {
-				if asJSON {
-					encoder := json.NewEncoder(os.Stdout)
-					encoder.SetIndent("", "  ")
-					return encoder.Encode(events)
-				}
-				printEvents(events)
-				return nil
-			}
-			kept, chunks := store.CollapseAudioTracks(events)
+			// Both tracks of an audio chunk are separate rows and stay that way:
+			// `lumi search --json` is a faithful export of what was stored, and
+			// nothing here may decide that two rows sharing a captured_at
+			// recorded the same sound. See internal/mcp's audioProvenanceContract.
 			if asJSON {
 				encoder := json.NewEncoder(os.Stdout)
 				encoder.SetIndent("", "  ")
-				return encoder.Encode(collapsedSearchOutput(kept, chunks))
+				return encoder.Encode(events)
 			}
-			printCollapsedEvents(kept, chunks)
+			printEvents(events)
 			return nil
 		},
 	}
@@ -256,40 +247,7 @@ func (a *app) searchCommand() *cobra.Command {
 	flags.StringVar(&window, "window", "", "only events whose window title contains this text")
 	flags.IntVar(&limit, "limit", store.DefaultSearchLimit, "maximum results")
 	flags.BoolVar(&asJSON, "json", false, "emit JSON")
-	flags.BoolVar(&collapseAudio, "collapse-audio", false,
-		"merge each audio chunk's microphone/system duplicate into one row, reporting its origin and merged tracks")
 	return cmd
-}
-
-// collapsedAudioChunk is one survivor's provenance for --collapse-audio --json.
-// It carries the origin and every merged track keyed by the survivor's id.
-type collapsedAudioChunk struct {
-	EventID int64              `json:"event_id"`
-	Origin  string             `json:"origin"`
-	Tracks  []store.AudioTrack `json:"tracks"`
-}
-
-// collapsedSearchView is the shape `lumi search --collapse-audio --json` emits.
-// It is deliberately different from the default bare `[]store.Event` array: an
-// explicitly requested collapsed view may carry the provenance the default
-// export must not grow.
-type collapsedSearchView struct {
-	Events      []store.Event         `json:"events"`
-	AudioChunks []collapsedAudioChunk `json:"audio_chunks"`
-}
-
-func collapsedSearchOutput(kept []store.Event, chunks map[int64]store.AudioChunk) collapsedSearchView {
-	view := collapsedSearchView{Events: kept, AudioChunks: make([]collapsedAudioChunk, 0)}
-	for _, event := range kept {
-		chunk, ok := chunks[event.ID]
-		if !ok {
-			continue
-		}
-		view.AudioChunks = append(view.AudioChunks, collapsedAudioChunk{
-			EventID: event.ID, Origin: chunk.Origin, Tracks: chunk.Tracks,
-		})
-	}
-	return view
 }
 
 func (a *app) pruneCommand() *cobra.Command {
@@ -781,24 +739,5 @@ func printEvents(events []store.Event) {
 		text := truncateRunes(strings.Join(strings.Fields(event.Text), " "), 180)
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", event.CapturedAt.Local().Format("2006-01-02 15:04:05"), event.Kind, event.App, text)
 		fmt.Fprintf(w, "\tmedia\t%s\t\n", event.MediaPath)
-	}
-}
-
-// printCollapsedEvents prints collapsed search results, annotating each audio
-// survivor with its origin and the ids merged into it.
-func printCollapsedEvents(events []store.Event, chunks map[int64]store.AudioChunk) {
-	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	defer w.Flush()
-	for _, event := range events {
-		text := truncateRunes(strings.Join(strings.Fields(event.Text), " "), 180)
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", event.CapturedAt.Local().Format("2006-01-02 15:04:05"), event.Kind, event.App, text)
-		fmt.Fprintf(w, "\tmedia\t%s\t\n", event.MediaPath)
-		if chunk, ok := chunks[event.ID]; ok && len(chunk.Tracks) > 1 {
-			ids := make([]string, 0, len(chunk.Tracks))
-			for _, tr := range chunk.Tracks {
-				ids = append(ids, strconv.FormatInt(tr.ID, 10))
-			}
-			fmt.Fprintf(w, "\torigin=%s\tmerged %s\t\n", chunk.Origin, strings.Join(ids, ","))
-		}
 	}
 }

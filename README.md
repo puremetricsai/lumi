@@ -64,12 +64,12 @@ Earlier versions also wrote a `config.json` here to hold the provider settings f
 ./lumi search "launch budget" --type audio --since 8h
 ./lumi search --app "Safari" --window "Quarterly Plan" --since 24h
 ./lumi search --type screen --since 2026-07-18T09:00:00-07:00 --json
-./lumi search "standup" --type audio --collapse-audio
+./lumi search "standup" --type audio
 ```
 
 Search terms are safely combined with FTS5 `AND`. With no text argument, Lumi returns the most recent events. `--app` is an exact case-insensitive filter; `--window` is a case-insensitive substring filter. Results include timestamps and paths to the original screenshot or WAV chunk. JSON output also preserves screen-text source, display ID, audio source, and processor diagnostics.
 
-Each audio chunk is recorded twice — once from system output and once from the microphone — so a meeting played through your speakers is transcribed on both tracks. `--collapse-audio` merges that duplicate into one result and reports where the speech came from: `system` (a remote speaker or media), `microphone` (your own voice in the room), `both`, or `silent`. It is opt-in because it changes the shape of `--json` from a bare event array to `{events, audio_chunks}`, where each chunk names the surviving event's origin and the tracks merged into it.
+Each audio chunk is recorded twice — once from system output and once from the microphone — and the two are stored as separate rows sharing one timestamp, distinguished by `audio_source`. A search returns whichever of them matched your filters, never a merge of the two. A meeting played through your speakers is transcribed on both; a call where you also speak is not. Search does not try to tell those apart, because a shared timestamp is a shared 30-second interval and not a shared sound. `lumi transcript` is the view that resolves it, returning the conversation once with the machine's own speech deduplicated.
 
 ## Transcript
 
@@ -159,7 +159,7 @@ Four tools are exposed:
 
 | Tool | Parameters | Returns |
 |---|---|---|
-| `search_events` | `query`, `kind` (`screen`/`audio`), `app`, `window`, `since`, `until`, `limit`, `match` (`all`/`any`), `require_text`, `max_text_chars`, `collapse_audio_tracks` — all optional | matching events, ranked by relevance when `query` is set and newest first otherwise, with text capped at 600 characters by default and 20 events per page (500 maximum) |
+| `search_events` | `query`, `kind` (`screen`/`audio`), `app`, `window`, `since`, `until`, `limit`, `match` (`all`/`any`), `require_text`, `max_text_chars` — all optional | matching events, ranked by relevance when `query` is set and newest first otherwise, with text capped at 600 characters by default and 20 events per page (500 maximum) |
 | `get_event` | `id` | one event with its full untruncated text and processor metadata |
 | `list_apps` | `app`, `since`, `until`, `limit` — all optional | the applications captured, most active first, or the window titles for one application |
 | `get_transcript` | `since`, `until`, `origin`, `min_confidence`, `max_turns`, `max_text_chars` — all optional | captured audio as one ordered conversation, each turn labelled by origin with the machine's own speech deduplicated, 100 turns by default (1000 maximum) |
@@ -168,7 +168,7 @@ Four tools are exposed:
 
 `get_transcript` answers the question `search_events` cannot: what was actually said, in order. Each turn is labelled `internal` (sound this machine produced — the far side of a call, a video, music, a notification, and not necessarily a person), `external` (sound the microphone picked up from the room), or `unknown` (machine audio played but produced no transcript). Because the machine's audio also bleeds into the microphone, its words appear once here rather than twice. Every turn carries a `confidence` and an `order_confidence` — `exact` when position was measured, `sequence` when order is reliable but absolute times are not, `approximate` when position was inferred — and a range holding more audio than one call returns says so and names where to resume.
 
-Unlike the CLI, `search_events` collapses each audio chunk's microphone/system duplicate by default, so an agent does not read the same meeting twice. The surviving result carries `audio_origin` and, when more than one track was merged, `audio_tracks` listing each track's id, source, text length, and media path — never its text, which `get_event` fetches by id. Pass `collapse_audio_tracks: false` to see both rows unmerged.
+`search_events` never merges an audio chunk's two rows. It does return only what matched, though — every filter applies per row, so a query hitting one track's transcript, `require_text`, or a limit falling between the two gives you one row of a pair, and that is not evidence the chunk had one track. Nor does a pair necessarily hold one sound: the microphone re-records your speakers, but it also records the room. `get_transcript` is what answers both, reading each chunk whole and deciding per segment against word timings and an energy envelope.
 
 Results also come back with a `notice` when the outcome would otherwise be ambiguous: whether an empty page means the index itself is empty (the notice names the database file, so a mistyped `--data-dir` is obvious) or that the filters simply matched nothing, and whether a full page was capped and more results exist.
 

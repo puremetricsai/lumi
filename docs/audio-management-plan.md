@@ -1,5 +1,10 @@
 # Collapse duplicate microphone/system audio events, keeping track provenance
 
+> **Superseded.** The collapse this document designs was removed: merging a chunk's two rows on a shared
+> `captured_at` asserted they held the same sound when all they shared was a 30-second interval, and it
+> discarded real microphone transcripts. `search_events` and `lumi search` now return both tracks, and
+> `get_transcript` remains the deduplicated view. Kept for the reasoning, not as a description of the code.
+
 ## Context
 
 Lumi records every 30-second audio chunk **twice** — once from the system output

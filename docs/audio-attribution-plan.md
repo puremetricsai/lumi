@@ -1,5 +1,9 @@
 # Attribute captured audio by origin, and assemble it into one ordered transcript
 
+> **Partly superseded.** Passages here reasoning about `CollapseAudioTracks` and `audio_origin` describe a
+> feature since removed; see `internal/store/CLAUDE.md`'s "Audio tracks". The attribution design itself
+> still stands.
+
 ## Context
 
 Lumi records every audio chunk twice, from the machine's output and from the

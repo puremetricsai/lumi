@@ -68,6 +68,17 @@ const (
 	OriginSilent = string(transcript.OriginSilent)
 )
 
+// Capture device names, re-exported from internal/transcript for the same reason
+// the origins above are: internal/capture stamps events.audio_source from
+// transcript.TrackSystem/TrackMicrophone, so a second spelling here would be a
+// copy that is correct only until one of them moves. audio_source is the *device*
+// a row was read from, never a claim about what made the sound — Segment.Origin
+// is that question, and the two differ exactly where bleed was found.
+const (
+	AudioSourceSystem     = transcript.TrackSystem
+	AudioSourceMicrophone = transcript.TrackMicrophone
+)
+
 // ParseOrigin validates a caller's origin filter, returning the stored value or
 // an error naming the vocabulary. Empty means every origin.
 //
@@ -530,9 +541,8 @@ func (s *Store) AudioChunkTimes(ctx context.Context, since, until *time.Time, li
 }
 
 // AudioEventsAt returns both tracks of one chunk with their full transcripts, in
-// a stable order. It is what a re-attribution reads: AudioTracksAt reports only
-// text lengths, which is enough for collapse provenance but not for aligning two
-// transcripts against each other.
+// a stable order. It is what a re-attribution reads, which needs the transcripts
+// themselves in order to align the two tracks against each other.
 func (s *Store) AudioEventsAt(ctx context.Context, capturedAt string) ([]Event, error) {
 	return s.queryEvents(ctx,
 		eventSelect+" WHERE kind = 'audio' AND captured_at = ? ORDER BY id ASC", capturedAt)

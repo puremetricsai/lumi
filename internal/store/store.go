@@ -156,7 +156,7 @@ func (s *Store) Insert(ctx context.Context, event *Event) error {
 	// silently. Attributing room audio invents a source that outlives its
 	// evidence: the WAV is deleted on the retention schedule while whatever was
 	// built from it survives.
-	if event.AudioSource == AudioOriginMicrophone {
+	if event.AudioSource == AudioSourceMicrophone {
 		if attribution := AudioAttribution(event.AudioAttribution); attribution != "" &&
 			attribution != AttributionUnattributed {
 			return fmt.Errorf("microphone event carries attribution %q; microphone audio has no "+

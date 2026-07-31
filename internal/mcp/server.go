@@ -50,6 +50,22 @@ func Serve(ctx context.Context, s *store.Store, opts Options) error {
 // stated outright rather than a guess. Raw audio is deleted on the retention
 // schedule while any summary built from it survives, which makes a fabricated
 // speaker permanent.
+//
+// The pairing sentences are there for the same reason and were learned the same
+// way. search_events used to merge each chunk's two rows into one on the
+// strength of a shared captured_at, which asserted they held the same sound
+// when all they shared was a 30-second interval; a whole microphone transcript
+// could be dropped and the result still read as finished.
+//
+// They say what this tool does *not* do rather than what a caller will receive,
+// which is the only version that stays true. Every filter here is a predicate on
+// a single row — an FTS MATCH, require_text, the LIMIT — so one row of a pair
+// arrives alone routinely, and over a window of silent system tracks
+// require_text returns nothing else. Promising that "both are returned" would
+// re-create the original defect from the other side: an agent holding one row
+// would read it as the whole chunk. The honest contract is that the pair is
+// never merged, that a lone row proves nothing about its counterpart, and that
+// get_transcript is what reads a chunk whole.
 const audioProvenanceContract = "Audio results keep three different things apart. " +
 	"audio_source is the capture DEVICE the row was read from — \"system\" is the machine's own " +
 	"output, \"microphone\" is the room — and is never a claim about who or what made the sound. " +
@@ -63,7 +79,17 @@ const audioProvenanceContract = "Audio results keep three different things apart
 	"source. Microphone audio has NO reliable source — it may be the user, other people present, a " +
 	"TV, another machine, or ambient playback. Microphone rows are always \"unattributed\" and carry " +
 	"no source_app. Never attribute microphone content to a person or to an application, and never " +
-	"present it as something the user said or did."
+	"present it as something the user said or did. " +
+	"Audio rows come in PAIRS sharing one captured_at — one per capture device — and this tool never " +
+	"merges them. Whether both rows of a pair reach you depends on your query and filters, which are " +
+	"applied per ROW: a query matching only one track's transcript, require_text, or a limit falling " +
+	"between the two all return one row of a pair. So a single audio row is NOT evidence that the " +
+	"chunk held one track, and must never be read as the whole chunk. A pair also shares a 30-second " +
+	"interval, not necessarily a sound: the microphone re-records whatever the speakers play, so the " +
+	"two rows may transcribe the same speech twice, or hold two entirely different conversations. " +
+	"Nothing in a search result tells you which, so never assume one row of a pair is redundant. " +
+	"get_transcript answers both questions — it reads each chunk whole and returns the conversation " +
+	"once, in order, with the machine's own speech deduplicated."
 
 // newServer builds the server and registers the tools. It is separate from
 // Serve so tests can drive it over an in-memory transport.
