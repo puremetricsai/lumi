@@ -30,7 +30,10 @@ developer's own Claude config.
   `--dry-run` may skip it. Keep dry-run accounting equivalent to a real age-then-size run. The deletion
   ordering and orphan rules are `internal/retention/CLAUDE.md`.
 - **`transcript`/`get_transcript` must offer `ResumeFrom`, never `CoveredUntil`** — the two have opposite
-  inclusivity (`internal/store/CLAUDE.md`).
+  inclusivity (`internal/store/CLAUDE.md`). **Both print local**, like every other time this package renders:
+  `ResumeFrom` was UTC while the `CoveredUntil` in the sentence above it was local, so one paragraph named
+  two adjacent moments hours apart and read as a gap in the recording. `internal/mcp/CLAUDE.md` has the
+  same rule for the wire.
 - **The backfill (`attributeStoredChunk`) applies the recorder's rules, it does not restate them.** The
   silent-and-failed gate, the track vocabulary, the energy gate, and the verdict→row conversion are all
   exported from `internal/store`, `internal/transcript`, and `internal/capture` for that reason; see

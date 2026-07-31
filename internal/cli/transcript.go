@@ -224,9 +224,13 @@ func printTranscript(out io.Writer, result store.TranscriptResult) {
 	// Both notices offer ResumeFrom, never CoveredUntil: coverage ends inclusively
 	// at the last chunk the turns reach and the segment read is inclusive too, so
 	// re-running with that value would print the same chunk's turns again.
+	// Local, like every other time this command prints, and like the CoveredUntil
+	// in the sentence just below. Rendering this one UTC put two timestamps
+	// describing adjacent moments in one paragraph hours apart, which reads as a
+	// gap in the recording rather than as the same instant twice.
 	resume := ""
 	if !result.ResumeFrom.IsZero() {
-		resume = result.ResumeFrom.UTC().Format(time.RFC3339Nano)
+		resume = result.ResumeFrom.Local().Format(time.RFC3339Nano)
 	}
 	if result.Truncated {
 		fmt.Fprintf(out, "\nThis range holds more audio than one read returns, so the transcript stops at %s.\n"+

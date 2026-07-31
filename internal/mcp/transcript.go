@@ -61,6 +61,10 @@ type getTranscriptOutput struct {
 	// stopped short, and is absent when there is nothing left to read. It is
 	// given as a value rather than left to the notice's prose because an agent
 	// paging through a long range should not have to parse a sentence to do it.
+	//
+	// Rendered by localStamp like every other timestamp here. It used to be the
+	// one exception, in UTC, which read as a different instant beside a turn's
+	// started_at to anything comparing the two as strings.
 	ResumeFrom string `json:"resume_from,omitempty"`
 	// ConfidenceFiltered counts the turns min_confidence removed, keyed by origin,
 	// and is absent when it removed nothing. It is a value for the same reason
@@ -130,7 +134,7 @@ func (h *handlers) getTranscript(ctx context.Context, _ *sdk.CallToolRequest, in
 		ConfidenceFiltered: result.ConfidenceFiltered,
 	}
 	if !result.ResumeFrom.IsZero() {
-		out.ResumeFrom = result.ResumeFrom.UTC().Format(time.RFC3339Nano)
+		out.ResumeFrom = localStamp(result.ResumeFrom)
 	}
 	for _, turn := range result.Turns {
 		text, truncated, length := truncateText(turn.Text, maxChars)
@@ -140,10 +144,10 @@ func (h *handlers) getTranscript(ctx context.Context, _ *sdk.CallToolRequest, in
 			Overlaps: turn.Overlaps, EventIDs: turn.EventIDs,
 		}
 		if turn.StartedAt != nil {
-			record.StartedAt = turn.StartedAt.Local().Format(time.RFC3339Nano)
+			record.StartedAt = localStamp(*turn.StartedAt)
 		}
 		if turn.EndedAt != nil {
-			record.EndedAt = turn.EndedAt.Local().Format(time.RFC3339Nano)
+			record.EndedAt = localStamp(*turn.EndedAt)
 		}
 		out.Turns = append(out.Turns, record)
 	}
@@ -227,7 +231,7 @@ func (h *handlers) transcriptNotice(ctx context.Context, opts store.TranscriptOp
 	// same chunk's turns again on every page.
 	resume := ""
 	if !result.ResumeFrom.IsZero() {
-		resume = result.ResumeFrom.UTC().Format(time.RFC3339Nano)
+		resume = localStamp(result.ResumeFrom)
 	}
 	if result.Truncated {
 		parts = append(parts, fmt.Sprintf(

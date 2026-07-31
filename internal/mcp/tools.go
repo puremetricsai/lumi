@@ -139,7 +139,7 @@ func newEventRecord(event store.Event, maxTextChars int) EventRecord {
 	record := EventRecord{
 		ID:          event.ID,
 		Kind:        string(event.Kind),
-		CapturedAt:  event.CapturedAt.Local().Format(time.RFC3339Nano),
+		CapturedAt:  localStamp(event.CapturedAt),
 		Text:        text,
 		Truncated:   truncated,
 		TextLength:  length,
@@ -579,7 +579,7 @@ func (h *handlers) listApps(ctx context.Context, _ *sdk.CallToolRequest, in list
 			App:      row.App,
 			Window:   row.Window,
 			Events:   row.Events,
-			LastSeen: row.LastSeen.Local().Format(time.RFC3339Nano),
+			LastSeen: localStamp(row.LastSeen),
 		})
 	}
 	if len(out.Entries) == 0 {

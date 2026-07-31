@@ -45,6 +45,19 @@ reports is the one enforced.
   would not produce, and a caller composing one would ask for a file that does not exist. And a kind whose
   files sit in two directories — an index carried between data dirs — is left un-hoisted with whole paths,
   because a short name joined to the wrong directory is worse than a long one.
+- **Every timestamp a tool returns goes through `localStamp`** — the machine's local zone with its offset,
+  at nanosecond precision, matching what `lumi search` prints. The precision is what lets a value round-trip
+  when it is handed back as a `since` or `until` bound. The *zone* matters for a reason that only appears
+  between fields: an agent cannot know two timestamps in one response are the same kind of thing, so it
+  compares them as strings. `resume_from` was rendered UTC while `captured_at`, `started_at`, `ended_at` and
+  `last_seen` were local — both parse, both round-trip, and nothing failed, so the only symptom was an agent
+  reading a resume point as hours away from the turns it continues. The notice offering `resume_from` names
+  `covered_until` in the same sentence, which printed the two spellings side by side.
+  `lumi transcript` had the identical pair and was fixed with it. Note that `resume_from` legitimately sorts
+  *at or before* the last turn's `ended_at` when a cap falls inside a chunk — the next page re-reads that
+  chunk by design (`internal/store/transcript.go`), so ordering is not a property to assert here.
+  `TestEveryTimestampIsRenderedInTheLocalZone` walks whole payloads rather than named fields, so a timestamp
+  added later is covered without anyone remembering. Storage and range comparison stay UTC.
 - **Truncation lives at the MCP boundary, never in the store.** `search_events` caps `text` in the handler
   after `Search` returns, counting runes so multi-byte text is never split. Pushing `max_text_chars` into
   the SQL `SELECT` would corrupt `lumi search --json`, a faithful export.

@@ -642,7 +642,9 @@ func TestCappedTranscriptPrintsWhereToContinue(t *testing.T) {
 	}
 	// The offered value must be the third chunk — the first turn the cap dropped —
 	// and not the second, which the page already printed.
-	resume := "--since " + base.Add(2*time.Hour).Format(time.RFC3339Nano)
+	// Local, like the CoveredUntil printed beside it — base is UTC here, so
+	// Format alone would assert the exact drift this renders away.
+	resume := "--since " + base.Add(2*time.Hour).Local().Format(time.RFC3339Nano)
 	if !strings.Contains(out, resume) {
 		t.Errorf("a capped transcript does not point at the first dropped turn (%s): %s", resume, out)
 	}
