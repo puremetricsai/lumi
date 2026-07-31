@@ -42,6 +42,20 @@ func audioChunkWithText(t *testing.T, s *store.Store, at time.Time, systemText, 
 	return store.FormatCapturedAt(at)
 }
 
+// runCLISplit keeps the two streams apart, which runCLI deliberately does not.
+// A test that merges them cannot tell a faithful export from one with a warning
+// printed into the middle of it.
+func runCLISplit(t *testing.T, args ...string) (stdout, stderr string, err error) {
+	t.Helper()
+	cmd := newRootCommand()
+	out, errOut := &bytes.Buffer{}, &bytes.Buffer{}
+	cmd.SetOut(out)
+	cmd.SetErr(errOut)
+	cmd.SetArgs(args)
+	err = cmd.ExecuteContext(context.Background())
+	return out.String(), errOut.String(), err
+}
+
 func runCLI(t *testing.T, args ...string) (string, error) {
 	t.Helper()
 	cmd := newRootCommand()
@@ -270,6 +284,96 @@ func TestTranscriptOriginFilter(t *testing.T) {
 		if turn.Origin != store.OriginExternal {
 			t.Errorf("origin filter returned a %s turn", turn.Origin)
 		}
+	}
+}
+
+// TestTranscriptPrintsWhatMinConfidenceRemoved covers the deletion the printed
+// turns cannot reveal: a transcript that reads as a whole conversation because
+// the threshold removed the other side of it.
+//
+// The largest attribution penalties fall on microphone turns, so
+// --min-confidence sorts by origin as much as by quality. Nothing above the
+// counts says a turn was dropped, and the transcript looks the same either way.
+func TestTranscriptPrintsWhatMinConfidenceRemoved(t *testing.T) {
+	var out strings.Builder
+	printTranscript(&out, store.TranscriptResult{
+		Turns: []store.TranscriptTurn{{
+			Origin: store.OriginInternal, Text: "the far side of the call",
+			Confidence: 0.91, OrderConfidence: store.OrderExact,
+		}},
+		ConfidenceFiltered: map[string]int{store.OriginExternal: 3},
+	})
+	printed := out.String()
+	for _, want := range []string{"min-confidence", "3", store.OriginExternal} {
+		if !strings.Contains(printed, want) {
+			t.Errorf("printed transcript never mentions %q:\n%s", want, printed)
+		}
+	}
+
+	// A transcript nothing was removed from stays quiet, so a real removal is
+	// never buried in a line that prints every time.
+	var quiet strings.Builder
+	printTranscript(&quiet, store.TranscriptResult{
+		Turns: []store.TranscriptTurn{{
+			Origin: store.OriginInternal, Text: "the far side of the call",
+			Confidence: 0.91, OrderConfidence: store.OrderExact,
+		}},
+	})
+	if strings.Contains(quiet.String(), "min-confidence") {
+		t.Errorf("an unfiltered transcript warns about the threshold:\n%s", quiet.String())
+	}
+}
+
+// TestTranscriptJSONWarnsOnStderrWithoutBreakingTheArray covers the surface the
+// renderer cannot reach: --json encodes result.Turns and never calls
+// printTranscript, so a threshold that deleted one side of the conversation left
+// no trace anywhere in the output.
+//
+// The export itself must stay a bare array — it is a faithful dump, and `lumi
+// search --json` sets that contract — so the warning goes to stderr, where it
+// reaches a person without touching a pipe.
+func TestTranscriptJSONWarnsOnStderrWithoutBreakingTheArray(t *testing.T) {
+	root, s := transcriptRoot(t)
+	ctx := context.Background()
+	at := time.Now().UTC().Add(-10 * time.Minute).Truncate(time.Second)
+	system := store.Event{Kind: store.KindAudio, CapturedAt: at, Text: "the far side of the call",
+		MediaPath: filepath.Join(t.TempDir(), "system.wav"), AudioSource: "system", DurationMS: 30000}
+	mic := store.Event{Kind: store.KindAudio, CapturedAt: at, Text: "somebody in the room answered",
+		MediaPath: filepath.Join(t.TempDir(), "microphone.wav"), AudioSource: "microphone", DurationMS: 30000}
+	if err := s.Insert(ctx, &system); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Insert(ctx, &mic); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReplaceChunkSegments(ctx, store.FormatCapturedAt(at), []store.Segment{
+		{EventID: system.ID, Seq: 0, Origin: store.OriginInternal, SourceTrack: "system",
+			Text: "the far side of the call", Confidence: 0.91, OrderConfidence: store.OrderExact},
+		{EventID: mic.ID, Seq: 1, Origin: store.OriginExternal, SourceTrack: "microphone",
+			Text: "somebody in the room answered", Confidence: 0.36, OrderConfidence: store.OrderExact},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, stderr, err := runCLISplit(t, "--data-dir", root, "transcript",
+		"--since", "1h", "--min-confidence", "0.6", "--json")
+	if err != nil {
+		t.Fatalf("transcript --json: %v\n%s", err, stderr)
+	}
+
+	// Still a bare array, and still parseable by whatever is on the other end.
+	var turns []store.TranscriptTurn
+	if err := json.Unmarshal([]byte(stdout), &turns); err != nil {
+		t.Fatalf("stdout is not a bare array: %v\n%s", err, stdout)
+	}
+	if len(turns) != 1 || turns[0].Origin != store.OriginInternal {
+		t.Fatalf("got %+v, want the internal turn alone", turns)
+	}
+	if strings.Contains(stdout, "min-confidence") {
+		t.Errorf("the warning was written into the export:\n%s", stdout)
+	}
+	if !strings.Contains(stderr, "1 external turn") {
+		t.Errorf("stderr does not say what the threshold removed: %q", stderr)
 	}
 }
 
