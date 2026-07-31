@@ -168,6 +168,10 @@ type trackStream struct {
 	chunk     time.Duration
 	origin    time.Time
 	index     int
+	// jitter displaces each chunk's start from its grid point by index*jitter,
+	// mimicking the measured rotation clock the native session now reports. It is
+	// zero by default so existing tests keep the exact grid they assert on.
+	jitter time.Duration
 }
 
 func newTrackStream(directory string, chunk time.Duration, sources ...string) *trackStream {
@@ -180,7 +184,9 @@ func (s *trackStream) Next(ctx context.Context) (AudioChunk, error) {
 		return AudioChunk{}, ErrAudioStreamClosed
 	case <-time.After(s.chunk):
 	}
-	startedAt := s.origin.Add(time.Duration(s.index) * s.chunk)
+	grid := s.origin.Add(time.Duration(s.index) * s.chunk)
+	startedAt := grid.Add(time.Duration(s.index) * s.jitter)
+	offset := (time.Duration(s.index) * s.chunk).Milliseconds()
 	s.index++
 	frames := make([]AudioFrame, 0, len(s.sources))
 	for _, source := range s.sources {
@@ -190,7 +196,9 @@ func (s *trackStream) Next(ctx context.Context) (AudioChunk, error) {
 		}
 		frames = append(frames, AudioFrame{Path: path, Source: source, DurationMS: s.chunk.Milliseconds()})
 	}
-	return AudioChunk{StartedAt: startedAt, Frames: frames}, nil
+	return AudioChunk{
+		StartedAt: startedAt, GridStartedAt: grid, StreamOffsetMS: &offset, Frames: frames,
+	}, nil
 }
 
 func (s *trackStream) Close() error { return nil }
@@ -917,7 +925,7 @@ func TestRecorderIndexesSystemAndMicrophoneAudioSeparately(t *testing.T) {
 	bySource := map[string]map[string]bool{"system": {}, "microphone": {}}
 	for _, event := range events {
 		if set, ok := bySource[event.AudioSource]; ok {
-			set[event.CapturedAt.UTC().Format(time.RFC3339Nano)] = true
+			set[store.FormatCapturedAt(event.CapturedAt)] = true
 		}
 	}
 	var shared bool
@@ -1303,8 +1311,19 @@ func TestSilentChunkIsRecordedAsAttributed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(missing) != 0 {
-		t.Errorf("%d silent chunks stayed on the backfill queue: %v", len(missing), missing)
+	// The chunk in flight when the recording stops has its transcription skipped,
+	// so it is a *failed* chunk rather than a silent one — and a failed chunk is
+	// deliberately the one thing this queue cannot drain, since labelling it
+	// silent would make a false claim about the world permanent. Whether the
+	// timeout lands mid-chunk varies run to run, so allow exactly those and no
+	// others; counting them is what ChunksFailedTranscription exists for.
+	failed, err := s.ChunksFailedTranscription(ctx, time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if int64(len(missing)) > failed {
+		t.Errorf("%d silent chunks stayed on the backfill queue with only %d failed transcriptions: %v",
+			len(missing), failed, missing)
 	}
 	segments, err := s.SegmentsBetween(ctx, time.Now().Add(-time.Hour), time.Now().Add(time.Hour), true, 0)
 	if err != nil {
@@ -1531,7 +1550,7 @@ func TestBothAudioTracksShareOneAttribution(t *testing.T) {
 	events := audioEventsFrom(t, s)
 	byChunk := map[string][]store.Event{}
 	for _, event := range events {
-		key := event.CapturedAt.UTC().Format(time.RFC3339Nano)
+		key := store.FormatCapturedAt(event.CapturedAt)
 		byChunk[key] = append(byChunk[key], event)
 	}
 	pairs := 0
@@ -1767,5 +1786,521 @@ func TestShutdownChunkKeepsAttribution(t *testing.T) {
 		if _, present := metadata["active_audio_output_processes"]; !present {
 			t.Errorf("shutdown chunk row %d lost its active output processes", event.ID)
 		}
+	}
+}
+
+// fakeAudioMarkers reports one window declaring it is playing audio, from an
+// application that is deliberately not the focused one.
+type fakeAudioMarkers struct{}
+
+func (fakeAudioMarkers) Playing(ctx context.Context) ([]AudioMarkerWindow, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return []AudioMarkerWindow{
+		{PID: 812, BundleID: "com.perplexity.comet", Name: "Comet",
+			Window: "(45) Why Intelligence Always Escapes - YouTube - Comet"},
+	}, nil
+}
+
+// silentAudioMarkers reports that no window declared audio, which is a finding
+// rather than a failure.
+type silentAudioMarkers struct{}
+
+func (silentAudioMarkers) Playing(context.Context) ([]AudioMarkerWindow, error) { return nil, nil }
+
+type failingAudioMarkers struct{}
+
+func (failingAudioMarkers) Playing(context.Context) ([]AudioMarkerWindow, error) {
+	return nil, errors.New("scan windows for the audio-playing marker: window list unavailable")
+}
+
+// scriptedAudioOutputs changes its answer partway through, so a chunk that spans
+// the change sees both applications. A single read at chunk close cannot observe
+// this, which is exactly what the test using it proves.
+type scriptedAudioOutputs struct {
+	calls atomic.Int32
+}
+
+func (o *scriptedAudioOutputs) Active(ctx context.Context) ([]AudioProcess, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if o.calls.Add(1) <= 2 {
+		return []AudioProcess{{PID: 812, BundleID: "com.perplexity.comet", Name: "Comet"}}, nil
+	}
+	return []AudioProcess{{PID: 990, BundleID: "com.apple.Music", Name: "Music"}}, nil
+}
+
+// sourceAppsOf decodes an event's source list along with whether one was recorded
+// at all. The two absences mean opposite things, so both are returned.
+func sourceAppsOf(t *testing.T, event store.Event) ([]store.SourceApp, bool) {
+	t.Helper()
+	apps, recorded, err := store.DecodeSourceApps(event.SourceApps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return apps, recorded
+}
+
+// TestSystemAudioNamesTheEmittingProcessNotTheFocusedApp is acceptance criterion
+// 1. The focused application (fakeContext, "Test App") and the emitting one
+// (fakeAudioOutputs, "Comet") are deliberately different, which is the whole
+// case: before this change the row named the focused app and was simply wrong
+// whenever the user was not looking at what was making noise.
+func TestSystemAudioNamesTheEmittingProcessNotTheFocusedApp(t *testing.T) {
+	s, paths, logger := newRecorderFixture(t)
+	defer s.Close()
+	recorder := Recorder{
+		Store: s, Paths: paths, CaptureAudio: true, AudioChunk: 5 * time.Millisecond,
+		Audio: dualAudio{}, Transcriber: fakeTranscriber{}, Context: fakeContext{},
+		AudioOutputs: fakeAudioOutputs{}, AudioMarkers: silentAudioMarkers{}, Logger: logger,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	if err := recorder.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	checked := 0
+	for _, event := range audioEventsFrom(t, s) {
+		if event.AudioSource != "system" {
+			continue
+		}
+		checked++
+		if event.AudioAttribution != string(store.AttributionEmittingProcess) {
+			t.Fatalf("system row attribution = %q, want %q",
+				event.AudioAttribution, store.AttributionEmittingProcess)
+		}
+		apps, recorded := sourceAppsOf(t, event)
+		if !recorded || len(apps) == 0 || apps[0].Name != "Comet" {
+			t.Fatalf("system row source apps = %#v, want Comet first", apps)
+		}
+		if apps[0].Evidence != store.EvidenceProcess {
+			t.Fatalf("source app evidence = %q, want %q", apps[0].Evidence, store.EvidenceProcess)
+		}
+		// The focus field keeps its own, different meaning. If these ever became
+		// the same value the two questions have been conflated again.
+		if event.App != "Test App" {
+			t.Fatalf("foreground app = %q, want Test App", event.App)
+		}
+		if apps[0].Name == event.App {
+			t.Fatal("the emitting app and the focused app must stay separate fields")
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no system audio row was indexed")
+	}
+}
+
+// TestEmitterSamplingSpansTheChunkWindow is the headline test for sampling across
+// the chunk rather than once at its close: a chunk that spans an emitter change
+// must name both applications. A single close-of-chunk read cannot pass it.
+func TestEmitterSamplingSpansTheChunkWindow(t *testing.T) {
+	s, paths, logger := newRecorderFixture(t)
+	defer s.Close()
+	recorder := Recorder{
+		Store: s, Paths: paths, CaptureAudio: true, AudioChunk: 600 * time.Millisecond,
+		EmitterInterval: 50 * time.Millisecond,
+		Audio:           dualAudio{}, Transcriber: fakeTranscriber{}, Context: fakeContext{},
+		AudioOutputs: &scriptedAudioOutputs{}, AudioMarkers: silentAudioMarkers{}, Logger: logger,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 900*time.Millisecond)
+	defer cancel()
+	if err := recorder.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range audioEventsFrom(t, s) {
+		if event.AudioSource != "system" {
+			continue
+		}
+		apps, _ := sourceAppsOf(t, event)
+		names := make(map[string]bool, len(apps))
+		for _, app := range apps {
+			names[app.Name] = true
+		}
+		if names["Comet"] && names["Music"] {
+			return // both halves of the window were observed
+		}
+	}
+	t.Fatal("no chunk recorded both emitters; the window was sampled once rather than across")
+}
+
+// TestWindowMarkerAttributesWhenNoProcessHeldAStream covers the fallback: a
+// browser playing in the background is found by its own window title when
+// CoreAudio names nobody.
+func TestWindowMarkerAttributesWhenNoProcessHeldAStream(t *testing.T) {
+	s, paths, logger := newRecorderFixture(t)
+	defer s.Close()
+	recorder := Recorder{
+		Store: s, Paths: paths, CaptureAudio: true, AudioChunk: 5 * time.Millisecond,
+		Audio: dualAudio{}, Transcriber: fakeTranscriber{}, Context: fakeContext{},
+		AudioOutputs: silentAudioOutputs{}, AudioMarkers: fakeAudioMarkers{}, Logger: logger,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	if err := recorder.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	checked := 0
+	for _, event := range audioEventsFrom(t, s) {
+		if event.AudioSource != "system" {
+			continue
+		}
+		checked++
+		if event.AudioAttribution != string(store.AttributionForegroundInferred) {
+			t.Fatalf("attribution = %q, want %q", event.AudioAttribution,
+				store.AttributionForegroundInferred)
+		}
+		apps, _ := sourceAppsOf(t, event)
+		if len(apps) != 1 || apps[0].Evidence != store.EvidenceWindowMarker {
+			t.Fatalf("source apps = %#v, want one window-marker entry", apps)
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no system audio row was indexed")
+	}
+}
+
+// TestNothingEmittingIsRecordedApartFromNothingSampled keeps the two absences
+// distinct at the column level. Collapsing them is unrecoverable: an agent could
+// never afterwards tell "the machine was quiet" from "Lumi could not look".
+func TestNothingEmittingIsRecordedApartFromNothingSampled(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		outputs      AudioOutputs
+		markers      AudioMarkers
+		wantRecorded bool
+	}{
+		{"sampled and quiet", silentAudioOutputs{}, silentAudioMarkers{}, true},
+		{"could not sample", failingAudioOutputs{}, failingAudioMarkers{}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, paths, logger := newRecorderFixture(t)
+			defer s.Close()
+			recorder := Recorder{
+				Store: s, Paths: paths, CaptureAudio: true, AudioChunk: 5 * time.Millisecond,
+				Audio: dualAudio{}, Transcriber: fakeTranscriber{}, Context: fakeContext{},
+				AudioOutputs: tc.outputs, AudioMarkers: tc.markers, Logger: logger,
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+			defer cancel()
+			if err := recorder.Run(ctx); err != nil {
+				t.Fatal(err)
+			}
+			checked := 0
+			for _, event := range audioEventsFrom(t, s) {
+				if event.AudioSource != "system" {
+					continue
+				}
+				checked++
+				if event.AudioAttribution != string(store.AttributionUnattributed) {
+					t.Fatalf("attribution = %q, want %q", event.AudioAttribution,
+						store.AttributionUnattributed)
+				}
+				apps, recorded := sourceAppsOf(t, event)
+				if len(apps) != 0 {
+					t.Fatalf("source apps = %#v, want none", apps)
+				}
+				if recorded != tc.wantRecorded {
+					t.Fatalf("source list recorded = %v, want %v — an empty list and an absent "+
+						"one are different findings", recorded, tc.wantRecorded)
+				}
+			}
+			if checked == 0 {
+				t.Fatal("no system audio row was indexed")
+			}
+		})
+	}
+}
+
+// TestMicrophoneRowsAreNeverAttributed is acceptance criterion 2, end to end.
+// The emitter fake is wired and firing throughout, so this fails if any evidence
+// about what the machine was playing leaks onto the row that recorded the room.
+func TestMicrophoneRowsAreNeverAttributed(t *testing.T) {
+	s, paths, logger := newRecorderFixture(t)
+	defer s.Close()
+	recorder := Recorder{
+		Store: s, Paths: paths, CaptureAudio: true, AudioChunk: 5 * time.Millisecond,
+		Audio: dualAudio{}, Transcriber: fakeTranscriber{}, Context: fakeContext{},
+		AudioOutputs: fakeAudioOutputs{}, AudioMarkers: fakeAudioMarkers{}, Logger: logger,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	if err := recorder.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	checked := 0
+	for _, event := range audioEventsFrom(t, s) {
+		if event.AudioSource != "microphone" {
+			continue
+		}
+		checked++
+		if event.AudioAttribution != string(store.AttributionUnattributed) {
+			t.Fatalf("microphone attribution = %q, want %q",
+				event.AudioAttribution, store.AttributionUnattributed)
+		}
+		apps, recorded := sourceAppsOf(t, event)
+		if recorded || len(apps) != 0 {
+			t.Fatalf("microphone row named a source: %#v", apps)
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no microphone audio row was indexed")
+	}
+}
+
+// TestAudioRowsRecordTheirRecognizer covers text_source on audio rows, so a
+// transcript-quality regression can be traced to a model.
+func TestAudioRowsRecordTheirRecognizer(t *testing.T) {
+	s, paths, logger := newRecorderFixture(t)
+	defer s.Close()
+	recorder := Recorder{
+		Store: s, Paths: paths, CaptureAudio: true, AudioChunk: 5 * time.Millisecond,
+		Audio: dualAudio{}, Transcriber: sourcedTranscriber{}, Context: fakeContext{},
+		AudioOutputs: silentAudioOutputs{}, AudioMarkers: silentAudioMarkers{}, Logger: logger,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	if err := recorder.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	transcribed := 0
+	for _, event := range audioEventsFrom(t, s) {
+		// The chunk in flight at shutdown is indexed without being transcribed, so
+		// it legitimately names no recognizer — that is the point of the companion
+		// test below. Only a row that actually holds text must name one.
+		if event.Text == "" {
+			continue
+		}
+		transcribed++
+		if event.TextSource != SpeechAnalyzerSource {
+			t.Fatalf("audio row text_source = %q, want %q", event.TextSource, SpeechAnalyzerSource)
+		}
+	}
+	if transcribed == 0 {
+		t.Fatal("no audio row was transcribed")
+	}
+}
+
+// sourcedTranscriber names itself the way NativeSpeech does.
+type sourcedTranscriber struct{}
+
+func (sourcedTranscriber) Transcribe(context.Context, string) (Transcription, error) {
+	return Transcription{Text: "Lumi end to end audio transcript", Source: SpeechAnalyzerSource}, nil
+}
+
+// TestFailedTranscriptionClaimsNoRecognizer keeps text_source honest: a failed
+// recognition must not name a source for text that does not exist.
+func TestFailedTranscriptionClaimsNoRecognizer(t *testing.T) {
+	s, paths, logger := newRecorderFixture(t)
+	defer s.Close()
+	recorder := Recorder{
+		Store: s, Paths: paths, CaptureAudio: true, AudioChunk: 5 * time.Millisecond,
+		Audio: dualAudio{}, Transcriber: failingTranscriber{}, Context: fakeContext{},
+		AudioOutputs: silentAudioOutputs{}, AudioMarkers: silentAudioMarkers{}, Logger: logger,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	if err := recorder.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range audioEventsFrom(t, s) {
+		if event.TextSource != "" {
+			t.Fatalf("a failed transcription claimed text_source %q", event.TextSource)
+		}
+	}
+}
+
+// TestEmitterLoopTakesNoAccessibilitySnapshotWhileScreenCaptureIsOn pins the
+// contention rule. AccessibilityContext.Snapshot serializes on a package-level
+// mutex shared with the screen tick, so the emitter loop reuses the screen tick's
+// snapshot rather than taking its own — at a cadence that would otherwise add a
+// second caller for every emitter sample.
+func TestEmitterLoopTakesNoAccessibilitySnapshotWhileScreenCaptureIsOn(t *testing.T) {
+	s, paths, logger := newRecorderFixture(t)
+	defer s.Close()
+	counter := &countingContext{}
+	recorder := Recorder{
+		Store: s, Paths: paths, CaptureScreen: true, CaptureAudio: true,
+		ScreenInterval: 40 * time.Millisecond, AudioChunk: 40 * time.Millisecond,
+		EmitterInterval: 5 * time.Millisecond,
+		Screen:          &fakeScreen{}, Text: fakeVision{}, Context: counter,
+		Audio: dualAudio{}, Transcriber: fakeTranscriber{},
+		AudioOutputs: fakeAudioOutputs{}, AudioMarkers: silentAudioMarkers{}, Logger: logger,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if err := recorder.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Screen ticks at 40ms over ~200ms is a handful; the emitter samples at 5ms
+	// would be dozens. Anything in that upper range means the emitter loop started
+	// reading Accessibility itself.
+	if snapshots := counter.calls.Load(); snapshots > 15 {
+		t.Fatalf("Accessibility was read %d times; the emitter loop is taking its own "+
+			"snapshots instead of reusing the screen tick's", snapshots)
+	}
+}
+
+type countingContext struct{ calls atomic.Int64 }
+
+func (c *countingContext) Snapshot(ctx context.Context) (ScreenContext, error) {
+	c.calls.Add(1)
+	if err := ctx.Err(); err != nil {
+		return ScreenContext{}, err
+	}
+	return ScreenContext{App: "Test App", Window: "Test Window", AppSource: "workspace"}, nil
+}
+
+// jitteredAudio delivers chunks whose starts are displaced from the grid, the way
+// the measured rotation clock displaces them in a real recording.
+type jitteredAudio struct{ jitter time.Duration }
+
+func (a jitteredAudio) Open(ctx context.Context, directory string, chunk time.Duration) (AudioStream, error) {
+	stream := newTrackStream(directory, chunk, "system", "microphone")
+	stream.jitter = a.jitter
+	return stream, nil
+}
+
+// TestBothTracksShareOneMeasuredCapturedAt is acceptance criterion 3.
+//
+// A measured timestamp is only safe while both tracks of a chunk still carry the
+// *same* one: CollapseAudioTracks groups on that string, so a per-track stamp
+// would stop the microphone duplicate from ever merging and would make the app a
+// search reports depend on which track happened to transcribe.
+func TestBothTracksShareOneMeasuredCapturedAt(t *testing.T) {
+	s, paths, logger := newRecorderFixture(t)
+	defer s.Close()
+	recorder := Recorder{
+		Store: s, Paths: paths, CaptureAudio: true, AudioChunk: 20 * time.Millisecond,
+		Audio: jitteredAudio{jitter: 3 * time.Millisecond}, Transcriber: fakeTranscriber{},
+		Context: fakeContext{}, AudioOutputs: silentAudioOutputs{}, AudioMarkers: silentAudioMarkers{},
+		Logger: logger,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	defer cancel()
+	if err := recorder.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	events := audioEventsFrom(t, s)
+	byChunk := map[string][]store.Event{}
+	for _, event := range events {
+		key := store.FormatCapturedAt(event.CapturedAt)
+		byChunk[key] = append(byChunk[key], event)
+	}
+	paired := 0
+	for key, tracks := range byChunk {
+		if len(tracks) < 2 {
+			continue
+		}
+		paired++
+		for _, track := range tracks {
+			if store.FormatCapturedAt(track.CapturedAt) != key {
+				t.Fatalf("tracks of one chunk rendered different keys: %q vs %q",
+					store.FormatCapturedAt(track.CapturedAt), key)
+			}
+			if track.StreamOffsetMS == nil {
+				t.Fatalf("track %d carried no stream offset", track.ID)
+			}
+		}
+		if *tracks[0].StreamOffsetMS != *tracks[1].StreamOffsetMS {
+			t.Fatalf("tracks of one chunk disagree on stream offset: %d vs %d",
+				*tracks[0].StreamOffsetMS, *tracks[1].StreamOffsetMS)
+		}
+	}
+	if paired == 0 {
+		t.Fatal("no chunk indexed both of its tracks")
+	}
+
+	// The offsets are the drift-free grid captured_at gave up, so they must step
+	// by exactly one chunk even though the timestamps no longer do.
+	offsets := map[int64]bool{}
+	for _, event := range events {
+		offsets[*event.StreamOffsetMS] = true
+	}
+	for offset := range offsets {
+		if offset%recorder.AudioChunk.Milliseconds() != 0 {
+			t.Fatalf("stream offset %dms is not a whole number of %dms chunks",
+				offset, recorder.AudioChunk.Milliseconds())
+		}
+	}
+}
+
+// TestCapturedAtIsStoredAtFixedWidth pins the rendering that makes lexicographic
+// comparison agree with chronological order. Every range filter in the store
+// compares these strings as bytes.
+func TestCapturedAtIsStoredAtFixedWidth(t *testing.T) {
+	s, paths, logger := newRecorderFixture(t)
+	defer s.Close()
+	recorder := Recorder{
+		Store: s, Paths: paths, CaptureScreen: true, CaptureAudio: true,
+		ScreenInterval: 10 * time.Millisecond, AudioChunk: 20 * time.Millisecond,
+		Screen: &fakeScreen{}, Text: fakeVision{}, Context: fakeContext{},
+		Audio: jitteredAudio{jitter: 7 * time.Microsecond}, Transcriber: fakeTranscriber{},
+		AudioOutputs: silentAudioOutputs{}, AudioMarkers: silentAudioMarkers{}, Logger: logger,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	defer cancel()
+	if err := recorder.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	events, err := s.Search(context.Background(), store.SearchOptions{Limit: 500})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) == 0 {
+		t.Fatal("nothing was indexed")
+	}
+	widths := map[int]bool{}
+	for _, event := range events {
+		widths[len(store.FormatCapturedAt(event.CapturedAt))] = true
+	}
+	if len(widths) != 1 {
+		t.Fatalf("captured_at renderings differ in width across kinds: %v", widths)
+	}
+}
+
+// TestChunkKeyMatchesStoredCapturedAt is the direct regression for the two
+// renderings of one instant that used to sit in this file: Insert wrote
+// events.captured_at while attributeChunk formatted the audio_segments key
+// separately. If they ever diverge every chunk the recorder writes is parked on
+// the backfill queue forever and coverage reports nothing attributed — with no
+// error logged anywhere, which is what makes it worth a test.
+func TestChunkKeyMatchesStoredCapturedAt(t *testing.T) {
+	s, paths, logger := newRecorderFixture(t)
+	defer s.Close()
+	recorder := Recorder{
+		Store: s, Paths: paths, CaptureAudio: true, AudioChunk: 20 * time.Millisecond,
+		Audio: jitteredAudio{jitter: 3 * time.Millisecond}, Transcriber: segmentTranscriber{},
+		Context: fakeContext{}, AudioOutputs: silentAudioOutputs{}, AudioMarkers: silentAudioMarkers{},
+		Logger: logger,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	defer cancel()
+	if err := recorder.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	background := context.Background()
+	times, err := s.AudioChunkTimes(background, nil, nil, 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(times) == 0 {
+		t.Fatal("no audio chunks were indexed")
+	}
+	// Every chunk the recorder attributed must have drained from the derived work
+	// queue. Anything left is a key that did not match the row it describes.
+	missing, err := s.ChunksMissingSegments(background, nil, nil, 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed, err := s.ChunksFailedTranscription(background, time.Time{}, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if int64(len(missing)) > failed {
+		t.Fatalf("%d of %d chunks are still queued for attribution with only %d failed "+
+			"transcriptions; the segment key does not match events.captured_at",
+			len(missing), len(times), failed)
 	}
 }

@@ -44,28 +44,107 @@ rows are shaped is `internal/store`'s; the labelling rules the recorder applies 
   1.7 s of that was the native lifecycle and 0.45 s was transcription blocking the loop, so fixing either
   alone leaves most of the hole. Measured after: consecutive chunk starts exactly one chunk duration apart,
   each file holding that whole interval to within one sample buffer.
-- **A chunk's `captured_at` is the instant its audio began**, derived by offsetting the session anchor
-  rather than by reading the clock at rotation, so the grid cannot drift and both tracks of a chunk share
-  one timestamp — which is what audio collapse groups on. Reading `time.Now()` between chunks made every
-  timestamp absorb the previous chunk's processing time, which is what let indexed chunks sit 32 s apart
-  while each held 30 s of sound.
+- **A chunk's `captured_at` is the instant its audio began, *measured* at rotation** by reading the host
+  clock and ageing it back to the boundary presentation timestamp. Both tracks of a chunk still share one
+  timestamp — that is what audio collapse groups on, and per-track stamps would break it.
+  - It used to be arithmetic on the session anchor (`anchor + N×chunkDuration`). That is uniform but not
+    observed: every audio timestamp in an index shared one sub-second fraction (`.943675136` across 24
+    events in one measured sample), so clock drift was undetectable, a dropped chunk renumbered silently
+    instead of leaving a visible hole, and audio↔screen correlation degraded over a long session with
+    nothing to show for it.
+  - **Ageing the clock is what keeps this from being the old bug.** Reading `time.Now()` between chunks
+    made every timestamp absorb the previous chunk's processing time, which let indexed chunks sit 32 s
+    apart while each held 30 s of sound. Subtracting the buffer's age puts the value back at the instant
+    the audio began.
+  - **The drift-free grid is not lost, only moved.** `stream_offset_ms` carries the exact distance from
+    the session anchor and `grid_started_at` the grid point itself, so coverage arithmetic stays exact.
+  - **Two guards in `rotate`, and the tolerance comes from the turn-merge headroom, not the chunk
+    duration.** A measured stamp at or before its predecessor falls back to the grid, because turn
+    continuation requires a strictly positive gap. So does a drift beyond `LumiMaxMeasuredDriftNS`
+    (250 ms): chunks sit 30 s apart and `transcript.DefaultMaxChunkGap` is 35 s, so there are only **5 s**
+    of slack — a half-chunk tolerance would admit a 5–15 s jump and silently split a continuously recorded
+    turn mid-sentence, reintroducing exactly what the contiguous stream removed. The tolerance is capped at
+    half the *configured* chunk as well, since `--audio-chunk` has no lower bound and 250 ms spans two
+    whole 100 ms chunks. **Falling back is not sufficient on its own**: the previous chunk may have kept a
+    measured stamp ahead of its grid point, so the fallback value can still be non-increasing and is
+    clamped to `previous + 1`. Every fallback sets `clock_anomaly` in metadata; capture never stops for one.
 - **Cancellation stops capture but never abandons it.** `Stop` finalizes the chunk in flight and `Next`
   keeps delivering queued chunks — including that partial one — before reporting `ErrAudioStreamClosed`.
   The native session has no reader to interrupt, so `Next` polls in short slices; that poll interval, not
   the chunk duration, bounds shutdown latency.
 - **Preserve provenance.** `text_source`, `display_id`, and `audio_source` are first-class event columns
-  (migration 3) and appear in JSON exports. In metadata, `app_source` and `attribution_source` answer
+  (migration 3), joined by `audio_attribution`, `source_apps_json`, and `stream_offset_ms` (migration 5),
+  and all of them appear in JSON exports. Audio rows carry `text_source` too — the transcriber names
+  itself (`SpeechAnalyzerSource`) rather than the recorder hardcoding it, so the two cannot fork once a
+  second recognizer exists, and a *failed* recognition names none: it must never claim a source for text
+  that does not exist. In metadata, `app_source` and `attribution_source` answer
   different questions — which source named the *app*, and which supplied the *window title* — and routinely
   differ. Merging them would change what `attribution_source` means for every indexed row.
 
 ## What an audio row is attributed to
 
+An audio row answers **two** questions with two separate sets of fields, and conflating them is the defect
+this design exists to remove. `app`/`window` say what the user was working in; `audio_attribution` and
+`source_apps_json` say what was producing the sound. Measured on a live capture, they disagreed in 2 of 12
+chunks over eight minutes, and the ratio scales with how much the user switches applications.
+
 - **An audio row's `app`/`window` name the *focused* application, not the one making the sound.** They
   answer the same question `app` answers for every screen row — "what was the user working in" — sampled
-  once when the chunk closes. Which processes held the audio output is a different question with a
-  different answer, and lives in `metadata_json` as `active_audio_output_processes`. Putting one of those
-  in `events.app` would fork the column's meaning by row kind, and it cannot hold the answer anyway: it
-  is a *set*.
+  once per chunk. Putting the sound's source in `events.app` would fork the column's meaning by row kind,
+  and it cannot hold the answer anyway: it is a *set*. `internal/mcp` therefore renames the pair to
+  `foreground_app`/`foreground_window` on audio rows at the boundary; the SQL columns keep their names
+  because FTS5, `Search`'s app filter, and `ListAttribution` all depend on them.
+- **`DecideAudioAttribution` is one pure function and the only place the rule lives.** Its precedence is:
+  a microphone track is `unattributed` unconditionally; otherwise observed processes win
+  (`emitting_process`), then window markers (`foreground_inferred`), then `unattributed`. It performs no
+  I/O so the rule is exercisable without permissions, CoreAudio, or a recording.
+- **Several emitters is not a downgrade.** The attribution names how the claim was earned, not how many
+  earned it. The system track really is the mix of the whole output graph, so naming one of three would be
+  *less* true; ordering by sample count carries the prominence instead.
+- **`foreground_inferred` does not mean "we used the focused app".** No path may do that. It means the
+  evidence came from the window layer — a window whose own title said it was playing audio — rather than
+  from CoreAudio. It also does not mean CoreAudio *failed*: the branch fires whenever CoreAudio names
+  nobody, and the common case is a clean read that found nothing. Describing it as a read failure
+  overstates how unusual the value is and understates the evidence behind it, so the tool description and
+  the `AttributionForegroundInferred` doc must both say "named no process", not "could not be read".
+- **Emitters are sampled across the chunk, not once at its close.** A 30 s chunk can span several
+  application switches, and a single close-of-chunk read attributed all of it to whatever was true at the
+  end. `emitterTimeline` collects observations throughout and `foldEmitters` reduces them to a union
+  ordered by how much of the chunk each application was present for. A synchronous fallback covers the
+  chunk in flight at shutdown and the very short chunks tests use.
+- **Exactly one goroutine samples Accessibility at a time.** `AccessibilityContext.Snapshot` serializes on
+  a package-level mutex shared with the screen tick, so when screen capture is on the emitter loop reuses
+  the snapshot that tick already takes, and only takes its own when there is no screen loop to contend
+  with. `TestEmitterLoopTakesNoAccessibilitySnapshotWhileScreenCaptureIsOn` pins it.
+- **An empty `source_apps_json` (`[]`) and an absent one (`""`) are different findings.** Sampled-and-quiet
+  versus could-not-sample; collapsing them is unrecoverable afterwards. Same rule, one level up, as an
+  absent `active_audio_output_processes` against its `..._error` sibling — and the same reason a silent
+  chunk is `silent` rather than `unknown`.
+- **The two evidence sources succeed and fail *independently*, and are counted separately.** A shared
+  "did this observation work" flag lets one source's success mask the other's failure: with CoreAudio
+  failing every sample and the window scan merely finding nothing, the chunk was recorded as
+  sampled-and-quiet when no process list had ever been read — the exact conflation above, arrived at from
+  the other side. So `foldEmitters` keeps a per-source observation count, reports a source's error whenever
+  *that* source never read, and sets `Observations` to the **minimum** of the two: only a sample that read
+  every source can support "nothing was emitting". The native scan must therefore fail loudly too — a
+  `NULL` window list is an error, never an empty result.
+- **The synchronous fallback uses its own sample, never a widened window query.** Re-querying the timeline
+  through `time.Now()` sweeps in observations belonging to *later* chunks, so a chunk whose indexing ran
+  long could be attributed to an application that only began playing after its audio ended.
+- **A microphone row is never attributed, however loud the machine was.** The microphone records the room;
+  nothing in that signal names an application, and the only app-shaped value within reach is what the user
+  had focused — a fact about the user, not about the sound. The claim would also outlive its evidence,
+  since the WAV is deleted on the retention schedule while any summary built from it survives. Lumi does
+  not identify speakers and does not try: the requirement is that the ambiguity is *stated*, in the data
+  and in the MCP tool descriptions, not resolved.
+- **The window-title marker is the fallback, and it scans *every* on-screen window.** Chromium appends
+  " - Audio playing" to a title while a tab plays sound; measured on a live index, 116 of 117 Comet events
+  captured during playback carried it. Scanning only the frontmost window would be useless here — the case
+  worth catching is a browser playing in the background while the user works elsewhere, which is precisely
+  what a focused-window reading gets wrong. It is the weaker signal (a self-report, absent for any app that
+  does not update its title) so it is consulted only when CoreAudio names nobody. It is a separate seam
+  from `AudioOutputs` rather than another return value on it, because the decision has to tell "no process
+  held a stream" from "the window scan failed" and one error cannot carry both.
 - **`active_audio_output_processes` names stream occupancy, not audible sound, and is named for what it
   can prove.** `kAudioProcessPropertyIsRunningOutput` reports "running IO with at least one active output
   stream": a *paused* player still answers yes, while the same app with its document closed does not —

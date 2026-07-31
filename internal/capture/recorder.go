@@ -39,18 +39,54 @@ type Recorder struct {
 	// constructor always wires it, so that ambiguity is confined to tests; a
 	// marker distinguishing them would be runtime state for a state production
 	// cannot reach.
-	AudioOutputs   AudioOutputs
+	AudioOutputs AudioOutputs
+	// AudioMarkers is optional and carries the same caveat as AudioOutputs: it is
+	// the weaker fallback signal, consulted only when CoreAudio names nobody.
+	AudioMarkers   AudioMarkers
 	Transcriber    SpeechTranscriber
 	Comparer       *FrameComparer
 	ScreenInterval time.Duration
 	AudioChunk     time.Duration
-	CaptureScreen  bool
-	CaptureAudio   bool
-	Logger         *slog.Logger
+	// EmitterInterval is how often the emitter state is sampled while a chunk
+	// records. It defaults from AudioChunk; see defaultEmitterInterval.
+	EmitterInterval time.Duration
+	CaptureScreen   bool
+	CaptureAudio    bool
+	Logger          *slog.Logger
 
 	// attribution is owned by the screen goroutine alone; captureScreen is the
 	// only reader and writer, so it needs no lock.
 	attribution attributionHealth
+	// timeline is written by the screen and emitter loops and read by the audio
+	// loop at chunk close, so it carries its own lock.
+	timeline *emitterTimeline
+}
+
+// defaultEmitterInterval samples roughly a dozen times per chunk, bounded at
+// both ends because AudioChunk is a flag: a one-second chunk must not sample
+// every 80ms, and a five-minute chunk must not sample only twice.
+func defaultEmitterInterval(chunk time.Duration) time.Duration {
+	interval := chunk / 12
+	if interval < 250*time.Millisecond {
+		interval = 250 * time.Millisecond
+	}
+	if interval > 2*time.Second {
+		interval = 2 * time.Second
+	}
+	return interval
+}
+
+// ringCapacity holds a few chunks' worth of observations, so a chunk whose
+// indexing runs long still finds its own window intact.
+func ringCapacity(chunk, interval time.Duration) int {
+	if interval <= 0 {
+		return 64
+	}
+	capacity := 3 * int(chunk/interval)
+	if capacity < 64 {
+		capacity = 64
+	}
+	return capacity
 }
 
 // attributionEscalationDelay is how long attribution must stay degraded before
@@ -183,6 +219,12 @@ func (r *Recorder) Run(ctx context.Context) error {
 	if r.Comparer == nil {
 		r.Comparer = &FrameComparer{}
 	}
+	if r.EmitterInterval <= 0 {
+		r.EmitterInterval = defaultEmitterInterval(r.AudioChunk)
+	}
+	r.timeline = newEmitterTimeline(
+		ringCapacity(r.AudioChunk, r.EmitterInterval),
+		ringCapacity(r.AudioChunk, r.ScreenInterval))
 	if err := r.Paths.Ensure(); err != nil {
 		return err
 	}
@@ -199,6 +241,11 @@ func (r *Recorder) Run(ctx context.Context) error {
 		go func() {
 			defer wg.Done()
 			r.audioLoop(ctx)
+		}()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r.emitterLoop(ctx)
 		}()
 	}
 	<-ctx.Done()
@@ -218,6 +265,66 @@ func (r *Recorder) screenLoop(ctx context.Context) {
 			r.captureScreen(ctx)
 		}
 	}
+}
+
+// emitterLoop samples what is producing sound while chunks record.
+//
+// It reads CoreAudio process objects and the window list, neither of which needs
+// the Accessibility grant, and it deliberately does *not* take a focus snapshot
+// while the screen loop is running: AccessibilityContext.Snapshot serializes on a
+// package-level mutex shared with the screen tick, and a second caller at this
+// cadence would contend with capture for no gain. When screen capture is on, the
+// screen tick already produces exactly the focus samples this timeline needs, so
+// they are reused. When it is off there is no tick and no contention, and this
+// loop takes them itself.
+func (r *Recorder) emitterLoop(ctx context.Context) {
+	sampleForeground := !r.CaptureScreen && r.Context != nil
+	r.sampleEmitters(ctx, sampleForeground)
+	ticker := time.NewTicker(r.EmitterInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			r.sampleEmitters(ctx, sampleForeground)
+		}
+	}
+}
+
+// sampleEmitters reads the emitter state once, records it on the timeline, and
+// returns it so a caller that needs the sample immediately does not have to read
+// it back out of a window query.
+func (r *Recorder) sampleEmitters(ctx context.Context, withForeground bool) EmitterObservation {
+	now := time.Now().UTC()
+	observation := EmitterObservation{At: now}
+	if r.AudioOutputs != nil {
+		processes, err := r.AudioOutputs.Active(ctx)
+		if err != nil {
+			observation.ProcessErr = err.Error()
+		} else {
+			observation.Processes = processes
+		}
+	} else {
+		observation.ProcessErr = "audio output processes were never sampled"
+	}
+	if r.AudioMarkers != nil {
+		windows, err := r.AudioMarkers.Playing(ctx)
+		if err != nil {
+			observation.WindowErr = err.Error()
+		} else {
+			observation.Windows = windows
+		}
+	} else {
+		observation.WindowErr = "audio marker windows were never sampled"
+	}
+	r.timeline.observeEmitters(observation)
+	if !withForeground {
+		return observation
+	}
+	screenContext, err := r.Context.Snapshot(ctx)
+	r.timeline.observeForeground(ForegroundObservation{At: now, Context: screenContext, Err: err})
+	return observation
 }
 
 func (r *Recorder) captureScreen(ctx context.Context) {
@@ -243,6 +350,11 @@ func (r *Recorder) captureScreen(ctx context.Context) {
 		cancel()
 	}
 	r.noteAttribution(now, screenContext, contextErr)
+	// Feed the same snapshot to the audio side rather than letting it take its
+	// own. Accessibility reads serialize on a package-level mutex, so a second
+	// sampler at the emitter cadence would contend with capture to learn what this
+	// tick already knows. See emitterLoop.
+	r.timeline.observeForeground(ForegroundObservation{At: now, Context: screenContext, Err: contextErr})
 	for _, frame := range frames {
 		duplicate, similarity, compareErr := r.Comparer.Duplicate(
 			frame.Path, frame.DisplayID, screenContext.InputActive, now)
@@ -414,13 +526,20 @@ func (r *Recorder) consumeAudio(ctx context.Context, stream AudioStream) {
 // storeAudioChunk transcribes, indexes, and attributes one chunk. Both tracks
 // are stamped with the chunk's own start rather than a fresh clock read, so the
 // pair keeps the single captured_at that audio collapse groups on.
+//
+// The two attribution axes are resolved separately and mean different things.
+// App/Window say what the user was working in — one sample, exactly as before —
+// while audio_attribution and source_apps_json say what was producing the sound,
+// folded from every sample taken across the chunk. Conflating them is the defect
+// this shape exists to prevent: a video playing in a background browser is
+// attributed to the browser, not to whatever the user had focused.
 func (r *Recorder) storeAudioChunk(ctx context.Context, chunk AudioChunk) {
 	capturedAt := chunk.StartedAt
 	if capturedAt.IsZero() {
 		capturedAt = time.Now().UTC()
 	}
 	capturedAt = capturedAt.UTC()
-	attribution := r.audioAttribution(ctx)
+	attribution := r.audioAttribution(ctx, capturedAt, chunk)
 	results := make([]audioChunkResult, 0, len(chunk.Frames))
 	for _, frame := range chunk.Frames {
 		var transcription Transcription
@@ -430,10 +549,24 @@ func (r *Recorder) storeAudioChunk(ctx context.Context, chunk AudioChunk) {
 		} else {
 			transcription, processErr = r.Transcriber.Transcribe(ctx, frame.Path)
 		}
+		// The verdict is per track: the microphone is unattributed however loudly
+		// the machine was playing, and only the system track may name a source.
+		verdict := DecideAudioAttribution(attribution.inputFor(frame.Source))
+		sourceApps, encodeErr := store.EncodeSourceApps(verdict.SourceApps)
+		if encodeErr != nil {
+			r.Logger.Warn("audio source list could not be encoded; the audio is still indexed",
+				"source", frame.Source, "error", encodeErr)
+			sourceApps = ""
+		}
 		event := &store.Event{Kind: store.KindAudio, CapturedAt: capturedAt, Text: transcription.Text, MediaPath: frame.Path,
 			App: attribution.screen.App, Window: attribution.screen.Window,
 			DurationMS: frame.DurationMS, AudioSource: frame.Source,
-			Metadata: audioMetadata(frame.Source, frame.CaptureError, processErr, attribution)}
+			TextSource:       transcription.Source,
+			AudioAttribution: string(verdict.Attribution),
+			SourceApps:       sourceApps,
+			StreamOffsetMS:   chunk.StreamOffsetMS,
+			Metadata: audioMetadata(frame.Source, frame.CaptureError, processErr, attribution,
+				verdict, chunk)}
 		storeCtx, cancel := preservationContext(ctx)
 		err := r.Store.Insert(storeCtx, event)
 		cancel()
@@ -524,7 +657,13 @@ func (r *Recorder) attributeChunk(ctx context.Context, capturedAt time.Time, res
 	}
 	storeCtx, cancel := preservationContext(ctx)
 	defer cancel()
-	if err := r.Segments.ReplaceChunkSegments(storeCtx, capturedAt.UTC().Format(time.RFC3339Nano), rows); err != nil {
+	// The chunk key must be the byte-identical string Insert wrote into
+	// events.captured_at: ChunksMissingSegments joins the two columns on equality,
+	// so any divergence leaves every chunk this recorder writes permanently on the
+	// backfill queue with SegmentCoverage reporting nothing attributed — and
+	// reports no error while doing it. One shared renderer is what makes that
+	// impossible rather than merely unlikely.
+	if err := r.Segments.ReplaceChunkSegments(storeCtx, store.FormatCapturedAt(capturedAt), rows); err != nil {
 		r.Logger.Warn("audio attribution was not stored; the audio is still indexed and `lumi transcript backfill` will retry",
 			"error", err)
 		return
@@ -591,47 +730,118 @@ func preservationContext(ctx context.Context) (context.Context, context.CancelFu
 }
 
 // audioAttributionSample is what a chunk could learn about its own provenance:
-// which application the user was working in, and which processes held an active
-// audio output stream. They answer different questions and routinely disagree —
-// a call recorded while the user takes notes elsewhere is the ordinary case — so
-// neither substitutes for the other.
+// which application the user was working in, and what was producing sound. They
+// answer different questions and routinely disagree — a call recorded while the
+// user takes notes elsewhere is the ordinary case — so neither substitutes for
+// the other.
 type audioAttributionSample struct {
-	screen     ScreenContext
-	screenErr  error
-	outputs    []AudioProcess
-	outputsErr error
+	screen    ScreenContext
+	screenErr error
+	// emitters is folded from every sample taken across the chunk, not from one
+	// read at its close.
+	emitters AttributionInput
+	// foregroundSamples and foregroundApps describe how much focus moved while
+	// the chunk recorded, which is what makes "App is one sample of a
+	// thirty-second window" visible in the data rather than only in a comment.
+	foregroundSamples int
+	foregroundApps    int
 }
 
-// audioAttribution samples both attribution sources once per chunk. It is
-// called after the chunk has closed and before its tracks are indexed, so a
-// slow read delays indexing rather than capture — the stream keeps recording
-// throughout.
+// inputFor names the track a verdict is being decided for. Everything else about
+// the chunk is shared; the track is what makes the microphone's answer different.
+func (s audioAttributionSample) inputFor(track string) AttributionInput {
+	input := s.emitters
+	input.Track = track
+	return input
+}
+
+// audioAttribution assembles what the chunk observed while it was recording.
 //
-// Both reads run under preservationContext, for the same reason the inserts
-// below do: the chunk's audio already exists, and these describe it. Using the
-// cancelled context cost the last chunk of every recording its attribution —
-// the shutdown chunk is finalised and indexed precisely so it is not lost, and
-// a sub-millisecond "what is focused" read has no reason to be the one thing
-// that gives up on it.
+// The emitter side is read from the timeline, which the emitter loop has been
+// filling throughout the chunk — the point being that a 30-second chunk can span
+// several application switches, and a single read at chunk close attributed all
+// of it to whatever was true at the end.
 //
-// Neither read can fail the chunk. An error is carried into metadata and the
-// corresponding field is simply left empty, because captured media is never
-// lost to a downstream failure.
-func (r *Recorder) audioAttribution(ctx context.Context) audioAttributionSample {
+// It falls back to sampling synchronously when the timeline holds nothing for
+// this window. That covers the chunk in flight at shutdown and the very short
+// chunks tests use, where the loop may not have ticked inside the window at all;
+// the fallback is exactly the behaviour this function had before the timeline
+// existed, so those paths did not change.
+//
+// Reads run under preservationContext, for the same reason the inserts do: the
+// chunk's audio already exists and these merely describe it. Using the cancelled
+// context cost the last chunk of every recording its attribution.
+//
+// No read here can fail the chunk. An error is carried into metadata and the
+// corresponding field left empty, because captured media is never lost to a
+// downstream failure.
+func (r *Recorder) audioAttribution(ctx context.Context, capturedAt time.Time, chunk AudioChunk) audioAttributionSample {
 	sampleCtx, cancel := preservationContext(ctx)
 	defer cancel()
 	var sample audioAttributionSample
-	if r.Context != nil {
-		sample.screen, sample.screenErr = r.Context.Snapshot(sampleCtx)
+
+	emitters, foreground := r.timeline.window(capturedAt, capturedAt.Add(chunkSpan(chunk, r.AudioChunk)))
+	if len(emitters) == 0 {
+		// Use the fresh sample itself rather than re-querying a widened window.
+		// Widening to time.Now() would sweep in observations belonging to *later*
+		// chunks, so a chunk whose indexing ran long could be attributed to an
+		// application that only started playing after its audio had ended.
+		//
+		// This sample is taken after the chunk closed, which is imprecise but
+		// bounded and is exactly what this function did before the timeline
+		// existed. It is folded at the chunk's own start so its offsets stay
+		// relative to the chunk.
+		emitters = []EmitterObservation{r.sampleEmitters(sampleCtx, false)}
 	}
-	if r.AudioOutputs != nil {
-		sample.outputs, sample.outputsErr = r.AudioOutputs.Active(sampleCtx)
+	sample.emitters = foldEmitters(emitters, capturedAt)
+
+	if observation, ok := lastForeground(foreground); ok {
+		sample.screen, sample.screenErr = observation.Context, observation.Err
+		sample.foregroundSamples = len(foreground)
+		sample.foregroundApps = distinctForegroundApps(foreground)
+	} else if r.Context != nil {
+		sample.screen, sample.screenErr = r.Context.Snapshot(sampleCtx)
+		sample.foregroundSamples = 1
+		sample.foregroundApps = 1
 	}
 	return sample
 }
 
+// chunkSpan is how long the chunk actually covered, and bounds the window its
+// emitters are read from.
+//
+// A measured duration wins outright over the requested one wherever any frame
+// reports it. Taking the maximum of the two instead lets the requested duration
+// override a *shorter* measurement, which is exactly backwards for the case that
+// matters: a chunk closed early — at shutdown, or when a stream fault forces a
+// reopen — really did hold less audio than was asked for, and stretching its
+// window to the full interval attributes it to emitters that started after its
+// sound had stopped. Measured 8s against a requested 30s widened the window by
+// 22 seconds.
+//
+// The requested duration remains the fallback for chunks the native layer could
+// not measure, which is every chunk recorded before it reported one.
+func chunkSpan(chunk AudioChunk, configured time.Duration) time.Duration {
+	var measured, requested int64
+	for _, frame := range chunk.Frames {
+		if frame.MeasuredDurationMS > measured {
+			measured = frame.MeasuredDurationMS
+		}
+		if frame.DurationMS > requested {
+			requested = frame.DurationMS
+		}
+	}
+	if measured > 0 {
+		return time.Duration(measured) * time.Millisecond
+	}
+	if requested > 0 {
+		return time.Duration(requested) * time.Millisecond
+	}
+	return configured
+}
+
 func audioMetadata(source, captureError string, processErr error,
-	attribution audioAttributionSample) json.RawMessage {
+	attribution audioAttributionSample, verdict AttributionVerdict, chunk AudioChunk) json.RawMessage {
 	metadata := map[string]any{"audio_source": source}
 	if captureError != "" {
 		metadata["capture_error"] = captureError
@@ -660,11 +870,42 @@ func audioMetadata(source, captureError string, processErr error,
 	// active_audio_output_processes_error means Lumi could not tell, which is
 	// the opposite one. Absence carries that meaning only because the recorder
 	// is always constructed with an AudioOutputs source; see Recorder.
-	if len(attribution.outputs) > 0 {
-		metadata["active_audio_output_processes"] = attribution.outputs
+	//
+	// This key now holds the union across the chunk rather than one read at its
+	// close — the same meaning, sampled better. It is still written because
+	// get_event's metadata is the diagnostic channel, and because it and the
+	// source_apps_json column are two renderings of one fold rather than two
+	// rules that could disagree.
+	if len(attribution.emitters.Processes) > 0 {
+		metadata["active_audio_output_processes"] = attribution.emitters.Processes
 	}
-	if attribution.outputsErr != nil {
-		metadata["active_audio_output_processes_error"] = attribution.outputsErr.Error()
+	if attribution.emitters.ProcessErr != "" {
+		metadata["active_audio_output_processes_error"] = attribution.emitters.ProcessErr
+	}
+	if len(attribution.emitters.Markers) > 0 {
+		metadata["audio_marker_windows"] = attribution.emitters.Markers
+	}
+	if attribution.emitters.MarkerErr != "" {
+		metadata["audio_marker_windows_error"] = attribution.emitters.MarkerErr
+	}
+	if attribution.emitters.Attempts > 0 {
+		metadata["audio_source_samples"] = attribution.emitters.Observations
+		metadata["audio_source_sample_attempts"] = attribution.emitters.Attempts
+	}
+	// How much the focused application moved while this chunk recorded. App and
+	// Window are a single sample of that window, and this is what says so.
+	if attribution.foregroundSamples > 0 {
+		metadata["foreground_samples"] = attribution.foregroundSamples
+		metadata["foreground_apps_seen"] = attribution.foregroundApps
+	}
+	if verdict.Reason != "" {
+		metadata["audio_attribution_reason"] = verdict.Reason
+	}
+	if chunk.ClockAnomaly {
+		metadata["clock_anomaly"] = true
+	}
+	if !chunk.GridStartedAt.IsZero() {
+		metadata["grid_started_at"] = store.FormatCapturedAt(chunk.GridStartedAt)
 	}
 	data, err := json.Marshal(metadata)
 	if err != nil {

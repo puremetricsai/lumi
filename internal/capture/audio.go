@@ -29,6 +29,17 @@ type AudioFrame struct {
 	// skew between the tracks. Zero when the native layer reported none, which
 	// is the case for every chunk captured before this field existed.
 	StartedAt time.Time
+	// MeasuredDurationMS is what the file actually holds, as opposed to
+	// DurationMS which is what was requested. It is carried across so the chunk's
+	// attribution window matches the audio rather than the configured interval,
+	// and so a measured timestamp can be audited against the sound it names.
+	// Zero when the native layer reported none.
+	MeasuredDurationMS int64
+	// SessionStartPTSNS is this track's first-sample presentation timestamp on the
+	// shared host timebase. The difference between the two tracks' values is the
+	// exact inter-track skew, which is the number that says whether a chunk's
+	// shared captured_at is honest. Zero when unreported.
+	SessionStartPTSNS int64
 }
 
 // TimedSegment is one transcribed phrase with a measured span, relative to the
@@ -56,6 +67,15 @@ type TimedRun = transcript.TimedRun
 type Transcription struct {
 	Text     string
 	Segments []TimedSegment
+	// Source names the recognizer that produced this text, and becomes the row's
+	// text_source — the same column a screen row uses to say "vision". Without
+	// it a transcript-quality regression cannot be traced to a model.
+	//
+	// The transcriber names itself rather than the recorder hardcoding it, which
+	// is what keeps the two from forking the moment a second recognizer exists.
+	// It is set on success only: a failed recognition must never claim a source
+	// for text that does not exist.
+	Source string
 }
 
 // AudioChunk is one recording interval's worth of audio: every track captured
@@ -66,7 +86,21 @@ type AudioChunk struct {
 	// StartedAt is when the chunk's audio begins. Zero when the source could
 	// not say, which leaves the caller to fall back to its own clock.
 	StartedAt time.Time
-	Frames    []AudioFrame
+	// GridStartedAt is where this chunk sits on the drift-free session grid:
+	// the session anchor plus a whole number of chunk durations. StartedAt used
+	// to be exactly this value, which is why every audio timestamp in an index
+	// shared one sub-second fraction. Keeping it lets a measured stamp be
+	// compared against the grid it replaced. Zero when unreported.
+	GridStartedAt time.Time
+	// StreamOffsetMS is this chunk's exact offset from the start of the capture
+	// session. It is the drift-free arithmetic that StartedAt no longer carries,
+	// and nil when the source could not say. Zero is a real value — the first
+	// chunk of every session has it — so this must stay a pointer.
+	StreamOffsetMS *int64
+	// ClockAnomaly reports that the measured wall clock disagreed with the grid
+	// by more than the guard allows, so the grid value was used instead.
+	ClockAnomaly bool
+	Frames       []AudioFrame
 }
 
 // ErrAudioStreamClosed reports that a stream has ended and delivered everything
@@ -138,6 +172,40 @@ func (NativeAudioOutputs) Active(ctx context.Context) ([]AudioProcess, error) {
 	return result, nil
 }
 
+// AudioMarkerWindow is one on-screen window whose own title declared it was
+// playing audio while a chunk was captured. Window holds the title with the
+// marker removed.
+type AudioMarkerWindow = macosnative.AudioMarkerWindow
+
+// AudioMarkers lists the windows that say they are playing sound.
+//
+// It is a separate seam from AudioOutputs rather than another return value on
+// it, because the attribution decision has to tell "no process held an output
+// stream" apart from "the window scan failed", and one error return cannot carry
+// both. Collapsing them would make a transient scan failure indistinguishable
+// from the finding that the machine was quiet.
+//
+// It is the weaker of the two signals and is consulted only when CoreAudio names
+// nobody: a title is a self-report, and an application that never updates its
+// title while playing simply is not found. It earned its place by being measured
+// — of 117 events captured while a video played in Comet, 116 carried the marker.
+type AudioMarkers interface {
+	Playing(context.Context) ([]AudioMarkerWindow, error)
+}
+
+// NativeAudioMarkers scans the window list. It reads the same
+// CGWindowListCopyWindowInfo the attribution snapshot already uses, so it needs
+// no permission the recorder does not hold.
+type NativeAudioMarkers struct{}
+
+func (NativeAudioMarkers) Playing(ctx context.Context) ([]AudioMarkerWindow, error) {
+	windows, err := macosnative.AudioMarkerWindows(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("scan windows for the audio-playing marker: %w", err)
+	}
+	return windows, nil
+}
+
 // AudioStream delivers chunks from a capture session that keeps recording
 // between them.
 type AudioStream interface {
@@ -205,7 +273,16 @@ func (s *nativeAudioStream) Close() error {
 // the bytes.
 func (s *nativeAudioStream) adopt(chunk macosnative.AudioChunk) AudioChunk {
 	started := unixNanoTime(chunk.StartedAtUnixNS)
-	result := AudioChunk{StartedAt: started, Frames: make([]AudioFrame, 0, len(chunk.Frames))}
+	result := AudioChunk{
+		StartedAt:     started,
+		GridStartedAt: unixNanoTime(chunk.GridStartedAtUnixNS),
+		ClockAnomaly:  chunk.ClockAnomaly,
+		Frames:        make([]AudioFrame, 0, len(chunk.Frames)),
+	}
+	if chunk.StreamOffsetNS != nil {
+		offset := *chunk.StreamOffsetNS / int64(time.Millisecond)
+		result.StreamOffsetMS = &offset
+	}
 	for _, frame := range chunk.Frames {
 		path := frame.Path
 		if !started.IsZero() {
@@ -216,8 +293,10 @@ func (s *nativeAudioStream) adopt(chunk macosnative.AudioChunk) AudioChunk {
 		}
 		result.Frames = append(result.Frames, AudioFrame{
 			Path: path, Source: frame.Source, DurationMS: frame.DurationMS,
-			CaptureError: frame.CaptureError,
-			StartedAt:    unixNanoTime(frame.StartedAtUnixNS),
+			CaptureError:       frame.CaptureError,
+			StartedAt:          unixNanoTime(frame.StartedAtUnixNS),
+			MeasuredDurationMS: frame.MeasuredDurationMS,
+			SessionStartPTSNS:  frame.SessionStartPTSNS,
 		})
 	}
 	return result
@@ -247,8 +326,17 @@ func (n NativeSpeech) Transcribe(ctx context.Context, audioPath string) (Transcr
 	if err != nil {
 		return Transcription{}, fmt.Errorf("transcribe audio with SpeechAnalyzer: %w", err)
 	}
-	return Transcription{Text: native.Text, Segments: TimedSegmentsFrom(native.Segments)}, nil
+	return Transcription{
+		Text:     native.Text,
+		Segments: TimedSegmentsFrom(native.Segments),
+		Source:   SpeechAnalyzerSource,
+	}, nil
 }
+
+// SpeechAnalyzerSource is the text_source an audio row carries when Apple's
+// on-device SpeechAnalyzer produced its transcript, alongside "vision" and
+// "accessibility" on screen rows.
+const SpeechAnalyzerSource = "speechanalyzer"
 
 // TimedSegmentsFrom carries the bridge's timed segments across the cgo boundary
 // into the attribution types.
