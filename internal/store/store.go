@@ -20,19 +20,31 @@ const (
 )
 
 type Event struct {
-	ID          int64           `json:"id"`
-	Kind        Kind            `json:"kind"`
-	CapturedAt  time.Time       `json:"captured_at"`
-	Text        string          `json:"text"`
-	App         string          `json:"app,omitempty"`
-	Window      string          `json:"window,omitempty"`
-	MediaPath   string          `json:"media_path"`
-	DurationMS  int64           `json:"duration_ms,omitempty"`
-	TextSource  string          `json:"text_source,omitempty"`
-	DisplayID   uint32          `json:"display_id,omitempty"`
-	AudioSource string          `json:"audio_source,omitempty"`
-	Metadata    json.RawMessage `json:"metadata,omitempty"`
-	Rank        float64         `json:"rank,omitempty"`
+	ID          int64     `json:"id"`
+	Kind        Kind      `json:"kind"`
+	CapturedAt  time.Time `json:"captured_at"`
+	Text        string    `json:"text"`
+	App         string    `json:"app,omitempty"`
+	Window      string    `json:"window,omitempty"`
+	MediaPath   string    `json:"media_path"`
+	DurationMS  int64     `json:"duration_ms,omitempty"`
+	TextSource  string    `json:"text_source,omitempty"`
+	DisplayID   uint32    `json:"display_id,omitempty"`
+	AudioSource string    `json:"audio_source,omitempty"`
+	// AudioAttribution says how SourceApps was earned; see AudioAttribution.
+	// Empty on screen rows and on audio rows predating the column.
+	AudioAttribution string `json:"audio_attribution,omitempty"`
+	// SourceApps is the raw source_apps_json column. It stays raw for the same
+	// reason Metadata does — the store stores it and does not interpret it — and
+	// because "" and "[]" mean different things that a decoded slice cannot hold
+	// apart. Read it with DecodeSourceApps.
+	SourceApps string `json:"source_apps,omitempty"`
+	// StreamOffsetMS is how far into the capture session this chunk began. It is
+	// the exact, drift-free grid position that captured_at used to be before
+	// captured_at became a measured instant; nil means it was never recorded.
+	StreamOffsetMS *int64          `json:"stream_offset_ms,omitempty"`
+	Metadata       json.RawMessage `json:"metadata,omitempty"`
+	Rank           float64         `json:"rank,omitempty"`
 }
 
 type SearchOptions struct {
@@ -119,12 +131,50 @@ func (s *Store) Insert(ctx context.Context, event *Event) error {
 	if !json.Valid(event.Metadata) {
 		return errors.New("event metadata is not valid JSON")
 	}
+	if _, err := ParseAudioAttribution(event.AudioAttribution); err != nil {
+		return err
+	}
+	// A screen row carrying an audio attribution would fork what the column means
+	// by row kind, which is the defect this column exists to undo rather than
+	// repeat.
+	if event.Kind == KindScreen && event.AudioAttribution != "" {
+		return fmt.Errorf("screen event carries audio attribution %q", event.AudioAttribution)
+	}
+	// Decoding, not merely json.Valid: a syntactically fine but wrongly shaped
+	// payload such as `["Comet"]` parses as JSON and then fails to decode, so
+	// validating only syntax stores provenance nothing can read. Downstream that
+	// is worse than rejecting it — the MCP boundary silently drops an
+	// undecodable list, so the row looks like it simply had no source.
+	sourceApps, _, err := DecodeSourceApps(event.SourceApps)
+	if err != nil {
+		return err
+	}
+	// Microphone audio is never attributed to an application. The rule is decided
+	// in internal/capture, but it is enforced here as well because it is a
+	// guarantee the whole repository makes to its users — and a guarantee that
+	// rests on one caller getting it right is one a second writer can break
+	// silently. Attributing room audio invents a source that outlives its
+	// evidence: the WAV is deleted on the retention schedule while whatever was
+	// built from it survives.
+	if event.AudioSource == AudioOriginMicrophone {
+		if attribution := AudioAttribution(event.AudioAttribution); attribution != "" &&
+			attribution != AttributionUnattributed {
+			return fmt.Errorf("microphone event carries attribution %q; microphone audio has no "+
+				"identifiable source", event.AudioAttribution)
+		}
+		if len(sourceApps) > 0 {
+			return errors.New("microphone event names a source application; microphone audio has " +
+				"no identifiable source")
+		}
+	}
 	result, err := s.db.ExecContext(ctx, `
 INSERT INTO events(kind, captured_at, text, app, window, media_path, duration_ms,
-                   text_source, display_id, audio_source, metadata_json)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, event.Kind, event.CapturedAt.UTC().Format(time.RFC3339Nano),
+                   text_source, display_id, audio_source, audio_attribution,
+                   source_apps_json, stream_offset_ms, metadata_json)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, event.Kind, FormatCapturedAt(event.CapturedAt),
 		event.Text, event.App, event.Window, event.MediaPath, event.DurationMS,
-		event.TextSource, event.DisplayID, event.AudioSource, string(event.Metadata))
+		event.TextSource, event.DisplayID, event.AudioSource, event.AudioAttribution,
+		event.SourceApps, nullableInt(event.StreamOffsetMS), string(event.Metadata))
 	if err != nil {
 		return fmt.Errorf("insert event: %w", err)
 	}
@@ -187,14 +237,13 @@ func (s *Store) Search(ctx context.Context, opts SearchOptions) ([]Event, error)
 	}
 	if opts.Since != nil {
 		where = append(where, "e.captured_at >= ?")
-		args = append(args, opts.Since.UTC().Format(time.RFC3339Nano))
+		args = append(args, LowerCapturedAtBound(*opts.Since))
 	}
 	if opts.Until != nil {
 		where = append(where, "e.captured_at <= ?")
-		args = append(args, opts.Until.UTC().Format(time.RFC3339Nano))
+		args = append(args, UpperCapturedAtBound(*opts.Until))
 	}
-	query := `SELECT e.id, e.kind, e.captured_at, e.text, e.app, e.window,
-e.media_path, e.duration_ms, e.text_source, e.display_id, e.audio_source, e.metadata_json,
+	query := `SELECT ` + prefixedEventColumns("e.") + `,
 ` + rank + ` AS rank FROM ` + from
 	if len(where) > 0 {
 		query += " WHERE " + strings.Join(where, " AND ")
@@ -214,17 +263,9 @@ e.media_path, e.duration_ms, e.text_source, e.display_id, e.audio_source, e.meta
 	events := make([]Event, 0)
 	for rows.Next() {
 		var event Event
-		var capturedAt, metadata string
-		if err := rows.Scan(&event.ID, &event.Kind, &capturedAt, &event.Text, &event.App,
-			&event.Window, &event.MediaPath, &event.DurationMS, &event.TextSource, &event.DisplayID,
-			&event.AudioSource, &metadata, &event.Rank); err != nil {
+		if err := scanEvent(rows, &event, &event.Rank); err != nil {
 			return nil, fmt.Errorf("scan search result: %w", err)
 		}
-		event.CapturedAt, err = time.Parse(time.RFC3339Nano, capturedAt)
-		if err != nil {
-			return nil, fmt.Errorf("parse event timestamp %q: %w", capturedAt, err)
-		}
-		event.Metadata = json.RawMessage(metadata)
 		events = append(events, event)
 	}
 	if err := rows.Err(); err != nil {
@@ -233,17 +274,62 @@ e.media_path, e.duration_ms, e.text_source, e.display_id, e.audio_source, e.meta
 	return events, nil
 }
 
-// eventSelect is the column list every queryEvents caller must select, in the
-// order queryEvents scans them. Keeping it in one place means a new column is a
-// single edit rather than four that fail at runtime if one is missed.
-const eventSelect = `SELECT id, kind, captured_at, text, app, window, media_path, duration_ms,
-text_source, display_id, audio_source, metadata_json FROM events`
+// eventColumns is the column list every event query selects, in the order
+// scanEvent reads them. Keeping it in one place means a new column is a single
+// edit rather than several that fail at runtime if one is missed — and Search
+// and queryEvents, which maintained the list separately, are exactly the pair
+// that would drift.
+const eventColumns = `id, kind, captured_at, text, app, window, media_path, duration_ms,
+text_source, display_id, audio_source, audio_attribution, source_apps_json, stream_offset_ms,
+metadata_json`
+
+const eventSelect = `SELECT ` + eventColumns + ` FROM events`
+
+// prefixedEventColumns qualifies every column with a table alias. Search joins
+// events_fts against events, where text, app, and window are ambiguous without
+// one.
+func prefixedEventColumns(prefix string) string {
+	parts := strings.Split(eventColumns, ",")
+	for i, part := range parts {
+		parts[i] = prefix + strings.TrimSpace(part)
+	}
+	return strings.Join(parts, ", ")
+}
+
+// rowScanner is satisfied by both *sql.Row and *sql.Rows.
+type rowScanner interface{ Scan(...any) error }
+
+// scanEvent reads one row selected with eventColumns. Both query paths go
+// through it so the column list and the scan order cannot disagree.
+func scanEvent(row rowScanner, event *Event, extra ...any) error {
+	var capturedAt, metadata string
+	var streamOffset sql.NullInt64
+	dest := []any{&event.ID, &event.Kind, &capturedAt, &event.Text, &event.App,
+		&event.Window, &event.MediaPath, &event.DurationMS, &event.TextSource, &event.DisplayID,
+		&event.AudioSource, &event.AudioAttribution, &event.SourceApps, &streamOffset, &metadata}
+	if err := row.Scan(append(dest, extra...)...); err != nil {
+		return err
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, capturedAt)
+	if err != nil {
+		return fmt.Errorf("parse event timestamp %q: %w", capturedAt, err)
+	}
+	event.CapturedAt = parsed
+	if streamOffset.Valid {
+		value := streamOffset.Int64
+		event.StreamOffsetMS = &value
+	}
+	event.Metadata = json.RawMessage(metadata)
+	return nil
+}
 
 // Expired returns events captured strictly before the cutoff, oldest first.
 // A limit of zero or less means no limit.
 func (s *Store) Expired(ctx context.Context, before time.Time, limit int) ([]Event, error) {
 	query := eventSelect + ` WHERE captured_at < ? ORDER BY captured_at ASC`
-	args := []any{before.UTC().Format(time.RFC3339Nano)}
+	// Strictly-before, so the endpoint itself must be excluded under either
+	// rendering: the lower bound is the one that does that.
+	args := []any{LowerCapturedAtBound(before)}
 	if limit > 0 {
 		query += " LIMIT ?"
 		args = append(args, limit)
@@ -301,17 +387,9 @@ func (s *Store) queryEvents(ctx context.Context, query string, args ...any) ([]E
 	events := make([]Event, 0)
 	for rows.Next() {
 		var event Event
-		var capturedAt, metadata string
-		if err := rows.Scan(&event.ID, &event.Kind, &capturedAt, &event.Text, &event.App,
-			&event.Window, &event.MediaPath, &event.DurationMS, &event.TextSource, &event.DisplayID,
-			&event.AudioSource, &metadata); err != nil {
+		if err := scanEvent(rows, &event); err != nil {
 			return nil, fmt.Errorf("scan event: %w", err)
 		}
-		event.CapturedAt, err = time.Parse(time.RFC3339Nano, capturedAt)
-		if err != nil {
-			return nil, fmt.Errorf("parse event timestamp %q: %w", capturedAt, err)
-		}
-		event.Metadata = json.RawMessage(metadata)
 		events = append(events, event)
 	}
 	if err := rows.Err(); err != nil {

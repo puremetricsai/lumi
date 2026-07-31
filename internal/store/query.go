@@ -149,7 +149,7 @@ FROM events WHERE kind = ? AND captured_at >= ?`
 	// COUNT is 0 over an empty set but SUM and MAX are NULL, so both need a
 	// destination that tolerates it.
 	err := s.db.QueryRowContext(ctx, query, string(KindScreen), string(KindScreen),
-		since.UTC().Format(time.RFC3339Nano)).
+		LowerCapturedAtBound(since)).
 		Scan(&report.Total, &report.Unattributed, &lastAttributed)
 	if err != nil {
 		return AttributionHealthReport{}, fmt.Errorf("read attribution health: %w", err)
@@ -185,11 +185,11 @@ func (s *Store) ListAttribution(ctx context.Context, opts AttributionOptions) ([
 	}
 	if opts.Since != nil {
 		where = append(where, "captured_at >= ?")
-		args = append(args, opts.Since.UTC().Format(time.RFC3339Nano))
+		args = append(args, LowerCapturedAtBound(*opts.Since))
 	}
 	if opts.Until != nil {
 		where = append(where, "captured_at <= ?")
-		args = append(args, opts.Until.UTC().Format(time.RFC3339Nano))
+		args = append(args, UpperCapturedAtBound(*opts.Until))
 	}
 	if opts.Kind != "" {
 		where = append(where, "kind = ?")

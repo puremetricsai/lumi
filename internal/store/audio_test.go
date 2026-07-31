@@ -241,7 +241,7 @@ func TestAudioTracksAt(t *testing.T) {
 	defer s.Close()
 
 	base := time.Date(2026, 7, 29, 9, 13, 16, 493218000, time.UTC)
-	key := base.UTC().Format(time.RFC3339Nano)
+	key := FormatCapturedAt(base)
 	events := []Event{
 		{Kind: KindAudio, CapturedAt: base, AudioSource: "system", Text: "system heard this", MediaPath: "sys.wav"},
 		{Kind: KindScreen, CapturedAt: base, Text: "screen at same time", MediaPath: "s.jpg"},
@@ -253,7 +253,7 @@ func TestAudioTracksAt(t *testing.T) {
 		}
 	}
 
-	got, err := s.AudioTracksAt(ctx, []string{key})
+	got, err := s.AudioTracksAt(ctx, []time.Time{base})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,9 +285,9 @@ func TestAudioTracksAtBatchesPastVariableLimit(t *testing.T) {
 	defer s.Close()
 
 	base := time.Date(2026, 7, 29, 9, 0, 0, 0, time.UTC)
-	times := make([]string, deleteBatchSize*2+5) // > 900, forces multiple batches
+	times := make([]time.Time, deleteBatchSize*2+5) // > 900, forces multiple batches
 	for i := range times {
-		times[i] = base.Add(time.Duration(i) * time.Second).UTC().Format(time.RFC3339Nano)
+		times[i] = base.Add(time.Duration(i) * time.Second)
 	}
 	if _, err := s.AudioTracksAt(ctx, times); err != nil {
 		t.Fatalf("batched query should not trip the variable limit: %v", err)
