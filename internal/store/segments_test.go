@@ -544,6 +544,333 @@ func TestTranscriptMinConfidenceDefaultsToReturningEverything(t *testing.T) {
 	}
 }
 
+// TestTranscriptReportsWhatMinConfidenceRemoved is a regression test for a
+// silent, one-sided deletion found in review.
+//
+// Confidence is not comparable across origins: internal/transcript's crosstalk
+// and ambiguity multipliers reach microphone-derived turns alone, so on a live
+// index internal turns scored 0.682-0.983 while external turns scored
+// 0.331-0.592. One threshold at 0.6
+// therefore deletes one whole side of the conversation and returns a transcript
+// that looks complete. The counts are the only thing that can reveal a removal
+// the caller did not know it was asking for.
+func TestTranscriptReportsWhatMinConfidenceRemoved(t *testing.T) {
+	ctx := context.Background()
+	s, _ := segmentStore(t)
+	at := time.Date(2026, 7, 29, 19, 0, 0, 0, time.UTC)
+	systemID, micID, key := audioChunk(t, s, at)
+	if err := s.ReplaceChunkSegments(ctx, key, []Segment{
+		{EventID: systemID, Seq: 0, Origin: OriginInternal, SourceTrack: "system",
+			Text: "the machine spoke", Confidence: 0.9, OrderConfidence: "exact"},
+		{EventID: micID, Seq: 1, Origin: OriginExternal, SourceTrack: "microphone",
+			Text: "the room replied", Confidence: 0.36, OrderConfidence: "exact"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	window := TranscriptOptions{Since: at.Add(-time.Hour), Until: at.Add(time.Hour)}
+
+	all, err := s.Transcript(ctx, window)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all.ConfidenceFiltered) != 0 {
+		t.Errorf("the default threshold reported %v removed; it removes nothing", all.ConfidenceFiltered)
+	}
+
+	strict := window
+	strict.MinConfidence = 0.6
+	filtered, err := s.Transcript(ctx, strict)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(filtered.Turns) != 1 || filtered.Turns[0].Origin != OriginInternal {
+		t.Fatalf("threshold returned %+v, want the internal turn alone", filtered.Turns)
+	}
+	if got := filtered.ConfidenceFiltered[OriginExternal]; got != 1 {
+		t.Errorf("removed %d external turns, want 1: %v", got, filtered.ConfidenceFiltered)
+	}
+	if _, ok := filtered.ConfidenceFiltered[OriginInternal]; ok {
+		t.Errorf("an origin nothing was removed from is reported: %v", filtered.ConfidenceFiltered)
+	}
+
+	// A turn the caller excluded by naming an origin is not a confidence removal.
+	// Reporting it as one would blame the threshold for a filter the caller can
+	// already see it set, and bury the asymmetry this count exists to expose.
+	byOrigin := window
+	byOrigin.Origin = OriginInternal
+	byOrigin.MinConfidence = 0.6
+	narrowed, err := s.Transcript(ctx, byOrigin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(narrowed.ConfidenceFiltered) != 0 {
+		t.Errorf("the origin filter was counted as a confidence removal: %v", narrowed.ConfidenceFiltered)
+	}
+}
+
+// TestConfidenceRemovalsStopAtTheCappedPage pins the counts to what this page
+// covers: everything before ResumeFrom, which is where the next page begins. The
+// chunk sitting exactly on that bound is the one exception, covered separately by
+// TestConfidenceRemovalsStopAtTheBoundaryEvenWhenItOverlaps.
+//
+// The cap is applied after filtering and drags CoveredUntil and ResumeFrom back
+// with it, so a tally taken over every assembled turn describes removals from
+// past the point this page stops — and the next page, resuming at ResumeFrom,
+// reads those same turns and counts them again. A number that both overstates
+// the page and double-counts across pages is worse than no number.
+func TestConfidenceRemovalsStopAtTheCappedPage(t *testing.T) {
+	ctx := context.Background()
+	s, _ := segmentStore(t)
+	base := time.Date(2026, 7, 29, 20, 0, 0, 0, time.UTC)
+	for i := range 4 {
+		at := base.Add(time.Duration(i) * time.Minute)
+		systemID, micID, key := audioChunk(t, s, at)
+		if err := s.ReplaceChunkSegments(ctx, key, []Segment{
+			{EventID: systemID, Seq: 0, Origin: OriginInternal, SourceTrack: "system",
+				Text: "machine line", Confidence: 0.9, OrderConfidence: "exact"},
+			{EventID: micID, Seq: 1, Origin: OriginExternal, SourceTrack: "microphone",
+				Text: "room line", Confidence: 0.36, OrderConfidence: "exact"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Every external turn fails the threshold; the cap then keeps two of the four
+	// internal turns that passed it.
+	page, err := s.Transcript(ctx, TranscriptOptions{
+		Since: base.Add(-time.Hour), Until: base.Add(time.Hour),
+		MinConfidence: 0.6, MaxTurns: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !page.Capped || len(page.Turns) != 2 {
+		t.Fatalf("got %d turns, capped=%v; want a 2-turn capped page", len(page.Turns), page.Capped)
+	}
+	if got := page.ConfidenceFiltered[OriginExternal]; got != 2 {
+		t.Errorf("page reports %d external turns removed, want the 2 inside its own coverage: %v",
+			got, page.ConfidenceFiltered)
+	}
+
+	// The turns the cap deferred are counted by the page that actually returns
+	// them, so paging through the range totals each removal once.
+	rest, err := s.Transcript(ctx, TranscriptOptions{
+		Since: page.ResumeFrom, Until: base.Add(time.Hour),
+		MinConfidence: 0.6, MaxTurns: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := rest.ConfidenceFiltered[OriginExternal]; got != 2 {
+		t.Errorf("the second page reports %d external turns removed, want 2: %v",
+			got, rest.ConfidenceFiltered)
+	}
+}
+
+// TestConfidenceRemovalsSurviveAChunkThatOnlyHeldRejectedTurns is the gap
+// between the two boundaries a capped page carries.
+//
+// CoveredUntil is the last turn this page *returned*; ResumeFrom is the first
+// turn it *deferred*. A chunk between them holding nothing but rejected turns
+// belongs to neither if the count is taken against CoveredUntil: page one skips
+// it as beyond its coverage, and page two starts after it and never reads it. The
+// removal then exists in no page's accounting at all, which is the failure the
+// counts were added to prevent, reproduced one level up.
+func TestConfidenceRemovalsSurviveAChunkThatOnlyHeldRejectedTurns(t *testing.T) {
+	ctx := context.Background()
+	s, _ := segmentStore(t)
+	base := time.Date(2026, 7, 29, 21, 0, 0, 0, time.UTC)
+
+	// Alternating origins so nothing merges across the chunk boundaries, and the
+	// middle chunk holds a rejected turn alone.
+	for i, segment := range []Segment{
+		{Origin: OriginInternal, SourceTrack: "system", Text: "machine line", Confidence: 0.9},
+		{Origin: OriginExternal, SourceTrack: "microphone", Text: "room line", Confidence: 0.36},
+		{Origin: OriginInternal, SourceTrack: "system", Text: "machine again", Confidence: 0.9},
+	} {
+		at := base.Add(time.Duration(i) * time.Minute)
+		systemID, micID, key := audioChunk(t, s, at)
+		segment.EventID = systemID
+		if segment.SourceTrack == "microphone" {
+			segment.EventID = micID
+		}
+		segment.OrderConfidence = "exact"
+		if err := s.ReplaceChunkSegments(ctx, key, []Segment{segment}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	page, err := s.Transcript(ctx, TranscriptOptions{
+		Since: base.Add(-time.Hour), Until: base.Add(time.Hour),
+		MinConfidence: 0.6, MaxTurns: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !page.Capped || len(page.Turns) != 1 {
+		t.Fatalf("got %d turns, capped=%v; want a 1-turn capped page", len(page.Turns), page.Capped)
+	}
+	// The rejected chunk sits before ResumeFrom, so page two will never read it.
+	// This page is the only one that can report it.
+	if got := page.ConfidenceFiltered[OriginExternal]; got != 1 {
+		t.Errorf("page reports %d external turns removed, want 1: the chunk between CoveredUntil "+
+			"and ResumeFrom is reported by no page at all", got)
+	}
+
+	rest, err := s.Transcript(ctx, TranscriptOptions{
+		Since: page.ResumeFrom, Until: base.Add(time.Hour),
+		MinConfidence: 0.6, MaxTurns: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := rest.ConfidenceFiltered[OriginExternal]; got != 0 {
+		t.Errorf("the second page counts %d external removals it never read", got)
+	}
+}
+
+// TestConfidenceRemovalsCountTheChunkTooLargeToReturnWhole is the degenerate
+// boundary, where ResumeFrom and CoveredUntil name the same chunk.
+//
+// One chunk over the segment ceiling is the case trimToWholeChunks cannot
+// paginate: it keeps the prefix and points ResumeFrom back at the very chunk it
+// just served, so the overlap is unavoidable rather than accidental. A removal
+// bound that excludes everything at or after ResumeFrom therefore excludes the
+// only chunk on the page, and the next request — landing on the same chunk and
+// the same ceiling — excludes it again. The page reports nothing removed while
+// having removed something, which is the whole defect these counts exist to
+// prevent, reproduced in the one place it is hardest to see.
+func TestConfidenceRemovalsCountTheChunkTooLargeToReturnWhole(t *testing.T) {
+	ctx := context.Background()
+	s, _ := segmentStore(t)
+	at := time.Date(2026, 7, 30, 9, 0, 0, 0, time.UTC)
+	event := &Event{Kind: KindAudio, CapturedAt: at, Text: "x",
+		MediaPath: "/tmp/microphone.wav", AudioSource: "microphone"}
+	if err := s.Insert(ctx, event); err != nil {
+		t.Fatal(err)
+	}
+	// One segment past the ceiling, all in this chunk, all below any threshold.
+	rows := make([]Segment, 0, maxTranscriptSegments+1)
+	for i := range maxTranscriptSegments + 1 {
+		rows = append(rows, Segment{EventID: event.ID, Seq: i, Origin: OriginExternal,
+			SourceTrack: "microphone", Text: "word", Confidence: 0.36, OrderConfidence: "sequence"})
+	}
+	if err := s.ReplaceChunkSegments(ctx, formatTime(at), rows); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := s.Transcript(ctx, TranscriptOptions{
+		Since: at.Add(-time.Hour), Until: at.Add(time.Hour), MinConfidence: 0.6,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Truncated {
+		t.Fatalf("a chunk past the segment ceiling came back as a complete transcript")
+	}
+	if !result.ResumeFrom.Equal(result.CoveredUntil) {
+		t.Fatalf("ResumeFrom %s and CoveredUntil %s differ; this is not the degenerate case",
+			result.ResumeFrom, result.CoveredUntil)
+	}
+	if got := result.ConfidenceFiltered[OriginExternal]; got == 0 {
+		t.Error("the page removed every turn it held and reported nothing removed")
+	}
+}
+
+// TestConfidenceRemovalsStopAtTheBoundaryEvenWhenItOverlaps is the other half of
+// the equal-boundary case.
+//
+// A cap falling inside a chunk leaves ResumeFrom and CoveredUntil pointing at the
+// same chunk, and that chunk's own removals are counted here because the next
+// page re-reads it either way. That accepted overlap must not become a licence to
+// count *everything*: a rejected turn in a later chunk was never part of this
+// page's ground, and the next page — starting inclusively at ResumeFrom — reads
+// and reports it. Counting it here too makes it the one thing the overlap is not
+// supposed to produce, a removal attributed to a page that never covered it.
+func TestConfidenceRemovalsStopAtTheBoundaryEvenWhenItOverlaps(t *testing.T) {
+	ctx := context.Background()
+	s, _ := segmentStore(t)
+	base := time.Date(2026, 7, 30, 10, 0, 0, 0, time.UTC)
+
+	// Two passing turns in the first chunk, so the cap falls inside it and both
+	// boundaries land on the same chunk.
+	systemID, micID, key := audioChunk(t, s, base)
+	if err := s.ReplaceChunkSegments(ctx, key, []Segment{
+		{EventID: systemID, Seq: 0, Origin: OriginInternal, SourceTrack: "system",
+			Text: "machine line", Confidence: 0.9, OrderConfidence: "exact"},
+		{EventID: micID, Seq: 1, Origin: OriginExternal, SourceTrack: "microphone",
+			Text: "room line", Confidence: 0.9, OrderConfidence: "exact"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// A later chunk holding one rejected turn, internal so it cannot merge with
+	// the external turn before it.
+	laterSystemID, _, laterKey := audioChunk(t, s, base.Add(time.Minute))
+	if err := s.ReplaceChunkSegments(ctx, laterKey, []Segment{
+		{EventID: laterSystemID, Seq: 0, Origin: OriginInternal, SourceTrack: "system",
+			Text: "faint machine line", Confidence: 0.36, OrderConfidence: "exact"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	page, err := s.Transcript(ctx, TranscriptOptions{
+		Since: base.Add(-time.Hour), Until: base.Add(time.Hour),
+		MinConfidence: 0.6, MaxTurns: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !page.Capped {
+		t.Fatal("the cap did not fire")
+	}
+	if page.ResumeFrom.After(page.CoveredUntil) {
+		t.Fatalf("ResumeFrom %s is past CoveredUntil %s; this is not the overlapping case",
+			page.ResumeFrom, page.CoveredUntil)
+	}
+	if got := page.ConfidenceFiltered[OriginInternal]; got != 0 {
+		t.Errorf("page counts %d internal removals from a chunk past its own ResumeFrom", got)
+	}
+
+	// The page that actually reaches that chunk is the one that reports it.
+	rest, err := s.Transcript(ctx, TranscriptOptions{
+		Since: page.ResumeFrom, Until: base.Add(time.Hour), MinConfidence: 0.6,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := rest.ConfidenceFiltered[OriginInternal]; got != 1 {
+		t.Errorf("the page covering the later chunk reports %d internal removals, want 1", got)
+	}
+}
+
+// TestConfidenceRemovalsReadAsASentence covers the rendering every consumer
+// shares. Ordering is fixed rather than map order so one removal never reads two
+// ways between calls, and the counts are pluralized because the string is shown
+// to a person.
+func TestConfidenceRemovalsReadAsASentence(t *testing.T) {
+	for _, testCase := range []struct {
+		name     string
+		filtered map[string]int
+		want     string
+	}{
+		{"nothing removed", nil, ""},
+		{"one turn is singular", map[string]int{OriginExternal: 1}, "1 external turn"},
+		{"several turns are plural", map[string]int{OriginExternal: 3}, "3 external turns"},
+		{"two origins are joined and sorted", map[string]int{
+			OriginUnknown: 1, OriginExternal: 3}, "3 external turns and 1 unknown turn"},
+		{"three origins keep the serial comma out of the final join", map[string]int{
+			OriginUnknown: 1, OriginExternal: 3, OriginInternal: 2},
+			"3 external turns, 2 internal turns and 1 unknown turn"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			got := TranscriptResult{ConfidenceFiltered: testCase.filtered}.ConfidenceRemovals()
+			if got != testCase.want {
+				t.Errorf("got %q, want %q", got, testCase.want)
+			}
+		})
+	}
+}
+
 // TestTranscriptTruncationIsReportedAndCoverageFollowsIt is a regression test for
 // a silent truncation found in review.
 //

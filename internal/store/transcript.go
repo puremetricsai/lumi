@@ -2,6 +2,10 @@ package store
 
 import (
 	"context"
+	"fmt"
+	"maps"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/puremetricsai/lumi/internal/transcript"
@@ -67,6 +71,32 @@ type TranscriptResult struct {
 	// that no backfill can ever move, so a caller that reports the gap without
 	// them ends up recommending a command that cannot change the number.
 	FailedChunks int64 `json:"failed_chunks,omitempty"`
+	// ConfidenceFiltered counts the turns MinConfidence removed, keyed by origin.
+	// It is empty when the threshold removed nothing, so a caller that did not
+	// filter is never handed a number to interpret.
+	//
+	// It is broken down by origin rather than totalled because a turn's confidence
+	// is not comparable across origins, and one number would conceal exactly the
+	// failure this field exists to reveal. internal/transcript's crosstalk and
+	// ambiguity multipliers reach microphone-derived segments alone — a timed
+	// system segment is machine audio unconditionally and is never marked down for
+	// attribution — so on the timed path a threshold sorts turns by which track
+	// recorded them at least as much as by how far they can be trusted. Measured
+	// on a live index, internal turns scored 0.682-0.983 and external turns
+	// 0.331-0.592 with no overlap, so min_confidence 0.6 took every external turn
+	// and no internal one and returned a transcript that looked complete. Turns
+	// the caller excluded by naming an Origin are not counted, since that omission
+	// is one the caller already knows it asked for.
+	//
+	// The asymmetry is not the only way the threshold surprises: the text path
+	// penalises every segment it emits, including system ones, so a chunk with no
+	// usable timings scores 0.48 on both sides and the same 0.6 cuts the machine
+	// away too. That is why what was removed is reported rather than predicted.
+	//
+	// A map rather than a field per origin, because the origin vocabulary is
+	// deliberately open — the column carries no CHECK so a machine-side
+	// participant can be distinguished later without a migration.
+	ConfidenceFiltered map[string]int `json:"confidence_filtered,omitempty"`
 	// Capped reports that turns were dropped from the tail to satisfy MaxTurns.
 	Capped bool `json:"capped,omitempty"`
 	// Truncated reports that the window held more segments than one call reads,
@@ -112,6 +142,37 @@ func (r TranscriptResult) MissingChunks() int64 {
 // can fill it.
 func (r TranscriptResult) RecoverableChunks() int64 {
 	return r.MissingChunks() - r.FailedChunks
+}
+
+// ConfidenceRemovals renders what MinConfidence took, as "3 external turns" or
+// "3 external turns and 1 unknown turn". It is empty when nothing was removed.
+//
+// It is a derivation every reader of a filtered transcript needs and none of them
+// should restate, for the same reason RecoverableChunks is: `lumi transcript` and
+// `get_transcript` both have to say it, and two copies of the rule are correct
+// only until one of them moves.
+//
+// The breakdown is always by origin and never a single total. One number reads as
+// ordinary quality filtering, and the fact worth reporting is which side of the
+// conversation went. Origins are sorted so the same removal always reads the same
+// way rather than following map order.
+func (r TranscriptResult) ConfidenceRemovals() string {
+	if len(r.ConfidenceFiltered) == 0 {
+		return ""
+	}
+	origins := slices.Sorted(maps.Keys(r.ConfidenceFiltered))
+	phrases := make([]string, 0, len(origins))
+	for _, origin := range origins {
+		turns := "turns"
+		if r.ConfidenceFiltered[origin] == 1 {
+			turns = "turn"
+		}
+		phrases = append(phrases, fmt.Sprintf("%d %s %s", r.ConfidenceFiltered[origin], origin, turns))
+	}
+	if len(phrases) == 1 {
+		return phrases[0]
+	}
+	return strings.Join(phrases[:len(phrases)-1], ", ") + " and " + phrases[len(phrases)-1]
 }
 
 // Order confidence tiers, re-exported from internal/transcript so a caller can
@@ -191,11 +252,19 @@ func (s *Store) Transcript(ctx context.Context, opts TranscriptOptions) (Transcr
 	// the filtered list, and the boundary it leaves can only be read off the
 	// assembled turn, which knows the chunk it ended in.
 	kept := make([]transcript.Turn, 0, len(turns))
+	// The turns MinConfidence rejected, in the order they were assembled. They are
+	// counted only once the page boundary is final; see below.
+	var removed []transcript.Turn
 	for _, turn := range turns {
 		if opts.Origin != "" && string(turn.Origin) != opts.Origin {
 			continue
 		}
 		if turn.Confidence < opts.MinConfidence {
+			// Recorded after the origin filter, so a turn the caller excluded by
+			// name is never also reported as something the threshold took. Held
+			// with its capture time rather than tallied here, because the cap below
+			// can still move the page boundary back past some of these.
+			removed = append(removed, turn)
 			continue
 		}
 		row := TranscriptTurn{
@@ -231,6 +300,44 @@ func (s *Store) Transcript(ctx context.Context, opts TranscriptOptions) (Transcr
 		resumeFrom = kept[limit].CapturedAt
 	}
 	result.CoveredUntil, result.ResumeFrom = coveredUntil, resumeFrom
+
+	// Counted last, against the boundary the cap may just have moved.
+	//
+	// What these counts promise is what a page can actually keep: every turn this
+	// page's threshold removed from the ground this page covers. They do not
+	// promise that summing them across pages totals each removal once, because
+	// pages themselves do not partition that way — where ResumeFrom equals
+	// CoveredUntil the same chunk is deliberately served twice, and its turns are
+	// returned twice with it.
+	//
+	// The bound is ResumeFrom, never CoveredUntil. CoveredUntil is the last turn
+	// this page *returned*; ResumeFrom is the first it *deferred*; a chunk lying
+	// between them holding nothing but rejected turns belongs to neither under a
+	// CoveredUntil test — this page calls it out of range, the next page begins
+	// after it and never reads it, and the removal is reported by nobody. Since
+	// the follow-up read is inclusive at ResumeFrom, everything strictly before it
+	// is this page's to account for and everything past it is the next page's.
+	//
+	// The chunk sitting exactly on the bound is the only one both pages may claim,
+	// and only where ResumeFrom has not moved past CoveredUntil — a chunk too
+	// large to return whole, or a cap falling inside one. There the next page
+	// re-reads that chunk regardless, so excluding it would drop the boundary
+	// chunk — the whole page, where that chunk was too large to return whole —
+	// from its own accounting; the overlap is accepted exactly as it is for the
+	// turns themselves. That licence stops at the chunk on the boundary:
+	// a later chunk was never this page's ground, and the next page reports it.
+	// A zero ResumeFrom means the transcript is complete and all of it is ours.
+	overlapping := !resumeFrom.IsZero() && !resumeFrom.After(coveredUntil)
+	for _, turn := range removed {
+		if !resumeFrom.IsZero() && !turn.CapturedAt.Before(resumeFrom) &&
+			!(overlapping && turn.CapturedAt.Equal(resumeFrom)) {
+			continue
+		}
+		if result.ConfidenceFiltered == nil {
+			result.ConfidenceFiltered = make(map[string]int, 2)
+		}
+		result.ConfidenceFiltered[string(turn.Origin)]++
+	}
 
 	// Coverage is measured over what the turns reach, not over what was asked
 	// for; see TranscriptResult.Chunks.
