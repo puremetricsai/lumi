@@ -16,11 +16,12 @@ lexicographically — any new time column must go through `FormatCapturedAt` or 
   order is a wrong answer at any range boundary. `TestLexicographicOrderMatchesChronologicalOrder` pins it.
 - **A `captured_at` key can never be rebuilt from an instant by picking one layout.** The index holds two
   renderings: rows written before `CapturedAtLayout` existed carry `RFC3339Nano`'s trimmed form, rows
-  since carry the fixed-width one. `AudioTracksAt` therefore takes `[]time.Time`, offers *both* renderings
-  to its `IN (…)` (`capturedAtKeys`), and keys its result canonically rather than by the bytes it read.
-  Two successive designs of this got it wrong in opposite directions — one truncating, one padding — and
-  both failed the same way: `AudioTracksAt` matches nothing, and `OriginOf` labels a real two-track chunk
-  `silent`. `TestLegacyNanosecondRowsStillResolveTheirAudioTracks` is the guard.
+  since carry the fixed-width one. So no equality lookup may mint its key from a `time.Time` — every one
+  here (`SegmentsForChunk`, `ReplaceChunkSegments`, `AudioEventsAt`) is handed the stored string, from
+  `ChunksMissingSegments` or `AudioChunkTimes` or from the recorder's own stamp. Two successive designs of
+  a since-removed whole-chunk reader got this wrong in opposite directions — one truncating, one padding —
+  and both failed the same way: the lookup matched nothing and a real two-track chunk read as empty, with
+  no error anywhere. Passing the stored bytes through is what removes the question.
 - **A range bound covers both renderings; an equality key must be exact.**
   `LowerCapturedAtBound`/`UpperCapturedAtBound` pick the smallest rendering for `>=`/`<` and the largest
   for `<=`, because a fixed-width upper bound silently excludes a legacy row sitting exactly on it —
@@ -43,10 +44,8 @@ lexicographically — any new time column must go through `FormatCapturedAt` or 
 
 Facts about querying live here, not in callers: `DefaultSearchLimit` (20) / `MaxSearchLimit` (500),
 `HasSearchableTerms`, `HasEvents`, `EventByID` (with `ErrEventNotFound`), `ListAttribution`.
-`CollapseAudioTracks` merges each chunk's mic/system duplicate into one survivor, returning `AudioChunk`
-provenance (`Origin` of `system`/`microphone`/`both`/`silent` plus every merged `AudioTrack`);
-`AudioTracksAt` re-reads every audio row at a set of timestamps so `Origin` describes the whole chunk even
-when a search matched one track.
+`Search` returns both tracks of an audio chunk as their own rows; nothing here merges them (see the audio
+section below).
 
 `audio_segments` (migration 4) holds each chunk's origin-attributed pieces, derived from events and never
 the reverse, so re-deriving them is always safe — that is what makes the backfill idempotent.
@@ -98,21 +97,24 @@ and `transcript.Segment` — shadow each other the way `internal/mcp`'s `Attribu
   `PRAGMA foreign_keys` is per-connection and a replaced pooled connection would silently stop enforcing
   it.
 
-## Audio collapse
+## Audio tracks
 
-- **System outranks the microphone on every duplicate, but never outranks a non-empty transcript with
-  silence.** `CollapseAudioTracks` orders survivors by `(hasText, isSystem, runeLen, -id)`, and the first
-  two keys *are* the rule — `hasText` above `isSystem` so a silent row never deletes a transcript;
-  `isSystem` above `runeLen` because the mic is re-recording the speakers, so the system track is the
-  cleaner original. Inverting either is silent data loss (`TestSystemAudioWinsEveryDuplicate`). The pair
-  shares one `captured_at` by construction (one `Audio.Record` call, one `now`), so collapse groups on the
-  timestamp, never id adjacency.
-- **Collapse must never become a SQL pre-filter.** An FTS query landing only in the microphone transcript
-  matches just that row, and a `NOT EXISTS` filter consulting the non-matching system row would drop the
-  only hit. Provenance therefore comes from `AudioTracksAt` reading the whole chunk, so `audio_origin` stays
-  truthful even where the survivor is not the system row. `audio_origin` is the only thing separating a
-  remote speaker or media (`system`) from the user's own voice (`microphone`). On the CLI collapse is opt-in
-  (`--collapse-audio`) so the default `--json` stays a bare `[]store.Event`.
+- **The two rows of a chunk are never merged, and nothing here may decide they hold the same sound.**
+  `Search` returns both, distinguished by `audio_source`. A shared `captured_at` is a shared 30-second
+  *interval*; the microphone re-records whatever the speakers play, but it also records the room, and the
+  two rows routinely carry different speech. `CollapseAudioTracks` used to merge them on the timestamp
+  alone, keep the system track, and report an `audio_origin` of `both` that its own comments described as
+  speaker bleed — an unverified claim. Reported from a live index: the microphone was carrying an entirely
+  separate talk, every word was dropped, and the merged result read as finished. Returning two rows is
+  obviously incomplete; returning one that looks whole is worse.
+- **Whether one track re-recorded the other is `internal/transcript`'s question, decided once.** It answers
+  per segment against word timings, token alignment and an energy envelope, stores the verdict as
+  `audio_segments.is_bleed`, and reaches callers through `Transcript` — which excludes a bleed span while
+  keeping the room speech that brackets it. A second, cruder copy of that rule in the search path is what
+  the deletion removed; the root `CLAUDE.md` rule about two copies of a rule is the general case.
+- **The pair still shares one `captured_at` by construction** (one `Audio.Record` call, one `now`), because
+  that string is the key `ReplaceChunkSegments` writes segments under and `ChunksMissingSegments` joins on.
+  That is now the only thing depending on it.
 
 ## Transcript assembly and coverage
 

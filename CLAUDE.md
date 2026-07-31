@@ -49,7 +49,7 @@ changing anything there** — the rationale lives with the code it constrains, n
 | --- | --- |
 | `internal/macosnative` | cgo/Objective-C bridge: ScreenCaptureKit, Accessibility, Vision, AVFoundation WAV writing, CoreAudio process enumeration, permission preflight. Non-macOS stub. |
 | `internal/capture` | `Recorder`: independent screen and audio goroutines, native processors behind small interfaces, everything in-process. Owns what an event's `app` means, and what produced an audio row's sound. |
-| `internal/store` | Single-file SQLite (`modernc.org/sqlite`, no cgo), FTS5, versioned migrations, search, audio collapse, `audio_segments`, transcript assembly and coverage. |
+| `internal/store` | Single-file SQLite (`modernc.org/sqlite`, no cgo), FTS5, versioned migrations, search, `audio_segments`, transcript assembly and coverage. |
 | `internal/transcript` | Pure: decides where captured sound came from (`internal`/`external`) and assembles turns. No database, cgo, or filesystem. |
 | `internal/wav` | Reads Lumi's mono 16-bit PCM WAVs and measures their energy. |
 | `internal/vocabulary` | The custom vocabulary file's format, cache, and cap. |

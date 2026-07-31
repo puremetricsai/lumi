@@ -80,7 +80,8 @@ type Transcription struct {
 
 // AudioChunk is one recording interval's worth of audio: every track captured
 // across the same span, sharing one start instant. That shared instant is what
-// makes the pair a chunk — collapse groups audio rows by timestamp, so both
+// makes the pair a chunk — ReplaceChunkSegments keys a chunk's segments by it,
+// and ChunksMissingSegments joins events.captured_at against that key — so both
 // tracks must be stamped from it and not from two separate clock reads.
 type AudioChunk struct {
 	// StartedAt is when the chunk's audio begins. Zero when the source could

@@ -24,14 +24,12 @@ const CapturedAtLayout = "2006-01-02T15:04:05.000000000Z"
 // FormatCapturedAt renders t as the string stored in captured_at. It is the only
 // way any caller may produce that key.
 //
-// It does not round or truncate. Two callers ask for this string for two
-// different reasons — one is *minting* an instant for a row about to be written,
-// the other is *rebuilding* a key for a row already stored — and only the first
-// could tolerate a precision change. Since a single function serves both, it
-// changes nothing: a lossy version silently turned an indexed
-// "…T19:33:48.123456789Z" row into a "…T19:33:48.123456Z" lookup that matched no
-// row at all, and AudioTracksAt returning nothing makes OriginOf label a real
-// two-track chunk "silent".
+// It does not round or truncate. Insert stamps events.captured_at with it and
+// ReplaceChunkSegments keys audio_segments with it, and ChunksMissingSegments
+// joins those two columns on equality — so a lossy version turns an indexed
+// "…T19:33:48.123456789Z" row into a "…T19:33:48.123456Z" key that matches no
+// row, parking every newly recorded chunk on the backfill queue forever and
+// reporting 0 % SegmentCoverage, with no error anywhere.
 func FormatCapturedAt(t time.Time) string {
 	return t.UTC().Format(CapturedAtLayout)
 }
@@ -47,8 +45,12 @@ func FormatCapturedAt(t time.Time) string {
 // rendering for a lower bound and the largest for an upper bound covers both
 // without widening the range to any instant that is not already inside it.
 //
-// These are bounds only. A key used for equality must still be exact, which is
-// what capturedAtKeys is for.
+// These are bounds only, and nothing may reuse them as an equality key: they
+// deliberately name an instant two ways, which is right for a comparison and
+// wrong for a lookup. Every equality caller here (SegmentsForChunk,
+// ReplaceChunkSegments, AudioEventsAt) is handed the stored string rather than
+// rebuilding one from an instant, which is what keeps the two renderings from
+// mattering at all.
 func LowerCapturedAtBound(t time.Time) string {
 	fixed, legacy := FormatCapturedAt(t), t.UTC().Format(time.RFC3339Nano)
 	if legacy < fixed {

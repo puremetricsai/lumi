@@ -5,8 +5,8 @@ Cobra commands (`record start`/`status`/`stop`, `search`, `mcp`, `prune`, `docto
 `capture.Recorder`; data flows one way from here and never back. `record start` detaches to the background
 by default (`--foreground` keeps it inline) as a re-exec tracked by a JSON state file and log under the data
 dir (`record_daemon.go`); `record stop` sends SIGTERM and waits for graceful shutdown. `search` offers exact
-case-insensitive app filtering, case-insensitive window-substring filtering, `--type all|screen|audio`, and
-`--collapse-audio`. `transcript` keeps its own `RunE` for the same reason `mcp` does: reading a transcript
+case-insensitive app filtering, case-insensitive window-substring filtering, and `--type all|screen|audio`;
+`--json` is a bare `[]store.Event` export and both tracks of an audio chunk stay separate rows. `transcript` keeps its own `RunE` for the same reason `mcp` does: reading a transcript
 is the useful thing, and `backfill` is maintenance hanging off it. `permissions --request` invokes native
 TCC flows — never add `tccutil reset` as a side effect.
 

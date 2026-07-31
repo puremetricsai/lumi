@@ -525,7 +525,7 @@ func (r *Recorder) consumeAudio(ctx context.Context, stream AudioStream) {
 
 // storeAudioChunk transcribes, indexes, and attributes one chunk. Both tracks
 // are stamped with the chunk's own start rather than a fresh clock read, so the
-// pair keeps the single captured_at that audio collapse groups on.
+// pair keeps the single captured_at that its segments are keyed by.
 //
 // The two attribution axes are resolved separately and mean different things.
 // App/Window say what the user was working in — one sample, exactly as before —

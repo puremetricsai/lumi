@@ -68,10 +68,12 @@ func runSearchCapturingStdout(t *testing.T, dataDir string, args ...string) stri
 	return out
 }
 
-// TestSearchJSONWithoutFlagStaysBareArray pins the faithful-export contract:
-// with no --collapse-audio, `lumi search --json` must emit a bare []store.Event
-// array, byte-for-byte what it emitted before this feature.
-func TestSearchJSONWithoutFlagStaysBareArray(t *testing.T) {
+// TestSearchJSONStaysBareArray pins the faithful-export contract: `lumi search
+// --json` emits a bare []store.Event array and both tracks of a chunk survive as
+// their own rows. Nothing on this path may decide that two rows sharing a
+// captured_at recorded the same sound — see internal/mcp's
+// TestSearchEventsKeepsBothTracksOfAChunk for what that cost.
+func TestSearchJSONStaysBareArray(t *testing.T) {
 	dataDir := t.TempDir()
 	base := time.Now().UTC().Truncate(time.Second)
 	seedAudioPair(t, dataDir, base, "system heard this", "microphone heard this")
@@ -90,56 +92,5 @@ func TestSearchJSONWithoutFlagStaysBareArray(t *testing.T) {
 	trimmed := strings.TrimSpace(out)
 	if strings.HasPrefix(trimmed, "{") {
 		t.Fatalf("default --json must be an array, not an object: %q", trimmed)
-	}
-}
-
-// TestSearchCollapseAudioJSONWrapsWithChunks pins that --collapse-audio --json
-// emits the wrapped {events, audio_chunks} view instead of the bare array.
-func TestSearchCollapseAudioJSONWrapsWithChunks(t *testing.T) {
-	dataDir := t.TempDir()
-	base := time.Now().UTC().Truncate(time.Second)
-	seedAudioPair(t, dataDir, base, "system heard this", "microphone heard this too")
-
-	out := runSearchCapturingStdout(t, dataDir, "--type", "audio", "--collapse-audio", "--json")
-
-	var view collapsedSearchView
-	if err := json.Unmarshal([]byte(out), &view); err != nil {
-		t.Fatalf("collapsed --json must decode into the wrapped view: %v\nout=%q", err, out)
-	}
-	if len(view.Events) != 1 {
-		t.Fatalf("expected one collapsed survivor, got %d", len(view.Events))
-	}
-	if view.Events[0].AudioSource != "system" {
-		t.Fatalf("survivor should be the system row, got %q", view.Events[0].AudioSource)
-	}
-	if len(view.AudioChunks) != 1 {
-		t.Fatalf("expected one audio_chunk, got %d", len(view.AudioChunks))
-	}
-	chunk := view.AudioChunks[0]
-	if chunk.EventID != view.Events[0].ID {
-		t.Fatalf("audio_chunk event_id %d must match survivor id %d", chunk.EventID, view.Events[0].ID)
-	}
-	if chunk.Origin != "both" {
-		t.Fatalf("origin = %q, want both", chunk.Origin)
-	}
-	if len(chunk.Tracks) != 2 {
-		t.Fatalf("expected both tracks in the chunk, got %d", len(chunk.Tracks))
-	}
-}
-
-// TestSearchCollapseAudioHumanShowsOrigin pins that the text output annotates a
-// collapsed audio row with its origin and merged ids.
-func TestSearchCollapseAudioHumanShowsOrigin(t *testing.T) {
-	dataDir := t.TempDir()
-	base := time.Now().UTC().Truncate(time.Second)
-	seedAudioPair(t, dataDir, base, "system heard this", "microphone heard this")
-
-	out := runSearchCapturingStdout(t, dataDir, "--type", "audio", "--collapse-audio")
-
-	if !strings.Contains(out, "origin=both") {
-		t.Fatalf("collapsed human output must show origin=both, got %q", out)
-	}
-	if !strings.Contains(out, "merged ") {
-		t.Fatalf("collapsed human output must list merged track ids, got %q", out)
 	}
 }

@@ -46,7 +46,7 @@ rows are shaped is `internal/store`'s; the labelling rules the recorder applies 
   each file holding that whole interval to within one sample buffer.
 - **A chunk's `captured_at` is the instant its audio began, *measured* at rotation** by reading the host
   clock and ageing it back to the boundary presentation timestamp. Both tracks of a chunk still share one
-  timestamp — that is what audio collapse groups on, and per-track stamps would break it.
+  timestamp — that is the key their segments are written under, and per-track stamps would break it.
   - It used to be arithmetic on the session anchor (`anchor + N×chunkDuration`). That is uniform but not
     observed: every audio timestamp in an index shared one sub-second fraction (`.943675136` across 24
     events in one measured sample), so clock drift was undetectable, a dropped chunk renumbered silently
@@ -161,10 +161,12 @@ chunks over eight minutes, and the ratio scales with how much the user switches 
   because `internal/cli` always wires `Recorder.AudioOutputs`; leaving it nil makes absence mean "never
   sampled" instead. That precondition is documented on the field rather than enforced with a marker,
   since Go's `internal/` rule puts the unwired state out of reach of anything but this module's tests.
-- **Both tracks of a chunk carry the same stamp.** `CollapseAudioTracks` picks a survivor by
-  `(hasText, isSystem, runeLen, -id)`, so per-track stamps would make the app a search reports depend on
-  which track happened to transcribe. Stamping identically makes the survivor's attribution stable by
-  construction, as the shared `captured_at` already is.
+- **Both tracks of a chunk carry the same stamp and the same attribution.** The stamp is the key
+  `ReplaceChunkSegments` writes the chunk's segments under, so a per-track one would split a chunk across
+  two keys and leave half of it on the backfill's derived queue forever. The attribution has to match for a
+  narrower reason: the tracks are attributed independently, so if they could disagree, which app a search
+  reported for a chunk would depend on which track happened to match. Stamping identically makes both
+  stable by construction.
 - **`events.text` for an audio row is the recognizer's results concatenated with no separator.** Runs
   carry their own leading whitespace. Segments derive from it, never the reverse, and joining with a space
   would silently re-index the corpus.

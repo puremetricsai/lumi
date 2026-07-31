@@ -50,6 +50,14 @@ func Serve(ctx context.Context, s *store.Store, opts Options) error {
 // stated outright rather than a guess. Raw audio is deleted on the retention
 // schedule while any summary built from it survives, which makes a fabricated
 // speaker permanent.
+//
+// The pairing sentence is there for the same reason and was learned the same
+// way. search_events used to merge each chunk's two rows into one on the
+// strength of a shared captured_at, which asserted they held the same sound
+// when all they shared was a 30-second interval; a whole microphone transcript
+// could be dropped and the result still read as finished. Both rows are now
+// returned, and the description says what a caller may and may not infer from
+// the pair — the ambiguity is stated rather than resolved by guessing.
 const audioProvenanceContract = "Audio results keep three different things apart. " +
 	"audio_source is the capture DEVICE the row was read from — \"system\" is the machine's own " +
 	"output, \"microphone\" is the room — and is never a claim about who or what made the sound. " +
@@ -63,7 +71,13 @@ const audioProvenanceContract = "Audio results keep three different things apart
 	"source. Microphone audio has NO reliable source — it may be the user, other people present, a " +
 	"TV, another machine, or ambient playback. Microphone rows are always \"unattributed\" and carry " +
 	"no source_app. Never attribute microphone content to a person or to an application, and never " +
-	"present it as something the user said or did."
+	"present it as something the user said or did. " +
+	"Audio rows come in PAIRS sharing one captured_at — one per capture device — and both are " +
+	"returned. A pair shares a 30-second interval, not necessarily a sound: the microphone re-records " +
+	"whatever the speakers play, so the two rows may transcribe the same speech twice, or they may " +
+	"hold two entirely different conversations. Nothing in a search result tells you which, so never " +
+	"assume one row of a pair is redundant and never drop it. get_transcript answers that question — " +
+	"it returns the conversation once, in order, with the machine's own speech deduplicated."
 
 // newServer builds the server and registers the tools. It is separate from
 // Serve so tests can drive it over an in-memory transport.

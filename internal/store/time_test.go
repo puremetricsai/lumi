@@ -53,63 +53,6 @@ func TestLexicographicOrderMatchesChronologicalOrder(t *testing.T) {
 	}
 }
 
-// TestLegacyNanosecondRowsStillResolveTheirAudioTracks is the regression for the
-// hazard that killed two earlier designs of this change: a caller rebuilding a
-// captured_at key for an equality lookup cannot reproduce the stored bytes,
-// because the index holds rows written under time.RFC3339Nano's trimmed
-// rendering *and* rows written under CapturedAtLayout.
-//
-// It writes the legacy rendering through raw SQL rather than Insert, because
-// Insert is exactly what no longer produces it. When this breaks, AudioTracksAt
-// returns nothing for a real two-track chunk and OriginOf calls it "silent" —
-// silently, for every chunk recorded before this change.
-func TestLegacyNanosecondRowsStillResolveTheirAudioTracks(t *testing.T) {
-	ctx := context.Background()
-	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-
-	// A whole-second instant is the worst case: RFC3339Nano omits the fraction
-	// entirely, so the legacy and fixed-width renderings share no suffix at all.
-	for _, at := range []time.Time{
-		time.Date(2026, 7, 29, 9, 13, 16, 493218000, time.UTC), // trailing zeros trimmed
-		time.Date(2026, 7, 29, 9, 14, 0, 0, time.UTC),          // no fraction at all
-	} {
-		legacy := at.UTC().Format(time.RFC3339Nano)
-		if legacy == FormatCapturedAt(at) {
-			t.Fatalf("fixture is not a legacy rendering: %q", legacy)
-		}
-		for _, track := range []struct{ source, text, path string }{
-			{"system", "system heard this", "sys.wav"},
-			{"microphone", "mic heard this", "mic.wav"},
-		} {
-			_, err := s.db.ExecContext(ctx, `
-INSERT INTO events(kind, captured_at, text, app, window, media_path, duration_ms,
-                   text_source, display_id, audio_source, metadata_json)
-VALUES ('audio', ?, ?, '', '', ?, 30000, '', 0, ?, '{}')`,
-				legacy, track.text, track.path, track.source)
-			if err != nil {
-				t.Fatal(err)
-			}
-		}
-
-		tracks, err := s.AudioTracksAt(ctx, []time.Time{at})
-		if err != nil {
-			t.Fatal(err)
-		}
-		got := tracks[FormatCapturedAt(at)]
-		if len(got) != 2 {
-			t.Fatalf("legacy row at %q resolved %d tracks, want 2", legacy, len(got))
-		}
-		if origin := OriginOf(got); origin != AudioOriginBoth {
-			t.Fatalf("legacy two-track chunk at %q reported origin %q, want %q",
-				legacy, origin, AudioOriginBoth)
-		}
-	}
-}
-
 // TestBoundsCoverBothStoredRenderings is the regression for a fixed-width bound
 // silently excluding a legacy row that sits exactly on it. ".12Z" sorts *above*
 // ".120000000Z" — same instant, opposite order — so an upper bound rendered one

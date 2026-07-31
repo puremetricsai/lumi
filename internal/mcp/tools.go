@@ -77,21 +77,13 @@ type EventRecord struct {
 	DurationMS     int64  `json:"duration_ms,omitempty"`
 	TextSource     string `json:"text_source,omitempty"`
 	DisplayID      uint32 `json:"display_id,omitempty"`
-	AudioSource    string `json:"audio_source,omitempty"`
-	// AudioOrigin says which tracks of this 30-second audio chunk carried
-	// speech — "system", "microphone", "both", or "silent" — independent of
-	// which track survived a collapse. "both" is speaker bleed; nothing
-	// distinguishes a remote speaker from local media playback, so both read as
-	// "system". Set only on collapsed audio events.
-	AudioOrigin string `json:"audio_origin,omitempty"`
-	// AudioTracks lists every row of a collapsed chunk (survivor first). It is
-	// emitted only when the chunk held more than one row, since a lone track
-	// would just restate this record's own id/audio_source/media_path and
-	// audio_origin already carries the answer. The dropped track's text is not
-	// inlined: text_length says whether it held speech and its id reaches the
-	// full transcript through get_event.
-	AudioTracks []AudioTrackRecord `json:"audio_tracks,omitempty"`
-	Metadata    map[string]any     `json:"metadata,omitempty"`
+	// AudioSource is the capture device this row was read from, "system" or
+	// "microphone". Both tracks of a chunk are returned, each as its own row: a
+	// pair sharing one captured_at may hold the same sound or two different
+	// ones, and only get_transcript can tell those apart — see
+	// audioProvenanceContract in server.go.
+	AudioSource string         `json:"audio_source,omitempty"`
+	Metadata    map[string]any `json:"metadata,omitempty"`
 }
 
 // SourceAppRecord is one application observed producing sound during a chunk.
@@ -109,16 +101,6 @@ type SourceAppRecord struct {
 	Evidence     string `json:"evidence"`
 	Samples      int    `json:"samples"`
 	Observations int    `json:"observations"`
-}
-
-// AudioTrackRecord is one track of a collapsed audio chunk as a client sees it.
-// Like EventRecord it carries media_path as a string the user can open, never
-// bytes — it is the only way to reach a dropped track's WAV at all.
-type AudioTrackRecord struct {
-	ID          int64  `json:"id"`
-	AudioSource string `json:"audio_source"`
-	TextLength  int    `json:"text_length"`
-	MediaPath   string `json:"media_path,omitempty"`
 }
 
 // newEventRecord converts a stored event for the wire, capping Text at
@@ -204,11 +186,6 @@ type searchEventsInput struct {
 	Match        string `json:"match,omitempty" jsonschema:"\"all\" (default) requires every query term; \"any\" requires one and ranks by relevance"`
 	RequireText  bool   `json:"require_text,omitempty" jsonschema:"drop events whose text or transcript is empty or only whitespace"`
 	MaxTextChars *int   `json:"max_text_chars,omitempty" jsonschema:"per-event character cap on text; defaults to 600, and 0 means no cap"`
-	// CollapseAudioTracks is a pointer so an omitted value means true: each
-	// 30-second chunk is recorded twice (system output and microphone), and by
-	// default the duplicate is merged into one result carrying audio_origin and
-	// audio_tracks. false returns both rows unmerged.
-	CollapseAudioTracks *bool `json:"collapse_audio_tracks,omitempty" jsonschema:"collapse the microphone/system duplicate of each audio chunk into one result; defaults to true, and false returns both tracks unmerged"`
 }
 
 type searchEventsOutput struct {
@@ -252,16 +229,8 @@ func (h *handlers) searchEvents(ctx context.Context, _ *sdk.CallToolRequest, in 
 		return nil, empty, err
 	}
 	limit := clampLimit(in.Limit, store.DefaultSearchLimit, store.MaxSearchLimit)
-	collapse := in.CollapseAudioTracks == nil || *in.CollapseAudioTracks
-	// Over-fetch when collapsing so a page stays full: a chunk yields at most
-	// two rows, so fetching 2*limit (bounded by the store ceiling) guarantees at
-	// least limit survivors. With collapse off the two coincide.
-	fetchLimit := limit
-	if collapse {
-		fetchLimit = min(2*limit, store.MaxSearchLimit)
-	}
-	opts.Limit = fetchLimit
-	rawEvents, err := h.store.Search(ctx, opts)
+	opts.Limit = limit
+	events, err := h.store.Search(ctx, opts)
 	if err != nil {
 		return nil, empty, fmt.Errorf("search the activity index: %w", err)
 	}
@@ -270,39 +239,22 @@ func (h *handlers) searchEvents(ctx context.Context, _ *sdk.CallToolRequest, in 
 		maxTextChars = *in.MaxTextChars
 	}
 
-	events := rawEvents
-	var chunks map[int64]store.AudioChunk
-	if collapse {
-		events, chunks = store.CollapseAudioTracks(rawEvents)
-	}
-	if len(events) > limit {
-		events = events[:limit]
-	}
-
+	// Both tracks of an audio chunk are returned, each as its own row. They are
+	// not merged: two rows sharing a captured_at share an *interval*, not
+	// necessarily a sound, and nothing available here can tell a microphone
+	// re-recording of the speakers from an unrelated conversation in the room.
+	// That question belongs to internal/transcript, which answers it per segment
+	// against word timings and an energy envelope, and reaches an agent through
+	// get_transcript. Deciding it a second time from a timestamp alone deleted
+	// real transcripts.
 	out := searchEventsOutput{Events: make([]EventRecord, 0, len(events))}
 	for _, event := range events {
 		out.Events = append(out.Events, newEventRecord(event, maxTextChars))
 	}
 
-	var collapsed int
-	if collapse {
-		// Provenance describes the whole chunk, not the matched set: a query
-		// that hit only the microphone track of a bleed pair must still report
-		// audio_origin "both". AudioTracksAt re-reads every track at each
-		// survivor's timestamp, regardless of what the search matched.
-		if err = h.annotateAudio(ctx, out.Events, chunks); err != nil {
-			return nil, empty, err
-		}
-		for _, event := range events {
-			if event.Kind == store.KindAudio {
-				collapsed += len(chunks[event.ID].Tracks) - 1
-			}
-		}
-	}
-
 	// Two independent notices can apply at once, so compose the non-empty parts.
 	var parts []string
-	capped := len(out.Events) == limit || len(rawEvents) == fetchLimit
+	capped := len(out.Events) == limit
 	switch {
 	case len(out.Events) == 0:
 		notice, err := h.noResultNotice(ctx,
@@ -315,18 +267,9 @@ func (h *handlers) searchEvents(ctx context.Context, _ *sdk.CallToolRequest, in 
 		// A full page is indistinguishable from "there happen to be exactly
 		// this many results" unless we say so: an agent that gets exactly the
 		// limit back cannot otherwise tell it saw a recency-truncated slice.
-		// Over-fetching means a short page can still be capped, so the raw fetch
-		// hitting fetchLimit is a second signal there is more.
 		parts = append(parts, fmt.Sprintf(
 			"results were capped at %d events; there may be more — narrow since/until or raise limit to see them",
 			limit))
-	}
-	if collapsed > 0 {
-		parts = append(parts, fmt.Sprintf(
-			"collapsed %d duplicate audio events: the microphone and system tracks record the same "+
-				"30-second chunk; each result lists its merged tracks in audio_tracks and which carried "+
-				"speech in audio_origin, and collapse_audio_tracks: false returns them unmerged",
-			collapsed))
 	}
 	// An audio hit is a 30-second window of one track, which reads poorly as
 	// conversation: the machine's speech still appears in both tracks here, and
@@ -375,70 +318,6 @@ func (h *handlers) hasAttributedAudio(ctx context.Context, events []store.Event)
 	}
 	attributed, err := h.store.HasSpeechSegments(ctx, earliest, latest)
 	return err == nil && attributed
-}
-
-// annotateAudio fills audio_origin and audio_tracks on the collapsed audio
-// records. Provenance is read fresh from the store (AudioTracksAt) so it
-// describes every track of the chunk even when the search matched only one, and
-// audio_tracks is emitted only for chunks that held more than one row.
-func (h *handlers) annotateAudio(ctx context.Context, records []EventRecord, chunks map[int64]store.AudioChunk) error {
-	times := make([]time.Time, 0, len(records))
-	seen := make(map[string]bool)
-	recordTime := make(map[int]string, len(records))
-	for i := range records {
-		if records[i].Kind != string(store.KindAudio) {
-			continue
-		}
-		// CapturedAt is rendered local; re-parse to recover the instant. The
-		// *instant* is what identifies a chunk here, never the rendering — the
-		// index holds captured_at in two layouts and no single one of them would
-		// match both halves. store.AudioTracksAt owns reaching both and keys its
-		// result canonically, so this side only has to canonicalise the same way.
-		parsed, err := time.Parse(time.RFC3339Nano, records[i].CapturedAt)
-		if err != nil {
-			return fmt.Errorf("parse audio timestamp %q: %w", records[i].CapturedAt, err)
-		}
-		key := store.FormatCapturedAt(parsed)
-		recordTime[i] = key
-		if !seen[key] {
-			seen[key] = true
-			times = append(times, parsed)
-		}
-	}
-	if len(times) == 0 {
-		return nil
-	}
-	tracksAt, err := h.store.AudioTracksAt(ctx, times)
-	if err != nil {
-		return fmt.Errorf("read audio track provenance: %w", err)
-	}
-	for i := range records {
-		key, ok := recordTime[i]
-		if !ok {
-			continue
-		}
-		tracks := tracksAt[key]
-		records[i].AudioOrigin = store.OriginOf(tracks)
-		if len(tracks) > 1 {
-			records[i].AudioTracks = audioTrackRecords(records[i].ID, tracks)
-		}
-	}
-	return nil
-}
-
-// audioTrackRecords converts store tracks for the wire with the survivor first.
-func audioTrackRecords(survivorID int64, tracks []store.AudioTrack) []AudioTrackRecord {
-	out := make([]AudioTrackRecord, 0, len(tracks))
-	var rest []AudioTrackRecord
-	for _, tr := range tracks {
-		rec := AudioTrackRecord{ID: tr.ID, AudioSource: tr.AudioSource, TextLength: tr.TextLength, MediaPath: tr.MediaPath}
-		if tr.ID == survivorID {
-			out = append(out, rec)
-		} else {
-			rest = append(rest, rec)
-		}
-	}
-	return append(out, rest...)
 }
 
 // noResultNotice explains an empty result set, which every tool must do and

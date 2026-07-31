@@ -689,8 +689,8 @@ func TestSearchEventsEmptyStoreNoticeIncludesDatabasePath(t *testing.T) {
 	}
 }
 
-// audioPair inserts a system+microphone pair sharing one captured_at, the
-// invariant CollapseAudioTracks groups on. It returns the two stored events.
+// audioPair inserts a system+microphone pair sharing one captured_at — the
+// stamp both tracks of a chunk are written with — and returns the two events.
 func audioPair(t *testing.T, ctx context.Context, s *store.Store, at time.Time, systemText, micText string) []store.Event {
 	t.Helper()
 	return insertEvents(t, ctx, s,
@@ -699,116 +699,69 @@ func audioPair(t *testing.T, ctx context.Context, s *store.Store, at time.Time, 
 	)
 }
 
-func TestSearchEventsCollapsesByDefault(t *testing.T) {
+// TestSearchEventsKeepsBothTracksOfAChunk is the regression for the defect that
+// removed audio collapse. search_events used to merge a chunk's two rows into
+// one on the strength of a shared captured_at and return only the system track,
+// under a notice calling them "duplicate audio events". A shared captured_at is
+// a shared 30-second *interval*, never evidence of a shared *sound*: reported
+// from a live index, the microphone was carrying an entirely separate talk and
+// every word of it was dropped, while audio_tracks reported its text_length and
+// not its text. The result read as finished, which is what made it worse than
+// returning both rows.
+//
+// Both rows must come back, each with its own text and its own audio_source, and
+// nothing may describe them as duplicates. Whether one track re-recorded the
+// other is internal/transcript's question, decided per segment against word
+// timings and an energy envelope, and reaching an agent through get_transcript.
+func TestSearchEventsKeepsBothTracksOfAChunk(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
 	base := time.Now().UTC().Truncate(time.Second)
-	audioPair(t, ctx, s, base, "system heard the same words", "microphone heard the same words")
+	const (
+		systemText = "the quarterly revenue review starts on the next slide"
+		micText    = "the cluster manager talks to the control plane not the data plane"
+	)
+	pair := audioPair(t, ctx, s, base, systemText, micText)
 	h := &handlers{store: s}
 
 	out := callSearch(t, ctx, h, searchEventsInput{Kind: "audio"})
-	if len(out.Events) != 1 {
-		t.Fatalf("expected the pair collapsed to one result, got %d", len(out.Events))
-	}
-	rec := out.Events[0]
-	if rec.AudioSource != "system" {
-		t.Fatalf("survivor = %q, want system", rec.AudioSource)
-	}
-	if rec.AudioOrigin != "both" {
-		t.Fatalf("audio_origin = %q, want both", rec.AudioOrigin)
-	}
-	if len(rec.AudioTracks) != 2 {
-		t.Fatalf("expected two-entry audio_tracks, got %d", len(rec.AudioTracks))
-	}
-	if rec.AudioTracks[0].ID != rec.ID {
-		t.Fatalf("survivor must be first in audio_tracks; got %d, want %d", rec.AudioTracks[0].ID, rec.ID)
-	}
-	if !strings.Contains(out.Notice, "collapse_audio_tracks: false") {
-		t.Fatalf("notice = %q, want it to name the escape hatch", out.Notice)
-	}
-}
-
-func TestSearchEventsLoneAudioHasOriginButNoTracks(t *testing.T) {
-	ctx := context.Background()
-	s := testStore(t)
-	insertEvents(t, ctx, s, store.Event{
-		Kind: store.KindAudio, CapturedAt: time.Now().UTC(), AudioSource: "system",
-		Text: "a solitary chunk", MediaPath: "/tmp/lone.wav", DurationMS: 30000,
-	})
-	h := &handlers{store: s}
-
-	out := callSearch(t, ctx, h, searchEventsInput{Kind: "audio"})
-	if len(out.Events) != 1 {
-		t.Fatalf("expected one result, got %d", len(out.Events))
-	}
-	rec := out.Events[0]
-	if rec.AudioOrigin != "system" {
-		t.Fatalf("audio_origin = %q, want system", rec.AudioOrigin)
-	}
-	if rec.AudioTracks != nil {
-		t.Fatalf("a lone audio row must not carry audio_tracks, got %#v", rec.AudioTracks)
-	}
-}
-
-func TestSearchEventsCollapseFalseReturnsBothUnmerged(t *testing.T) {
-	ctx := context.Background()
-	s := testStore(t)
-	base := time.Now().UTC().Truncate(time.Second)
-	audioPair(t, ctx, s, base, "system heard this", "microphone heard this")
-	h := &handlers{store: s}
-
-	off := false
-	out := callSearch(t, ctx, h, searchEventsInput{Kind: "audio", CollapseAudioTracks: &off})
 	if len(out.Events) != 2 {
-		t.Fatalf("expected both rows unmerged, got %d", len(out.Events))
+		t.Fatalf("both tracks of a chunk must be returned, got %d", len(out.Events))
 	}
+
+	bySource := map[string]EventRecord{}
 	for _, rec := range out.Events {
-		if rec.AudioOrigin != "" || rec.AudioTracks != nil {
-			t.Fatalf("collapse off must leave audio_origin/audio_tracks empty, got %#v", rec)
+		bySource[rec.AudioSource] = rec
+	}
+	for _, want := range []struct {
+		source, text string
+		id           int64
+	}{
+		{"system", systemText, pair[0].ID},
+		{"microphone", micText, pair[1].ID},
+	} {
+		rec, ok := bySource[want.source]
+		if !ok {
+			t.Fatalf("no %s row in the results: %#v", want.source, out.Events)
+		}
+		if rec.ID != want.id {
+			t.Errorf("%s row id = %d, want %d", want.source, rec.ID, want.id)
+		}
+		// The whole point: the text is present, not reduced to a length.
+		if rec.Text != want.text {
+			t.Errorf("%s text = %q, want %q", want.source, rec.Text, want.text)
 		}
 	}
-	if strings.Contains(out.Notice, "collapsed") {
-		t.Fatalf("collapse off must not add a collapse notice, got %q", out.Notice)
+	if strings.Contains(out.Notice, "duplicate") || strings.Contains(out.Notice, "collaps") {
+		t.Fatalf("nothing may call the two tracks duplicates; notice = %q", out.Notice)
 	}
 }
 
-func TestSearchEventsDroppedTrackResolvesThroughGetEvent(t *testing.T) {
-	ctx := context.Background()
-	s := testStore(t)
-	base := time.Now().UTC().Truncate(time.Second)
-	pair := audioPair(t, ctx, s, base, "system transcript", "the microphone captured its own longer transcript here")
-	h := &handlers{store: s}
-
-	out := callSearch(t, ctx, h, searchEventsInput{Kind: "audio"})
-	if len(out.Events) != 1 {
-		t.Fatalf("expected one collapsed result, got %d", len(out.Events))
-	}
-	// Find the dropped (microphone) track id in audio_tracks.
-	var droppedID int64
-	for _, tr := range out.Events[0].AudioTracks {
-		if tr.AudioSource == "microphone" {
-			droppedID = tr.ID
-		}
-	}
-	if droppedID == 0 {
-		t.Fatalf("microphone track id missing from audio_tracks: %#v", out.Events[0].AudioTracks)
-	}
-	if droppedID != pair[1].ID {
-		t.Fatalf("dropped track id = %d, want the microphone row %d", droppedID, pair[1].ID)
-	}
-	_, got, err := h.getEvent(ctx, nil, getEventInput{ID: droppedID})
-	if err != nil {
-		t.Fatalf("get_event on dropped track: %v", err)
-	}
-	if got.Event.Text != "the microphone captured its own longer transcript here" {
-		t.Fatalf("get_event returned %q, want the microphone's full text", got.Event.Text)
-	}
-}
-
-// TestAudioOriginDescribesTheChunkNotTheMatch is the test that fails if
-// provenance is ever derived from the matched set alone: a query that hits only
-// the microphone track of a bleed pair must still report audio_origin "both".
-func TestAudioOriginDescribesTheChunkNotTheMatch(t *testing.T) {
+// TestSearchEventsMicrophoneOnlyHitIsNotReplaced pins the other half: a query
+// landing only in the microphone transcript returns that row. It used to be at
+// risk from a collapse consulting the non-matching system row and judging it the
+// better copy, which would drop the only hit.
+func TestSearchEventsMicrophoneOnlyHitIsNotReplaced(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
 	base := time.Now().UTC().Truncate(time.Second)
@@ -817,107 +770,47 @@ func TestAudioOriginDescribesTheChunkNotTheMatch(t *testing.T) {
 		"the mic transcribed 52000000 as digits")
 	h := &handlers{store: s}
 
-	// "52000000" appears only in the microphone transcript, so only that row
-	// matches — a SQL pre-filter judging the non-matching system row "better"
-	// would drop the only hit.
 	out := callSearch(t, ctx, h, searchEventsInput{Query: "52000000", Kind: "audio"})
 	if len(out.Events) != 1 {
-		t.Fatalf("expected the microphone hit returned, got %d", len(out.Events))
+		t.Fatalf("expected the microphone hit alone, got %d", len(out.Events))
 	}
 	rec := out.Events[0]
 	if rec.ID != pair[1].ID || rec.AudioSource != "microphone" {
-		t.Fatalf("expected the microphone row %d to survive, got id %d source %q", pair[1].ID, rec.ID, rec.AudioSource)
+		t.Fatalf("expected microphone row %d, got id %d source %q", pair[1].ID, rec.ID, rec.AudioSource)
 	}
-	if rec.AudioOrigin != "both" {
-		t.Fatalf("audio_origin = %q, want both — provenance must describe the whole chunk", rec.AudioOrigin)
-	}
-	var sawSystem bool
-	for _, tr := range rec.AudioTracks {
-		if tr.AudioSource == "system" && tr.ID == pair[0].ID {
-			sawSystem = true
-		}
-	}
-	if !sawSystem {
-		t.Fatalf("unmatched system row %d must appear in audio_tracks: %#v", pair[0].ID, rec.AudioTracks)
+	if rec.Text != "the mic transcribed 52000000 as digits" {
+		t.Fatalf("microphone text = %q, want it verbatim", rec.Text)
 	}
 }
 
-func TestSearchEventsOverFetchKeepsPageFull(t *testing.T) {
+// TestSearchEventsCapNoticeFiresOnAFullAudioPage pins the cap notice over audio
+// rows, which now reach the page one per track rather than one per chunk.
+func TestSearchEventsCapNoticeFiresOnAFullAudioPage(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
 	base := time.Now().UTC().Truncate(time.Second)
-	// 20 distinct chunks, each a system+mic pair with speech in both.
+	// 20 chunks = 40 rows, so a limit of 10 is comfortably saturated.
 	for i := 0; i < 20; i++ {
 		at := base.Add(time.Duration(i) * time.Second)
 		audioPair(t, ctx, s, at, fmt.Sprintf("system speech %d", i), fmt.Sprintf("microphone speech %d", i))
 	}
 	h := &handlers{store: s}
 
-	out := callSearch(t, ctx, h, searchEventsInput{Kind: "audio", Limit: 10})
-	if len(out.Events) != 10 {
-		t.Fatalf("over-fetch must yield 10 survivors, not 5; got %d", len(out.Events))
+	full := callSearch(t, ctx, h, searchEventsInput{Kind: "audio", Limit: 10})
+	if len(full.Events) != 10 {
+		t.Fatalf("expected a full page of 10, got %d", len(full.Events))
 	}
-	if !strings.Contains(out.Notice, "capped") {
-		t.Fatalf("a full collapsed page must still read as capped, got %q", out.Notice)
-	}
-}
-
-// TestSearchEventsCapNoticeUnderOverFetch covers the two disjuncts of the cap
-// condition separately, seeding audio pairs so collapse is actually exercised.
-//
-//	capped := len(out.Events) == limit || len(rawEvents) == fetchLimit
-//
-// The first disjunct fires whenever the collapsed page exactly fills the limit.
-// The second is only *independently* reachable when 2*limit clamps against
-// store.MaxSearchLimit, so fetchLimit < 2*limit and a saturated fetch can
-// collapse to fewer survivors than the limit — that is the case (b) isolates.
-func TestSearchEventsCapNoticeUnderOverFetch(t *testing.T) {
-	ctx := context.Background()
-	s := testStore(t)
-	base := time.Now().UTC().Truncate(time.Second)
-
-	// (a) exactly `limit` survivors: 20 chunks, limit 10 → 10 survivors == limit
-	// via the first disjunct.
-	for i := 0; i < 20; i++ {
-		at := base.Add(time.Duration(i) * time.Second)
-		audioPair(t, ctx, s, at, fmt.Sprintf("system speech %d", i), fmt.Sprintf("microphone speech %d", i))
-	}
-	h := &handlers{store: s}
-
-	a := callSearch(t, ctx, h, searchEventsInput{Kind: "audio", Limit: 10})
-	if len(a.Events) != 10 || !strings.Contains(a.Notice, "capped") {
-		t.Fatalf("(a) exactly-limit survivors must be capped: got %d events, notice %q", len(a.Events), a.Notice)
+	if !strings.Contains(full.Notice, "capped") {
+		t.Fatalf("a full page must read as capped, got %q", full.Notice)
 	}
 
-	// (c) fewer rows than fetchLimit and fewer survivors than limit → not capped.
-	// 20 chunks (40 rows), limit 100 → fetchLimit min(200,500)=200; rawEvents 40
-	// != 200 and 20 survivors != 100, so neither disjunct fires.
-	c := callSearch(t, ctx, h, searchEventsInput{Kind: "audio", Limit: 100})
-	if len(c.Events) != 20 {
-		t.Fatalf("(c) expected all 20 chunks, got %d", len(c.Events))
+	// A page short of the limit must not.
+	short := callSearch(t, ctx, h, searchEventsInput{Kind: "audio", Limit: 100})
+	if len(short.Events) != 40 {
+		t.Fatalf("expected all 40 rows, got %d", len(short.Events))
 	}
-	if strings.Contains(c.Notice, "capped") {
-		t.Fatalf("(c) a page short of the limit with an unsaturated fetch must not be capped: %q", c.Notice)
-	}
-
-	// (b) saturated raw fetch, survivors < limit → capped by the second disjunct
-	// alone. Seed enough pairs that a limit whose 2*limit exceeds the store
-	// ceiling clamps fetchLimit to store.MaxSearchLimit. With limit 300,
-	// fetchLimit = min(600,500) = 500; 260 pairs = 520 rows saturate that fetch
-	// (rawEvents == 500), which collapse to ~250 survivors — short of 300, so the
-	// first disjunct is false and only len(rawEvents) == fetchLimit remains.
-	s2 := testStore(t)
-	for i := 0; i < 260; i++ {
-		at := base.Add(time.Duration(i) * time.Second)
-		audioPair(t, ctx, s2, at, fmt.Sprintf("system speech %d", i), fmt.Sprintf("microphone speech %d", i))
-	}
-	h2 := &handlers{store: s2}
-	b := callSearch(t, ctx, h2, searchEventsInput{Kind: "audio", Limit: 300})
-	if len(b.Events) >= 300 {
-		t.Fatalf("(b) expected a page short of the limit (survivors < 300), got %d", len(b.Events))
-	}
-	if !strings.Contains(b.Notice, "capped") {
-		t.Fatalf("(b) a saturated raw fetch must be capped via the second disjunct: got %d events, notice %q", len(b.Events), b.Notice)
+	if strings.Contains(short.Notice, "capped") {
+		t.Fatalf("a page short of the limit must not read as capped: %q", short.Notice)
 	}
 }
 
@@ -1012,6 +905,15 @@ func TestToolDescriptionsStateTheMicrophoneCaveat(t *testing.T) {
 		"Microphone audio has NO reliable source",
 		"other people present",
 		"Never attribute microphone content to a person or to an application",
+		// The pairing clauses. Merging a chunk's two rows on a shared timestamp
+		// once discarded a whole microphone transcript while the result still
+		// read as complete, so the description has to say both that a pair
+		// shares an interval rather than a sound and that neither row may be
+		// treated as the other's duplicate.
+		"Audio rows come in PAIRS sharing one captured_at",
+		"not necessarily a sound",
+		"never assume one row of a pair is redundant",
+		"get_transcript answers that question",
 	} {
 		if !strings.Contains(search, required) {
 			t.Errorf("search_events description omits %q", required)
