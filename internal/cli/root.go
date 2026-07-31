@@ -180,11 +180,16 @@ func (a *app) runForeground(cmd *cobra.Command, f recordFlags) error {
 	recorder := capture.Recorder{
 		Store: s, Paths: paths, ScreenInterval: f.interval, AudioChunk: f.audioChunk,
 		CaptureScreen: !f.noScreen, CaptureAudio: !f.noAudio, Logger: logger,
-		Screen:       capture.NativeScreens{},
-		Text:         capture.VisionText{},
-		Context:      capture.AccessibilityContext{},
-		Audio:        capture.NativeAudio{},
+		Screen:  capture.NativeScreens{},
+		Text:    capture.VisionText{},
+		Context: capture.AccessibilityContext{},
+		Audio:   capture.NativeAudio{},
+		// Both audio-source seams are always wired. Leaving either nil changes what
+		// an absent source list *means* in every row written — "no source was
+		// found" rather than "no source was looked for" — and nothing downstream
+		// can tell those apart afterwards.
 		AudioOutputs: capture.NativeAudioOutputs{},
+		AudioMarkers: capture.NativeAudioMarkers{},
 		Transcriber: capture.NativeSpeech{
 			Locale:     f.speechLocale,
 			Vocabulary: &vocabulary.Loader{Path: paths.Vocabulary},
