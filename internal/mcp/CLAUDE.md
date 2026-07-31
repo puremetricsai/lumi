@@ -46,6 +46,21 @@ reports is the one enforced.
   a `Kind` and `list_apps` exposes it; `search_events` already had `kind`. Summing the two into one count
   is what makes the conflation invisible: the split is the whole signal. Measured on a live index,
   `app = "Zed"` over 30 minutes was 30 screen rows and 8 audio rows, and the audio was a podcast.
+- **An audio row's provenance is three fields, and the tool description is where they are kept apart.**
+  `audio_source` is the capture *device*; `source_app` is what was observed producing the sound;
+  `foreground_app` is what the user had focused. `attribution` says how `source_app` was earned, so a
+  consumer branching on it cannot mistake a guess for a fact. The description text is the real contract —
+  it loads into an agent's context before any row is fetched — so `audioProvenanceContract` lives in
+  `server.go` beside the tools rather than in a doc, and
+  `TestToolDescriptionsStateTheMicrophoneCaveat` pins it.
+- **No tool may attribute microphone content to a person or an application.** It is room audio with no
+  recoverable owner and every microphone row is `unattributed` with no `source_app`. `get_transcript`'s
+  `external` origin carries the same caveat: it may be the user, other people present, a TV, another
+  machine, or ambient playback (root `CLAUDE.md`).
+- **The `app`/`window` → `foreground_app`/`foreground_window` rename lives here, at the boundary.** The SQL
+  columns cannot be renamed — FTS5, `Search`'s app filter, and `ListAttribution` depend on them — and
+  `lumi search --json` stays a bare `[]store.Event`, so this is the only place an agent is told that an
+  audio row's app is a focus field rather than a source field.
 - **Neither kind's `app` says where the *content* came from, so no tool description may imply it does.**
   The tempting shorthand — "`kind: "screen"` shows where the text was read from" — is false twice over:
   screen text is full-display OCR carrying every visible window, and one focused-window snapshot is

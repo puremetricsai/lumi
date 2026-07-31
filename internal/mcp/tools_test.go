@@ -920,3 +920,115 @@ func TestSearchEventsCapNoticeUnderOverFetch(t *testing.T) {
 		t.Fatalf("(b) a saturated raw fetch must be capped via the second disjunct: got %d events, notice %q", len(b.Events), b.Notice)
 	}
 }
+
+// TestAudioRecordsRenameAppToForeground pins the boundary rename. The SQL columns
+// keep their names — FTS5 and the app filter depend on them — so this is the only
+// place an agent is told that an audio row's app is a focus field and not a
+// source field.
+func TestAudioRecordsRenameAppToForeground(t *testing.T) {
+	audio := newEventRecord(store.Event{
+		ID: 1, Kind: store.KindAudio, CapturedAt: time.Now(), App: "Ghostty", Window: "lumi — zsh",
+		AudioSource: "system", AudioAttribution: string(store.AttributionEmittingProcess),
+	}, 0)
+	if audio.App != "" || audio.Window != "" {
+		t.Fatalf("an audio record still carries app/window: %q/%q", audio.App, audio.Window)
+	}
+	if audio.ForegroundApp != "Ghostty" || audio.ForegroundWindow != "lumi — zsh" {
+		t.Fatalf("audio foreground fields = %q/%q", audio.ForegroundApp, audio.ForegroundWindow)
+	}
+
+	screen := newEventRecord(store.Event{
+		ID: 2, Kind: store.KindScreen, CapturedAt: time.Now(), App: "Zed", Window: "lumi — .env",
+	}, 0)
+	if screen.App != "Zed" || screen.Window != "lumi — .env" {
+		t.Fatalf("screen record lost app/window: %q/%q", screen.App, screen.Window)
+	}
+	if screen.ForegroundApp != "" || screen.Attribution != "" {
+		t.Fatal("a screen record must not carry audio attribution fields")
+	}
+}
+
+// TestMicrophoneRecordCarriesNoSourceApp is acceptance criterion 2 at the wire.
+func TestMicrophoneRecordCarriesNoSourceApp(t *testing.T) {
+	record := newEventRecord(store.Event{
+		ID: 1, Kind: store.KindAudio, CapturedAt: time.Now(), App: "Ghostty",
+		AudioSource: "microphone", AudioAttribution: string(store.AttributionUnattributed),
+	}, 0)
+	if record.Attribution != string(store.AttributionUnattributed) {
+		t.Fatalf("microphone attribution = %q", record.Attribution)
+	}
+	if len(record.SourceApp) != 0 {
+		t.Fatalf("microphone record named a source: %#v", record.SourceApp)
+	}
+	encoded, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "\"source_app\"") {
+		t.Fatalf("microphone record serialized a source_app key: %s", encoded)
+	}
+}
+
+// TestSourceAppReachesTheWire covers the emitting-process path end to end through
+// the record conversion.
+func TestSourceAppReachesTheWire(t *testing.T) {
+	apps, err := store.EncodeSourceApps([]store.SourceApp{{
+		PID: 812, BundleID: "com.perplexity.comet", Name: "Comet",
+		Evidence: store.EvidenceProcess, Samples: 11, Observations: 12,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := newEventRecord(store.Event{
+		ID: 1, Kind: store.KindAudio, CapturedAt: time.Now(), App: "Ghostty",
+		AudioSource: "system", AudioAttribution: string(store.AttributionEmittingProcess),
+		SourceApps: apps,
+	}, 0)
+	if len(record.SourceApp) != 1 || record.SourceApp[0].Name != "Comet" {
+		t.Fatalf("source_app = %#v, want Comet", record.SourceApp)
+	}
+	if record.SourceApp[0].Evidence != store.EvidenceProcess {
+		t.Fatalf("evidence = %q", record.SourceApp[0].Evidence)
+	}
+	if record.SourceApp[0].Samples != 11 || record.SourceApp[0].Observations != 12 {
+		t.Fatalf("sample counts did not survive: %#v", record.SourceApp[0])
+	}
+	// The emitter and the focused app must remain separate answers.
+	if record.ForegroundApp != "Ghostty" {
+		t.Fatalf("foreground_app = %q, want Ghostty", record.ForegroundApp)
+	}
+}
+
+// TestToolDescriptionsStateTheMicrophoneCaveat is acceptance criterion 4. The
+// description text loads into an agent's context before any row is fetched, so it
+// is the actual contract — not documentation about one.
+func TestToolDescriptionsStateTheMicrophoneCaveat(t *testing.T) {
+	search := findToolDescription(t, "search_events")
+	for _, required := range []string{
+		"audio_source is the capture DEVICE",
+		"source_app",
+		"foreground_app",
+		"emitting_process",
+		"Microphone audio has NO reliable source",
+		"other people present",
+		"Never attribute microphone content to a person or to an application",
+	} {
+		if !strings.Contains(search, required) {
+			t.Errorf("search_events description omits %q", required)
+		}
+	}
+	// Every tool that can surface audio must carry the caveat, since an agent may
+	// reach the data through any of them.
+	for _, name := range []string{"get_event", "list_apps", "get_transcript"} {
+		description := findToolDescription(t, name)
+		if !strings.Contains(description, "source_app") {
+			t.Errorf("%s description never mentions source_app", name)
+		}
+	}
+	for _, name := range []string{"search_events", "get_event", "get_transcript"} {
+		description := findToolDescription(t, name)
+		if !strings.Contains(strings.ToLower(description), "never") {
+			t.Errorf("%s description states no prohibition on attributing microphone content", name)
+		}
+	}
+}
