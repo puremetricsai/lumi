@@ -38,8 +38,11 @@ func TestSearchEventsFiltersCombine(t *testing.T) {
 		t.Fatalf("query+app+since must isolate one event, got %d", len(out.Events))
 	}
 	got := out.Events[0]
-	if got.App != "Safari" || got.Window != "Quarterly plan" || got.MediaPath != "/tmp/a.jpg" {
+	if got.App != "Safari" || got.Window != "Quarterly plan" || got.MediaFile != "a.jpg" {
 		t.Fatalf("unexpected record: %#v", got)
+	}
+	if out.MediaDir["screen"] != "/tmp" {
+		t.Fatalf("media_dir must hoist the screen directory: %#v", out.MediaDir)
 	}
 	if got.TextSource != "vision" || got.DisplayID != 1 {
 		t.Fatalf("provenance columns were dropped: %#v", got)
@@ -106,7 +109,7 @@ func TestSearchEventsMatchAnyRanksBodyTextAboveAWindowTitle(t *testing.T) {
 	if len(out.Events) != 2 {
 		t.Fatalf("expected both events, got %d", len(out.Events))
 	}
-	if out.Events[0].MediaPath != "/tmp/body.jpg" {
+	if out.Events[0].MediaFile != "body.jpg" {
 		t.Fatalf("the body-text hit must rank first, got %#v", out.Events[0])
 	}
 }
@@ -124,7 +127,7 @@ func TestSearchEventsRequireTextDropsBlankTranscripts(t *testing.T) {
 		t.Fatalf("require_text defaults to off, got %d", len(out.Events))
 	}
 	out := callSearch(t, ctx, h, searchEventsInput{RequireText: true})
-	if len(out.Events) != 1 || out.Events[0].MediaPath != "/tmp/speech.wav" {
+	if len(out.Events) != 1 || out.Events[0].MediaFile != "speech.wav" {
 		t.Fatalf("require_text failed: %#v", out.Events)
 	}
 }
@@ -268,7 +271,10 @@ func TestGetEventReturnsUntruncatedTextAndMetadata(t *testing.T) {
 	events := insertEvents(t, ctx, s, store.Event{
 		Kind: store.KindScreen, Text: long, App: "Safari", Window: "Quarterly plan",
 		MediaPath: "/tmp/a.jpg", TextSource: "vision", DisplayID: 1,
-		Metadata: []byte(`{"ocr_ms":42,"focused_window_text":"plan"}`),
+		// display_id and text_source are here as well as in their own columns:
+		// the denylist has to drop the copies without touching a key it has
+		// never heard of, which is what ocr_ms and focused_window_text stand for.
+		Metadata: []byte(`{"ocr_ms":42,"focused_window_text":"plan","display_id":1,"text_source":"vision"}`),
 	})
 	h := &handlers{store: s}
 
@@ -291,8 +297,14 @@ func TestGetEventReturnsUntruncatedTextAndMetadata(t *testing.T) {
 	if out.Event.Metadata["ocr_ms"] != float64(42) {
 		t.Fatalf("metadata missing or wrong: %#v", out.Event.Metadata)
 	}
-	if out.Event.MediaPath != "/tmp/a.jpg" {
-		t.Fatalf("media_path = %q", out.Event.MediaPath)
+	for _, key := range []string{"display_id", "text_source"} {
+		if _, present := out.Event.Metadata[key]; present {
+			t.Fatalf("metadata %q duplicates a top-level field: %#v", key, out.Event.Metadata)
+		}
+	}
+	if out.Event.MediaFile != "a.jpg" || out.MediaDir != "/tmp" {
+		t.Fatalf("media_dir %q + media_file %q must rejoin to the stored path",
+			out.MediaDir, out.Event.MediaFile)
 	}
 }
 
@@ -927,8 +939,21 @@ func TestSourceAppReachesTheWire(t *testing.T) {
 	if record.SourceApp[0].Evidence != store.EvidenceProcess {
 		t.Fatalf("evidence = %q", record.SourceApp[0].Evidence)
 	}
-	if record.SourceApp[0].Samples != 11 || record.SourceApp[0].Observations != 12 {
-		t.Fatalf("sample counts did not survive: %#v", record.SourceApp[0])
+	// 11 of 12 samples is the case the pair existed for and the one live data
+	// never shows: an app present for most of a chunk but not all of it.
+	if record.SourceApp[0].Presence != 0.92 {
+		t.Fatalf("presence = %v, want 11/12 rounded to 0.92: %#v",
+			record.SourceApp[0].Presence, record.SourceApp[0])
+	}
+	// The pid is the store's, and stops here.
+	encoded, err := json.Marshal(record.SourceApp[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"pid", "samples", "observations"} {
+		if strings.Contains(string(encoded), `"`+key+`"`) {
+			t.Fatalf("source_app still serializes %q: %s", key, encoded)
+		}
 	}
 	// The emitter and the focused app must remain separate answers.
 	if record.ForegroundApp != "Ghostty" {
@@ -948,7 +973,6 @@ func TestToolDescriptionsStateTheMicrophoneCaveat(t *testing.T) {
 		"emitting_process",
 		"Microphone audio has NO reliable source",
 		"other people present",
-		"Never attribute microphone content to a person or to an application",
 		// The pairing clauses. Merging a chunk's two rows on a shared timestamp
 		// once discarded a whole microphone transcript while the result still
 		// read as complete, so the description has to say both that a pair
@@ -978,10 +1002,13 @@ func TestToolDescriptionsStateTheMicrophoneCaveat(t *testing.T) {
 			t.Errorf("%s description never mentions source_app", name)
 		}
 	}
+	// Each of them states the ambiguity as a fact about the row rather than as a
+	// rule about what the caller may conclude: the microphone records the room,
+	// and what it caught may be a person or anything else audible.
 	for _, name := range []string{"search_events", "get_event", "get_transcript"} {
 		description := findToolDescription(t, name)
-		if !strings.Contains(strings.ToLower(description), "never") {
-			t.Errorf("%s description states no prohibition on attributing microphone content", name)
+		if !strings.Contains(description, "other people present") {
+			t.Errorf("%s description never says what microphone audio may have caught", name)
 		}
 	}
 }

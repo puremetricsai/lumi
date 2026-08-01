@@ -6,7 +6,8 @@
 // Two rules hold everywhere in this package. Nothing may write to os.Stdout
 // except JSON-RPC protocol frames — the stdio transport owns that stream, and a
 // stray write silently corrupts the session. And no tool returns screenshot or
-// audio bytes: media_path is a string the user can open themselves.
+// audio bytes: media_dir joined to an event's media_file is a path the user can
+// open themselves.
 package mcp
 
 import (
@@ -17,6 +18,24 @@ import (
 
 	"github.com/puremetricsai/lumi/internal/store"
 )
+
+// localStamp renders an instant the way every timestamp this package returns is
+// rendered: the machine's local zone with its offset, at nanosecond precision.
+//
+// One function rather than a convention, because the two halves of the rule are
+// not equally obvious. The precision is what lets a value round-trip when it is
+// handed back as a since or until bound. The *zone* matters for a reason that
+// only shows up between fields: an agent has no way to know that two timestamps
+// in one response are the same kind of thing, so it compares them as strings —
+// and resume_from was rendered UTC while captured_at, started_at, ended_at and
+// last_seen were local. Both parse, both round-trip, and the notice that offers
+// resume_from names covered_until in the same sentence, so the two read seven
+// hours apart while describing adjacent moments.
+//
+// Storage and range comparison stay UTC; this is a rendering rule only.
+func localStamp(at time.Time) string {
+	return at.Local().Format(time.RFC3339Nano)
+}
 
 // parseTimestamp accepts an RFC3339 timestamp or a Go duration such as "2h",
 // which reads as "that long ago". An empty value means "no bound".

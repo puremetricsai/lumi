@@ -7,7 +7,8 @@ cancelled. It depends on `internal/store` and nothing else of Lumi's.
 
 `search_events` truncates text per event and reports `truncated` plus true `text_length`, and never merges
 an audio chunk's two rows; `get_event` is the untruncated escape hatch and the only tool returning
-metadata. `get_transcript` reads audio as one ordered conversation
+metadata, which it filters. Every tool returns its payload both as `structuredContent` and, serialized, as
+the `Content` text block. `get_transcript` reads audio as one ordered conversation
 with the machine's own speech deduplicated, and its `confidence` and `order_confidence` carry no `omitempty`
 for the same reason `truncated` does not: a doubtful label must never be something an agent infers from a
 missing key. Validation and store failures come back as tool results with `isError`, never JSON-RPC protocol
@@ -25,15 +26,71 @@ reports is the one enforced.
   default `slog` handler, or cobra usage dump silently corrupts the session and the user just sees the agent
   lose Lumi. `mcpCommand` (in `internal/cli`) sets `SilenceUsage`/`SilenceErrors` explicitly; every
   diagnostic goes to stderr; `TestServeWritesOnlyJSONRPCFramesToStdout` pins it.
-- **MCP tools return text and metadata only — screenshots and WAVs never leave the machine.** `media_path`
-  is a string the user can open themselves. There is no `read_media`, and no filesystem-reading call
-  anywhere in this package. No test can prove this negative; keep it true by construction.
+- **MCP tools return text and metadata only — screenshots and WAVs never leave the machine.** `media_dir`
+  joined to an event's `media_file` is a path the user can open themselves. There is no `read_media`, and no
+  filesystem-reading call anywhere in this package — `hoistMediaDir` splits a string and never touches the
+  disk. No test can prove this negative; keep it true by construction.
+- **A payload crosses the wire twice, on purpose, and `Content` is never a summary of it.** Every handler
+  returns a nil `*sdk.CallToolResult`, so the go-sdk fills `Content` with the serialized output
+  (`mcp/server.go`, the `res.Content == nil` branch) — the same bytes in `structuredContent` and again as
+  text. That duplication is the spec's own backwards-compatibility rule and it is load-bearing:
+  `structuredContent` is optional for a client to read, and Codex CLI and Claude Desktop — two of the three
+  clients `mcpsetup` registers — render the content blocks and nothing else. Setting `Content` ourselves is
+  what silences the fallback, so a "cheaper" `Content` is not a smaller response, it is the *only* response
+  those clients get. This was learned the expensive way: `Content` briefly held a digest — counts, a time
+  span, and the `notice` — and an agent asked to write up a meeting it had watched Lumi record reported that
+  Lumi returned metadata for the window but no transcript text. Every call had carried the full transcript
+  in `structuredContent`. Nothing failed, no tool errored, and the agent's account of the failure was
+  accurate about what it could see. `TestEveryToolResultCarriesItsWholePayloadAsText` pins it by asserting
+  the text block parses and equals `structuredContent`, so a summary reintroduced on either side alone
+  fails. Trim what a payload *contains* — see the media-path split and the metadata denylist below — never
+  which clients can read it.
+- **The media path is split, and the contract says how to rejoin it.** Every event of a kind comes from one
+  directory, so repeating it per event was two thirds of each path and the largest constant cost on a page;
+  `media_dir` states it once. Two rules keep the split honest. `media_file` is `filepath.Base` of the stored
+  path and never a name composed from `captured_at` — the recorder's rename to the timestamped form is
+  best-effort (`internal/capture/audio.go`), so a chunk whose rename fell through keeps a name that formula
+  would not produce, and a caller composing one would ask for a file that does not exist. And a kind whose
+  files sit in two directories — an index carried between data dirs — is left un-hoisted with whole paths,
+  because a short name joined to the wrong directory is worse than a long one.
+- **Every timestamp a tool returns goes through `localStamp`** — the machine's local zone with its offset,
+  at nanosecond precision, matching what `lumi search` prints. The precision is what lets a value round-trip
+  when it is handed back as a `since` or `until` bound. The *zone* matters for a reason that only appears
+  between fields: an agent cannot know two timestamps in one response are the same kind of thing, so it
+  compares them as strings. `resume_from` was rendered UTC while `captured_at`, `started_at`, `ended_at` and
+  `last_seen` were local — both parse, both round-trip, and nothing failed, so the only symptom was an agent
+  reading a resume point as hours away from the turns it continues. The notice offering `resume_from` names
+  `covered_until` in the same sentence, which printed the two spellings side by side.
+  `lumi transcript` had the identical pair and was fixed with it. Note that `resume_from` legitimately sorts
+  *at or before* the last turn's `ended_at` when a cap falls inside a chunk — the next page re-reads that
+  chunk by design (`internal/store/transcript.go`), so ordering is not a property to assert here.
+  `TestEveryTimestampIsRenderedInTheLocalZone` walks whole payloads rather than named fields, so a timestamp
+  added later is covered without anyone remembering. Storage and range comparison stay UTC.
 - **Truncation lives at the MCP boundary, never in the store.** `search_events` caps `text` in the handler
   after `Search` returns, counting runes so multi-byte text is never split. Pushing `max_text_chars` into
   the SQL `SELECT` would corrupt `lumi search --json`, a faithful export.
 - **A rule about the store is read from the store, not reimplemented here.** `HasSearchableTerms` exists
   because this package had copied the unexported term-drop rule, and the drift was invisible to both test
   suites (`internal/store/CLAUDE.md`).
+- **`get_event`'s metadata is filtered by a denylist, never an allowlist.** `redundantMetadataKeys` drops
+  keys whose meaning is already on the wire — `display_id`, `text_source` and `audio_source` are first-class
+  columns rendered at the top of the same record; `active_audio_output_processes` and `audio_marker_windows`
+  are the other rendering of the fold `source_app` already carries decoded and ordered — plus ones that
+  answer a question about Lumi's capture rather than about what was captured. `accessibility_text` goes with
+  them: it was a second, differently-sourced rendering of the same frame, as long again as the OCR text
+  beside it, while `text_length` described only that text and nothing said the two overlapped. **The
+  direction matters.** Metadata is where a failed processor leaves the only account of what went wrong, and
+  a processor added later writes a key nothing here knows about; an allowlist would drop that account
+  silently, which is the failure this channel exists to prevent. Every `*_error` key, `clock_anomaly` and
+  `audio_attribution_reason` pass through, and `TestMetadataKeepsEveryDiagnostic` pins it. None of this
+  reaches storage: the blob is kept whole and `lumi search --json` exports it whole.
+- **What a boundary drops is not what Lumi forgets.** `source_app`'s `pid` stops here for the same reason
+  the store's `FirstOffsetMS`/`LastOffsetMS` already did — it is valid only for the length of that recording
+  and names nothing a caller off this machine can resolve, while looking exactly like a durable identity to
+  key on. `samples` and `observations` became one `presence` ratio because that is what the pair always
+  meant: `observations` is a chunk-level denominator repeated identically on every entry, and two numbers
+  read as two independent measurements. `stream_offset_ms` went because `captured_at` already places the
+  chunk and no tool accepts an offset. All of them remain in the columns and in `lumi search --json`.
 
 ## What an `app` filter means to an agent
 
@@ -52,10 +109,14 @@ reports is the one enforced.
   it loads into an agent's context before any row is fetched — so `audioProvenanceContract` lives in
   `server.go` beside the tools rather than in a doc, and
   `TestToolDescriptionsStateTheMicrophoneCaveat` pins it.
-- **No tool may attribute microphone content to a person or an application.** It is room audio with no
-  recoverable owner and every microphone row is `unattributed` with no `source_app`. `get_transcript`'s
-  `external` origin carries the same caveat: it may be the user, other people present, a TV, another
-  machine, or ambient playback (root `CLAUDE.md`).
+- **A tool description states the microphone's ambiguity as a fact and stops there — it does not instruct
+  the caller.** Microphone audio is room audio with no recoverable owner: every microphone row is
+  `unattributed` with no `source_app`, and what it caught may be the user, other people present, a TV,
+  another machine, or ambient playback. `get_transcript`'s `external` origin carries the same caveat (root
+  `CLAUDE.md`). The descriptions used to follow that with prohibitions — never attribute this to a person
+  or an application, never present it as something the user said — which read as a rule about people
+  rather than a fact about the data, leaving an agent holding a microphone row that plainly did hold
+  speech to reconcile the two. The fact is what the row supports and is what the tools say.
 - **The `app`/`window` → `foreground_app`/`foreground_window` rename lives here, at the boundary.** The SQL
   columns cannot be renamed — FTS5, `Search`'s app filter, and `ListAttribution` depend on them — and
   `lumi search --json` stays a bare `[]store.Event`, so this is the only place an agent is told that an

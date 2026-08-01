@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -24,17 +26,30 @@ const (
 
 // handlers binds the tool implementations to a store. databasePath is only
 // used to name the file in "this index is empty" notices — it leaks nothing
-// new, since every media_path a tool returns already sits under that
+// new, since every media file a tool names already sits under that
 // directory — and is empty when Options carried none.
+//
+// Every handler returns a nil *sdk.CallToolResult, which is what puts its
+// payload on the wire twice: the go-sdk fills Content with the serialized output
+// when a handler leaves it nil, as the spec asks a tool returning
+// structuredContent to do. Do not "save" those bytes by composing a summary
+// there. structuredContent is optional for a client to read — Codex CLI and
+// Claude Desktop, two of the three clients `lumi mcp setup` registers, render
+// the content blocks and nothing else — so a summary in Content is the whole
+// answer for them. A digest of counts and a time span once shipped there, and an
+// agent asked to write up a meeting it had watched Lumi record reported that
+// Lumi held metadata for the window but no words: the transcript was in
+// structuredContent, complete, on every one of those calls.
 type handlers struct {
 	store        *store.Store
 	databasePath string
 }
 
 // EventRecord is one event as an MCP client sees it. It deliberately carries no
-// image or audio bytes — only media_path, a string the user can open on their
-// own machine. An MCP client is usually a hosted agent, so anything a tool
-// returns leaves this machine.
+// image or audio bytes — only the media file's name, which joined to the
+// response's media_dir is a path the user can open on their own machine. An MCP
+// client is usually a hosted agent, so anything a tool returns leaves this
+// machine.
 type EventRecord struct {
 	ID         int64  `json:"id"`
 	Kind       string `json:"kind"`
@@ -71,12 +86,22 @@ type EventRecord struct {
 	// never recorded — never that the sound was unattributable, which
 	// "unattributed" states outright.
 	Attribution string `json:"attribution,omitempty"`
-	// StreamOffsetMS is how far into the capture session this chunk began.
-	StreamOffsetMS *int64 `json:"stream_offset_ms,omitempty"`
-	MediaPath      string `json:"media_path,omitempty"`
-	DurationMS     int64  `json:"duration_ms,omitempty"`
-	TextSource     string `json:"text_source,omitempty"`
-	DisplayID      uint32 `json:"display_id,omitempty"`
+	// MediaFile is the capture's file name, which joined to the response's
+	// media_dir entry for this event's kind is the path the user can open. The
+	// directory is identical for every event of a kind and was two thirds of
+	// each repetition, so it is stated once per response instead.
+	//
+	// It is the stored path's base name, never a name composed from captured_at:
+	// the recorder's rename to the timestamped form is best-effort, so a chunk
+	// whose rename fell through keeps a name that formula would not produce. On
+	// the rare page holding two directories for one kind — an index moved
+	// between data dirs — that kind is absent from media_dir and its events
+	// carry a whole path here rather than a name that would join to the wrong
+	// directory.
+	MediaFile  string `json:"media_file,omitempty"`
+	DurationMS int64  `json:"duration_ms,omitempty"`
+	TextSource string `json:"text_source,omitempty"`
+	DisplayID  uint32 `json:"display_id,omitempty"`
 	// AudioSource is the capture device this row was read from, "system" or
 	// "microphone". A chunk's two rows are never merged, but a search returns
 	// only the rows that matched: every filter is a per-row predicate, so one
@@ -91,17 +116,25 @@ type EventRecord struct {
 //
 // Evidence names what earned it the place: "process" is a CoreAudio process
 // object holding an output stream, "window_marker" is a window whose own title
-// said it was playing audio. Samples out of Observations says how much of the
-// chunk it was present for, so a notification blip and a video that filled the
-// recording do not read alike.
+// said it was playing audio.
+//
+// The store's PID is not forwarded. It is valid only for the length of that
+// recording and names nothing a caller off this machine can resolve, while
+// looking exactly like a durable identity to key on; BundleID and Name are the
+// answer to "which application". Same reason the store's FirstOffsetMS and
+// LastOffsetMS stop here.
 type SourceAppRecord struct {
-	PID          int32  `json:"pid"`
-	BundleID     string `json:"bundle_id,omitempty"`
-	Name         string `json:"name,omitempty"`
-	Window       string `json:"window,omitempty"`
-	Evidence     string `json:"evidence"`
-	Samples      int    `json:"samples"`
-	Observations int    `json:"observations"`
+	BundleID string `json:"bundle_id,omitempty"`
+	Name     string `json:"name,omitempty"`
+	Window   string `json:"window,omitempty"`
+	Evidence string `json:"evidence"`
+	// Presence is how much of the chunk this application was emitting for, from
+	// 0 to 1, so a notification blip and a video that filled the recording do not
+	// read alike. It is the store's Samples over its Observations, sent as the
+	// one ratio they were always meant to express: Observations is a chunk-level
+	// count repeated identically on every entry, and the pair reads as two
+	// independent measurements when it is one. Absent when nothing was observed.
+	Presence float64 `json:"presence,omitempty"`
 }
 
 // newEventRecord converts a stored event for the wire, capping Text at
@@ -118,11 +151,11 @@ func newEventRecord(event store.Event, maxTextChars int) EventRecord {
 	record := EventRecord{
 		ID:          event.ID,
 		Kind:        string(event.Kind),
-		CapturedAt:  event.CapturedAt.Local().Format(time.RFC3339Nano),
+		CapturedAt:  localStamp(event.CapturedAt),
 		Text:        text,
 		Truncated:   truncated,
 		TextLength:  length,
-		MediaPath:   event.MediaPath,
+		MediaFile:   event.MediaPath,
 		DurationMS:  event.DurationMS,
 		TextSource:  event.TextSource,
 		DisplayID:   event.DisplayID,
@@ -131,7 +164,6 @@ func newEventRecord(event store.Event, maxTextChars int) EventRecord {
 	if event.Kind == store.KindAudio {
 		record.ForegroundApp, record.ForegroundWindow = event.App, event.Window
 		record.Attribution = event.AudioAttribution
-		record.StreamOffsetMS = event.StreamOffsetMS
 		record.SourceApp = sourceAppRecords(event.SourceApps)
 		return record
 	}
@@ -151,17 +183,76 @@ func sourceAppRecords(raw string) []SourceAppRecord {
 	out := make([]SourceAppRecord, 0, len(apps))
 	for _, app := range apps {
 		out = append(out, SourceAppRecord{
-			PID: app.PID, BundleID: app.BundleID, Name: app.Name, Window: app.Window,
-			Evidence: app.Evidence, Samples: app.Samples, Observations: app.Observations,
+			BundleID: app.BundleID, Name: app.Name, Window: app.Window,
+			Evidence: app.Evidence, Presence: presenceOf(app),
 		})
 	}
 	return out
 }
 
+// presenceOf reduces the store's sample counts to the fraction of the chunk an
+// application was emitting for. Zero observations means nothing was ever read,
+// which is not the same finding as "present for none of it" — it returns 0 so
+// omitempty drops the key rather than claiming a measured absence.
+//
+// Rounded to two places because the input is a count of samples taken a second
+// or so apart: more digits would imply a resolution the measurement does not
+// have.
+func presenceOf(app store.SourceApp) float64 {
+	if app.Observations <= 0 {
+		return 0
+	}
+	return math.Round(float64(app.Samples)/float64(app.Observations)*100) / 100
+}
+
+// redundantMetadataKeys are the stored metadata keys get_event does not send.
+//
+// It is a denylist and not an allowlist on purpose. Metadata is where a failed
+// processor leaves the only account of what went wrong, and a processor added
+// later will write a key nothing here knows about; an allowlist would drop that
+// account silently, which is the failure this channel exists to prevent. Every
+// key below is one whose meaning is already on the wire, or one that answers a
+// question about Lumi's own capture rather than about what was captured.
+//
+// Nothing is lost by removing them: the blob is stored whole and `lumi search
+// --json` exports it whole. This is what one tool sends, not what Lumi keeps.
+var redundantMetadataKeys = map[string]struct{}{
+	// Promoted to first-class event columns by migration 3 and already rendered
+	// at the top level of this same record.
+	"display_id":   {},
+	"text_source":  {},
+	"audio_source": {},
+	// The other rendering of the fold that source_app already carries, decoded,
+	// ordered by presence, and labelled with the evidence that earned it.
+	"active_audio_output_processes": {},
+	"audio_marker_windows":          {},
+	// A second, differently-sourced rendering of the same frame, as long again
+	// as the OCR text beside it — while text_length describes only that text and
+	// nothing names this or says the two overlap. The Accessibility read's
+	// verdict still reaches a caller as app_source/attribution_source.
+	"accessibility_text": {},
+	// How capture decided to keep the frame, what resolution it was, where the
+	// chunk sat on the drift-free grid, and how often the samplers ran. All are
+	// questions about the recorder.
+	"frame_similarity":             {},
+	"accessibility_trusted":        {},
+	"width":                        {},
+	"height":                       {},
+	"grid_started_at":              {},
+	"audio_source_samples":         {},
+	"audio_source_sample_attempts": {},
+	"foreground_samples":           {},
+	"foreground_apps_seen":         {},
+}
+
 // decodeMetadata turns the stored metadata blob into an object the tool's
-// output schema can describe. Capture always writes a JSON object; anything
-// else is preserved verbatim under "_raw" rather than dropped, because
-// metadata is where a failed processor leaves its diagnostics.
+// output schema can describe, less the keys above. Capture always writes a JSON
+// object; anything else is preserved verbatim under "_raw" rather than dropped,
+// because metadata is where a failed processor leaves its diagnostics.
+//
+// Every *_error key survives, as do clock_anomaly and audio_attribution_reason:
+// they say why text is missing or doubtful, which is the whole point of handing
+// an agent this blob.
 func decodeMetadata(blob json.RawMessage) map[string]any {
 	if len(blob) == 0 {
 		return nil
@@ -170,7 +261,52 @@ func decodeMetadata(blob json.RawMessage) map[string]any {
 	if err := json.Unmarshal(blob, &decoded); err != nil {
 		return map[string]any{"_raw": string(blob)}
 	}
+	for key := range decoded {
+		if _, redundant := redundantMetadataKeys[key]; redundant {
+			delete(decoded, key)
+		}
+	}
+	if len(decoded) == 0 {
+		return nil
+	}
 	return decoded
+}
+
+// hoistMediaDir replaces each record's whole media path with its file name and
+// returns the directory each kind's files sit in.
+//
+// Every event of a kind comes from one directory, so repeating it per event was
+// two thirds of each path and the largest constant cost on a page. A kind that
+// somehow spans two directories — an index carried between data dirs — is left
+// alone: its records keep whole paths and it gets no media_dir entry, because a
+// name that joins to the wrong directory is worse than a long one.
+func hoistMediaDir(records []EventRecord) map[string]string {
+	dirs := make(map[string]string, 2)
+	split := make(map[string]bool, 2)
+	for _, record := range records {
+		if record.MediaFile == "" {
+			continue
+		}
+		dir := filepath.Dir(record.MediaFile)
+		if seen, ok := dirs[record.Kind]; ok && seen != dir {
+			split[record.Kind] = true
+			continue
+		}
+		dirs[record.Kind] = dir
+	}
+	for kind := range split {
+		delete(dirs, kind)
+	}
+	for i := range records {
+		if records[i].MediaFile == "" || split[records[i].Kind] {
+			continue
+		}
+		records[i].MediaFile = filepath.Base(records[i].MediaFile)
+	}
+	if len(dirs) == 0 {
+		return nil
+	}
+	return dirs
 }
 
 type searchEventsInput struct {
@@ -191,6 +327,11 @@ type searchEventsInput struct {
 
 type searchEventsOutput struct {
 	Events []EventRecord `json:"events"`
+	// MediaDir is the directory each kind's media_file sits in, keyed by "screen"
+	// or "audio" — join the two for a path the user can open. It carries only the
+	// kinds this page actually returned files for, and omits a kind whose files
+	// came from more than one directory, whose records then hold whole paths.
+	MediaDir map[string]string `json:"media_dir,omitempty"`
 	// Notice explains an empty Events array, which is otherwise ambiguous:
 	// nothing recorded yet and nothing matching these filters call for
 	// different next moves.
@@ -252,6 +393,7 @@ func (h *handlers) searchEvents(ctx context.Context, _ *sdk.CallToolRequest, in 
 	for _, event := range events {
 		out.Events = append(out.Events, newEventRecord(event, maxTextChars))
 	}
+	out.MediaDir = hoistMediaDir(out.Events)
 
 	// Two independent notices can apply at once, so compose the non-empty parts.
 	var parts []string
@@ -354,6 +496,10 @@ type getEventInput struct {
 
 type getEventOutput struct {
 	Event EventRecord `json:"event"`
+	// MediaDir is the directory this event's media_file sits in — join the two
+	// for a path the user can open. It is a plain string rather than the map
+	// search_events returns because one event has one kind.
+	MediaDir string `json:"media_dir,omitempty"`
 }
 
 // getEvent returns one event with its text in full and its processor metadata
@@ -368,10 +514,14 @@ func (h *handlers) getEvent(ctx context.Context, _ *sdk.CallToolRequest, in getE
 	if err != nil {
 		return nil, empty, fmt.Errorf("read event %d: %w", in.ID, err)
 	}
-	record := newEventRecord(*event, 0)
+	records := []EventRecord{newEventRecord(*event, 0)}
 	// get_event is the only tool that returns the metadata blob.
-	record.Metadata = decodeMetadata(event.Metadata)
-	return nil, getEventOutput{Event: record}, nil
+	records[0].Metadata = decodeMetadata(event.Metadata)
+	// hoistMediaDir rewrites the record in place, so it has to see the slice the
+	// result is read back out of. One record cannot split a kind across two
+	// directories, so the map it returns holds at most this event's own kind.
+	dirs := hoistMediaDir(records)
+	return nil, getEventOutput{Event: records[0], MediaDir: dirs[records[0].Kind]}, nil
 }
 
 // AttributionRecord is one row of the list_apps inventory. In app mode Window
@@ -440,7 +590,7 @@ func (h *handlers) listApps(ctx context.Context, _ *sdk.CallToolRequest, in list
 			App:      row.App,
 			Window:   row.Window,
 			Events:   row.Events,
-			LastSeen: row.LastSeen.Local().Format(time.RFC3339Nano),
+			LastSeen: localStamp(row.LastSeen),
 		})
 	}
 	if len(out.Entries) == 0 {
