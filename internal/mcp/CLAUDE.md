@@ -7,8 +7,8 @@ cancelled. It depends on `internal/store` and nothing else of Lumi's.
 
 `search_events` truncates text per event and reports `truncated` plus true `text_length`, and never merges
 an audio chunk's two rows; `get_event` is the untruncated escape hatch and the only tool returning
-metadata, which it filters. Every tool returns its data once, as `structuredContent`, with a digest in
-`Content`. `get_transcript` reads audio as one ordered conversation
+metadata, which it filters. Every tool returns its payload both as `structuredContent` and, serialized, as
+the `Content` text block. `get_transcript` reads audio as one ordered conversation
 with the machine's own speech deduplicated, and its `confidence` and `order_confidence` carry no `omitempty`
 for the same reason `truncated` does not: a doubtful label must never be something an agent infers from a
 missing key. Validation and store failures come back as tool results with `isError`, never JSON-RPC protocol
@@ -30,13 +30,21 @@ reports is the one enforced.
   joined to an event's `media_file` is a path the user can open themselves. There is no `read_media`, and no
   filesystem-reading call anywhere in this package — `hoistMediaDir` splits a string and never touches the
   disk. No test can prove this negative; keep it true by construction.
-- **A payload crosses the wire once.** Every handler returns a non-nil `*sdk.CallToolResult` whose `Content`
-  is a digest, because the go-sdk fills `Content` with the entire marshalled output when a handler leaves it
-  nil (`mcp/server.go`, the `res.Content == nil` branch) — the same bytes in `structuredContent` and again as
-  text, on every call. The digest must carry the `notice` verbatim: a client that renders only `Content`
-  would otherwise be told nothing about a result that was capped, filtered, or drawn from a range holding
-  unattributed audio, which is exactly when a partial answer reads as a complete one.
-  `TestToolResultsDoNotRepeatTheStructuredPayload` and `TestDigestCarriesTheNotice` pin both halves.
+- **A payload crosses the wire twice, on purpose, and `Content` is never a summary of it.** Every handler
+  returns a nil `*sdk.CallToolResult`, so the go-sdk fills `Content` with the serialized output
+  (`mcp/server.go`, the `res.Content == nil` branch) — the same bytes in `structuredContent` and again as
+  text. That duplication is the spec's own backwards-compatibility rule and it is load-bearing:
+  `structuredContent` is optional for a client to read, and Codex CLI and Claude Desktop — two of the three
+  clients `mcpsetup` registers — render the content blocks and nothing else. Setting `Content` ourselves is
+  what silences the fallback, so a "cheaper" `Content` is not a smaller response, it is the *only* response
+  those clients get. This was learned the expensive way: `Content` briefly held a digest — counts, a time
+  span, and the `notice` — and an agent asked to write up a meeting it had watched Lumi record reported that
+  Lumi returned metadata for the window but no transcript text. Every call had carried the full transcript
+  in `structuredContent`. Nothing failed, no tool errored, and the agent's account of the failure was
+  accurate about what it could see. `TestEveryToolResultCarriesItsWholePayloadAsText` pins it by asserting
+  the text block parses and equals `structuredContent`, so a summary reintroduced on either side alone
+  fails. Trim what a payload *contains* — see the media-path split and the metadata denylist below — never
+  which clients can read it.
 - **The media path is split, and the contract says how to rejoin it.** Every event of a kind comes from one
   directory, so repeating it per event was two thirds of each path and the largest constant cost on a page;
   `media_dir` states it once. Two rules keep the split honest. `media_file` is `filepath.Base` of the stored

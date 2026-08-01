@@ -28,6 +28,18 @@ const (
 // used to name the file in "this index is empty" notices — it leaks nothing
 // new, since every media file a tool names already sits under that
 // directory — and is empty when Options carried none.
+//
+// Every handler returns a nil *sdk.CallToolResult, which is what puts its
+// payload on the wire twice: the go-sdk fills Content with the serialized output
+// when a handler leaves it nil, as the spec asks a tool returning
+// structuredContent to do. Do not "save" those bytes by composing a summary
+// there. structuredContent is optional for a client to read — Codex CLI and
+// Claude Desktop, two of the three clients `lumi mcp setup` registers, render
+// the content blocks and nothing else — so a summary in Content is the whole
+// answer for them. A digest of counts and a time span once shipped there, and an
+// agent asked to write up a meeting it had watched Lumi record reported that
+// Lumi held metadata for the window but no words: the transcript was in
+// structuredContent, complete, on every one of those calls.
 type handlers struct {
 	store        *store.Store
 	databasePath string
@@ -411,7 +423,7 @@ func (h *handlers) searchEvents(ctx context.Context, _ *sdk.CallToolRequest, in 
 			"conversation with per-turn origin labels and the machine's own speech deduplicated")
 	}
 	out.Notice = strings.Join(parts, "; ")
-	return summary(eventsDigest(out.Events), out.Notice), out, nil
+	return nil, out, nil
 }
 
 // hasAttributedAudio reports whether any returned audio event's chunk holds
@@ -509,8 +521,7 @@ func (h *handlers) getEvent(ctx context.Context, _ *sdk.CallToolRequest, in getE
 	// result is read back out of. One record cannot split a kind across two
 	// directories, so the map it returns holds at most this event's own kind.
 	dirs := hoistMediaDir(records)
-	return summary(eventDigest(records[0])),
-		getEventOutput{Event: records[0], MediaDir: dirs[records[0].Kind]}, nil
+	return nil, getEventOutput{Event: records[0], MediaDir: dirs[records[0].Kind]}, nil
 }
 
 // AttributionRecord is one row of the list_apps inventory. In app mode Window
@@ -595,5 +606,5 @@ func (h *handlers) listApps(ctx context.Context, _ *sdk.CallToolRequest, in list
 			return nil, empty, err
 		}
 	}
-	return summary(appsDigest(out.Entries, in.App), out.Notice), out, nil
+	return nil, out, nil
 }
