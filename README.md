@@ -1,6 +1,12 @@
+<p align="center">
+  <img src="assets/img/lumi-logo.png" alt="Lumi" width="160" height="160">
+</p>
+
 # Lumi
 
-Lumi is an open-source, local-first work memory for Apple Silicon Macs. It continuously captures every display plus system and microphone audio, extracts screen text with full-display Apple Vision OCR (using macOS Accessibility for focused-app attribution), transcribes speech on-device with Apple SpeechAnalyzer, stores the media on disk, indexes the text in SQLite FTS5, and lets you search and manage it from a Go CLI. `lumi mcp` exposes the same index to the AI agent of your choice over MCP.
+Lumi is an open-source AI memory of everything you do. It sees your screen and hears your meetings, then turns all of it into a searchable record of your work — so you never have to take notes again. Connect it to Claude or any other AI agent and ask what happened.
+
+Everything runs on your Mac. Nothing is uploaded, and it's completely free.
 
 Lumi deliberately targets a small surface: capture → process → store → query, with no GUI, server, or plugins.
 
@@ -15,7 +21,20 @@ Transcription runs entirely on-device through Apple SpeechAnalyzer — no extern
 
 ScreenCaptureKit captures system output and the default microphone directly; no loopback audio device is required. Lumi excludes its own process audio from system capture.
 
-## Build and run
+## Installation
+
+```sh
+task install # compiles the Swift SpeechAnalyzer bridge (task speech), then go install
+lumi permissions --request
+lumi doctor
+lumi record start
+```
+
+`task install` places the `lumi` binary in your Go bin directory — `go env GOBIN` if set, otherwise `$(go env GOPATH)/bin` — and prints the path it used. Add that directory to your `PATH` if it isn't there already. Remove the binary with `task uninstall`.
+
+macOS grants capture permissions to a specific binary, so re-run `lumi permissions --request` after installing if you had previously granted them to a `./lumi` built in the repository.
+
+## Build and run (Development)
 
 ```sh
 task build # compiles the Swift SpeechAnalyzer bridge (task speech), then go build
