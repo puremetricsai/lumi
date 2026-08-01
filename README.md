@@ -4,7 +4,7 @@
 
 # Lumi
 
-Lumi is an open-source AI memory of everything you do. It sees your screen and hears your meetings, then turns all of it into a searchable record of your work — so you never have to take notes again. Connect it to Claude or any other AI agent and ask what happened.
+Lumi is a minimal, open source AI memory of everything you do. It sees your screen and hears your meetings, then turns all of it into a searchable record of your work — so you never have to take notes again. Connect it to Claude or any other AI agent and ask what happened.
 
 Everything runs on your Mac. Nothing is uploaded, and it's completely free.
 
