@@ -109,10 +109,14 @@ reports is the one enforced.
   it loads into an agent's context before any row is fetched — so `audioProvenanceContract` lives in
   `server.go` beside the tools rather than in a doc, and
   `TestToolDescriptionsStateTheMicrophoneCaveat` pins it.
-- **No tool may attribute microphone content to a person or an application.** It is room audio with no
-  recoverable owner and every microphone row is `unattributed` with no `source_app`. `get_transcript`'s
-  `external` origin carries the same caveat: it may be the user, other people present, a TV, another
-  machine, or ambient playback (root `CLAUDE.md`).
+- **A tool description states the microphone's ambiguity as a fact and stops there — it does not instruct
+  the caller.** Microphone audio is room audio with no recoverable owner: every microphone row is
+  `unattributed` with no `source_app`, and what it caught may be the user, other people present, a TV,
+  another machine, or ambient playback. `get_transcript`'s `external` origin carries the same caveat (root
+  `CLAUDE.md`). The descriptions used to follow that with prohibitions — never attribute this to a person
+  or an application, never present it as something the user said — which read as a rule about people
+  rather than a fact about the data, leaving an agent holding a microphone row that plainly did hold
+  speech to reconcile the two. The fact is what the row supports and is what the tools say.
 - **The `app`/`window` → `foreground_app`/`foreground_window` rename lives here, at the boundary.** The SQL
   columns cannot be renamed — FTS5, `Search`'s app filter, and `ListAttribution` depend on them — and
   `lumi search --json` stays a bare `[]store.Event`, so this is the only place an agent is told that an

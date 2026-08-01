@@ -45,11 +45,20 @@ func Serve(ctx context.Context, s *store.Store, opts Options) error {
 // the ordinary case is a video playing in a background browser while the user
 // works somewhere else.
 //
-// The microphone sentence is the load-bearing one. Lumi cannot tell who is
-// speaking in the room and does not try, so the honest output is an ambiguity
+// The microphone sentence is the load-bearing one. Lumi cannot tell what made a
+// sound in the room and does not try, so the honest output is an ambiguity
 // stated outright rather than a guess. Raw audio is deleted on the retention
 // schedule while any summary built from it survives, which makes a fabricated
-// speaker permanent.
+// source permanent.
+//
+// It states that ambiguity and stops there. The sentences that used to follow it
+// — never attribute this to a person or an application, never present it as
+// something the user said — read as a rule about people rather than a fact about
+// the data, and an agent holding a microphone row that plainly did hold speech
+// had to reconcile the two. What the row supports is already said: the device is
+// the room, there is no source_app, and what it recorded may be anyone or
+// anything audible. A caller that knows that will not invent a speaker, and one
+// that would is not stopped by a prohibition.
 //
 // The pairing sentences are there for the same reason and were learned the same
 // way. search_events used to merge each chunk's two rows into one on the
@@ -78,8 +87,7 @@ const audioProvenanceContract = "Audio results keep three different things apart
 	"title said it was playing audio; \"unattributed\" means nothing named a " +
 	"source. Microphone audio has NO reliable source — it may be the user, other people present, a " +
 	"TV, another machine, or ambient playback. Microphone rows are always \"unattributed\" and carry " +
-	"no source_app. Never attribute microphone content to a person or to an application, and never " +
-	"present it as something the user said or did. " +
+	"no source_app: what a microphone row picked up may be a person or anything else audible. " +
 	"Audio rows come in PAIRS sharing one captured_at — one per capture device — and this tool never " +
 	"merges them. Whether both rows of a pair reach you depends on your query and filters, which are " +
 	"applied per ROW: a query matching only one track's transcript, require_text, or a limit falling " +
@@ -124,7 +132,8 @@ func newServer(s *store.Store, opts Options) *sdk.Server {
 			"Join media_dir to the event's media_file for a local path the user can open themselves. " +
 			"An audio event carries foreground_app (what the user had focused), source_app (what was " +
 			"observed producing the sound), and attribution (how that was earned) as three separate " +
-			"fields; see search_events. Microphone content is never attributed to a person or an app.",
+			"fields; see search_events. A microphone event records the room and carries no source_app: " +
+			"what it picked up may be the user, other people present, a TV, or ambient playback.",
 	}, h.getEvent)
 
 	sdk.AddTool(server, &sdk.Tool{
@@ -162,9 +171,8 @@ func newServer(s *store.Store, opts Options) *sdk.Server {
 			"time, which would repeat turns you already have. " +
 			"Use event_ids with get_event to read either track's raw, undeduplicated transcript. " +
 			"A turn's origin names provenance relative to this machine and is a different axis from an " +
-			"event's source_app. No turn is attributed to a person: \"external\" audio came from the " +
-			"room's microphone and may be the user, other people present, a TV, another machine, or " +
-			"ambient playback. Never present it as something the user said or did.",
+			"event's source_app. \"external\" audio came from the room's microphone and may be the " +
+			"user, other people present, a TV, another machine, or ambient playback.",
 	}, h.getTranscript)
 
 	return server

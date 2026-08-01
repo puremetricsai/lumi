@@ -973,7 +973,6 @@ func TestToolDescriptionsStateTheMicrophoneCaveat(t *testing.T) {
 		"emitting_process",
 		"Microphone audio has NO reliable source",
 		"other people present",
-		"Never attribute microphone content to a person or to an application",
 		// The pairing clauses. Merging a chunk's two rows on a shared timestamp
 		// once discarded a whole microphone transcript while the result still
 		// read as complete, so the description has to say both that a pair
@@ -1003,10 +1002,13 @@ func TestToolDescriptionsStateTheMicrophoneCaveat(t *testing.T) {
 			t.Errorf("%s description never mentions source_app", name)
 		}
 	}
+	// Each of them states the ambiguity as a fact about the row rather than as a
+	// rule about what the caller may conclude: the microphone records the room,
+	// and what it caught may be a person or anything else audible.
 	for _, name := range []string{"search_events", "get_event", "get_transcript"} {
 		description := findToolDescription(t, name)
-		if !strings.Contains(strings.ToLower(description), "never") {
-			t.Errorf("%s description states no prohibition on attributing microphone content", name)
+		if !strings.Contains(description, "other people present") {
+			t.Errorf("%s description never says what microphone audio may have caught", name)
 		}
 	}
 }
