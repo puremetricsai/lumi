@@ -16,12 +16,15 @@ class Lumi < Formula
   # pulls the keg-only homebrew-core `swift`, and then dies at `system "swiftc"` with a
   # message that hides the real reason: internal/macosnative is `darwin && arm64 && cgo`.
   depends_on :macos
-  depends_on macos: :tahoe
 
   # swiftc ships with the Command Line Tools that Homebrew already requires, so this only
   # documents the toolchain and installs nothing. Do not use `depends_on xcode:` — it
   # demands a full Xcode.app, which Lumi does not need.
   uses_from_macos "swift" => :build
+
+  on_macos do
+    depends_on macos: :tahoe
+  end
 
   def install
     # internal/macosnative links `-L${SRCDIR} -llumispeech`, so the static Swift bridge
