@@ -27,7 +27,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const version = "0.1.0-dev"
+// version is a var, not a const, so release builds can override it with
+// `-ldflags "-X github.com/puremetricsai/lumi/internal/cli.version=<tag>"`.
+var version = "0.1.0-dev"
 
 type app struct {
 	dataDir string
