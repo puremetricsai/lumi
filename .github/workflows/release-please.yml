@@ -87,6 +87,14 @@ jobs:
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           path: artifacts
+          # Without this the on-disk layout depends on how many artifacts the run
+          # produced: download-artifact nests each one under a directory named after it,
+          # except when exactly one artifact matched, which it drops flat into `path` --
+          # while still logging "an extra directory with the artifact name will be
+          # created". There is one artifact today, so the nested layout this job used to
+          # assume never existed. `merge-multiple: true` is flat unconditionally, so
+          # adding a second archive later cannot move the files out from under the glob.
+          merge-multiple: true
       - name: Generate checksums and upload
         env:
           GH_TOKEN: ${{ github.token }}
@@ -94,22 +102,27 @@ jobs:
           set -euo pipefail
           TAG="${{ needs.release-please.outputs.tag_name }}"
           cd artifacts
-          # download-artifact with no `name` nests every artifact under a directory named
-          # after it, so each archive sits at ./<artifact>/<file> and bare `-name` would
-          # also match the directory. `\./` must stay escaped: an unescaped dot is a BRE
-          # wildcard, and GNU sed matches leftmost, so `./[^/]*/` starts at offset 0 and
-          # deletes the checksum itself — publishing a SHA256SUMS.txt of bare filenames.
-          find . -mindepth 2 -type f -name '*.tar.gz' -exec sha256sum {} \; | sed 's|\./[^/]*/||' > SHA256SUMS.txt
-          cat SHA256SUMS.txt
-          if [ ! -s SHA256SUMS.txt ] || grep -qvE '^[0-9a-f]{64}  [^/]+$' SHA256SUMS.txt; then
-            echo "::error::SHA256SUMS.txt is empty or malformed"
+          # nullglob so a missing archive is caught by the count below with a message
+          # naming the job that should have produced it, not by sha256sum failing on a
+          # file literally called '*.tar.gz'.
+          shopt -s nullglob
+          ARCHIVES=(*.tar.gz)
+          if [ "${#ARCHIVES[@]}" -eq 0 ]; then
+            echo "::error::build-binaries produced no *.tar.gz archive"
+            ls -R
             exit 1
           fi
-          # Upload archives
-          for dir in */; do
-            for file in "$dir"*.tar.gz; do
-              [ -f "$file" ] && gh release upload "$TAG" "$file" --clobber --repo ${{ github.repository }}
-            done
+          # Hashing the bare glob rather than a `find` path keeps the names in
+          # SHA256SUMS.txt relative and unprefixed, which is what `sha256sum -c` in
+          # verify-release needs: it resolves every name against its own cwd.
+          sha256sum "${ARCHIVES[@]}" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          if grep -qvE '^[0-9a-f]{64}  [^/]+$' SHA256SUMS.txt; then
+            echo "::error::SHA256SUMS.txt is malformed"
+            exit 1
+          fi
+          for file in "${ARCHIVES[@]}"; do
+            gh release upload "$TAG" "$file" --clobber --repo ${{ github.repository }}
           done
           gh release upload "$TAG" SHA256SUMS.txt --clobber --repo ${{ github.repository }}
 
