@@ -66,6 +66,3 @@ see `internal/capture/CLAUDE.md`.
   and a continuously open stream lands at exactly 30 s rather than scattered through that band. 35 s still
   separates "the next chunk" from "the recorder stopped", for old rows and new alike, and a turn must never
   bridge a stop.
-- **Real captured conversation never becomes a test fixture.** The calibration and real-pair harnesses
-  read their input from a path in the environment and skip without it. The measured numbers belong in the
-  repository; the words do not.

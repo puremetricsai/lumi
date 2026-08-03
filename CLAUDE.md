@@ -4,7 +4,7 @@ Guidance for Claude Code (claude.ai/code) when working in this repository.
 
 ## What Lumi is
 
-A local-first work-memory CLI for Apple Silicon Macs: continuously capture all displays plus system and
+A local-first memory CLI for Apple Silicon Macs: continuously capture all displays plus system and
 microphone audio, extract screen text locally (full-display Apple Vision OCR, with Accessibility for
 focused-app attribution), transcribe audio with in-process Apple SpeechAnalyzer, store media on disk, index
 text in SQLite FTS5, and query it. Inspired by screenpipe but deliberately narrower — no GUI, server, or
@@ -77,14 +77,7 @@ changing anything there** — the rationale lives with the code it constrains, n
 - **Schema changes go through `internal/store/migrations.go`.** Append a new `migration` with the next
   version; never edit shipped SQL. → `internal/store/CLAUDE.md`
 - **Real captured conversation never becomes a test fixture.** Harnesses that need real audio read a path
-  from the environment and skip without it. The measured numbers belong in the repository; the words do
-  not.
-- **Microphone audio is never attributed to a person or an application.** It records the room and may be
-  the user, other people present, a TV, or ambient playback. Lumi does not identify speakers and does not
-  try; the requirement is that the ambiguity is *stated* — in the data (`attribution: unattributed`, no
-  `source_app`), in the MCP tool descriptions, and in anything that renders a transcript. Raw audio is
-  deleted on the retention schedule while a summary built from it survives, so a fabricated speaker
-  becomes permanent. → `internal/capture/CLAUDE.md`, `internal/mcp/CLAUDE.md`
+  from the environment and skip without it. The measured numbers belong in the repository; the words do not.
 
 ## External dependencies
 
