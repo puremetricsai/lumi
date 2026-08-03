@@ -1,0 +1,221 @@
+name: Release Please
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - name: Run Release Please
+        uses: googleapis/release-please-action@16a9c90856f42705d54a6fda1823352bdc62cf38 # v4.4.0
+        id: release
+
+  # Lumi is darwin/arm64 only: cgo links ScreenCaptureKit, Vision, AVFoundation and a
+  # static Swift archive built against the macOS 26 SDK. There is exactly one target and
+  # no cross-compilation is possible, so this job runs on an Apple Silicon macOS 26 runner.
+  build-binaries:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6.2.0
+        with:
+          go-version-file: go.mod
+      - name: Select a macOS 26 SDK toolchain
+        run: |
+          # SpeechAnalyzer exists only in the macOS 26 SDK. Pin Xcode when the expected
+          # version is present, then assert the SDK version so an image bump that changes
+          # the default toolchain fails here instead of inside swiftc.
+          if [ -d /Applications/Xcode_26.6.app ]; then
+            sudo xcode-select -s /Applications/Xcode_26.6.app
+          fi
+          xcodebuild -version
+          SDK_VERSION="$(xcrun --sdk macosx --show-sdk-version)"
+          echo "macOS SDK ${SDK_VERSION}"
+          # Compare the major numerically rather than enumerating majors: an allowlist
+          # rejects a future SDK that satisfies the rule this message states, and
+          # build-binaries is the only job gated on release_created, so failing here
+          # leaves a tag and a GitHub release with no assets attached.
+          SDK_MAJOR="${SDK_VERSION%%.*}"
+          case "${SDK_MAJOR}" in
+            ''|*[!0-9]*) echo "::error::could not parse a major version out of the macOS SDK version '${SDK_VERSION}'"; exit 1 ;;
+          esac
+          [ "${SDK_MAJOR}" -ge 26 ] || { echo "::error::the SpeechAnalyzer bridge needs the macOS 26 SDK or newer (found ${SDK_VERSION})"; exit 1; }
+      - name: Build binary
+        env:
+          CGO_ENABLED: 1
+        run: |
+          VERSION="${{ needs.release-please.outputs.tag_name }}"
+          # Same ordering as Taskfile.yml: the static Swift archive must exist before cgo
+          # runs, because internal/macosnative links -L${SRCDIR} -llumispeech.
+          swiftc -emit-library -static -O \
+            -o internal/macosnative/liblumispeech.a \
+            internal/macosnative/speech.swift
+          LDFLAGS="-s -w -X github.com/puremetricsai/lumi/internal/cli.version=${VERSION}"
+          go build -ldflags="${LDFLAGS}" -o lumi ./cmd/lumi
+      - name: Verify the injected version
+        run: |
+          TAG="${{ needs.release-please.outputs.tag_name }}"
+          # -X silently no-ops against a Go const, so assert the binary really reports the
+          # tag rather than the 0.1.0-dev default.
+          ACTUAL="$(./lumi version)"
+          [ "${ACTUAL}" = "${TAG}" ] || { echo "::error::lumi version printed '${ACTUAL}', expected '${TAG}'"; exit 1; }
+      - name: Archive binary
+        run: tar -czf lumi-darwin-arm64.tar.gz lumi LICENSE
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: lumi-darwin-arm64.tar.gz
+          path: lumi-darwin-arm64.tar.gz
+          retention-days: 1
+
+  upload-release-assets:
+    needs: [release-please, build-binaries]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          path: artifacts
+      - name: Generate checksums and upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.release-please.outputs.tag_name }}"
+          cd artifacts
+          # download-artifact with no `name` nests every artifact under a directory named
+          # after it, so each archive sits at ./<artifact>/<file> and bare `-name` would
+          # also match the directory. `\./` must stay escaped: an unescaped dot is a BRE
+          # wildcard, and GNU sed matches leftmost, so `./[^/]*/` starts at offset 0 and
+          # deletes the checksum itself — publishing a SHA256SUMS.txt of bare filenames.
+          find . -mindepth 2 -type f -name '*.tar.gz' -exec sha256sum {} \; | sed 's|\./[^/]*/||' > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          if [ ! -s SHA256SUMS.txt ] || grep -qvE '^[0-9a-f]{64}  [^/]+$' SHA256SUMS.txt; then
+            echo "::error::SHA256SUMS.txt is empty or malformed"
+            exit 1
+          fi
+          # Upload archives
+          for dir in */; do
+            for file in "$dir"*.tar.gz; do
+              [ -f "$file" ] && gh release upload "$TAG" "$file" --clobber --repo ${{ github.repository }}
+            done
+          done
+          gh release upload "$TAG" SHA256SUMS.txt --clobber --repo ${{ github.repository }}
+
+  verify-release:
+    needs: [release-please, upload-release-assets]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.release-please.outputs.tag_name }}"
+          ASSETS=$(gh release view "$TAG" --json assets --jq '.assets[].name' --repo ${{ github.repository }})
+          for asset in lumi-darwin-arm64.tar.gz SHA256SUMS.txt; do
+            echo "$ASSETS" | grep -q "^${asset}$" && echo "✓ $asset" || { echo "✗ Missing: $asset"; exit 1; }
+          done
+
+      - name: Verify published checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.release-please.outputs.tag_name }}"
+          # Checking asset names cannot see a SHA256SUMS.txt whose hashes were mangled on
+          # the way in, which is how this pipeline shipped unverifiable checksums before.
+          # Download what users download and run the command they would run.
+          mkdir -p verify
+          cd verify
+          gh release download "$TAG" --clobber --repo ${{ github.repository }}
+          cat SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt
+
+  update-homebrew-formula:
+    # Depends on the tag existing and nothing else: the formula builds from source and
+    # consumes none of the uploaded assets. Chaining it behind build-binaries would make
+    # a runner-image or SDK failure skip it through the `needs` cascade, and job 1 has
+    # already cut the tag by then — release-please will not re-cut a version whose release
+    # exists, so a re-run sets release_created to false and the tap keeps the previous
+    # release's url and checksum forever.
+    needs: [release-please]
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout lumi repository
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          token: ${{ github.token }}
+          # The push step below rebases onto whatever main has become. A shallow
+          # clone has no merge base to rebase against once main moves, so the
+          # rebase fails exactly in the race it exists to survive.
+          fetch-depth: 0
+
+      - name: Compute source tarball SHA256
+        id: sha256
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.release-please.outputs.tag_name }}"
+          # GitHub generates tag tarballs on demand and can 404 or 5xx briefly after the
+          # tag appears. `curl -s` without --fail exits 0 and writes the error body to
+          # stdout, so piping straight into sha256sum hashes an error page (or, on a reset
+          # connection, the empty string) into the formula. Download to a file, make curl's
+          # failure the step's failure, and prove the bytes are really a gzip stream.
+          curl -fsSL --retry 5 --retry-all-errors \
+            -o source.tar.gz \
+            "https://github.com/${{ github.repository }}/archive/refs/tags/${TAG}.tar.gz"
+          gzip -t source.tar.gz
+          SHA256="$(sha256sum source.tar.gz | awk '{print $1}')"
+          [ "${#SHA256}" -eq 64 ] || { echo "::error::bad source tarball sha256: '${SHA256}'"; exit 1; }
+          rm -f source.tar.gz
+          echo "source=${SHA256}" >> "$GITHUB_OUTPUT"
+
+      - name: Update formula
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.release-please.outputs.tag_name }}"
+          FORMULA="HomebrewFormula/lumi.rb"
+          URL="https://github.com/${{ github.repository }}/archive/refs/tags/${TAG}.tar.gz"
+          SHA256="${{ steps.sha256.outputs.source }}"
+          # These seds rewrite in place and cannot insert, so the formula must hold exactly
+          # one top-level `url`/`sha256` pair. A `resource` or `stable do` block would give
+          # them a second, wrong target; `^ *` and `[^"]*` keep them off a line like
+          # `url "...", tag: "...", revision: "..."`, which a greedy `.*` would collapse.
+          for field in url sha256; do
+            COUNT="$(grep -cE "^ *${field} \"[^\"]*\"$" "$FORMULA" || true)"
+            [ "${COUNT}" = "1" ] || { echo "::error::${FORMULA} has ${COUNT} top-level \`${field} \"...\"\` lines, expected exactly 1"; exit 1; }
+          done
+          sed -i -E "s|^( *)url \"[^\"]*\"|\1url \"${URL}\"|" "$FORMULA"
+          sed -i -E "s|^( *)sha256 \"[^\"]*\"|\1sha256 \"${SHA256}\"|" "$FORMULA"
+          # Assert the postcondition. `git diff --cached --quiet` below cannot tell "already
+          # correct" from "matched nothing", so without this a missed regex is a green job
+          # that ships the previous release's tarball under the new tag.
+          grep -qF -- "url \"${URL}\"" "$FORMULA" || { echo "::error::the url rewrite did not take"; exit 1; }
+          grep -qF -- "sha256 \"${SHA256}\"" "$FORMULA" || { echo "::error::the sha256 rewrite did not take"; exit 1; }
+          cat "$FORMULA"
+
+      - name: Commit and push
+        run: |
+          TAG="${{ needs.release-please.outputs.tag_name }}"
+          VERSION="${TAG#v}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add HomebrewFormula/lumi.rb
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "chore: update Homebrew formula to ${VERSION}"
+          # main can move underneath us between the checkout and here; rebase rather than
+          # fail the release on a non-fast-forward push.
+          git pull --rebase origin main
+          git push
