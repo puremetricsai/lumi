@@ -24,10 +24,17 @@ ScreenCaptureKit captures system output and the default microphone directly; no 
 ## Installation
 
 ```sh
-task install # compiles the Swift SpeechAnalyzer bridge (task speech), then go install
+brew tap puremetricsai/lumi https://github.com/puremetricsai/lumi
+brew install lumi
 lumi permissions --request
 lumi doctor
 lumi record start
+```
+
+To install using `go install`:
+
+```sh
+task install # compiles the Swift SpeechAnalyzer bridge (task speech), then go install
 ```
 
 `task install` places the `lumi` binary in your Go bin directory — `go env GOBIN` if set, otherwise `$(go env GOPATH)/bin` — and prints the path it used. Add that directory to your `PATH` if it isn't there already. Remove the binary with `task uninstall`.
