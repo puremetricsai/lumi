@@ -43,6 +43,94 @@ const (
 type handlers struct {
 	store        *store.Store
 	databasePath string
+	// version is this build's version string, named in a staleness notice so the
+	// skew reads as a fact about two builds rather than a vague warning.
+	version string
+	// binaryChanged reports whether the lumi binary on disk is no longer the one
+	// this process is running. Never nil once newServer has built it; it folds an
+	// absent Options hook into a constant false.
+	binaryChanged func() bool
+	// selfUpdating records whether this process can replace itself, which changes
+	// what a staleness notice should tell the caller to do.
+	selfUpdating bool
+}
+
+// stalenessNotice reports that this server process no longer matches what is
+// installed, or that its database was written by a different build.
+//
+// It exists because both kinds of skew are otherwise *silent*, which is the
+// failure mode this repository treats as the worst one. An agent holds a
+// long-lived `lumi mcp` subprocess for the whole session, so a `brew upgrade
+// lumi` leaves the old image mapped and serving old code — and every migration
+// is additive, so an older build reading a newer file finds every column its
+// fixed SELECT names, succeeds, and returns rows missing only what the new build
+// added. Nothing errors on either path. Without this the user upgrades to get a
+// fix, watches the agent keep producing the old behavior, and has no way to see
+// why; with it the answer says so in the same breath as the data.
+//
+// It is deliberately a notice and not a tool error. The results are real and
+// worth having — the skew makes them possibly-incomplete, not wrong — and
+// failing the call would deny the agent data it can still use. That is the same
+// direction as every other notice here: state the doubt on the wire rather than
+// leaving an agent to infer it from an absence.
+//
+// A failure to read the schema version returns no notice rather than an error,
+// for the reason hasAttributedAudio does: it can only come from the database the
+// results were just read out of, and losing the notice must never cost the call.
+func (h *handlers) stalenessNotice(ctx context.Context) string {
+	var parts []string
+	if h.binaryChanged != nil && h.binaryChanged() {
+		if h.selfUpdating {
+			parts = append(parts, fmt.Sprintf(
+				"the installed lumi binary has been upgraded since this server started (running %s); "+
+					"it will replace itself once this session goes briefly idle, so results after that "+
+					"may reflect newer behavior",
+				h.versionLabel()))
+		} else {
+			parts = append(parts, fmt.Sprintf(
+				"this MCP server is running an older lumi build (%s) than the one now installed, "+
+					"because the agent launched it before the upgrade; "+
+					"restart this session to pick up the new build",
+				h.versionLabel()))
+		}
+	}
+	if fileVersion, err := h.store.SchemaVersion(ctx); err == nil &&
+		fileVersion > store.CodeSchemaVersion {
+		// Additive migrations mean this cannot be detected from the rows: they
+		// arrive complete as far as this build's column list is concerned.
+		parts = append(parts, fmt.Sprintf(
+			"this index was written by a newer Lumi (database schema %d, this build reads %d), "+
+				"so events may carry fields this build does not return; "+
+				"restart this session, or re-run `lumi mcp setup`, to read it with the matching build",
+			fileVersion, store.CodeSchemaVersion))
+	}
+	return strings.Join(parts, "; ")
+}
+
+// versionLabel names this build for a notice, without ever rendering an empty
+// pair of parentheses when the version was not stamped in.
+func (h *handlers) versionLabel() string {
+	if h.version == "" {
+		return "unknown version"
+	}
+	return h.version
+}
+
+// withStaleness prefixes a tool's notice with any staleness warning.
+//
+// The skew goes first because it qualifies everything after it: a notice that
+// opens by explaining an empty result would otherwise have an agent acting on
+// "nothing matched" when the real answer is "this process cannot see what a
+// newer build wrote".
+func (h *handlers) withStaleness(ctx context.Context, notice string) string {
+	stale := h.stalenessNotice(ctx)
+	switch {
+	case stale == "":
+		return notice
+	case notice == "":
+		return stale
+	}
+	return stale + "; " + notice
 }
 
 // EventRecord is one event as an MCP client sees it. It deliberately carries no
@@ -422,7 +510,7 @@ func (h *handlers) searchEvents(ctx context.Context, _ *sdk.CallToolRequest, in 
 		parts = append(parts, "some results are audio: get_transcript returns these as one ordered "+
 			"conversation with per-turn origin labels and the machine's own speech deduplicated")
 	}
-	out.Notice = strings.Join(parts, "; ")
+	out.Notice = h.withStaleness(ctx, strings.Join(parts, "; "))
 	return nil, out, nil
 }
 
@@ -500,6 +588,11 @@ type getEventOutput struct {
 	// for a path the user can open. It is a plain string rather than the map
 	// search_events returns because one event has one kind.
 	MediaDir string `json:"media_dir,omitempty"`
+	// Notice reports build or schema skew, and nothing else — this tool has no
+	// empty result to explain, since a missing id is an error. It is here because
+	// this is the tool an agent calls for a *complete* answer after a truncated
+	// one, which is exactly where silently missing fields matter most.
+	Notice string `json:"notice,omitempty"`
 }
 
 // getEvent returns one event with its text in full and its processor metadata
@@ -521,7 +614,11 @@ func (h *handlers) getEvent(ctx context.Context, _ *sdk.CallToolRequest, in getE
 	// result is read back out of. One record cannot split a kind across two
 	// directories, so the map it returns holds at most this event's own kind.
 	dirs := hoistMediaDir(records)
-	return nil, getEventOutput{Event: records[0], MediaDir: dirs[records[0].Kind]}, nil
+	return nil, getEventOutput{
+		Event:    records[0],
+		MediaDir: dirs[records[0].Kind],
+		Notice:   h.stalenessNotice(ctx),
+	}, nil
 }
 
 // AttributionRecord is one row of the list_apps inventory. In app mode Window
@@ -606,5 +703,6 @@ func (h *handlers) listApps(ctx context.Context, _ *sdk.CallToolRequest, in list
 			return nil, empty, err
 		}
 	}
+	out.Notice = h.withStaleness(ctx, out.Notice)
 	return nil, out, nil
 }

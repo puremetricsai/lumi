@@ -2,21 +2,53 @@ package mcp
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"testing"
 
 	"github.com/puremetricsai/lumi/internal/store"
+	_ "modernc.org/sqlite"
 )
 
 func testStore(t *testing.T) *store.Store {
 	t.Helper()
-	s, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "lumi.db"))
+	s, _ := testStoreWithPath(t)
+	return s
+}
+
+// testStoreWithPath opens a store and reports the file it lives in, for tests
+// that need to reach the database behind the store's own API.
+func testStoreWithPath(t *testing.T) (*store.Store, string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "lumi.db")
+	s, err := store.Open(context.Background(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { s.Close() })
-	return s
+	return s, path
+}
+
+// bumpSchemaVersion writes a user_version above what this build's migrations
+// reach, standing in for an index a newer Lumi wrote.
+//
+// It goes around store.Store because there is deliberately no API for this: a
+// build never writes a version it does not have a migration for. The pragma is
+// set on a separate connection to the same file, which is also how the real skew
+// arises — another process, holding its own connection, migrating the file this
+// one already has open.
+func bumpSchemaVersion(t *testing.T, ctx context.Context, path string, version int) {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", version)); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func insertEvents(t *testing.T, ctx context.Context, s *store.Store, events ...store.Event) []store.Event {

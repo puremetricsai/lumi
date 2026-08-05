@@ -57,6 +57,7 @@ changing anything there** — the rationale lives with the code it constrains, n
 | `internal/cli` | Cobra commands and all the wiring. |
 | `internal/mcp` | Stdio MCP server: four read-only tools over `internal/store` and nothing else of Lumi's. |
 | `internal/mcpsetup` | Registers `lumi mcp` with Claude Code, Claude Desktop, and Codex. |
+| `internal/selfexec` | Watches the running binary and replaces the process image (`syscall.Exec`) when it changes, so an upgrade reaches a live `lumi mcp` session. |
 | `internal/config` | Resolves `Paths` from `--data-dir`, else `LUMI_HOME`, else `~/Library/Application Support/Lumi`; directories 0700. |
 | `internal/platform` | The `darwin/arm64` gate. |
 
@@ -75,7 +76,13 @@ changing anything there** — the rationale lives with the code it constrains, n
 - **Nothing may write to stdout in the `lumi mcp` path except JSON-RPC frames.** A stray `fmt.Println`,
   default `slog` handler, or cobra usage dump silently corrupts the session. → `internal/mcp/CLAUDE.md`
 - **Schema changes go through `internal/store/migrations.go`.** Append a new `migration` with the next
-  version; never edit shipped SQL. → `internal/store/CLAUDE.md`
+  version, and bump `CodeSchemaVersion` with it; never edit shipped SQL. → `internal/store/CLAUDE.md`
+- **A process serving stale code or reading a stranger's schema must say so, because neither is detectable
+  from the data.** Migrations are additive, so an older build reading a newer file succeeds and returns rows
+  short of whatever the new build added — no error, anywhere. The long-lived `lumi mcp` process is where this
+  actually bites: the agent holds it across the user's `brew upgrade`. `internal/mcp` reports both skews in
+  every tool's `notice` and replaces its own image to fix the first.
+  → `internal/mcp/CLAUDE.md`, `internal/selfexec/CLAUDE.md`
 - **Real captured conversation never becomes a test fixture.** Harnesses that need real audio read a path
   from the environment and skip without it. The measured numbers belong in the repository; the words do not.
 

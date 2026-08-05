@@ -90,7 +90,16 @@ and `transcript.Segment` — shadow each other the way `internal/mcp`'s `Attribu
 ## Schema
 
 - **Schema changes go through `migrations.go`.** Append a new `migration` with the next version; never edit
-  shipped SQL.
+  shipped SQL. **Bump `CodeSchemaVersion` in the same change** — it is the constant callers compare against
+  `SchemaVersion` to notice a database written by a different build, so leaving it behind reports every
+  current index as "written by a newer Lumi", the exact opposite of the truth.
+  `TestCodeSchemaVersionMatchesTheMigrations` pins it.
+- **The skew between a build and a file it opens is invisible in the rows, which is why the version is
+  exported.** Every migration here is additive — `ADD COLUMN`, `CREATE INDEX` — so an older build reading a
+  newer file finds every column its fixed `eventSelect` names: the query succeeds and the rows come back
+  missing only what the newer build added. Nothing errors, so a caller can only report it by comparing the
+  two numbers itself. `internal/mcp` does, because a server process an agent holds for a whole session is
+  exactly where the two drift apart.
 - **`origin` is TEXT with no `CHECK`**, so distinguishing machine-side participants later is a value
   change rather than a migration. `silent` already uses that room, and is why the column could gain a
   fourth value without touching the schema.

@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"log/slog"
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/puremetricsai/lumi/internal/store"
@@ -22,6 +23,21 @@ type Options struct {
 	// under that same directory. Optional; an empty value falls back to the
 	// generic notice.
 	DatabasePath string
+	// BinaryChanged reports whether the lumi binary this process was started
+	// from has since been replaced on disk, and BinaryExec replaces the process
+	// image with the new one. Both are injected because neither is something
+	// this package does: it reads the store and nothing else of the machine, and
+	// the rule that no code here touches the filesystem is kept by construction.
+	//
+	// Supplying both enables in-place upgrades: `lumi mcp` replaces itself
+	// between requests, carrying the client's pipes and handshake across, so a
+	// `brew upgrade lumi` reaches a live agent session. Leaving either nil
+	// disables that and leaves the process serving the build it started as.
+	BinaryChanged func() bool
+	BinaryExec    func() error
+	// Logger receives diagnostics. It must never write to stdout — that is the
+	// JSON-RPC stream. A nil Logger discards them.
+	Logger *slog.Logger
 }
 
 // Serve runs the MCP server on stdin/stdout until the client closes the
@@ -31,8 +47,60 @@ type Options struct {
 // JSON-RPC frame. A stray print, a default slog handler, or a cobra usage dump
 // corrupts the stream, and the failure reaches the user as "the agent cannot
 // see Lumi" with no error text anywhere. Diagnostics go to stderr.
+//
+// This does not call the SDK's Server.Run, because Run always connects a fresh
+// session. When this process is the replacement for one that upgraded itself
+// (see reexec.go), the client is mid-session and will never send `initialize`
+// again — so the handshake has to be restored, which only Connect accepts.
 func Serve(ctx context.Context, s *store.Store, opts Options) error {
-	return newServer(s, opts).Run(ctx, &sdk.StdioTransport{})
+	logger := opts.Logger
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
+	server := newServer(s, opts)
+
+	var transport sdk.Transport = &sdk.StdioTransport{}
+	var updater *selfUpdater
+	if opts.BinaryChanged != nil && opts.BinaryExec != nil {
+		updater = &selfUpdater{changed: opts.BinaryChanged, exec: opts.BinaryExec}
+		server.AddReceivingMiddleware(updater.middleware())
+		// Both halves are required. The middleware covers a handler that is still
+		// running; this covers the reply being written after it returned, which is
+		// where the SDK actually blocks on the client.
+		transport = updater.trackWrites(transport)
+	}
+
+	session, err := server.Connect(ctx, transport, &sdk.ServerSessionOptions{
+		State: restoreSessionState(logger),
+	})
+	if err != nil {
+		return err
+	}
+
+	if updater != nil {
+		// The state is read at replacement time rather than captured now: a
+		// restored session already holds its handshake, but a freshly launched
+		// one has not been handed it yet.
+		watchCtx, stop := context.WithCancel(ctx)
+		defer stop()
+		go updater.watch(watchCtx, func() *sdk.ServerSessionState {
+			return &sdk.ServerSessionState{
+				InitializeParams:  session.InitializeParams(),
+				InitializedParams: &sdk.InitializedParams{},
+			}
+		}, logger)
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- session.Wait() }()
+	select {
+	case <-ctx.Done():
+		session.Close()
+		<-closed
+		return ctx.Err()
+	case err := <-closed:
+		return err
+	}
 }
 
 // audioProvenanceContract is the part of search_events' description that keeps
@@ -106,7 +174,17 @@ func newServer(s *store.Store, opts Options) *sdk.Server {
 		opts.Name = "lumi"
 	}
 	server := sdk.NewServer(&sdk.Implementation{Name: opts.Name, Version: opts.Version}, nil)
-	h := &handlers{store: s, databasePath: opts.DatabasePath}
+	h := &handlers{
+		store:        s,
+		databasePath: opts.DatabasePath,
+		version:      opts.Version,
+		binaryChanged: func() bool {
+			return opts.BinaryChanged != nil && opts.BinaryChanged()
+		},
+		// A build that can replace itself reports skew differently: the fix is
+		// automatic and imminent, not something to tell the user to do.
+		selfUpdating: opts.BinaryChanged != nil && opts.BinaryExec != nil,
+	}
 
 	// AddTool infers each tool's input and output schema from the Go types and
 	// validates arguments before the handler runs, so the descriptions below are

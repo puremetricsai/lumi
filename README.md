@@ -155,6 +155,8 @@ legitimate baseline.
 
 You never run the server yourself. The agent spawns `lumi mcp` as a child process when it needs it and shuts it down afterwards, so there is no daemon to keep alive, no port, and no terminal to leave open.
 
+Because the agent keeps that process for the whole session, upgrading Lumi mid-session would otherwise leave it serving the old build — the replaced file on disk does not affect a process already running. So `lumi mcp` watches its own binary and, once the session is briefly idle, replaces itself in place with the new one. The agent's connection is preserved across the swap and it never sees an interruption. Until that happens, and if the index turns out to have been written by a newer Lumi than the server is running, every tool result says so in its `notice` rather than quietly returning results from the older build.
+
 ### Automatic setup
 
 ```sh
@@ -248,6 +250,7 @@ ScreenCaptureKit system + microphone ─→ WAV ─→ SpeechAnalyzer (in-proces
 - `internal/retention`: age-, size-, and wipe-based event/media pruning
 - `internal/mcp`: the read-only MCP tool surface served over stdio
 - `internal/mcpsetup`: registering `lumi mcp` with installed MCP clients
+- `internal/selfexec`: replacing the running process when its binary is upgraded
 - `internal/vocabulary`: the custom vocabulary file's format, cache, and cap
 - `internal/config`: data-directory path resolution
 - `internal/cli`: Cobra commands and lifecycle

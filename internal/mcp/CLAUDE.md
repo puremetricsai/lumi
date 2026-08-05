@@ -3,7 +3,9 @@
 Stdio MCP server on `github.com/modelcontextprotocol/go-sdk` (pinned v1.6.1; import aliased as `sdk`, since
 our package is also named `mcp`). `Serve(ctx, *store.Store, Options)` registers four read-only tools —
 `search_events`, `get_event`, `list_apps`, `get_transcript` — and runs until stdin closes or the context is
-cancelled. It depends on `internal/store` and nothing else of Lumi's.
+cancelled. It depends on `internal/store` and nothing else of Lumi's; the binary-watching and
+process-replacing hooks in `Options` are injected by `internal/cli` from `internal/selfexec`, because this
+package reads the store and never the filesystem.
 
 `search_events` truncates text per event and reports `truncated` plus true `text_length`, and never merges
 an audio chunk's two rows; `get_event` is the untruncated escape hatch and the only tool returning
@@ -22,6 +24,46 @@ reports is the one enforced.
 
 ## Invariants
 
+- **A server process that no longer matches what is installed says so, in every tool's `notice`.** Both
+  ways this drifts are silent by construction, which is why the reporting exists at all. An agent launches
+  `lumi mcp` once and keeps it for the session, so a `brew upgrade lumi` leaves the old image mapped and
+  answering — the client owns the process lifecycle and will not relaunch it mid-session. And every
+  migration is additive (`internal/store/migrations.go`), so an older build reading a newer file finds every
+  column its fixed `eventSelect` names, succeeds, and returns rows missing only what the new build added.
+  Nothing errors on either path; the user upgrades to get a fix, watches the old behavior persist, and has
+  no way to see why. `stalenessNotice` compares `store.CodeSchemaVersion` against `Store.SchemaVersion` and
+  asks `Options.BinaryChanged`, and `withStaleness` puts the result *first*, because it qualifies whatever
+  follows: an agent that reads "no events matched" ahead of it will act on the filters. It is a notice and
+  never a tool error — the results are real and worth having, and the skew makes them possibly-incomplete
+  rather than wrong. `get_event` grew a `notice` field for this and this alone, since it is where an agent
+  goes for the *complete* version of a truncated answer. A self-updating build words it differently
+  (`Options.BinaryExec` present): the fix is imminent and automatic, so telling the user to restart the
+  session would be wrong advice.
+- **`lumi mcp` replaces its own process image when its binary changes, and the handshake is what has to
+  survive.** `syscall.Exec` preserves fds 0/1/2, so the client keeps talking to the same pid on the same
+  pipes and never learns anything happened — that is the whole reason this works where a client-side restart
+  would not. But the 2025-11-25 protocol this SDK pins gates every method on having seen `initialize`
+  (go-sdk's `ServerSession.handle`), so a replacement that came up cold would reject the client's next
+  request with "method is invalid during session initialization" — and fail on request N+1, not at startup.
+  `reexec.go` therefore stashes `sdk.ServerSessionState` in `LUMI_MCP_SESSION_STATE` across the exec and
+  `Serve` restores it through `ServerSessionOptions.State`, which is why `Serve` cannot use the SDK's
+  `Server.Run` (it always connects a fresh session). The variable is unset the moment it is read, so a stale
+  handshake cannot be inherited by an unrelated child. Unparseable stashed state is discarded rather than
+  fatal, and a failed `execve` leaves this image intact and serving, which is why it clears the variable
+  again on the way out.
+- **A handler returning is not the end of a request, so the replacement waits on the *write*, not on the
+  handler.** `selfUpdater.inFlight` counts running handlers (`middleware`) *and* frames being written
+  (`trackWrites`), and both halves are load-bearing: jsonrpc2 serializes and writes the reply **after**
+  `Handle` returns (`processResult` calls `c.write`), and the SDK's `ioConn.Write` ends in a blocking write to
+  stdout. So a client that has stopped draining its pipe leaves a reply pending with every handler already
+  finished — counting handlers alone reported that session *idle*, and exec'ing there carries the reply away
+  and hangs the client on a response nobody will ever send. That was a real defect, found in review and
+  reproduced before it was fixed: `TestUpdaterMustNotBeIdleWhileAReplyIsStillBeingWritten` blocks a reply
+  mid-write and asserts the updater does not consider the session idle, and it fails if `trackWrites` is
+  taken out of the transport chain. `TestUpdaterIsIdleOnceTheReplyHasBeenWritten` pins the other direction,
+  because a guard that never lets go means the upgrade never happens. `reexecQuietPeriod` is a margin on top
+  of that guarantee — it covers the gap *between* two requests of one exchange — and is not what makes the
+  replacement safe.
 - **Nothing may write to stdout in the `lumi mcp` path except JSON-RPC frames.** A stray `fmt.Println`,
   default `slog` handler, or cobra usage dump silently corrupts the session and the user just sees the agent
   lose Lumi. `mcpCommand` (in `internal/cli`) sets `SilenceUsage`/`SilenceErrors` explicitly; every
