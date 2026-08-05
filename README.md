@@ -95,7 +95,7 @@ Earlier versions also wrote a `config.json` here to hold the provider settings f
 
 Search terms are safely combined with FTS5 `AND`. With no text argument, Lumi returns the most recent events. `--app` is an exact case-insensitive filter; `--window` is a case-insensitive substring filter. Results include timestamps and paths to the original screenshot or WAV chunk. JSON output also preserves screen-text source, display ID, audio source, and processor diagnostics.
 
-Each audio chunk is recorded twice — once from system output and once from the microphone — and the two are stored as separate rows sharing one timestamp, distinguished by `audio_source`. A search returns whichever of them matched your filters, never a merge of the two. A meeting played through your speakers is transcribed on both; a call where you also speak is not. Search does not try to tell those apart, because a shared timestamp is a shared 30-second interval and not a shared sound. `lumi transcript` is the view that resolves it, returning the conversation once with the machine's own speech deduplicated.
+Audio chunks are recorded from system output and from the microphone — and the two are stored as separate rows sharing one timestamp, distinguished by `audio_source`. A search returns whichever of them matched your filters, never a merge of the two. A meeting played through your speakers is transcribed on both; a call where you also speak is not. Search does not try to tell those apart, because a shared timestamp is a shared 30-second interval and not a shared sound. `lumi transcript` is the view that resolves it, returning the conversation once with the machine's own speech deduplicated.
 
 ## Transcript
 
