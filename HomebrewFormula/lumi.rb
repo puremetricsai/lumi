@@ -4,8 +4,8 @@ class Lumi < Formula
   # The `url` and `sha256` lines below are rewritten on every tag by the
   # update-homebrew-formula job in .github/workflows/release-please.yml. Both must exist
   # and stay well-formed: that job seds them in place, it does not insert them.
-  url "https://github.com/puremetricsai/lumi/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "c3b7409dd99e1bf26865bb60c685956f6ef72b9e282ed584c9dcd44a419cc4ce"
+  url "https://github.com/puremetricsai/lumi/archive/refs/tags/v0.2.0.tar.gz"
+  sha256 "c863eb8597836fdc203c498389b131924e3979fc976fb0229b244fe3951cc8cf"
   license "MIT"
   head "https://github.com/puremetricsai/lumi.git", branch: "main"
 
