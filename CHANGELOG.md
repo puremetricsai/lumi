@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.2.0](https://github.com/puremetricsai/lumi/compare/v0.1.0...v0.2.0) (2026-08-05)
+
+
+### Features
+
+* **mcp:** replace the server process on upgrade, and report both skews ([4458015](https://github.com/puremetricsai/lumi/commit/445801537952dbf6755121cb4b7341cb69771baf))
+* **mcp:** replace the server process on upgrade, and report both skews ([a873503](https://github.com/puremetricsai/lumi/commit/a87350327f28e3991522452c723da9d14040bc2a))
+
+
+### Bug Fixes
+
+* **brew:** update macOS dependency syntax ([d1b2f08](https://github.com/puremetricsai/lumi/commit/d1b2f082a4af7bbbcbeb3748bb3c45cdd7a7b1c9))
+* **brew:** update macOS dependency syntax ([b5701a5](https://github.com/puremetricsai/lumi/commit/b5701a565187dd88d94f1046df58297f287a79fb))
+
 ## 0.1.0 (2026-08-03)
 
 
