@@ -109,46 +109,6 @@ Each audio chunk is recorded twice — once from system output and once from the
 
 Turns are derived from the two transcripts, so `lumi transcript backfill` is what fills them in for audio captured before this existed. The default pass works from the index alone and needs no WAV files; `--retranscribe` re-runs recognition to recover word timings, which is far slower, needs the audio still on disk, and refuses to run beside a live recorder. The work queue is whatever is unattributed, so an interrupted run simply resumes.
 
-## Custom vocabulary
-
-Apple's on-device transcriber sometimes mishears names and jargon outside its general vocabulary, and a
-misheard term is permanently unsearchable. Drop an optional `vocabulary.txt` in your data directory — one
-term or phrase per line, UTF-8 — to bias recognition toward it:
-
-```text
-# people
-Mostafa
-Lumi
-
-# jargon
-SpeechAnalyzer
-```
-
-Blank lines and lines starting with `#` are ignored, surrounding whitespace is trimmed, and exact duplicate
-terms collapse to their first occurrence. File order is priority order: only the first 100 terms are used,
-and anything past that cap is dropped rather than silently ignored — `lumi doctor` reports how many. An edit
-takes effect on the next audio chunk; no restart needed.
-
-Compare the effect on fixed audio with `lumi transcribe`, which replays one WAV through the same
-transcription path the recorder uses:
-
-```sh
-./lumi transcribe recording.wav --no-vocabulary   # baseline
-./lumi transcribe recording.wav                    # with vocabulary.txt applied
-./lumi transcribe recording.wav --vocabulary other.txt  # a specific list instead
-```
-
-Comparing two live recordings would confound the vocabulary with how the words happened to be spoken;
-replaying the same file isolates the term list as the only variable. `lumi transcribe` also takes
-`--speech-locale` (same default as `record`, `en-US`), for replaying audio in a non-default locale.
-
-An explicit `--vocabulary <path>` that is missing or unreadable is a hard, non-zero error — the behavior
-you're most likely to hit by accident, for example a typo'd path or an unset `--vocabulary="$VOCAB"`. This
-is deliberate: silently falling back would print an ordinary baseline transcript that looks
-vocabulary-assisted, defeating the comparison this command exists to make. The default file (no
-`--vocabulary` given) is different — its absence stays silent, since running with no vocabulary at all is a
-legitimate baseline.
-
 ## Connect an AI agent
 
 `lumi mcp` serves the index to any MCP-capable agent — Claude Desktop, Claude Code, Cursor, Codex — over stdin/stdout. The agent brings its own model; Lumi does no inference.
@@ -208,56 +168,22 @@ Smoke-test the server without an agent:
 task mcp
 ```
 
+## Custom vocabulary
+
+An optional `vocabulary.txt` in your data directory biases transcription toward names and jargon Apple's
+on-device recognizer mishears. Its format, the 100-term cap, and comparing the effect with `lumi transcribe`:
+[docs/custom-vocabulary.md](docs/custom-vocabulary.md).
+
 ## Retention
 
-Captured JPEG and WAV files remain on disk until explicitly pruned. Preview an age policy before applying it:
-
-```sh
-./lumi prune --older-than 720h --dry-run
-./lumi prune --older-than 720h
-```
-
-You can instead cap indexed media by bytes, or combine both policies. Age pruning runs first; the size pass then removes the oldest remaining events until the cap is met.
-
-```sh
-# Keep indexed media under 50 GiB
-./lumi prune --max-bytes 53687091200
-
-# Combine age and size policies and emit a machine-readable preview
-./lumi prune --older-than 2160h --max-bytes 53687091200 --dry-run --json
-```
-
-To wipe everything, `--all` deletes every indexed event and all media, then sweeps the `screenshots/` and `audio/` directories for orphaned files no row referenced. It is irreversible, so it prompts you to type `yes`; only `--yes` (for scripts) or `--dry-run` (which deletes nothing) skips the prompt.
-
-```sh
-./lumi prune --all --dry-run
-./lumi prune --all
-```
-
-Lumi does not schedule retention automatically. Run `prune` periodically yourself if you want a fixed policy. Database rows are deleted before their media files, so an interrupted prune can leave recoverable orphaned files rather than indexed events whose media has disappeared.
+Captured media stays on disk until `lumi prune` removes it — nothing is scheduled automatically. Age and
+size policies, the irreversible `--all` wipe, and dry-run previews:
+[docs/retention.md](docs/retention.md).
 
 ## Architecture
 
-```text
-ScreenCaptureKit displays ─→ Vision OCR (full screen) ─┐
-                         └─→ Accessibility (attribution) ├─→ events + FTS5 ─→ search / mcp
-ScreenCaptureKit system + microphone ─→ WAV ─→ SpeechAnalyzer (in-process) ─┘
-```
-
-- `internal/macosnative`: cgo bridge to ScreenCaptureKit, Accessibility, Vision, and permission APIs
-- `internal/capture`: testable capture orchestration, perceptual deduplication, and transcription
-- `internal/store`: versioned SQLite migrations, FTS5 triggers, inserts, and filtered search
-- `internal/retention`: age-, size-, and wipe-based event/media pruning
-- `internal/mcp`: the read-only MCP tool surface served over stdio
-- `internal/mcpsetup`: registering `lumi mcp` with installed MCP clients
-- `internal/selfexec`: replacing the running process when its binary is upgraded
-- `internal/vocabulary`: the custom vocabulary file's format, cache, and cap
-- `internal/config`: data-directory path resolution
-- `internal/cli`: Cobra commands and lifecycle
-
-Frames use a hash fast path plus a sampled color-histogram comparison with independent state per display; recent user input makes the threshold more sensitive. Two safety intervals keep capture from going silent: a frame whose bytes changed but scored as a near-duplicate — a video, an advancing slide — is retained at least every ten seconds, while a byte-identical frame is retained every five minutes, so a frozen screen leaves a bounded presence marker instead of re-indexing the same JPEG. Full-display Vision OCR is the primary screen-text source, so the index reflects the whole screen rather than just the focused window; the Accessibility snapshot supplies focused-app attribution and its window text is kept in event metadata when substantive. If Accessibility, Vision, comparison, or transcription fails after media was captured, Lumi preserves and indexes the event with processor diagnostics instead of silently losing the original data.
-
-`lumi permissions --request` invokes Apple's native Screen Recording, Accessibility, Microphone, and Speech Recognition request flows. `lumi doctor` reports their current state with the matching System Settings location. Input Monitoring is informational and is only requested when `--input-monitoring` is explicitly passed; capture does not require an event tap.
+How capture, processing, storage, and query fit together, what each package owns, and how frame
+deduplication and permissions work: [docs/architecture.md](docs/architecture.md).
 
 ## Development
 
