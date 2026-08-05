@@ -128,12 +128,37 @@ CREATE INDEX IF NOT EXISTS events_audio_attribution_captured_at_idx
 	},
 }
 
+// CodeSchemaVersion is the schema version this build knows how to read: the
+// highest migration compiled into it. A process whose database reports a
+// user_version above this is reading a file a newer Lumi wrote.
+//
+// It is exported because the skew it makes visible is silent by construction.
+// Every migration here is additive — ADD COLUMN, CREATE INDEX — so an older
+// build's fixed eventSelect list keeps working against a newer file: the columns
+// it names all still exist, the query succeeds, and the rows come back missing
+// only whatever the newer build added. Nothing errors, so the only way a caller
+// can report the skew is to compare the two numbers itself. internal/mcp does,
+// because a long-lived server process is exactly where the two drift apart.
+const CodeSchemaVersion = 5
+
+// SchemaVersion reports the schema version recorded in the open database.
+//
+// This is the file's number, not the build's — compare it against
+// CodeSchemaVersion to detect a database written by a different Lumi.
+func (s *Store) SchemaVersion(ctx context.Context) (int, error) {
+	var version int
+	if err := s.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+		return 0, fmt.Errorf("read schema version: %w", err)
+	}
+	return version, nil
+}
+
 // runMigrations applies every migration whose version exceeds the database's
 // current user_version, each in its own transaction.
 func (s *Store) runMigrations(ctx context.Context) error {
-	var current int
-	if err := s.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&current); err != nil {
-		return fmt.Errorf("read schema version: %w", err)
+	current, err := s.SchemaVersion(ctx)
+	if err != nil {
+		return err
 	}
 	for _, m := range migrations {
 		if m.Version <= current {

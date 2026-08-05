@@ -156,7 +156,7 @@ func (h *handlers) getTranscript(ctx context.Context, _ *sdk.CallToolRequest, in
 	if err != nil {
 		return nil, empty, err
 	}
-	out.Notice = notice
+	out.Notice = h.withStaleness(ctx, notice)
 	return nil, out, nil
 }
 

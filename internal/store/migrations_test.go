@@ -24,6 +24,40 @@ func TestMigrateSetsUserVersion(t *testing.T) {
 	}
 }
 
+// CodeSchemaVersion is a constant, so appending a migration without bumping it
+// would leave the skew detection in internal/mcp comparing against a version
+// this build has moved past — silently reporting every current database as
+// "written by a newer Lumi", which is the opposite of the truth.
+func TestCodeSchemaVersionMatchesTheMigrations(t *testing.T) {
+	if CodeSchemaVersion != len(migrations) {
+		t.Errorf("CodeSchemaVersion = %d, but there are %d migrations; update the constant",
+			CodeSchemaVersion, len(migrations))
+	}
+	if last := migrations[len(migrations)-1].Version; CodeSchemaVersion != last {
+		t.Errorf("CodeSchemaVersion = %d, but the last migration is version %d",
+			CodeSchemaVersion, last)
+	}
+}
+
+// SchemaVersion reports the file's version, which is what makes a database
+// written by a different build detectable at all.
+func TestSchemaVersionReportsTheAppliedVersion(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	version, err := s.SchemaVersion(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version != CodeSchemaVersion {
+		t.Errorf("SchemaVersion() = %d, want %d", version, CodeSchemaVersion)
+	}
+}
+
 func TestMigrateIsIdempotent(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "lumi.db")

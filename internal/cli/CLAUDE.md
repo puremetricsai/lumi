@@ -22,7 +22,14 @@ developer's own Claude config.
 
 - **Nothing in the `lumi mcp` path may write to stdout except JSON-RPC frames.** `mcpCommand` sets
   `SilenceUsage`/`SilenceErrors` explicitly and every diagnostic goes to stderr — see
-  `internal/mcp/CLAUDE.md` for what a stray write costs.
+  `internal/mcp/CLAUDE.md` for what a stray write costs. The `slog.Logger` it hands `mcp.Serve` is built on
+  `cmd.ErrOrStderr()` for that reason; a default handler would corrupt the stream.
+- **`mcp` wires the binary watcher, and a watcher it cannot build is a warning rather than a failure.** The
+  client owning this process's lifecycle is also why the process watches its own binary: it is launched once
+  and kept for the session, so an upgrade otherwise never reaches the running server and the client will not
+  relaunch it to fix that. `internal/mcp` takes the hooks rather than doing this itself because that package
+  touches no filesystem; `internal/selfexec` owns the rules about which path to watch. Losing the watcher
+  costs the upgrade path, not the server, so it must never abort startup.
 - **`doctor` never opens the store through `openStore`**, which would create a mistyped `--data-dir` and
   then call the empty result healthy. It reports observed attribution from the index alongside permission
   status.
