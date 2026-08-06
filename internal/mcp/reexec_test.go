@@ -288,3 +288,64 @@ func TestARestoredSessionServesToolsWithoutAHandshake(t *testing.T) {
 		t.Errorf("expected a tool list, got %s", response.Result)
 	}
 }
+
+// The idleness check and the replacement must be one atomic decision.
+//
+// A check that releases the lock before exec'ing re-opens the race from the other
+// side: the watcher decides the session is idle, a request arrives in the interval
+// before execve, and the replacement carries it away. state() is called inside
+// that exact window, which makes it a precise stand-in for "a request landed here"
+// without having to win a real race.
+func TestReplacementIsAtomicWithTheIdlenessCheck(t *testing.T) {
+	t.Setenv(sessionStateEnv, "")
+	execed := make(chan struct{})
+	var once sync.Once
+	u := &selfUpdater{
+		changed:       func() bool { return true },
+		checkInterval: time.Millisecond,
+		quietPeriod:   time.Millisecond,
+	}
+	u.exec = func() error {
+		once.Do(func() { close(execed) })
+		return nil
+	}
+	u.begin()
+	u.end()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// Records whether a request could be admitted after the idleness decision but
+	// before the process was replaced. With the lock held across both, this
+	// goroutine cannot proceed until exec has returned.
+	// Guarded by its own Once: a failed stash leaves watch ticking, so state() can
+	// be called more than once and an unguarded close would panic.
+	admitted := make(chan struct{})
+	var probe sync.Once
+	go u.watch(ctx, func() *sdk.ServerSessionState {
+		probe.Do(func() {
+			go func() {
+				u.begin()
+				close(admitted)
+			}()
+		})
+		// Give that goroutine every chance to take the lock if it can.
+		time.Sleep(50 * time.Millisecond)
+		select {
+		case <-admitted:
+			t.Error("a request was admitted between the idleness check and the replacement: " +
+				"exec'ing here discards it and hangs the client on a reply that will never come")
+		default:
+		}
+		return &sdk.ServerSessionState{
+			InitializeParams:  &sdk.InitializeParams{ProtocolVersion: "2025-11-25"},
+			InitializedParams: &sdk.InitializedParams{},
+		}
+	}, quietLogger())
+
+	select {
+	case <-execed:
+	case <-ctx.Done():
+		t.Fatal("watch never attempted the replacement")
+	}
+}

@@ -40,6 +40,18 @@ see `internal/capture/CLAUDE.md`.
 - **A silent internal track and an untranscribed one are different findings**, needing opposite
   conclusions: silence means the microphone is confidently the room's, audio-without-words means a
   re-recording of unseen speech is possible and the honest answer is `unknown`.
+- **Asking the question always records an answer, so `Attribute` never returns an empty slice for a chunk
+  with a track.** The routing gate and the exit filter have to share one notion of a word, and they did not:
+  `hasSpeech` accepted any non-blank text while `finalize` drops every fragment without a letter or digit.
+  SpeechAnalyzer emits exactly that — 7 microphone rows in a live index held a bare `.` — so those chunks
+  routed to `externalOnly`, emitted one punctuation segment, lost it in `finalize`, and returned nothing.
+  Nothing is not `silent`: `IsSilent` needs a row to read, so no marker was written, and because the work
+  queue is *derived* from the chunks with no segments, each one sat there permanently while `lumi transcript`
+  counted it as a gap and advised a backfill that reached the same dead end. Measured on a live index, 5 of 6
+  gaps in one hour were this. `hasSpeech` now asks `hasWord`, and `attributed` falls back to the marker
+  whenever a path's output is emptied anyway — the gate is the fast path, the fallback is the guarantee,
+  since any route can lose its last word in `finalize`. A chunk with no track still returns nothing: there
+  is no event to store a row against, and orphaning a segment is worse than leaving it queued.
 - **Overlap comes from word intervals, never `result.range`.** A recognizer result extends to its
   finalization boundary; one measured reporting 3000–9660 ms held a single word at 3000–3660 ms. The wider
   span drags neighbouring room speech into an overlap it never had.

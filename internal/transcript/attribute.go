@@ -23,18 +23,51 @@ func Attribute(chunk Chunk, opts Options) []Segment {
 	case !hasSpeech(mic) && !hasSpeech(system):
 		return silentMarker(chunk)
 	case !hasSpeech(mic):
-		return finalize(internalOnly(system, chunk, opts))
+		return attributed(internalOnly(system, chunk, opts), chunk)
 	case !hasSpeech(system):
-		return finalize(externalOnly(mic, system, chunk, opts))
+		return attributed(externalOnly(mic, system, chunk, opts), chunk)
 	case timingsUsable(system) && timingsUsable(mic):
-		return finalize(timedPath(system, mic, chunk, opts))
+		return attributed(timedPath(system, mic, chunk, opts), chunk)
 	default:
-		return finalize(textPath(system, mic, chunk, opts))
+		return attributed(textPath(system, mic, chunk, opts), chunk)
 	}
 }
 
+// hasSpeech reports whether a track holds anything this package can attribute.
+//
+// It asks hasWord rather than testing for non-blank text, because finalize drops
+// every wordless fragment and a routing gate looser than that exit filter sends a
+// chunk down a path whose output is then thrown away entirely. The recognizer
+// really does emit such transcripts: measured on a live index, 7 microphone rows
+// held exactly "." — SpeechAnalyzer heard something and decided it was not words.
+// Those chunks routed to externalOnly, emitted one punctuation segment, lost it in
+// finalize, and returned nothing. Nothing is not silent (IsSilent needs a row), so
+// no marker was written, and since the work queue is derived from the chunks with
+// no segments, all of them sat on it permanently while `lumi transcript` counted
+// them as gaps a backfill could fill and the backfill reached the same dead end.
+// One notion of "is this speech", applied at both ends, is what removes that.
 func hasSpeech(track *Track) bool {
-	return track != nil && strings.TrimSpace(track.Text) != ""
+	return track != nil && hasWord(track.Text)
+}
+
+// attributed finalizes a path's output, falling back to the silent marker when
+// nothing survived.
+//
+// The fallback is the guarantee, and hasSpeech above is only the fast path to it:
+// every route into finalize can in principle have its last word dropped there —
+// a track whose text carries a word while its timed segments carry only
+// punctuation, or a split that leaves nothing but separators — and each one would
+// strand its chunk on the derived queue the same way. What a caller's queue needs
+// is that asking the question always records an answer, so it is enforced here
+// once rather than trusted to each path.
+//
+// A chunk with no track to hang a row on still returns nothing: silentMarker has
+// nowhere to store it, and an orphaned segment is worse than an absent one.
+func attributed(items []placed, chunk Chunk) []Segment {
+	if segments := finalize(items); len(segments) > 0 {
+		return segments
+	}
+	return silentMarker(chunk)
 }
 
 // silentMarker records that a chunk holding no words was attributed anyway.
