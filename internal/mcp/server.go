@@ -67,7 +67,7 @@ func Serve(ctx context.Context, s *store.Store, opts Options) error {
 		// Both halves are required. The middleware covers a handler that is still
 		// running; this covers the reply being written after it returned, which is
 		// where the SDK actually blocks on the client.
-		transport = updater.trackWrites(transport)
+		transport = updater.stdioTransport()
 	}
 
 	session, err := server.Connect(ctx, transport, &sdk.ServerSessionOptions{

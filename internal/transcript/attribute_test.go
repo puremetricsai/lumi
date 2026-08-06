@@ -671,6 +671,77 @@ func TestChunkWithNoTracksAtAllProducesNothing(t *testing.T) {
 	}
 }
 
+// TestWordlessTranscriptIsSilentRatherThanUnattributable pins the gate that keeps
+// the derived work queue drainable.
+//
+// SpeechAnalyzer emits a bare "." for audio it heard but did not read as words:
+// measured on a live index, 7 microphone rows held exactly that. Such a track used
+// to satisfy the routing gate (non-blank text) and then fail finalize's exit
+// filter (no letter or digit), so the chunk emitted nothing at all — and nothing
+// is not silent, because IsSilent needs a row to look at. No marker meant the
+// chunk never left the queue: 5 of 6 gaps in one hour of a live index were this,
+// with `lumi transcript` advertising a backfill that reached the same dead end.
+func TestWordlessTranscriptIsSilentRatherThanUnattributable(t *testing.T) {
+	// Every arrangement of a wordless transcript, on either track and with or
+	// without timings, so no single route back into the old behavior reopens it.
+	cases := []struct {
+		name  string
+		chunk Chunk
+	}{
+		{"punctuation on the microphone", Chunk{CapturedAt: anchor,
+			System:     &Track{Source: "system"},
+			Microphone: &Track{Source: "microphone", Text: "."}}},
+		{"punctuation on the system track", Chunk{CapturedAt: anchor,
+			System:     &Track{Source: "system", Text: "."},
+			Microphone: &Track{Source: "microphone"}}},
+		{"punctuation on both tracks", Chunk{CapturedAt: anchor,
+			System:     &Track{Source: "system", Text: "-"},
+			Microphone: &Track{Source: "microphone", Text: "."}}},
+		{"punctuation with timings", Chunk{CapturedAt: anchor,
+			System: &Track{Source: "system"},
+			Microphone: &Track{Source: "microphone", Text: ".", Segments: []TimedSegment{
+				{StartMS: 0, EndMS: 500, Text: ".", Confidence: 0.9}}}}},
+		// The gate is a fast path, not the guarantee: here the track text holds a
+		// real word while the timed segments carry only punctuation, so hasSpeech
+		// passes and finalize still drops everything. The fallback is what catches
+		// it.
+		{"words in text, punctuation in the timings", Chunk{CapturedAt: anchor,
+			System: &Track{Source: "system"},
+			Microphone: &Track{Source: "microphone", Text: "okay", Segments: []TimedSegment{
+				{StartMS: 0, EndMS: 500, Text: ",", Confidence: 0.9}}}}},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			segments := Attribute(test.chunk, Options{})
+			if len(segments) == 0 {
+				t.Fatal("no segments and no marker, so the chunk can never leave the " +
+					"derived work queue and reads as a gap a backfill could fill")
+			}
+			if !IsSilent(segments) {
+				t.Fatalf("IsSilent = false for a wordless transcript; got %d segments %v",
+					len(segments), textsOf(segments))
+			}
+			if text := segments[0].Text; text != "" {
+				t.Errorf("the marker carries text %q; punctuation must never reach a transcript", text)
+			}
+			if segments[0].SourceTrack == "" {
+				t.Error("the marker has no source track, so no event can own it")
+			}
+		})
+	}
+}
+
+// TestWordlessTranscriptStillNeedsATrackToOwnItsMarker holds the one case where
+// returning nothing is right: with no track there is no event to store a row
+// against, and orphaning a segment is worse than leaving the chunk queued.
+func TestWordlessTranscriptStillNeedsATrackToOwnItsMarker(t *testing.T) {
+	chunk := Chunk{CapturedAt: anchor, Microphone: &Track{Text: "."}}
+	if segments := Attribute(chunk, Options{}); len(segments) != 0 {
+		t.Errorf("got %d segments for a wordless chunk with no source track, want none: %v",
+			len(segments), textsOf(segments))
+	}
+}
+
 func textsOf(segments []Segment) []string {
 	out := make([]string, len(segments))
 	for i, segment := range segments {

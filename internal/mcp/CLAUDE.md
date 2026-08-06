@@ -51,19 +51,43 @@ reports is the one enforced.
   handshake cannot be inherited by an unrelated child. Unparseable stashed state is discarded rather than
   fatal, and a failed `execve` leaves this image intact and serving, which is why it clears the variable
   again on the way out.
-- **A handler returning is not the end of a request, so the replacement waits on the *write*, not on the
-  handler.** `selfUpdater.inFlight` counts running handlers (`middleware`) *and* frames being written
-  (`trackWrites`), and both halves are load-bearing: jsonrpc2 serializes and writes the reply **after**
-  `Handle` returns (`processResult` calls `c.write`), and the SDK's `ioConn.Write` ends in a blocking write to
-  stdout. So a client that has stopped draining its pipe leaves a reply pending with every handler already
-  finished — counting handlers alone reported that session *idle*, and exec'ing there carries the reply away
-  and hangs the client on a response nobody will ever send. That was a real defect, found in review and
-  reproduced before it was fixed: `TestUpdaterMustNotBeIdleWhileAReplyIsStillBeingWritten` blocks a reply
-  mid-write and asserts the updater does not consider the session idle, and it fails if `trackWrites` is
-  taken out of the transport chain. `TestUpdaterIsIdleOnceTheReplyHasBeenWritten` pins the other direction,
-  because a guard that never lets go means the upgrade never happens. `reexecQuietPeriod` is a margin on top
-  of that guarantee — it covers the gap *between* two requests of one exchange — and is not what makes the
-  replacement safe.
+- **A request is in flight from the moment it leaves the pipe until its reply has been written, and the
+  guard has to cover that whole span.** Neither end is where a handler runs, and each was a real defect found
+  in review. *After:* jsonrpc2 serializes and writes the reply **after** `Handle` returns (`processResult`
+  calls `c.write`) and the SDK's `ioConn.Write` ends in a blocking write to stdout, so a client that stopped
+  draining its pipe leaves a reply pending with every handler already finished — counting handlers alone
+  reported that session *idle*, and exec'ing there carries the reply away and hangs the client.
+  *Before:* `acceptRequest` appends to an unbounded `handlerQueue` and only then starts `handleAsync`
+  (`internal/jsonrpc2/conn.go`), so a call the client is already blocked on increments nothing until the
+  handler reaches it. That end is the worse of the two, because it is unrecoverable: the replacement image
+  **cannot re-read a frame this one already consumed**. The SDK's `IOTransport` makes this boundary earlier
+  still: its decoder goroutine consumes stdin before `Connection.Read` returns, so recording the ID there
+  alone cannot close the race. `guardedReader` polls without the updater lock, then holds it across the raw
+  read and records activity before releasing it; if replacement won the lock, bytes remain in the inherited
+  pipe for the new image. So `selfUpdater` tracks three things —
+  running handlers (`middleware`), frames being written (`trackWrites`'s `Write`), and calls read but not yet
+  answered (`trackWrites`'s `Read`, keyed by ID in `outstanding`) — and `idleLocked` states the rule once
+  because `claimIdle` acts on it without releasing the lock. Notifications are deliberately *not* tracked:
+  they carry no ID and get no response, so nothing could ever retire one and a permanent entry would block
+  every future upgrade — a worse failure than the one being fixed — while losing one hangs nobody.
+  A failed write retires its call for the same reason.
+- **The idleness check and the `execve` are one atomic decision.** Checking and then exec'ing without the
+  lock re-opens the race from the other side: the check passes, a request lands in the interval, and the
+  replacement discards it. `claimIdle` holds `mu` across both, which is safe precisely because a successful
+  `execve` never returns — there is no caller left to unblock. On failure the lock is released and the server
+  carries on, so the guard is scoped to one attempt and can never wedge future upgrades; both failure paths
+  (`stashSessionState` and `exec`) also clear `LUMI_MCP_SESSION_STATE`.
+- **Tests for all of this must fail with the guard removed, which is not automatic here.** A never-used
+  `selfUpdater` is never idle (`lastActivity` is zero), so an assertion that a request holds the guard passes
+  vacuously unless a completed exchange precedes it —
+  `TestAReadCallIsOutstandingBeforeAnyHandlerRuns` does that first, and was confirmed to fail with the `Read`
+  interception taken out. `TestRequestBytesAreNotConsumedDuringReplacement` pins the earlier raw-transport
+  boundary. `TestReplacementIsAtomicWithTheIdlenessCheck` probes inside the check-to-exec window
+  via the `state()` callback and fails when `claimIdle` is reduced to check-then-act;
+  `TestUpdaterMustNotBeIdleWhileAReplyIsStillBeingWritten` blocks a reply mid-write.
+  `TestUpdaterIsIdleOnceTheReplyHasBeenWritten` pins the other direction, because a guard that never lets go
+  means the upgrade never happens. `reexecQuietPeriod` is a margin on top of these guarantees — it covers the
+  gap *between* two requests of one exchange — and is not what makes the replacement safe.
 - **Nothing may write to stdout in the `lumi mcp` path except JSON-RPC frames.** A stray `fmt.Println`,
   default `slog` handler, or cobra usage dump silently corrupts the session and the user just sees the agent
   lose Lumi. `mcpCommand` (in `internal/cli`) sets `SilenceUsage`/`SilenceErrors` explicitly; every
