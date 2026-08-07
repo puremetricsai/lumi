@@ -14,15 +14,14 @@ import (
 	"github.com/puremetricsai/lumi/internal/macosnative"
 	"github.com/puremetricsai/lumi/internal/store"
 	"github.com/puremetricsai/lumi/internal/transcript"
-	"github.com/puremetricsai/lumi/internal/vocabulary"
 	"github.com/puremetricsai/lumi/internal/wav"
 )
 
 // retranscribeChunk is a package var purely as a test seam. Without it every
 // backfill test would need Speech Recognition granted and real WAVs on disk,
 // which is exactly the coupling that keeps a test suite from running in CI.
-var retranscribeChunk = func(ctx context.Context, path, locale string, terms []string) (macosnative.Transcription, error) {
-	return macosnative.TranscribeAudioSegments(ctx, path, locale, terms)
+var retranscribeChunk = func(ctx context.Context, path, locale string) (macosnative.Transcription, error) {
+	return macosnative.TranscribeAudioSegments(ctx, path, locale)
 }
 
 // minRetranscribeSimilarity is how closely a re-run must agree with the
@@ -87,25 +86,10 @@ func (a *app) transcriptBackfillCommand() *cobra.Command {
 					return err
 				}
 			}
-			// The re-run has to be biased the way the recorder's was, or it
-			// diverges on exactly the terms the list exists to protect and the
-			// similarity guard then throws its timings away. A vocabulary that
-			// cannot be read is advisory here, as everywhere: the text path needs
-			// no terms and a backfill must not fail over an optional file.
-			var terms []string
-			if retranscribe {
-				snapshot := (&vocabulary.Loader{Path: paths.Vocabulary}).Load()
-				if snapshot.Err != nil {
-					fmt.Fprintf(cmd.ErrOrStderr(),
-						"warning: reading %s: %v; re-transcribing without vocabulary\n",
-						paths.Vocabulary, snapshot.Err)
-				}
-				terms = snapshot.Terms
-			}
 			return runBackfill(cmd.Context(), cmd.OutOrStdout(), s, backfillOptions{
 				Since: sinceTime, Until: untilTime, Limit: limit, Force: force, DryRun: dryRun,
 				Explain: explain, Retranscribe: retranscribe, Pace: pace,
-				Locale: speechLocale, Terms: terms,
+				Locale: speechLocale,
 			})
 		},
 	}
@@ -158,8 +142,6 @@ type backfillOptions struct {
 	Retranscribe bool
 	Pace         time.Duration
 	Locale       string
-	// Terms bias a re-transcription the way the recorder's own run was biased.
-	Terms []string
 }
 
 func runBackfill(ctx context.Context, out io.Writer, s *store.Store, opts backfillOptions) error {
@@ -403,7 +385,7 @@ func loadTimings(ctx context.Context, chunk *transcript.Chunk, paths map[string]
 		if _, err := os.Stat(path); err != nil {
 			return fmt.Errorf("%s audio is gone", source)
 		}
-		result, err := retranscribeChunk(ctx, path, opts.Locale, opts.Terms)
+		result, err := retranscribeChunk(ctx, path, opts.Locale)
 		if err != nil {
 			return fmt.Errorf("re-transcribe %s: %w", source, err)
 		}

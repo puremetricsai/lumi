@@ -4,14 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
 
 	"github.com/puremetricsai/lumi/internal/macosnative"
 	"github.com/puremetricsai/lumi/internal/transcript"
-	"github.com/puremetricsai/lumi/internal/vocabulary"
 )
 
 type AudioFrame struct {
@@ -314,16 +312,12 @@ func unixNanoTime(unixNS int64) time.Time {
 }
 
 // NativeSpeech transcribes WAV chunks with Apple's on-device SpeechAnalyzer.
-// Vocabulary is optional; when set, its terms bias recognition toward names
-// and jargon outside the general lexicon.
 type NativeSpeech struct {
-	Locale     string
-	Vocabulary *vocabulary.Loader
-	Logger     *slog.Logger
+	Locale string
 }
 
 func (n NativeSpeech) Transcribe(ctx context.Context, audioPath string) (Transcription, error) {
-	native, err := macosnative.TranscribeAudioSegments(ctx, audioPath, n.Locale, n.vocabularyTerms())
+	native, err := macosnative.TranscribeAudioSegments(ctx, audioPath, n.Locale)
 	if err != nil {
 		return Transcription{}, fmt.Errorf("transcribe audio with SpeechAnalyzer: %w", err)
 	}
@@ -362,36 +356,4 @@ func TimedSegmentsFrom(native []macosnative.SpeechSegment) []TimedSegment {
 		})
 	}
 	return out
-}
-
-// vocabularyTerms reads the term list for this chunk. A vocabulary failure is
-// never allowed to fail transcription: losing biasing on one chunk is
-// recoverable, losing the chunk is not. Logging is gated on Snapshot.Changed,
-// so a persistently broken file warns once rather than once per chunk even
-// though the read itself is retried every chunk.
-func (n NativeSpeech) vocabularyTerms() []string {
-	if n.Vocabulary == nil {
-		return nil
-	}
-	snapshot := n.Vocabulary.Load()
-	if snapshot.Changed {
-		switch {
-		case snapshot.Err != nil:
-			n.logger().Warn("vocabulary unavailable; transcribing without contextual terms",
-				"error", snapshot.Err)
-		case !snapshot.Exists:
-			// Absence is the normal state for a user who has not opted in.
-		default:
-			n.logger().Info("vocabulary loaded",
-				"terms", len(snapshot.Terms), "dropped", snapshot.Dropped)
-		}
-	}
-	return snapshot.Terms
-}
-
-func (n NativeSpeech) logger() *slog.Logger {
-	if n.Logger == nil {
-		return slog.Default()
-	}
-	return n.Logger
 }

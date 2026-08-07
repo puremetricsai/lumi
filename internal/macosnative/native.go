@@ -29,8 +29,8 @@ char *lumi_audio_session_next_json(int64_t handle, double timeout_seconds, char 
 void lumi_audio_session_stop(int64_t handle);
 void lumi_audio_session_close(int64_t handle);
 void lumi_os_version(int *major, int *minor, int *patch);
-char *lumi_transcribe_audio_string(const char *audio_path, const char *locale, const char *vocabulary_json, double timeout_seconds, char **error_message);
-char *lumi_transcribe_audio_segments_json(const char *audio_path, const char *locale, const char *vocabulary_json, double timeout_seconds, char **error_message);
+char *lumi_transcribe_audio_string(const char *audio_path, const char *locale, double timeout_seconds, char **error_message);
+char *lumi_transcribe_audio_segments_json(const char *audio_path, const char *locale, double timeout_seconds, char **error_message);
 char *lumi_speech_ensure_assets(const char *locale, double timeout_seconds, char **error_message);
 int lumi_speech_assets_installed(const char *locale);
 */
@@ -380,24 +380,21 @@ type Transcription struct {
 	Segments []SpeechSegment `json:"segments"`
 }
 
-// TranscribeAudio transcribes a WAV file with on-device SpeechAnalyzer. Terms
-// bias recognition toward phrases outside the general lexicon; an empty list
-// applies no context at all, leaving behaviour identical to no vocabulary.
-func TranscribeAudio(ctx context.Context, audioPath, locale string, terms []string) (string, error) {
-	return transcribeNative(ctx, audioPath, locale, terms,
-		func(pathC, localeC, vocabularyC *C.char, timeout C.double, nativeErr **C.char) *C.char {
-			return C.lumi_transcribe_audio_string(pathC, localeC, vocabularyC, timeout, nativeErr)
+// TranscribeAudio transcribes a WAV file with on-device SpeechAnalyzer.
+func TranscribeAudio(ctx context.Context, audioPath, locale string) (string, error) {
+	return transcribeNative(ctx, audioPath, locale,
+		func(pathC, localeC *C.char, timeout C.double, nativeErr **C.char) *C.char {
+			return C.lumi_transcribe_audio_string(pathC, localeC, timeout, nativeErr)
 		})
 }
 
 // TranscribeAudioSegments transcribes a WAV file and returns the transcript
 // together with per-phrase spans and per-word timings. It shares the native ASR
-// path with TranscribeAudio, so the transcripts cannot diverge and vocabulary
-// biasing applies identically to both.
-func TranscribeAudioSegments(ctx context.Context, audioPath, locale string, terms []string) (Transcription, error) {
-	raw, err := transcribeNative(ctx, audioPath, locale, terms,
-		func(pathC, localeC, vocabularyC *C.char, timeout C.double, nativeErr **C.char) *C.char {
-			return C.lumi_transcribe_audio_segments_json(pathC, localeC, vocabularyC, timeout, nativeErr)
+// path with TranscribeAudio, so the transcripts cannot diverge.
+func TranscribeAudioSegments(ctx context.Context, audioPath, locale string) (Transcription, error) {
+	raw, err := transcribeNative(ctx, audioPath, locale,
+		func(pathC, localeC *C.char, timeout C.double, nativeErr **C.char) *C.char {
+			return C.lumi_transcribe_audio_segments_json(pathC, localeC, timeout, nativeErr)
 		})
 	if err != nil {
 		return Transcription{}, err
@@ -411,16 +408,12 @@ func TranscribeAudioSegments(ctx context.Context, audioPath, locale string, term
 
 // transcribeNative runs one of the two Swift entry points on its own goroutine so
 // a cancelled context returns promptly even though the native call itself cannot
-// be interrupted. Both callers share it to keep cancellation, timeout, and
-// vocabulary encoding identical.
-func transcribeNative(ctx context.Context, audioPath, locale string, terms []string,
-	call func(pathC, localeC, vocabularyC *C.char, timeout C.double, nativeErr **C.char) *C.char,
+// be interrupted. Both callers share it to keep cancellation and timeout
+// identical.
+func transcribeNative(ctx context.Context, audioPath, locale string,
+	call func(pathC, localeC *C.char, timeout C.double, nativeErr **C.char) *C.char,
 ) (string, error) {
 	if err := ctx.Err(); err != nil {
-		return "", err
-	}
-	vocabularyJSON, err := encodeVocabulary(terms)
-	if err != nil {
 		return "", err
 	}
 	timeout := nativeTimeout(ctx, 2*time.Minute)
@@ -432,13 +425,11 @@ func transcribeNative(ctx context.Context, audioPath, locale string, terms []str
 	go func() {
 		pathC := C.CString(audioPath)
 		localeC := C.CString(locale)
-		vocabularyC := C.CString(vocabularyJSON)
 		var nativeErr *C.char
 		result, err := nativeString(
-			call(pathC, localeC, vocabularyC, C.double(timeout.Seconds()), &nativeErr), nativeErr)
+			call(pathC, localeC, C.double(timeout.Seconds()), &nativeErr), nativeErr)
 		C.free(unsafe.Pointer(pathC))
 		C.free(unsafe.Pointer(localeC))
-		C.free(unsafe.Pointer(vocabularyC))
 		done <- transcription{text: result, err: err}
 	}()
 	select {
@@ -447,21 +438,6 @@ func transcribeNative(ctx context.Context, audioPath, locale string, terms []str
 	case r := <-done:
 		return r.text, r.err
 	}
-}
-
-// encodeVocabulary renders terms as a JSON array for the Swift bridge, matching
-// how lumi_resolve_frontmost_json and lumi_frontmost_candidates_json already
-// take JSON arrays across this boundary. An empty list encodes to "" so the
-// Swift side can skip AnalysisContext entirely.
-func encodeVocabulary(terms []string) (string, error) {
-	if len(terms) == 0 {
-		return "", nil
-	}
-	encoded, err := json.Marshal(terms)
-	if err != nil {
-		return "", fmt.Errorf("encode vocabulary terms: %w", err)
-	}
-	return string(encoded), nil
 }
 
 // EnsureSpeechAssets downloads missing SpeechAnalyzer assets for locale.

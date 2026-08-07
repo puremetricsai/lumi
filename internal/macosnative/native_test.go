@@ -576,7 +576,7 @@ func TestTranscribeAudioSmoke(t *testing.T) {
 		t.Fatal("RecordAudio returned no frames")
 	}
 	// A short real recording may be silent, so only require successful analysis.
-	if _, err := TranscribeAudio(ctx, audio[0].Path, "en-US", nil); err != nil {
+	if _, err := TranscribeAudio(ctx, audio[0].Path, "en-US"); err != nil {
 		t.Fatalf("SpeechAnalyzer transcription failed: %v", err)
 	}
 }
@@ -604,11 +604,11 @@ func TestTranscribeAudioSegmentsAgreesWithTranscribeAudio(t *testing.T) {
 	}
 	path := audio[0].Path
 
-	flat, err := TranscribeAudio(ctx, path, "en-US", nil)
+	flat, err := TranscribeAudio(ctx, path, "en-US")
 	if err != nil {
 		t.Fatalf("flat transcription failed: %v", err)
 	}
-	timed, err := TranscribeAudioSegments(ctx, path, "en-US", nil)
+	timed, err := TranscribeAudioSegments(ctx, path, "en-US")
 	if err != nil {
 		t.Fatalf("segmented transcription failed: %v", err)
 	}
@@ -656,7 +656,7 @@ func TestTranscribeAudioSegmentsOnRealAudio(t *testing.T) {
 	if path == "" {
 		t.Skip("set LUMI_SEGMENTS_AUDIO to a WAV containing speech")
 	}
-	result, err := TranscribeAudioSegments(context.Background(), path, "en-US", nil)
+	result, err := TranscribeAudioSegments(context.Background(), path, "en-US")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -870,33 +870,6 @@ func TestNativeCaptureSmoke(t *testing.T) {
 	}
 	if !seen["system"] || !seen["microphone"] {
 		t.Errorf("expected system and microphone sources, got %#v", audio)
-	}
-}
-
-func TestEncodeVocabularyJSON(t *testing.T) {
-	for _, tc := range []struct {
-		name  string
-		terms []string
-		want  string
-	}{
-		{name: "nil is empty so no context is applied", terms: nil, want: ""},
-		{name: "empty is empty", terms: []string{}, want: ""},
-		{name: "plain terms", terms: []string{"Acme Corp", "Mostafa"}, want: `["Acme Corp","Mostafa"]`},
-		{
-			name:  "quotes and non-ASCII survive encoding",
-			terms: []string{`say "hello"`, "Zoë", "日本語"},
-			want:  `["say \"hello\"","Zoë","日本語"]`,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := encodeVocabulary(tc.terms)
-			if err != nil {
-				t.Fatalf("encodeVocabulary: %v", err)
-			}
-			if got != tc.want {
-				t.Fatalf("encodeVocabulary(%q) = %q, want %q", tc.terms, got, tc.want)
-			}
-		})
 	}
 }
 

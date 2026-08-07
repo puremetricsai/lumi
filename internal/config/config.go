@@ -11,10 +11,6 @@ type Paths struct {
 	Database    string
 	Screenshots string
 	Audio       string
-	// Vocabulary is the optional user-maintained term list biasing speech
-	// recognition. It lives under Root so a re-exec'd daemon inherits it from
-	// --data-dir alone. Lumi never creates it; absence means "not opted in".
-	Vocabulary string
 	// RecordState is the JSON file that tracks a background recorder (pid,
 	// start time, what it captures). RecordLog collects the background
 	// recorder's stdout/stderr. Both live directly under Root.
@@ -48,7 +44,6 @@ func FromRoot(root string) (Paths, error) {
 		Database:    filepath.Join(root, "lumi.db"),
 		Screenshots: filepath.Join(root, "screenshots"),
 		Audio:       filepath.Join(root, "audio"),
-		Vocabulary:  filepath.Join(root, "vocabulary.txt"),
 		RecordState: filepath.Join(root, "record.json"),
 		RecordLog:   filepath.Join(root, "record.log"),
 	}, nil
