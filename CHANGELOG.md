@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.3.0](https://github.com/puremetricsai/lumi/compare/v0.2.0...v0.3.0) (2026-08-07)
+
+
+### ⚠ BREAKING CHANGES
+
+* `vocabulary.txt` is no longer read, and `lumi transcribe` no longer accepts `--vocabulary` or `--no-vocabulary`. Existing `vocabulary.txt` files are left on disk and ignored; they can be deleted. No transcript changes, because the terms never applied.
+
+### Features
+
+* remove custom vocabulary biasing ([3580bdb](https://github.com/puremetricsai/lumi/commit/3580bdb3bf8b0849cb606203ee01d2b537408f7f))
+* remove custom vocabulary biasing ([dc810b5](https://github.com/puremetricsai/lumi/commit/dc810b5d556314505b9b775cd4c9f389f0d1f6d1))
+
+
+### Bug Fixes
+
+* close MCP reexec race and retain silent chunks ([b9d7f4b](https://github.com/puremetricsai/lumi/commit/b9d7f4b04fef0bac32578d9ffc209cabeeac7d01))
+
 ## [0.2.0](https://github.com/puremetricsai/lumi/compare/v0.1.0...v0.2.0) (2026-08-05)
 
 
