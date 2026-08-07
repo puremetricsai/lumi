@@ -1,8 +1,6 @@
 package config
 
 import (
-	"errors"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
@@ -21,7 +19,6 @@ func TestFromRootDerivesEveryPath(t *testing.T) {
 		{"Audio", paths.Audio, filepath.Join(root, "audio")},
 		{"RecordState", paths.RecordState, filepath.Join(root, "record.json")},
 		{"RecordLog", paths.RecordLog, filepath.Join(root, "record.log")},
-		{name: "vocabulary", got: paths.Vocabulary, want: filepath.Join(root, "vocabulary.txt")},
 	} {
 		if c.got != c.want {
 			t.Errorf("%s = %q, want %q", c.name, c.got, c.want)
@@ -97,29 +94,5 @@ func TestEnsureIsIdempotent(t *testing.T) {
 	}
 	if err := paths.Ensure(); err != nil {
 		t.Fatalf("second Ensure must succeed on existing directories: %v", err)
-	}
-}
-
-func TestVocabularyPathLivesUnderRoot(t *testing.T) {
-	paths, err := FromRoot(t.TempDir())
-	if err != nil {
-		t.Fatalf("FromRoot: %v", err)
-	}
-	want := filepath.Join(paths.Root, "vocabulary.txt")
-	if paths.Vocabulary != want {
-		t.Fatalf("Vocabulary = %q, want %q", paths.Vocabulary, want)
-	}
-}
-
-func TestEnsureDoesNotCreateVocabularyFile(t *testing.T) {
-	paths, err := FromRoot(t.TempDir())
-	if err != nil {
-		t.Fatalf("FromRoot: %v", err)
-	}
-	if err := paths.Ensure(); err != nil {
-		t.Fatalf("Ensure: %v", err)
-	}
-	if _, err := os.Stat(paths.Vocabulary); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("Stat(Vocabulary) = %v, want fs.ErrNotExist", err)
 	}
 }

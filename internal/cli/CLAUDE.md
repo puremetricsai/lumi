@@ -48,9 +48,8 @@ developer's own Claude config.
 - **A re-transcription may contribute timings, never text.** `lumi transcript backfill --retranscribe` runs
   recognition again over the same WAV, under a possibly newer model, and its words may simply differ from
   the ones indexed; installing them puts phrases in a transcript that are absent from `events.text` and from
-  the FTS index, so a reader sees a sentence no query can find. The re-run is therefore biased with the same
-  vocabulary the recorder used and its timings are used only while `minRetranscribeSimilarity` says it is
-  saying the same thing — below that the chunk falls back to the text path, which needs no audio at all.
+  the FTS index, so a reader sees a sentence no query can find. Its timings are therefore used only while
+  `minRetranscribeSimilarity` says it is saying the same thing — below that the chunk falls back to the text path, which needs no audio at all.
   The `track.Text == ""` skip in `loadTimings` is a cost gate on genuinely silent tracks and nothing more:
   a track whose recognition *failed* never reaches it, because the chunk is declined a step earlier.
 - **`lumi mcp setup` bakes an absolute binary path and absolute `--data-dir` into the argv** — always, even

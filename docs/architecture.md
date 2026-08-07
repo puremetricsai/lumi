@@ -13,7 +13,6 @@ ScreenCaptureKit system + microphone ─→ WAV ─→ SpeechAnalyzer (in-proces
 - `internal/mcp`: the read-only MCP tool surface served over stdio
 - `internal/mcpsetup`: registering `lumi mcp` with installed MCP clients
 - `internal/selfexec`: replacing the running process when its binary is upgraded
-- `internal/vocabulary`: the custom vocabulary file's format, cache, and cap
 - `internal/config`: data-directory path resolution
 - `internal/cli`: Cobra commands and lifecycle
 

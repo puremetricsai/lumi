@@ -168,12 +168,6 @@ Smoke-test the server without an agent:
 task mcp
 ```
 
-## Custom vocabulary
-
-An optional `vocabulary.txt` in your data directory biases transcription toward names and jargon Apple's
-on-device recognizer mishears. Its format, the 100-term cap, and comparing the effect with `lumi transcribe`:
-[docs/custom-vocabulary.md](docs/custom-vocabulary.md).
-
 ## Retention
 
 Captured media stays on disk until `lumi prune` removes it — nothing is scheduled automatically. Age and

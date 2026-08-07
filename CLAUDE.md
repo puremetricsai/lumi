@@ -52,7 +52,6 @@ changing anything there** — the rationale lives with the code it constrains, n
 | `internal/store` | Single-file SQLite (`modernc.org/sqlite`, no cgo), FTS5, versioned migrations, search, `audio_segments`, transcript assembly and coverage. |
 | `internal/transcript` | Pure: decides where captured sound came from (`internal`/`external`) and assembles turns. No database, cgo, or filesystem. |
 | `internal/wav` | Reads Lumi's mono 16-bit PCM WAVs and measures their energy. |
-| `internal/vocabulary` | The custom vocabulary file's format, cache, and cap. |
 | `internal/retention` | Age- and size-based pruning behind `lumi prune`. No background scheduler. |
 | `internal/cli` | Cobra commands and all the wiring. |
 | `internal/mcp` | Stdio MCP server: four read-only tools over `internal/store` and nothing else of Lumi's. |

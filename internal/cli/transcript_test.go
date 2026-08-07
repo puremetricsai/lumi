@@ -544,10 +544,10 @@ func audioChunkWithWAVs(t *testing.T, s *store.Store, at time.Time, systemText, 
 // derived from events.
 //
 // A re-run of recognition is a second opinion about the same audio, not a
-// replacement for the transcript already indexed: it sees a possibly newer model
-// and, until this was fixed, no vocabulary at all. Installing its words as
-// segment text puts phrases in the transcript that are absent from the event and
-// from the search index, so a reader could see a sentence that no query can find.
+// replacement for the transcript already indexed: it sees a possibly newer
+// model, whose words may simply differ. Installing them as segment text puts
+// phrases in the transcript that are absent from the event and from the search
+// index, so a reader could see a sentence that no query can find.
 func TestRetranscribeSuppliesTimingsNeverText(t *testing.T) {
 	root, s := transcriptRoot(t)
 	ctx := context.Background()
@@ -557,7 +557,7 @@ func TestRetranscribeSuppliesTimingsNeverText(t *testing.T) {
 	const rival = "the department finished"
 	original := retranscribeChunk
 	t.Cleanup(func() { retranscribeChunk = original })
-	retranscribeChunk = func(context.Context, string, string, []string) (macosnative.Transcription, error) {
+	retranscribeChunk = func(context.Context, string, string) (macosnative.Transcription, error) {
 		return macosnative.Transcription{
 			Text: rival,
 			Segments: []macosnative.SpeechSegment{{StartMS: 0, EndMS: 2000, Text: rival, Confidence: 0.9,
@@ -580,34 +580,6 @@ func TestRetranscribeSuppliesTimingsNeverText(t *testing.T) {
 		if strings.Contains(segment.Text, "department") {
 			t.Errorf("segment %q carries text the event never held", segment.Text)
 		}
-	}
-}
-
-// TestRetranscribePassesTheVocabulary pins the other half: a re-run that omits
-// the term list the recorder used would diverge on exactly the words the list
-// exists to protect, and would then be rejected by the guard above — turning a
-// missing argument into permanently missing timings.
-func TestRetranscribePassesTheVocabulary(t *testing.T) {
-	root, s := transcriptRoot(t)
-	at := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
-	audioChunkWithWAVs(t, s, at, "", "kubectl rollout finished")
-
-	if err := os.WriteFile(filepath.Join(root, "vocabulary.txt"), []byte("kubectl\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	var seen []string
-	original := retranscribeChunk
-	t.Cleanup(func() { retranscribeChunk = original })
-	retranscribeChunk = func(_ context.Context, _, _ string, terms []string) (macosnative.Transcription, error) {
-		seen = terms
-		return macosnative.Transcription{}, nil
-	}
-
-	if _, err := runCLI(t, "--data-dir", root, "transcript", "backfill", "--retranscribe"); err != nil {
-		t.Fatal(err)
-	}
-	if len(seen) != 1 || seen[0] != "kubectl" {
-		t.Errorf("re-transcription ran with terms %v, want the data directory's vocabulary", seen)
 	}
 }
 

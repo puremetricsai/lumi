@@ -13,16 +13,6 @@ private func resolveLocaleID(_ locale: UnsafePointer<CChar>?) -> String {
     return requested.isEmpty ? "en-US" : requested
 }
 
-// decodeVocabulary reads the JSON array Go passes across the bridge. It runs
-// synchronously, before any Task is created, so the C pointer is never
-// captured by an async closure and cannot dangle.
-private func decodeVocabulary(_ vocabularyJSON: UnsafePointer<CChar>?) -> [String] {
-    guard let vocabularyJSON = vocabularyJSON else { return [] }
-    let text = String(cString: vocabularyJSON)
-    guard !text.isEmpty, let data = text.data(using: .utf8) else { return [] }
-    return (try? JSONDecoder().decode([String].self, from: data)) ?? []
-}
-
 // makeTranscriber requests per-run timing and confidence. Both are free — they
 // annotate results the transcriber already produces — and asking for them does
 // not change the transcript: the spike that preceded this code confirmed the
@@ -133,28 +123,23 @@ private func makeSegment(_ result: SpeechTranscriber.Result) -> SpeechSegment {
 }
 
 // runTranscription is the single ASR path. Both C entry points go through it, so
-// the flat transcript and the timed segments can never disagree, and neither can
-// silently lose vocabulary biasing.
-private func runTranscription(path: String, localeID: String,
-                              vocabulary: [String]) async throws -> TranscriptionPayload {
+// the flat transcript and the timed segments can never disagree.
+//
+// No AnalysisContext is set. Lumi shipped a custom-vocabulary feature that
+// supplied `context.contextualStrings = [.general: terms]` here, and it was
+// removed once measurement showed Apple ignores it: on macOS 26.5.2, replaying
+// fixed WAVs with and without terms produced byte-identical transcripts, for
+// both SpeechTranscriber and DictationTranscriber, whether the context was set
+// via `setContext` or passed at analyzer construction. The terms reached the
+// framework — reading `analyzer.context.contextualStrings` back returned them
+// exactly — so the plumbing was correct and the bias simply never applied.
+// Re-adding a term list means re-establishing that it changes a transcript
+// first; `DictationTranscriber.ContentHint.customizedLanguage` is the remaining
+// documented path, and it costs a large drop in how much speech is recovered.
+private func runTranscription(path: String, localeID: String) async throws -> TranscriptionPayload {
     let transcriber = makeTranscriber(localeID: localeID)
     try await ensureAssets(for: transcriber)
     let analyzer = SpeechAnalyzer(modules: [transcriber])
-    if !vocabulary.isEmpty {
-        // A vocabulary problem must cost biasing, never the whole
-        // transcription: this is its own do/catch, separate from the caller's,
-        // so a throwing setContext cannot fail the chunk. The diagnostic goes
-        // to stderr, never stdout, since `lumi transcribe` prints the
-        // transcript to stdout and `lumi mcp` speaks JSON-RPC there.
-        do {
-            let context = AnalysisContext()
-            context.contextualStrings = [.general: vocabulary]
-            try await analyzer.setContext(context)
-        } catch {
-            let message = "vocabulary: setContext failed, continuing unbiased: \(error.localizedDescription)\n"
-            FileHandle.standardError.write(Data(message.utf8))
-        }
-    }
     let audioFile = try AVAudioFile(forReading: URL(fileURLWithPath: path))
 
     let collector = Task { () -> TranscriptionPayload in
@@ -217,7 +202,6 @@ private func bridgeTranscription(
 public func lumi_transcribe_audio_string(
     _ audioPath: UnsafePointer<CChar>?,
     _ locale: UnsafePointer<CChar>?,
-    _ vocabularyJSON: UnsafePointer<CChar>?,
     _ timeoutSeconds: Double,
     _ errorMessage: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
 ) -> UnsafeMutablePointer<CChar>? {
@@ -226,11 +210,10 @@ public func lumi_transcribe_audio_string(
     }
     let path = String(cString: audioPath)
     let localeID = resolveLocaleID(locale)
-    let vocabulary = decodeVocabulary(vocabularyJSON)
     let timeout = timeoutSeconds > 0 ? timeoutSeconds : 120
 
     return bridgeTranscription(localeID: localeID, timeout: timeout, errorMessage) {
-        try await runTranscription(path: path, localeID: localeID, vocabulary: vocabulary).text
+        try await runTranscription(path: path, localeID: localeID).text
     }
 }
 
@@ -238,7 +221,6 @@ public func lumi_transcribe_audio_string(
 public func lumi_transcribe_audio_segments_json(
     _ audioPath: UnsafePointer<CChar>?,
     _ locale: UnsafePointer<CChar>?,
-    _ vocabularyJSON: UnsafePointer<CChar>?,
     _ timeoutSeconds: Double,
     _ errorMessage: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
 ) -> UnsafeMutablePointer<CChar>? {
@@ -247,11 +229,10 @@ public func lumi_transcribe_audio_segments_json(
     }
     let path = String(cString: audioPath)
     let localeID = resolveLocaleID(locale)
-    let vocabulary = decodeVocabulary(vocabularyJSON)
     let timeout = timeoutSeconds > 0 ? timeoutSeconds : 120
 
     return bridgeTranscription(localeID: localeID, timeout: timeout, errorMessage) {
-        let payload = try await runTranscription(path: path, localeID: localeID, vocabulary: vocabulary)
+        let payload = try await runTranscription(path: path, localeID: localeID)
         let encoder = JSONEncoder()
         let data = try encoder.encode(payload)
         guard let json = String(data: data, encoding: .utf8) else {
