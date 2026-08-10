@@ -14,7 +14,6 @@ import (
 	"github.com/puremetricsai/lumi/internal/macosnative"
 	"github.com/puremetricsai/lumi/internal/store"
 	"github.com/puremetricsai/lumi/internal/transcript"
-	"github.com/puremetricsai/lumi/internal/wav"
 )
 
 // retranscribeChunk is a package var purely as a test seam. Without it every
@@ -337,7 +336,7 @@ func attributeStoredChunk(ctx context.Context, s *store.Store, key string, opts 
 			method = "timed"
 		}
 	}
-	measureBackfillEnergy(&chunk, paths[transcript.TrackSystem])
+	measureBackfillEnergy(ctx, &chunk, paths[transcript.TrackSystem])
 
 	attributed := transcript.Attribute(chunk, transcript.Options{})
 	// Deferred rather than computed: --explain is off by default, and composing
@@ -419,11 +418,15 @@ func loadTimings(ctx context.Context, chunk *transcript.Chunk, paths map[string]
 // where the recorder did not would reach a different verdict for the same audio —
 // while reading a 960 KB WAV for every chunk of an afternoon's silence, the
 // common case by a wide margin.
-func measureBackfillEnergy(chunk *transcript.Chunk, systemPath string) {
+//
+// Which reader opens the file is capture.ReadAudioEnvelope's, for that same
+// reason: a chunk `lumi compress` has stored as FLAC has to measure the same as
+// one still stored as a WAV.
+func measureBackfillEnergy(ctx context.Context, chunk *transcript.Chunk, systemPath string) {
 	if systemPath == "" || !transcript.NeedsInternalEnergy(*chunk) {
 		return
 	}
-	envelope, _, err := wav.ReadEnvelope(systemPath, transcript.EnvelopeWindowMS)
+	envelope, _, err := capture.ReadAudioEnvelope(ctx, systemPath, transcript.EnvelopeWindowMS)
 	if err != nil {
 		return
 	}
