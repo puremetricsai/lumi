@@ -173,3 +173,33 @@ func (*AudioSession) Close() {}
 func OSVersion() (int, int, int, error) { return 0, 0, 0, errUnsupported }
 
 func SpeechAssetsInstalled(context.Context, string) (bool, error) { return false, errUnsupported }
+
+type ImageVerification struct {
+	Width               int     `json:"width"`
+	Height              int     `json:"height"`
+	SourceWidth         int     `json:"source_width"`
+	SourceHeight        int     `json:"source_height"`
+	PSNRDB              float64 `json:"psnr_db"`
+	HistogramSimilarity float64 `json:"histogram_similarity"`
+	Bytes               int64   `json:"bytes"`
+}
+
+type AudioEncoding struct {
+	Bytes      int64 `json:"bytes"`
+	Frames     int64 `json:"frames"`
+	SampleRate int   `json:"sample_rate"`
+}
+
+func TranscodeImageHEIC(context.Context, string, string, float64) (ImageVerification, error) {
+	return ImageVerification{}, errUnsupported
+}
+
+func InspectImage(context.Context, string) (ImageVerification, error) {
+	return ImageVerification{}, errUnsupported
+}
+
+func EncodeAudioFLAC(context.Context, string, string) (AudioEncoding, error) {
+	return AudioEncoding{}, errUnsupported
+}
+
+func DecodeMonoPCM16(context.Context, string) ([]int16, int, error) { return nil, 0, errUnsupported }

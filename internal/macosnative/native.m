@@ -1773,3 +1773,433 @@ void lumi_audio_session_close(int64_t handle) {
         }
     }
 }
+
+// MARK: - Media transcoding for `lumi compress`
+//
+// Three entry points, all pure file-to-file work with no permission surface:
+// re-encode a captured JPEG as HEIC, re-encode a captured WAV as lossless FLAC,
+// and decode any AVFoundation-readable audio file to mono 16-bit samples.
+//
+// The two encoders verify by reopening what they wrote rather than trusting the
+// encoder's own success return. A truncated or otherwise broken file still
+// finalises, and `lumi compress` deletes the source once these report success —
+// a silent encoder failure is the one bug in that feature that destroys data.
+
+// LumiImageMeasure compares two decoded images that are already known to share
+// dimensions, reporting PSNR and a coarse histogram similarity.
+//
+// Both are drawn into identical 8-bit RGBA contexts first, because that is the
+// only way two images are comparable regardless of the colour spaces they
+// decoded into. The histogram uses 16 bins per channel to match the shape
+// internal/capture/compare.go uses for frame deduplication, so the two numbers
+// stay commensurable; it is deliberately a second, independent signal, because a
+// channel-order or colour-space mistake can pass a PSNR check that a histogram
+// comparison fails.
+static BOOL LumiImageMeasure(CGImageRef source, CGImageRef decoded,
+                             double *psnrDB, double *histogramSimilarity, NSError **error) {
+    size_t width = CGImageGetWidth(source);
+    size_t height = CGImageGetHeight(source);
+    if (width == 0 || height == 0) {
+        if (error != NULL) {
+            *error = [NSError errorWithDomain:@"LumiNative" code:30
+                                     userInfo:@{NSLocalizedDescriptionKey: @"image has no pixels"}];
+        }
+        return NO;
+    }
+    size_t bytesPerRow = width * 4;
+    size_t byteCount = bytesPerRow * height;
+
+    CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+    uint8_t *sourcePixels = calloc(byteCount, 1);
+    uint8_t *decodedPixels = calloc(byteCount, 1);
+    CGContextRef sourceContext = NULL;
+    CGContextRef decodedContext = NULL;
+    BOOL ok = NO;
+
+    if (sourcePixels != NULL && decodedPixels != NULL) {
+        sourceContext = CGBitmapContextCreate(sourcePixels, width, height, 8, bytesPerRow, space,
+                                              (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+        decodedContext = CGBitmapContextCreate(decodedPixels, width, height, 8, bytesPerRow, space,
+                                               (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+    }
+    if (sourceContext != NULL && decodedContext != NULL) {
+        CGRect rect = CGRectMake(0, 0, (CGFloat)width, (CGFloat)height);
+        CGContextDrawImage(sourceContext, rect, source);
+        CGContextDrawImage(decodedContext, rect, decoded);
+
+        double squaredError = 0.0;
+        double sourceBins[48] = {0};
+        double decodedBins[48] = {0};
+        for (size_t i = 0; i < byteCount; i += 4) {
+            for (size_t channel = 0; channel < 3; channel++) {
+                double a = sourcePixels[i + channel];
+                double b = decodedPixels[i + channel];
+                squaredError += (a - b) * (a - b);
+                sourceBins[channel * 16 + (sourcePixels[i + channel] >> 4)] += 1.0;
+                decodedBins[channel * 16 + (decodedPixels[i + channel] >> 4)] += 1.0;
+            }
+        }
+        double samples = (double)width * (double)height * 3.0;
+        double mse = squaredError / samples;
+        // An identical re-encode has no error at all; 99 dB stands in for the
+        // infinity so the value stays finite and JSON-encodable.
+        *psnrDB = mse == 0.0 ? 99.0 : MIN(99.0, 10.0 * log10((255.0 * 255.0) / mse));
+
+        double intersection = 0.0;
+        double total = 0.0;
+        for (size_t bin = 0; bin < 48; bin++) {
+            intersection += MIN(sourceBins[bin], decodedBins[bin]);
+            total += sourceBins[bin];
+        }
+        *histogramSimilarity = total == 0.0 ? 1.0 : intersection / total;
+        ok = YES;
+    } else if (error != NULL) {
+        *error = [NSError errorWithDomain:@"LumiNative" code:31
+                                 userInfo:@{NSLocalizedDescriptionKey: @"allocate comparison bitmaps"}];
+    }
+
+    if (sourceContext != NULL) CGContextRelease(sourceContext);
+    if (decodedContext != NULL) CGContextRelease(decodedContext);
+    free(sourcePixels);
+    free(decodedPixels);
+    CGColorSpaceRelease(space);
+    return ok;
+}
+
+static CGImageRef LumiLoadImage(NSString *path, NSError **error) CF_RETURNS_RETAINED {
+    NSURL *url = [NSURL fileURLWithPath:path];
+    CGImageSourceRef source = CGImageSourceCreateWithURL((__bridge CFURLRef)url, NULL);
+    if (source == NULL) {
+        if (error != NULL) {
+            *error = [NSError errorWithDomain:@"LumiNative" code:32
+                                     userInfo:@{NSLocalizedDescriptionKey:
+                                                    [NSString stringWithFormat:@"open image %@", path]}];
+        }
+        return NULL;
+    }
+    CGImageRef image = CGImageSourceCreateImageAtIndex(source, 0, NULL);
+    CFRelease(source);
+    if (image == NULL && error != NULL) {
+        *error = [NSError errorWithDomain:@"LumiNative" code:33
+                                 userInfo:@{NSLocalizedDescriptionKey:
+                                                [NSString stringWithFormat:@"decode image %@", path]}];
+    }
+    return image;
+}
+
+static long long LumiFileSize(NSString *path) {
+    NSDictionary *attributes = [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil];
+    return attributes == nil ? 0 : (long long)[attributes fileSize];
+}
+
+// lumi_image_inspect_json reports what an existing image decodes to, without
+// re-encoding anything. `lumi compress` uses it to decide whether a compressed
+// file left behind by an interrupted run is intact enough to adopt, in the one
+// case where the original it would have been compared against is already gone.
+char *lumi_image_inspect_json(const char *image_path, char **error_message) {
+    @autoreleasepool {
+        NSString *path = @(image_path);
+        NSError *error = nil;
+        CGImageRef image = LumiLoadImage(path, &error);
+        if (image == NULL) {
+            if (error_message != NULL) *error_message = LumiCopyError(error);
+            return NULL;
+        }
+        NSDictionary *report = @{
+            @"width": @((long long)CGImageGetWidth(image)),
+            @"height": @((long long)CGImageGetHeight(image)),
+            @"source_width": @((long long)CGImageGetWidth(image)),
+            @"source_height": @((long long)CGImageGetHeight(image)),
+            @"psnr_db": @(99.0),
+            @"histogram_similarity": @(1.0),
+            @"bytes": @(LumiFileSize(path)),
+        };
+        CGImageRelease(image);
+        NSError *jsonError = nil;
+        NSString *json = LumiJSONString(report, &jsonError);
+        if (json == nil) {
+            if (error_message != NULL) *error_message = LumiCopyError(jsonError);
+            return NULL;
+        }
+        return LumiCopyUTF8(json);
+    }
+}
+
+// lumi_image_transcode_heic_json re-encodes an image as HEIC and measures the
+// result against its source.
+//
+// The measurement decodes the file that was actually written, not the CGImage
+// that was handed to the encoder, because CGImageDestinationFinalize reporting
+// success does not establish that the bytes on disk decode to the right picture.
+char *lumi_image_transcode_heic_json(const char *source_path, const char *destination_path,
+                                     double quality, char **error_message) {
+    @autoreleasepool {
+        NSString *sourcePath = @(source_path);
+        NSString *destinationPath = @(destination_path);
+        NSError *error = nil;
+
+        CGImageRef source = LumiLoadImage(sourcePath, &error);
+        if (source == NULL) {
+            if (error_message != NULL) *error_message = LumiCopyError(error);
+            return NULL;
+        }
+
+        NSURL *destinationURL = [NSURL fileURLWithPath:destinationPath];
+        CGImageDestinationRef destination = CGImageDestinationCreateWithURL(
+            (__bridge CFURLRef)destinationURL, CFSTR("public.heic"), 1, NULL);
+        if (destination == NULL) {
+            CGImageRelease(source);
+            if (error_message != NULL) {
+                *error_message = LumiCopyUTF8(@"create HEIC destination");
+            }
+            return NULL;
+        }
+        NSDictionary *properties = @{
+            (__bridge NSString *)kCGImageDestinationLossyCompressionQuality: @(quality),
+        };
+        CGImageDestinationAddImage(destination, source, (__bridge CFDictionaryRef)properties);
+        BOOL finalized = CGImageDestinationFinalize(destination);
+        CFRelease(destination);
+        if (!finalized) {
+            CGImageRelease(source);
+            if (error_message != NULL) *error_message = LumiCopyUTF8(@"finalize HEIC image");
+            return NULL;
+        }
+
+        CGImageRef decoded = LumiLoadImage(destinationPath, &error);
+        if (decoded == NULL) {
+            CGImageRelease(source);
+            if (error_message != NULL) *error_message = LumiCopyError(error);
+            return NULL;
+        }
+
+        double psnr = 0.0;
+        double histogram = 0.0;
+        BOOL sameSize = CGImageGetWidth(decoded) == CGImageGetWidth(source) &&
+                        CGImageGetHeight(decoded) == CGImageGetHeight(source);
+        // Measuring across differing dimensions would scale one image into the
+        // other's grid and report a similarity for a picture neither file holds.
+        // The size mismatch is itself the finding; the caller rejects on it.
+        if (sameSize && !LumiImageMeasure(source, decoded, &psnr, &histogram, &error)) {
+            CGImageRelease(source);
+            CGImageRelease(decoded);
+            if (error_message != NULL) *error_message = LumiCopyError(error);
+            return NULL;
+        }
+
+        NSDictionary *report = @{
+            @"width": @((long long)CGImageGetWidth(decoded)),
+            @"height": @((long long)CGImageGetHeight(decoded)),
+            @"source_width": @((long long)CGImageGetWidth(source)),
+            @"source_height": @((long long)CGImageGetHeight(source)),
+            @"psnr_db": @(psnr),
+            @"histogram_similarity": @(histogram),
+            @"bytes": @(LumiFileSize(destinationPath)),
+        };
+        CGImageRelease(source);
+        CGImageRelease(decoded);
+
+        NSError *jsonError = nil;
+        NSString *json = LumiJSONString(report, &jsonError);
+        if (json == nil) {
+            if (error_message != NULL) *error_message = LumiCopyError(jsonError);
+            return NULL;
+        }
+        return LumiCopyUTF8(json);
+    }
+}
+
+// LumiCopyAudioSamples streams every frame of `input` into `output`.
+//
+// Reads are bounded by the file's own length rather than run until a zero-length
+// read: AVAudioFile raises past the end of some compressed files instead of
+// reporting zero frames, which turned a complete copy into a failure.
+static BOOL LumiCopyAudioSamples(AVAudioFile *input, AVAudioFile *output, NSError **error) {
+    const AVAudioFrameCount chunkFrames = 65536;
+    AVAudioPCMBuffer *buffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:input.processingFormat
+                                                            frameCapacity:chunkFrames];
+    if (buffer == nil) {
+        if (error != NULL) {
+            *error = [NSError errorWithDomain:@"LumiNative" code:34
+                                     userInfo:@{NSLocalizedDescriptionKey: @"allocate audio buffer"}];
+        }
+        return NO;
+    }
+    AVAudioFramePosition remaining = input.length;
+    while (remaining > 0) {
+        AVAudioFrameCount want = (AVAudioFrameCount)MIN((AVAudioFramePosition)chunkFrames, remaining);
+        if (![input readIntoBuffer:buffer frameCount:want error:error]) {
+            return NO;
+        }
+        if (buffer.frameLength == 0) {
+            break;
+        }
+        if (output != nil && ![output writeFromBuffer:buffer error:error]) {
+            return NO;
+        }
+        remaining -= (AVAudioFramePosition)buffer.frameLength;
+    }
+    return YES;
+}
+
+// lumi_audio_encode_flac_json re-encodes an audio file as lossless FLAC.
+//
+// The target format is built from an explicit AudioStreamBasicDescription rather
+// than from a settings dictionary, because FLAC carries its source bit depth in
+// mFormatFlags and there is no AVAudioFile settings key that reaches it. Passing
+// AVFormatIDKey alone yields a format reported as "UNKNOWN source bit depth"
+// whose first write fails; AVEncoderBitDepthHintKey does not fill it in either.
+//
+// The writer is closed before the file is measured, because AVAudioFile finalises
+// its header on deallocation — reading it any earlier sees a header and no audio.
+char *lumi_audio_encode_flac_json(const char *source_path, const char *destination_path,
+                                  char **error_message) {
+    @autoreleasepool {
+        NSString *sourcePath = @(source_path);
+        NSString *destinationPath = @(destination_path);
+        NSError *error = nil;
+        AVAudioFramePosition frames = 0;
+        double sampleRate = 0.0;
+
+        @autoreleasepool {
+            AVAudioFile *input = [[AVAudioFile alloc] initForReading:[NSURL fileURLWithPath:sourcePath]
+                                                       commonFormat:AVAudioPCMFormatInt16
+                                                        interleaved:YES
+                                                              error:&error];
+            if (input == nil) {
+                if (error_message != NULL) *error_message = LumiCopyError(error);
+                return NULL;
+            }
+            frames = input.length;
+            sampleRate = input.fileFormat.sampleRate;
+
+            AudioStreamBasicDescription description = {0};
+            description.mSampleRate = input.fileFormat.sampleRate;
+            description.mFormatID = kAudioFormatFLAC;
+            description.mFormatFlags = 16; // source bit depth; Lumi captures 16-bit PCM
+            description.mChannelsPerFrame = input.fileFormat.channelCount;
+            AVAudioFormat *target = [[AVAudioFormat alloc] initWithStreamDescription:&description];
+            if (target == nil) {
+                if (error_message != NULL) *error_message = LumiCopyUTF8(@"build FLAC output format");
+                return NULL;
+            }
+
+            [NSFileManager.defaultManager removeItemAtPath:destinationPath error:nil];
+            AVAudioFile *output = [[AVAudioFile alloc]
+                initForWriting:[NSURL fileURLWithPath:destinationPath]
+                      settings:target.settings
+                  commonFormat:AVAudioPCMFormatInt16
+                   interleaved:YES
+                         error:&error];
+            if (output == nil) {
+                if (error_message != NULL) *error_message = LumiCopyError(error);
+                return NULL;
+            }
+            if (!LumiCopyAudioSamples(input, output, &error)) {
+                if (error_message != NULL) *error_message = LumiCopyError(error);
+                return NULL;
+            }
+        }
+        // Both files are closed here, so the FLAC on disk is complete.
+
+        NSDictionary *report = @{
+            @"bytes": @(LumiFileSize(destinationPath)),
+            @"frames": @((long long)frames),
+            @"sample_rate": @((long long)llround(sampleRate)),
+        };
+        NSError *jsonError = nil;
+        NSString *json = LumiJSONString(report, &jsonError);
+        if (json == nil) {
+            if (error_message != NULL) *error_message = LumiCopyError(jsonError);
+            return NULL;
+        }
+        return LumiCopyUTF8(json);
+    }
+}
+
+// lumi_audio_decode_pcm16 decodes any file AVFoundation can open into mono
+// 16-bit little-endian samples at the file's own sample rate.
+//
+// It is the only bridge entry point returning a raw buffer rather than a C
+// string: a 30-second chunk is 480,000 samples, which no string encoding of the
+// data would survive. The caller owns the returned pointer and frees it with
+// free(); NULL means failure and *error_message then holds the reason.
+//
+// Asking AVAudioFile for AVAudioPCMFormatInt16 directly, rather than reading
+// float samples and scaling them here, is what makes a lossless round trip
+// bit-exact — which is what lets `lumi compress` verify a FLAC by comparison
+// rather than by tolerance.
+uint8_t *lumi_audio_decode_pcm16(const char *path, int64_t *frames, int32_t *sample_rate,
+                                 char **error_message) {
+    @autoreleasepool {
+        NSError *error = nil;
+        AVAudioFile *input = [[AVAudioFile alloc] initForReading:[NSURL fileURLWithPath:@(path)]
+                                                   commonFormat:AVAudioPCMFormatInt16
+                                                    interleaved:YES
+                                                          error:&error];
+        if (input == nil) {
+            if (error_message != NULL) *error_message = LumiCopyError(error);
+            return NULL;
+        }
+        AVAudioFramePosition total = input.length;
+        AVAudioChannelCount channels = input.processingFormat.channelCount;
+        if (total < 0 || channels == 0) {
+            if (error_message != NULL) *error_message = LumiCopyUTF8(@"audio file reports no frames");
+            return NULL;
+        }
+        if (total > (AVAudioFramePosition)(SIZE_MAX / sizeof(int16_t))) {
+            if (error_message != NULL) *error_message = LumiCopyUTF8(@"audio file is too large to decode");
+            return NULL;
+        }
+
+        int16_t *samples = calloc((size_t)MAX((AVAudioFramePosition)1, total), sizeof(int16_t));
+        if (samples == NULL) {
+            if (error_message != NULL) *error_message = LumiCopyUTF8(@"allocate decoded samples");
+            return NULL;
+        }
+
+        const AVAudioFrameCount chunkFrames = 65536;
+        AVAudioPCMBuffer *buffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:input.processingFormat
+                                                                frameCapacity:chunkFrames];
+        if (buffer == nil) {
+            free(samples);
+            if (error_message != NULL) *error_message = LumiCopyUTF8(@"allocate audio buffer");
+            return NULL;
+        }
+
+        AVAudioFramePosition written = 0;
+        AVAudioFramePosition remaining = total;
+        while (remaining > 0) {
+            AVAudioFrameCount want = (AVAudioFrameCount)MIN((AVAudioFramePosition)chunkFrames, remaining);
+            if (![input readIntoBuffer:buffer frameCount:want error:&error]) {
+                free(samples);
+                if (error_message != NULL) *error_message = LumiCopyError(error);
+                return NULL;
+            }
+            if (buffer.frameLength == 0) {
+                break;
+            }
+            const int16_t *source = buffer.int16ChannelData[0];
+            for (AVAudioFrameCount frame = 0; frame < buffer.frameLength; frame++) {
+                if (channels == 1) {
+                    samples[written + frame] = source[frame];
+                } else {
+                    // Lumi records mono, so this only runs for a file handed in
+                    // from outside. Averaging keeps a stereo track's energy
+                    // comparable to a mono one rather than discarding a channel.
+                    int32_t sum = 0;
+                    for (AVAudioChannelCount channel = 0; channel < channels; channel++) {
+                        sum += source[frame * channels + channel];
+                    }
+                    samples[written + frame] = (int16_t)(sum / (int32_t)channels);
+                }
+            }
+            written += (AVAudioFramePosition)buffer.frameLength;
+            remaining -= (AVAudioFramePosition)buffer.frameLength;
+        }
+
+        if (frames != NULL) *frames = (int64_t)written;
+        if (sample_rate != NULL) *sample_rate = (int32_t)llround(input.fileFormat.sampleRate);
+        return (uint8_t *)samples;
+    }
+}

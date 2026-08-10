@@ -3,16 +3,21 @@
 package macosnative
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"image"
 	"image/color"
 	"image/draw"
 	"image/jpeg"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/puremetricsai/lumi/internal/wav"
 )
 
 func TestPermissionStatusUsesKnownStates(t *testing.T) {
@@ -957,5 +962,313 @@ func TestAudioMarkerWindowsFindTheBackgroundEmitter(t *testing.T) {
 				t.Fatalf("marker was not stripped from the title: %q, want %q", got[0].Window, tc.wantText)
 			}
 		})
+	}
+}
+
+// writeTestJPEG writes a JPEG shaped like the thing Lumi captures: a desktop of
+// flat panels separated by hard edges, with thin dark rules standing in for text.
+//
+// The shape is load-bearing, not decoration. An earlier version of this fixture
+// filled every pixel from a sawtooth of x and y, which is high-frequency noise —
+// the worst case for any DCT-based codec, and it measured 23.6 dB where 309 real
+// captured frames at the same quality measured no worse than 39.4 dB. Asserting
+// the shipped floor against an image nothing in the corpus resembles would have
+// meant lowering the floor to accommodate the test.
+func writeTestJPEG(t *testing.T, path string, width, height int) {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	draw.Draw(img, img.Bounds(), &image.Uniform{C: color.RGBA{R: 244, G: 244, B: 246, A: 255}},
+		image.Point{}, draw.Src)
+	panels := []struct {
+		rect  image.Rectangle
+		shade color.RGBA
+	}{
+		{image.Rect(0, 0, width/4, height), color.RGBA{R: 32, G: 34, B: 40, A: 255}},
+		{image.Rect(width/4, 0, width, height/8), color.RGBA{R: 210, G: 214, B: 220, A: 255}},
+		{image.Rect(width/2, height/3, width*7/8, height*3/4), color.RGBA{R: 255, G: 255, B: 255, A: 255}},
+	}
+	for _, panel := range panels {
+		draw.Draw(img, panel.rect, &image.Uniform{C: panel.shade}, image.Point{}, draw.Src)
+	}
+	// Thin horizontal rules across the light panels, the closest a synthetic
+	// image gets to the small text a user zooms into a screenshot to read.
+	for y := height / 8; y < height; y += 9 {
+		for x := width/4 + 8; x < width-8; x++ {
+			if (x/17)%3 != 0 {
+				img.Set(x, y, color.RGBA{R: 60, G: 62, B: 70, A: 255})
+			}
+		}
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jpeg.Encode(file, img, &jpeg.Options{Quality: 82}); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTranscodeImageHEICPreservesTheFrame(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "frame.jpg")
+	destination := filepath.Join(dir, "frame.heic")
+	writeTestJPEG(t, source, 640, 400)
+
+	verification, err := TranscodeImageHEIC(context.Background(), source, destination, 0.60)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verification.Width != 640 || verification.Height != 400 {
+		t.Errorf("HEIC decoded to %dx%d, want 640x400", verification.Width, verification.Height)
+	}
+	if verification.Width != verification.SourceWidth || verification.Height != verification.SourceHeight {
+		t.Errorf("decoded %dx%d differs from source %dx%d",
+			verification.Width, verification.Height, verification.SourceWidth, verification.SourceHeight)
+	}
+	// Measured over 309 real captured frames at this quality the worst PSNR was
+	// 39.4 dB and the worst histogram similarity 0.989; a synthetic gradient is
+	// harder than a desktop, so this only asserts the shipped floors.
+	if verification.PSNRDB < 30 {
+		t.Errorf("PSNR %.1f dB is below the floor `lumi compress` enforces", verification.PSNRDB)
+	}
+	if verification.HistogramSimilarity < 0.95 {
+		t.Errorf("histogram similarity %.4f is below the floor `lumi compress` enforces",
+			verification.HistogramSimilarity)
+	}
+	if verification.Bytes <= 0 {
+		t.Error("HEIC verification reported no bytes")
+	}
+	info, err := os.Stat(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != verification.Bytes {
+		t.Errorf("verification reported %d bytes, file is %d", verification.Bytes, info.Size())
+	}
+}
+
+func TestTranscodeImageHEICRejectsSomethingThatIsNotAnImage(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "frame.jpg")
+	if err := os.WriteFile(source, []byte("not an image"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := TranscodeImageHEIC(context.Background(), source, filepath.Join(dir, "out.heic"), 0.60); err == nil {
+		t.Error("transcoded a file that is not an image")
+	}
+}
+
+func TestInspectImageReportsDimensions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "frame.jpg")
+	writeTestJPEG(t, path, 128, 96)
+	verification, err := InspectImage(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verification.Width != 128 || verification.Height != 96 {
+		t.Errorf("inspected %dx%d, want 128x96", verification.Width, verification.Height)
+	}
+	// An inspection has no second image to compare against, so it must report
+	// the source as identical rather than as a mismatch a caller would reject.
+	if verification.SourceWidth != verification.Width || verification.SourceHeight != verification.Height {
+		t.Error("inspection reported a source size differing from the image it read")
+	}
+}
+
+// writeTestWAV writes the exact format Lumi captures: 16 kHz mono 16-bit
+// little-endian PCM in a RIFF/WAVE container.
+func writeTestWAV(t *testing.T, path string, samples []int16) {
+	t.Helper()
+	const sampleRate = 16000
+	body := make([]byte, len(samples)*2)
+	for i, sample := range samples {
+		binary.LittleEndian.PutUint16(body[i*2:], uint16(sample))
+	}
+	var buffer bytes.Buffer
+	buffer.WriteString("RIFF")
+	binary.Write(&buffer, binary.LittleEndian, uint32(36+len(body)))
+	buffer.WriteString("WAVEfmt ")
+	binary.Write(&buffer, binary.LittleEndian, uint32(16))
+	binary.Write(&buffer, binary.LittleEndian, uint16(1)) // PCM
+	binary.Write(&buffer, binary.LittleEndian, uint16(1)) // mono
+	binary.Write(&buffer, binary.LittleEndian, uint32(sampleRate))
+	binary.Write(&buffer, binary.LittleEndian, uint32(sampleRate*2))
+	binary.Write(&buffer, binary.LittleEndian, uint16(2))
+	binary.Write(&buffer, binary.LittleEndian, uint16(16))
+	buffer.WriteString("data")
+	binary.Write(&buffer, binary.LittleEndian, uint32(len(body)))
+	buffer.Write(body)
+	if err := os.WriteFile(path, buffer.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func toneWithSilence(seconds int) []int16 {
+	samples := make([]int16, 16000*seconds)
+	for i := range samples[:len(samples)*2/3] {
+		samples[i] = int16(12000 * math.Sin(2*math.Pi*440*float64(i)/16000))
+	}
+	return samples
+}
+
+func TestEncodeAudioFLACRoundTripsExactly(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		samples []int16
+	}{
+		// Speech-like content and a silent run are the two cases the corpus is
+		// made of; a silent system track is 45% of captured chunks and is where
+		// lossless compression pays for itself.
+		{"tone then silence", toneWithSilence(3)},
+		{"silence", make([]int16, 16000*3)},
+		// Not a multiple of the encoder's packet size, which is where a frame
+		// count off by one would show up.
+		{"odd length", make([]int16, 4609)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			source := filepath.Join(dir, "chunk.wav")
+			destination := filepath.Join(dir, "chunk.flac")
+			writeTestWAV(t, source, tc.samples)
+
+			encoding, err := EncodeAudioFLAC(context.Background(), source, destination)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if encoding.SampleRate != 16000 {
+				t.Errorf("encoded at %d Hz, want 16000", encoding.SampleRate)
+			}
+			if encoding.Frames != int64(len(tc.samples)) {
+				t.Errorf("encoded %d frames, want %d", encoding.Frames, len(tc.samples))
+			}
+
+			decoded, sampleRate, err := DecodeMonoPCM16(context.Background(), destination)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sampleRate != 16000 {
+				t.Errorf("decoded at %d Hz, want 16000", sampleRate)
+			}
+			if len(decoded) != len(tc.samples) {
+				t.Fatalf("decoded %d samples, want %d", len(decoded), len(tc.samples))
+			}
+			for i := range decoded {
+				if decoded[i] != tc.samples[i] {
+					t.Fatalf("sample %d decoded as %d, want %d — FLAC is lossless and must round trip exactly",
+						i, decoded[i], tc.samples[i])
+				}
+			}
+		})
+	}
+}
+
+func TestEncodeAudioFLACShrinksASilentTrack(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "system.wav")
+	destination := filepath.Join(dir, "system.flac")
+	// A full 30-second chunk, the size the recorder actually writes.
+	writeTestWAV(t, source, make([]int16, 16000*30))
+	if _, err := EncodeAudioFLAC(context.Background(), source, destination); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Silence is what makes the audio pass worth running at all: a silent track
+	// is 960 KB of zeroes on disk and a few hundred bytes of FLAC.
+	if after.Size()*50 > before.Size() {
+		t.Errorf("silent track compressed only %.1fx (%d -> %d bytes)",
+			float64(before.Size())/float64(after.Size()), before.Size(), after.Size())
+	}
+}
+
+func TestDecodeMonoPCM16AgreesWithTheWAVReader(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		samples []int16
+	}{
+		{"tone then silence", toneWithSilence(2)},
+		{"single sample", []int16{-32768}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "chunk.wav")
+			writeTestWAV(t, path, tc.samples)
+
+			// The two halves of capture.ReadAudioEnvelope must return the same
+			// samples for the same audio, or the recorder and a backfill reach
+			// different bleed verdicts depending only on the container.
+			native, nativeRate, err := DecodeMonoPCM16(context.Background(), path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pure, info, err := wav.ReadMono16(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if nativeRate != info.SampleRate {
+				t.Errorf("native decoder reports %d Hz, internal/wav reports %d", nativeRate, info.SampleRate)
+			}
+			if len(native) != len(pure) {
+				t.Fatalf("native decoded %d samples, internal/wav decoded %d", len(native), len(pure))
+			}
+			for i := range native {
+				if native[i] != pure[i] {
+					t.Fatalf("sample %d: native %d, internal/wav %d", i, native[i], pure[i])
+				}
+			}
+		})
+	}
+}
+
+func TestDecodeMonoPCM16RejectsSomethingThatIsNotAudio(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "chunk.wav")
+	if err := os.WriteFile(path, []byte("not audio"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := DecodeMonoPCM16(context.Background(), path); err == nil {
+		t.Error("decoded a file that is not audio")
+	}
+}
+
+// TestFLACTranscriptionIdentity is the regression test behind the whole audio
+// recommendation: SpeechAnalyzer must transcribe a compressed chunk to exactly
+// what it transcribed the WAV to, or compressing audio silently changes what the
+// index would say on a re-transcription.
+//
+// It reads a real captured chunk from the environment and skips without one.
+// Only the fact that the two transcripts matched is ever reported — the words
+// themselves stay out of this repository.
+func TestFLACTranscriptionIdentity(t *testing.T) {
+	source := os.Getenv("LUMI_WAV_FILE")
+	if source == "" {
+		t.Skip("set LUMI_WAV_FILE to a captured WAV carrying speech")
+	}
+	destination := filepath.Join(t.TempDir(), "chunk.flac")
+	if _, err := EncodeAudioFLAC(context.Background(), source, destination); err != nil {
+		t.Fatal(err)
+	}
+	fromWAV, err := TranscribeAudio(context.Background(), source, "en-US")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fromFLAC, err := TranscribeAudio(context.Background(), destination, "en-US")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fromWAV == "" {
+		t.Skip("LUMI_WAV_FILE transcribed to nothing; point it at a chunk carrying speech")
+	}
+	if fromWAV != fromFLAC {
+		t.Errorf("transcripts differ after FLAC encoding (%d vs %d characters)",
+			len(fromWAV), len(fromFLAC))
 	}
 }
