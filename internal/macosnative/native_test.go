@@ -1272,3 +1272,20 @@ func TestFLACTranscriptionIdentity(t *testing.T) {
 			len(fromWAV), len(fromFLAC))
 	}
 }
+
+// Re-running OCR later with a better model is one of the reasons the research
+// behind `lumi compress` refused to downscale frames, so it has to keep working
+// on what compress actually stores. Vision reads through ImageIO, which is
+// format-agnostic, but that is a property worth pinning rather than assuming.
+func TestVisionReadsACompressedFrame(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "frame.jpg")
+	destination := filepath.Join(dir, "frame.heic")
+	writeTestJPEG(t, source, 320, 240)
+	if _, err := TranscodeImageHEIC(context.Background(), source, destination, 0.60); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RecognizeText(context.Background(), destination); err != nil {
+		t.Fatalf("Apple Vision rejected a compressed frame: %v", err)
+	}
+}
