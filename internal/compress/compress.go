@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -127,22 +128,25 @@ type Options struct {
 	Logger *slog.Logger
 }
 
+// quality treats only an unset (zero) value as "use the default". A caller
+// asking for a specific quality gets it; validation that the number is usable
+// happens once in Validate rather than being silently corrected here.
 func (o Options) quality() float64 {
-	if o.Quality <= 0 {
+	if o.Quality == 0 {
 		return DefaultQuality
 	}
 	return o.Quality
 }
 
 func (o Options) minPSNR() float64 {
-	if o.MinPSNRDB <= 0 {
+	if o.MinPSNRDB == 0 {
 		return DefaultMinPSNRDB
 	}
 	return o.MinPSNRDB
 }
 
 func (o Options) minHistogram() float64 {
-	if o.MinHistogramSimilarity <= 0 {
+	if o.MinHistogramSimilarity == 0 {
 		return DefaultMinHistogramSimilarity
 	}
 	return o.MinHistogramSimilarity
@@ -180,6 +184,14 @@ type PassResult struct {
 	// Raced counts rows another writer repointed between the read and the
 	// update. Their newly written file is removed and the original left alone.
 	Raced int64 `json:"raced"`
+	// Conflicted counts rows skipped because compressing them would overwrite
+	// or orphan media another row depends on. It is an inconsistency in the
+	// index rather than a failure of this run; see preflight.go.
+	Conflicted int64 `json:"conflicted"`
+	// FlushFailed counts results that encoded and verified but could not be
+	// flushed durably. Counted apart from EncodeFailed because it means a
+	// filesystem problem rather than a broken encoder.
+	FlushFailed int64 `json:"flush_failed"`
 }
 
 // ReconcileResult accounts for the leftover sweep.
@@ -221,6 +233,9 @@ func Compress(ctx context.Context, s *store.Store, opts Options) (Result, error)
 	if opts.Before == nil {
 		return result, errors.New("compress requires a cutoff; recompressing the frame captured a moment ago races the recorder for it")
 	}
+	if err := opts.validate(); err != nil {
+		return result, err
+	}
 	if opts.Screens == CodecHEIC && opts.Images == nil {
 		return result, errors.New("compressing screenshots needs an image transcoder")
 	}
@@ -232,15 +247,21 @@ func Compress(ctx context.Context, s *store.Store, opts Options) (Result, error)
 	if err != nil {
 		return result, err
 	}
+	// Before anything on disk is touched: refuse a run whose media does not
+	// belong to this data directory, and identify rows whose paths collide.
+	report, err := runPreflight(ctx, events, opts)
+	if err != nil {
+		return result, err
+	}
 
 	if opts.Screens == CodecHEIC {
-		result.Screens, err = runPass(ctx, s, opts, events, store.KindScreen, screenPass{})
+		result.Screens, err = runPass(ctx, s, opts, events, store.KindScreen, screenPass{}, report)
 		if err != nil {
 			return result, err
 		}
 	}
 	if opts.Audio == CodecFLAC {
-		result.Audio, err = runPass(ctx, s, opts, events, store.KindAudio, audioPass{})
+		result.Audio, err = runPass(ctx, s, opts, events, store.KindAudio, audioPass{}, report)
 		if err != nil {
 			return result, err
 		}
@@ -271,7 +292,7 @@ type pass interface {
 }
 
 func runPass(ctx context.Context, s *store.Store, opts Options,
-	events []store.Event, kind store.Kind, p pass) (PassResult, error) {
+	events []store.Event, kind store.Kind, p pass, report preflightReport) (PassResult, error) {
 	var result PassResult
 	logger := opts.logger()
 	for _, event := range events {
@@ -285,6 +306,13 @@ func runPass(ctx context.Context, s *store.Store, opts Options,
 		}
 		if p.done(event.MediaPath) {
 			result.AlreadyDone++
+			continue
+		}
+		if reason, conflicted := report.conflicts[event.ID]; conflicted {
+			// Compressing this row would take another row's media with it.
+			result.Conflicted++
+			logger.Warn("skipping media that another event also depends on",
+				"event", event.ID, "media", event.MediaPath, "reason", reason)
 			continue
 		}
 		destination, eligible := p.classify(event.MediaPath)
@@ -320,8 +348,8 @@ func runPass(ctx context.Context, s *store.Store, opts Options,
 			os.Remove(destination)
 			continue
 		}
-		if err := durable(destination); err != nil {
-			result.EncodeFailed++
+		if err := flushDurably(destination); err != nil {
+			result.FlushFailed++
 			logger.Warn("could not flush compressed media to disk; keeping the original",
 				"event", event.ID, "media", destination, "error", err)
 			os.Remove(destination)
@@ -368,6 +396,12 @@ func isVerificationError(err error) bool {
 	var target verificationError
 	return errors.As(err, &target)
 }
+
+// flushDurably is a package var purely as a test seam. The dir-sync failure path
+// is load-bearing — it is the one place a verified file is thrown away — and
+// without a seam it would be unreachable outside a filesystem that fails on
+// demand.
+var flushDurably = durable
 
 // durable flushes a freshly written file and the directory entry naming it.
 //
@@ -444,4 +478,21 @@ func swapExtension(path, extension string) string {
 
 func lowerExt(path string) string {
 	return strings.ToLower(filepath.Ext(path))
+}
+
+// validate rejects settings that would silently disable a check rather than
+// applying it. A NaN threshold is the case that matters: every comparison
+// against it is false, so `--min-psnr NaN` would turn the verification gate off
+// while still reporting that images were verified.
+func (o Options) validate() error {
+	if math.IsNaN(o.Quality) || o.Quality < 0 || o.Quality > 1 {
+		return fmt.Errorf("quality must be between 0 and 1, not %v", o.Quality)
+	}
+	if math.IsNaN(o.MinPSNRDB) || o.MinPSNRDB < 0 {
+		return fmt.Errorf("the PSNR floor must be a non-negative number, not %v", o.MinPSNRDB)
+	}
+	if math.IsNaN(o.MinHistogramSimilarity) || o.MinHistogramSimilarity < 0 || o.MinHistogramSimilarity > 1 {
+		return fmt.Errorf("the histogram floor must be between 0 and 1, not %v", o.MinHistogramSimilarity)
+	}
+	return nil
 }

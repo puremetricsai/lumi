@@ -33,6 +33,20 @@ how densely to keep it.
   compressor running, that file can be the one the winner's row now names, which is unrecoverable. The
   single-instance lock lives in `internal/cli` (see its `CLAUDE.md`). State the scope wherever the claim is
   repeated.
+- **Every pass is confined to `Options.MediaDirs`, and a run naming media outside them fails before it
+  touches anything.** `media_path` is stored absolute, so pointing `--data-dir` at a *copy* of an index
+  gives you the copy's database and the original's files — and this is the only command that rewrites and
+  deletes what it reads. That is not hypothetical: it destroyed 3,300 originals in a live index during this
+  feature's own verification, silently, while reporting success. `checkRoots` fails the whole run rather
+  than skipping the offending rows, because media outside the roots means the caller is not looking at the
+  index they think they are. Note the asymmetry that allowed it: reconcile was always scoped to
+  `MediaDirs`; the passes were not.
+- **One-to-one path ownership is checked, not assumed.** `events.media_path` has no uniqueness constraint,
+  and destinations are derived by swapping the extension, so two rows naming one file (the first
+  replacement deletes the second's media) or a row whose destination another row already holds (the encode
+  overwrites it — the FLAC writer truncates an existing destination outright) both break the sequence.
+  `findConflicts` skips and counts those rows instead. Neither arises in an index Lumi wrote, which is
+  exactly why it needs a check rather than a comment.
 - **`reconcile` is sibling-scoped and must never become a general orphan sweep.** Captured media exists on
   disk *before* its row does — a frame is written, compared, then inserted; a WAV exists for a whole chunk
   plus transcription latency before its `Insert` — so removing any unreferenced file would delete media the
@@ -41,6 +55,11 @@ how densely to keep it.
   sibling is named by a row may be touched; freshly captured media has no such sibling, so it is
   untouchable by construction rather than by a check. `TestReconcileNeverTouchesMediaThatHasNoIndexedSibling`
   pins it.
+- **"Could not stat" is not "is gone", and reconcile must keep them apart.** Routing every stat error to
+  the adopt branch is the one single-process path in this package that destroys data: a transient EACCES or
+  EIO on a *present* original adopts the unverified leftover, and the next run then sees the original as an
+  unreferenced sibling of a referenced file and deletes the only copy that was ever verified. Adopt only on
+  `os.IsNotExist`; anything else leaves both files alone and logs.
 - **A leftover whose row's media is *gone* is adopted, not deleted.** Media is flushed with a full barrier
   while SQLite's WAL commit by default is not, so a power loss can drop the committed row update while the
   unlink of the original persists. Deleting the survivor would destroy the last copy; repointing the row at
@@ -78,3 +97,20 @@ below anything the corpus contains — if a real frame ever fails one, the answe
 not to lower the gate. A synthetic test fixture is not evidence about them: high-frequency noise measures
 23.6 dB at the same setting, which is why `writeTestJPEG` in `internal/macosnative` is shaped like a
 desktop.
+
+## What this package assumes about the rest of the system
+
+- **Two filenames differing only by extension belong to the same event.** Both the reconcile sibling rule
+  and the passes' willingness to overwrite an existing destination rest on it. It holds because capture
+  names files uniquely per display per instant and per chunk per track, and because a duplicate frame
+  inserts no row at all — so a same-stem/different-extension pair across two events cannot arise. A coarser
+  naming scheme would silently re-arm both hazards, which is why `findConflicts` exists as a backstop and
+  why this assumption is written down rather than left in the filenames.
+- **Concurrent `lumi transcript backfill` and `lumi prune` are accepted races, and neither destroys data.**
+  A backfill that resolves a path and then opens it can find the file replaced underneath; it degrades to
+  the text path or to a verdict with no envelope, which is pre-existing behaviour for aged-out media rather
+  than a new failure — but it *is* silent, so `--older-than`'s 48-hour default matters as more than
+  politeness. A prune that deletes a row this run has just repointed unlinks the old path and leaves the
+  new file unreferenced, where reconcile can never reach it because its sibling is no longer named by any
+  row: a leaked file, not a lost one. The recorder is gated in `internal/cli` because it is the writer with
+  the highest contention, not because the others are safe by analysis.

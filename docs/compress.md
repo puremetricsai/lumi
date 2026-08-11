@@ -120,22 +120,33 @@ Re-running is always safe. A row whose media is already HEIC or FLAC is simply c
 Only one compress may run at a time. A second refuses:
 
 ```
-compression is already in progress (pid 4821); two runs would race for the same files
+compression is already in progress; two runs would race for the same files
 ```
+
+The lock is held by the running process rather than recorded in a file, so a run killed outright leaves
+nothing to clean up and the next run simply proceeds.
 
 It also refuses while `lumi record` is running, since it rewrites the media paths the recorder is using.
 Stop the recorder, or pass `--while-recording` to override.
 
-## `--data-dir` does not sandbox a copy of your index
-
-**Copying your data directory and running compress against the copy will modify the original.**
+## Copying your index: compress refuses rather than reaching outside
 
 `events.media_path` is stored as an absolute path, so a copied database still names the files in the
-original directory. `--data-dir` redirects which *database* is opened, not where the media it points at
-lives. Every other command only reads media, so this has never mattered before; compress is the first one
-that rewrites it.
+*original* directory. `--data-dir` redirects which database is opened, not where the media it points at
+lives. Every other command only reads media, so this has never mattered; compress is the first one that
+rewrites and deletes it — which without a guard means running against a copy destroys the original's files.
 
-To experiment safely, copy the index and rewrite the paths:
+So it refuses:
+
+```
+error: 7040 indexed events name media outside this data directory (for example …); compress rewrites and
+deletes the files it reads, so it will not touch media belonging to another index.
+```
+
+The whole run fails rather than compressing the subset that happens to be inside, because media outside
+the data directory means you are not looking at the index you think you are.
+
+To experiment on a copy, rewrite the paths so they point inside it:
 
 ```sh
 cp -R ~/Library/Application\ Support/Lumi /tmp/lumi-copy
@@ -143,6 +154,10 @@ sqlite3 /tmp/lumi-copy/lumi.db \
   "UPDATE events SET media_path = replace(media_path, '$HOME/Library/Application Support/Lumi', '/tmp/lumi-copy');"
 ./lumi --data-dir /tmp/lumi-copy compress --dry-run
 ```
+
+If you have deliberately moved your media elsewhere, move the data directory as a whole and rewrite the
+paths the same way; compress will only ever touch files beneath the `screenshots/` and `audio/` directories
+of the index it was given.
 
 ## The database rebuild
 
@@ -171,7 +186,12 @@ index takes about 15 minutes; audio is far faster. It is safe to interrupt and r
 ```
 
 Reports per-pass counts (`files`, `bytes_before`, `bytes_after`, `already_done`, `skipped`,
-`missing_files`, `encode_failed`, `verify_failed`, `raced`), the reconcile counts, and the vacuum's status.
+`missing_files`, `encode_failed`, `verify_failed`, `flush_failed`, `raced`, `conflicted`), the reconcile
+counts, and the vacuum's status.
+
+`conflicted` counts rows left alone because compressing them would have taken another row's media with
+them — two events naming one file, or an event whose compressed name another event already holds. Neither
+happens in an index Lumi wrote; a non-zero count means the index has been edited or merged.
 
 ## What it deliberately does not do
 

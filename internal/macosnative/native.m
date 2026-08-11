@@ -1806,10 +1806,27 @@ static BOOL LumiImageMeasure(CGImageRef source, CGImageRef decoded,
         }
         return NO;
     }
+    // Guard the sizing arithmetic before it reaches an allocator: a wrapped
+    // byteCount would under-allocate the buffers the bitmap contexts then draw
+    // into. No real frame comes near this; an untrusted or corrupt header can.
+    if (width > SIZE_MAX / 4 || height > SIZE_MAX / (width * 4)) {
+        if (error != NULL) {
+            *error = [NSError errorWithDomain:@"LumiNative" code:35
+                                     userInfo:@{NSLocalizedDescriptionKey: @"image dimensions are too large to compare"}];
+        }
+        return NO;
+    }
     size_t bytesPerRow = width * 4;
     size_t byteCount = bytesPerRow * height;
 
     CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+    if (space == NULL) {
+        if (error != NULL) {
+            *error = [NSError errorWithDomain:@"LumiNative" code:36
+                                     userInfo:@{NSLocalizedDescriptionKey: @"create comparison colour space"}];
+        }
+        return NO;
+    }
     uint8_t *sourcePixels = calloc(byteCount, 1);
     uint8_t *decodedPixels = calloc(byteCount, 1);
     CGContextRef sourceContext = NULL;
@@ -1896,6 +1913,11 @@ static long long LumiFileSize(NSString *path) {
 // re-encoding anything. `lumi compress` uses it to decide whether a compressed
 // file left behind by an interrupted run is intact enough to adopt, in the one
 // case where the original it would have been compared against is already gone.
+//
+// It draws the image rather than reading its header, because a truncated file
+// keeps an intact header: dimensions alone would declare a half-written frame
+// healthy and adopt it as an event's only surviving media. Drawing is the
+// strongest check available with no original to compare against.
 char *lumi_image_inspect_json(const char *image_path, char **error_message) {
     @autoreleasepool {
         NSString *path = @(image_path);
@@ -1905,13 +1927,23 @@ char *lumi_image_inspect_json(const char *image_path, char **error_message) {
             if (error_message != NULL) *error_message = LumiCopyError(error);
             return NULL;
         }
+        // Compared against itself: the comparison is what forces every pixel
+        // through a bitmap context, and an image that cannot be drawn fails here
+        // rather than being reported as intact.
+        double psnr = 0.0;
+        double histogram = 0.0;
+        if (!LumiImageMeasure(image, image, &psnr, &histogram, &error)) {
+            CGImageRelease(image);
+            if (error_message != NULL) *error_message = LumiCopyError(error);
+            return NULL;
+        }
         NSDictionary *report = @{
             @"width": @((long long)CGImageGetWidth(image)),
             @"height": @((long long)CGImageGetHeight(image)),
             @"source_width": @((long long)CGImageGetWidth(image)),
             @"source_height": @((long long)CGImageGetHeight(image)),
-            @"psnr_db": @(99.0),
-            @"histogram_similarity": @(1.0),
+            @"psnr_db": @(psnr),
+            @"histogram_similarity": @(histogram),
             @"bytes": @(LumiFileSize(path)),
         };
         CGImageRelease(image);

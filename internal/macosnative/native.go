@@ -839,13 +839,16 @@ func DecodeMonoPCM16(ctx context.Context, path string) ([]int16, int, error) {
 	// The bridge owns none of these numbers once it has returned, so they are
 	// checked here rather than trusted: C.GoBytes takes an int length, and a
 	// negative or overlarge count would read outside the buffer.
+	// Bounds are checked before the multiplication, not after: frames is int64
+	// and C.GoBytes takes an int length, so a count above MaxInt32/2 would wrap
+	// negative and slip past a check made on the product.
 	if frames < 0 || sampleRate <= 0 {
 		return nil, 0, fmt.Errorf("decode %s: native decoder reported %d frames at %d Hz", path, int64(frames), int32(sampleRate))
 	}
-	byteCount := int64(frames) * 2
-	if byteCount > int64(math.MaxInt32) {
+	if int64(frames) > int64(math.MaxInt32)/2 {
 		return nil, 0, fmt.Errorf("decode %s: %d frames is too many to copy", path, int64(frames))
 	}
+	byteCount := int64(frames) * 2
 	raw := C.GoBytes(unsafe.Pointer(buffer), C.int(byteCount))
 	samples := make([]int16, frames)
 	for i := range samples {

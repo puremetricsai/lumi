@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -147,12 +146,13 @@ func TestCompressDryRunIgnoresTheRecordingGate(t *testing.T) {
 func TestCompressRefusesWhileAnotherRunHoldsTheLock(t *testing.T) {
 	dataDir, run := newCompressTest(t)
 	paths := compressPaths(t, dataDir)
-	lock := filepath.Join(paths.Root, compressLockName)
-	if err := os.WriteFile(lock, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o600); err != nil {
+	release, err := lockFile(filepath.Join(paths.Root, compressLockName))
+	if err != nil {
 		t.Fatal(err)
 	}
+	defer release()
 
-	_, _, err := run("--screens", "none", "--audio", "none")
+	_, _, err = run("--screens", "none", "--audio", "none")
 	if err == nil {
 		t.Fatal("a second compress ran while the lock was held")
 	}
@@ -161,22 +161,40 @@ func TestCompressRefusesWhileAnotherRunHoldsTheLock(t *testing.T) {
 	}
 }
 
-// A run killed mid-flight leaves its lock behind; the next run must not be
-// blocked forever by a process that no longer exists.
-func TestCompressTakesOverAStaleLock(t *testing.T) {
+// flock is released by the kernel when the holding process dies however
+// abruptly, so a lock file left behind by a killed run holds nothing. A pid file
+// needed explicit stale-takeover logic here, and that logic was itself racy.
+func TestCompressIgnoresALockFileNobodyHolds(t *testing.T) {
 	dataDir, run := newCompressTest(t)
 	paths := compressPaths(t, dataDir)
 	lock := filepath.Join(paths.Root, compressLockName)
-	// A pid nothing can be running under.
-	if err := os.WriteFile(lock, []byte("2147483647 2026-08-10T00:00:00Z\n"), 0o600); err != nil {
+	if err := os.WriteFile(lock, []byte("2147483647\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
 	if _, _, err := run("--screens", "none", "--audio", "none", "--vacuum=false"); err != nil {
-		t.Fatalf("a stale lock blocked the run: %v", err)
+		t.Fatalf("an unheld lock file blocked the run: %v", err)
 	}
-	if _, err := os.Stat(lock); !os.IsNotExist(err) {
-		t.Error("the lock was left behind after a successful run")
+}
+
+// The window a pid file could not close: a lock that exists but has not been
+// written yet. flock makes the file's *contents* irrelevant, so an empty lock
+// held by a live process still excludes.
+func TestCompressRefusesWhileAnEmptyLockIsHeld(t *testing.T) {
+	dataDir, run := newCompressTest(t)
+	paths := compressPaths(t, dataDir)
+	release, err := lockFile(filepath.Join(paths.Root, compressLockName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	_, _, err = run("--screens", "none", "--audio", "none")
+	if err == nil {
+		t.Fatal("a second compress ran while an empty lock was held")
+	}
+	if !strings.Contains(err.Error(), "already in progress") {
+		t.Errorf("the refusal does not say why: %v", err)
 	}
 }
 

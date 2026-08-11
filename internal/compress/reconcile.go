@@ -120,7 +120,19 @@ func settle(ctx context.Context, s *store.Store, opts Options, leftover string,
 	var result ReconcileResult
 	size := fileSize(leftover)
 
-	if _, err := os.Stat(owner.MediaPath); err == nil {
+	_, ownerErr := os.Stat(owner.MediaPath)
+	switch {
+	case ownerErr != nil && !os.IsNotExist(ownerErr):
+		// "Could not stat" is not "is gone", and conflating them is the one
+		// single-process path in this package that destroys data. A transient
+		// EACCES or EIO on a *present* original would otherwise adopt the
+		// unverified leftover, and the next run — seeing the original as an
+		// unreferenced sibling of a referenced file — would delete the only copy
+		// that was ever verified. Leave both files alone and say so.
+		logger.Warn("could not tell whether an event's media is still there; leaving its leftover alone",
+			"event", owner.ID, "media", owner.MediaPath, "leftover", leftover, "error", ownerErr)
+		return result, nil
+	case ownerErr == nil:
 		// The row's own media is present, so this leftover is a redundant copy
 		// from an interrupted run — either an unverified compressed file written
 		// before the update, or an original left behind after it. Both are safe

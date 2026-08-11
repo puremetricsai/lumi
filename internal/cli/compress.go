@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"time"
 
 	"github.com/spf13/cobra"
 
@@ -52,6 +51,12 @@ func (a *app) compressCommand() *cobra.Command {
 			audioCodec, err := parseAudioCodec(audio)
 			if err != nil {
 				return err
+			}
+			// Options treats a zero quality as "unset", so an explicit zero would
+			// silently become the default rather than the minimum the user asked
+			// for. Reject it instead of quietly disagreeing with them.
+			if cmd.Flags().Changed("quality") && quality == 0 {
+				return errors.New("--quality 0 is not meaningful; pass a small positive value such as 0.1")
 			}
 			before, err := parseTime(olderThan, true)
 			if err != nil {
@@ -97,6 +102,12 @@ func (a *app) compressCommand() *cobra.Command {
 				Logger:       slog.New(slog.NewTextHandler(cmd.ErrOrStderr(), nil)),
 			})
 			if err != nil {
+				// Ctrl-C after thousands of files should not print only
+				// "context canceled": everything already compressed is committed,
+				// and the counters say so.
+				if !asJSON {
+					printCompressResult(os.Stdout, result, dryRun)
+				}
 				return err
 			}
 			if asJSON {
@@ -174,6 +185,9 @@ func refuseCompressWhileRecording(paths config.Paths) error {
 // beside the recorder's state file for the same reason: any terminal can find it.
 const compressLockName = "compress.lock"
 
+// errHeld reports that another process already holds the compress lock.
+var errHeld = errors.New("the compress lock is held")
+
 // lockCompress refuses to start while another compress run holds the lock.
 //
 // This is not politeness about contention, it is what makes the crash-safety
@@ -183,51 +197,15 @@ const compressLockName = "compress.lock"
 // by then the file the first run's row names. That leaves a row pointing at
 // nothing with no original left, the one state the whole ordering exists to
 // prevent.
-//
-// A pid file rather than flock, because internal/cli carries no build tag and
-// flock would need a per-platform pair. A stale lock left by a killed process is
-// taken over, the same way `record start` treats a dead recorder.
 func lockCompress(paths config.Paths) (func(), error) {
-	path := filepath.Join(paths.Root, compressLockName)
 	if err := os.MkdirAll(paths.Root, 0o700); err != nil {
 		return nil, err
 	}
-	for attempt := 0; attempt < 2; attempt++ {
-		file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-		if err == nil {
-			fmt.Fprintf(file, "%d %s\n", os.Getpid(), time.Now().UTC().Format(time.RFC3339))
-			file.Close()
-			return func() { os.Remove(path) }, nil
-		}
-		if !errors.Is(err, os.ErrExist) {
-			return nil, fmt.Errorf("take the compress lock: %w", err)
-		}
-		holder := lockHolder(path)
-		if processAlive(holder) {
-			return nil, fmt.Errorf("compression is already in progress (pid %d); "+
-				"two runs would race for the same files", holder)
-		}
-		// Nobody holds it — a previous run was killed. Take it over.
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("clear the stale compress lock: %w", err)
-		}
+	release, err := lockFile(filepath.Join(paths.Root, compressLockName))
+	if errors.Is(err, errHeld) {
+		return nil, errors.New("compression is already in progress; two runs would race for the same files")
 	}
-	return nil, errors.New("could not take the compress lock")
-}
-
-// lockHolder reads the pid out of a lock file, returning 0 when it says nothing
-// usable — an empty or truncated lock is treated as stale rather than as a live
-// holder nobody can identify.
-func lockHolder(path string) int {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0
-	}
-	var pid int
-	if _, err := fmt.Sscanf(string(data), "%d", &pid); err != nil {
-		return 0
-	}
-	return pid
+	return release, err
 }
 
 func printCompressResult(out io.Writer, result compress.Result, dryRun bool) {

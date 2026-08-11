@@ -27,6 +27,10 @@ rows are shaped is `internal/store`'s; the labelling rules the recorder applies 
 - **Never lose captured media.** If Accessibility, Vision, comparison, or transcription fails after a file
   was written, preserve and index the event with diagnostic metadata. Don't convert downstream failures
   into early returns that drop the file.
+- **Captured filenames are unique per display per instant, and per chunk per track, and something else now
+  depends on that.** `internal/compress` pairs a file with an event by swapping its extension, so two
+  events whose media differed only by extension would let it overwrite or delete the wrong one. A coarser
+  naming scheme re-arms that; it has a backstop (`findConflicts`) but the naming is the real guarantee.
 - **Deduplicate per display, not globally.** `FrameComparer` uses SHA-256 as an exact fast path and a
   sampled RGB histogram for near-duplicates; active input raises sensitivity. Two retention deadlines:
   `MaxSilence` (10s) when bytes *changed* but scored similar (video, advancing slides), and `ExactSilence`

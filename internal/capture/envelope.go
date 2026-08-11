@@ -44,9 +44,14 @@ func ReadAudioEnvelope(ctx context.Context, path string, windowMS int) ([]float6
 		return nil, wav.Info{}, fmt.Errorf("decode %s for energy measurement: %w", filepath.Ext(path), err)
 	}
 	// The native decoder is asked for mono 16-bit samples, so this describes what
-	// it returned rather than re-deriving anything. Truncated stays false: a
-	// compressed file either decodes or errors, and there is no short final
-	// sample to report the way a cut-off RIFF data chunk has.
+	// it returned rather than re-deriving anything.
+	//
+	// Truncated stays false, which is a narrower claim than it looks: the native
+	// decoder stops at a short read and reports what it got, so a truncated
+	// compressed file decodes short without saying so. Nothing reads Truncated on
+	// this path — both callers discard Info and want only the envelope — so this
+	// is a gap in what the field could mean rather than a wrong answer given to
+	// anybody. Filling it in means reporting the shortfall from the bridge.
 	info := wav.Info{
 		SampleRate:    sampleRate,
 		Channels:      1,

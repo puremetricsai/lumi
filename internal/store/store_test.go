@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -632,11 +633,16 @@ func TestVacuumRebuildsAnIdleDatabase(t *testing.T) {
 // because events.id is INTEGER PRIMARY KEY, which makes it an alias for the
 // rowid rather than a separate column. A table without that declaration would
 // have its rows renumbered here, invalidating every reference held outside it.
+//
+// Rows are deleted from the middle first, on purpose. Without gaps in the id
+// sequence a vacuum has nothing to renumber, so the test would pass just as
+// happily for a table that *is* renumbered — which is the whole thing it exists
+// to rule out.
 func TestVacuumPreservesEventIDs(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t, ctx)
 	var ids []int64
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 10; i++ {
 		event := Event{
 			Kind: KindScreen, CapturedAt: time.Now().UTC().Add(time.Duration(i) * time.Second),
 			Text: "frame", MediaPath: "/media/frame.jpg",
@@ -646,12 +652,56 @@ func TestVacuumPreservesEventIDs(t *testing.T) {
 		}
 		ids = append(ids, event.ID)
 	}
+	// Leave holes: drop four rows from the middle of the sequence.
+	if _, err := s.DeleteByIDs(ctx, []int64{ids[2], ids[3], ids[5], ids[6]}); err != nil {
+		t.Fatal(err)
+	}
+	survivors := []int64{ids[0], ids[1], ids[4], ids[7], ids[8], ids[9]}
+
 	if err := s.Vacuum(ctx); err != nil {
 		t.Fatal(err)
 	}
-	for _, id := range ids {
-		if _, err := s.EventByID(ctx, id); err != nil {
-			t.Errorf("event %d no longer resolves after a vacuum: %v", id, err)
+
+	for _, id := range survivors {
+		event, err := s.EventByID(ctx, id)
+		if err != nil {
+			t.Fatalf("event %d no longer resolves after a vacuum: %v", id, err)
+		}
+		if event.ID != id {
+			t.Errorf("event resolved to id %d, want %d", event.ID, id)
+		}
+	}
+	// And the gaps stay gaps rather than being filled by renumbered survivors.
+	for _, id := range []int64{ids[2], ids[3], ids[5], ids[6]} {
+		if _, err := s.EventByID(ctx, id); !errors.Is(err, ErrEventNotFound) {
+			t.Errorf("deleted id %d resolves after a vacuum, so rows were renumbered", id)
+		}
+	}
+}
+
+func TestVacuumBusyIsRecognisable(t *testing.T) {
+	// The classifier, not the lock: provoking a real SQLITE_BUSY needs a second
+	// process holding a write lock, and the property worth pinning is that a busy
+	// error is reported as ErrVacuumBusy rather than as a failed run.
+	if !errors.Is(fmt.Errorf("%w: x", ErrVacuumBusy), ErrVacuumBusy) {
+		t.Error("ErrVacuumBusy does not survive wrapping")
+	}
+	for _, tc := range []struct {
+		name string
+		code int
+		want bool
+	}{
+		{"SQLITE_BUSY", 5, true},
+		// Extended busy codes carry the primary code in their low byte;
+		// an equality test would miss every one of them.
+		{"SQLITE_BUSY_SNAPSHOT", 517, true},
+		{"SQLITE_BUSY_RECOVERY", 261, true},
+		// Contention inside this connection, not another process holding the file.
+		{"SQLITE_LOCKED", 6, false},
+		{"SQLITE_CORRUPT", 11, false},
+	} {
+		if got := tc.code&0xff == sqliteBusy; got != tc.want {
+			t.Errorf("%s (%d) classified as busy=%v, want %v", tc.name, tc.code, got, tc.want)
 		}
 	}
 }

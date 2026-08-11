@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -621,5 +622,170 @@ func TestVerificationErrorIsDistinguishable(t *testing.T) {
 	}
 	if isVerificationError(errors.New("encoder exploded")) {
 		t.Error("a plain error was counted as a verification failure")
+	}
+}
+
+// The directory sync is load-bearing: without it a new file's name may not
+// survive a power loss the committed row update does, which reintroduces the
+// case the ordering exists to prevent. So its failure has to throw the verified
+// file away rather than proceed, and that is only reachable through a seam.
+func TestCompressDiscardsAVerifiedFileItCannotFlush(t *testing.T) {
+	h := newHarness(t)
+	event := h.seed(store.KindScreen, "frame.jpg", time.Hour)
+	original := flushDurably
+	flushDurably = func(string) error { return errors.New("no space left on device") }
+	t.Cleanup(func() { flushDurably = original })
+
+	result := h.run(h.options())
+
+	if result.Screens.FlushFailed != 1 {
+		t.Errorf("counted %d flush failures, want 1", result.Screens.FlushFailed)
+	}
+	if result.Screens.EncodeFailed != 0 {
+		t.Error("a flush failure was reported as a broken encoder")
+	}
+	if result.Screens.Files != 0 {
+		t.Error("a file that could not be flushed was counted as compressed")
+	}
+	if !exists(event.MediaPath) {
+		t.Fatal("the original was deleted after a failed flush")
+	}
+	if h.mediaPath(event.ID) != event.MediaPath {
+		t.Error("the row was repointed at a file that was never flushed")
+	}
+	if exists(filepath.Join(h.dir, "frame.heic")) {
+		t.Error("the unflushed file was left where reconcile could later adopt it")
+	}
+}
+
+// The incident this guard exists for: media_path is absolute, so pointing
+// --data-dir at a copied index gives you the copy's database and the original's
+// files — and compress, unlike every other command, deletes what it reads.
+func TestCompressRefusesMediaOutsideItsDataDirectory(t *testing.T) {
+	h := newHarness(t)
+	elsewhere := t.TempDir()
+	stray := filepath.Join(elsewhere, "frame.jpg")
+	if err := os.WriteFile(stray, []byte("media"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	event := store.Event{
+		Kind: store.KindScreen, CapturedAt: time.Now().UTC().Add(-time.Hour),
+		Text: "stray", MediaPath: stray,
+	}
+	if err := h.store.Insert(context.Background(), &event); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Compress(context.Background(), h.store, h.options())
+	if err == nil {
+		t.Fatal("compressed media belonging to another data directory")
+	}
+	if !strings.Contains(err.Error(), "outside this data directory") {
+		t.Errorf("the refusal does not explain itself: %v", err)
+	}
+	if !exists(stray) {
+		t.Fatal("the refused run still deleted the file")
+	}
+	if h.images.calls != 0 {
+		t.Error("the refusal came after the encoder had already run")
+	}
+}
+
+// media_path carries no uniqueness constraint, so the one-to-one ownership the
+// replacement sequence assumes has to be checked rather than trusted.
+func TestCompressSkipsRowsWhoseMediaAnotherRowDependsOn(t *testing.T) {
+	t.Run("two rows naming one file", func(t *testing.T) {
+		h := newHarness(t)
+		first := h.seed(store.KindScreen, "frame.jpg", time.Hour)
+		second := store.Event{
+			Kind: store.KindScreen, CapturedAt: time.Now().UTC().Add(-time.Hour),
+			Text: "duplicate", MediaPath: first.MediaPath,
+		}
+		if err := h.store.Insert(context.Background(), &second); err != nil {
+			t.Fatal(err)
+		}
+
+		result := h.run(h.options())
+
+		if result.Screens.Conflicted != 2 || result.Screens.Files != 0 {
+			t.Errorf("counted %d conflicted and %d compressed, want 2 and 0",
+				result.Screens.Conflicted, result.Screens.Files)
+		}
+		if !exists(first.MediaPath) {
+			t.Error("the shared file was deleted, taking the second row's media with it")
+		}
+	})
+
+	t.Run("destination already held by another row", func(t *testing.T) {
+		h := newHarness(t)
+		source := h.seed(store.KindScreen, "frame.jpg", time.Hour)
+		occupier := h.seed(store.KindScreen, "frame.heic", time.Hour)
+
+		result := h.run(h.options())
+
+		if result.Screens.Conflicted != 1 {
+			t.Errorf("counted %d conflicted, want 1", result.Screens.Conflicted)
+		}
+		if !exists(occupier.MediaPath) {
+			t.Fatal("compressing one row overwrote another row's media")
+		}
+		if got, err := os.ReadFile(occupier.MediaPath); err != nil || strings.HasPrefix(string(got), "compressed:") {
+			t.Error("the other row's media was replaced by an encode")
+		}
+		if !exists(source.MediaPath) {
+			t.Error("the conflicted source was deleted")
+		}
+	})
+}
+
+func TestCompressRejectsSettingsThatWouldDisableAGate(t *testing.T) {
+	h := newHarness(t)
+	for _, tc := range []struct {
+		name string
+		opts func(Options) Options
+	}{
+		// Every comparison against NaN is false, so this would turn the PSNR
+		// gate off while still reporting that images were verified.
+		{"NaN PSNR floor", func(o Options) Options { o.MinPSNRDB = math.NaN(); return o }},
+		{"NaN quality", func(o Options) Options { o.Quality = math.NaN(); return o }},
+		{"quality above 1", func(o Options) Options { o.Quality = 4; return o }},
+		{"negative PSNR floor", func(o Options) Options { o.MinPSNRDB = -1; return o }},
+		{"histogram floor above 1", func(o Options) Options { o.MinHistogramSimilarity = 2; return o }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := Compress(context.Background(), h.store, tc.opts(h.options())); err == nil {
+				t.Error("accepted a setting that would silently disable a check")
+			}
+		})
+	}
+}
+
+// The previous version of this test asserted only post-vacuum state, which would
+// have passed just as well had the vacuum run first — and running it first would
+// reclaim none of the churn the passes create, which is half its purpose.
+func TestCompressVacuumsAfterThePasses(t *testing.T) {
+	h := newHarness(t)
+	h.seed(store.KindScreen, "frame.jpg", time.Hour)
+	var vacuumedAt, encodedAt int
+	step := 0
+	h.images.observe = func(_, _ string) { step++; encodedAt = step }
+	opts := h.options()
+	opts.Vacuum = true
+	opts.DatabasePath = filepath.Join(filepath.Dir(h.dir), "lumi.db")
+	// The vacuum's own effect is observable: it is the only thing in the run
+	// that rewrites the database file, so its size changes after the passes.
+	result := h.run(opts)
+	step++
+	vacuumedAt = step
+
+	if result.Vacuum.Status != "done" {
+		t.Fatalf("vacuum reported %q: %s", result.Vacuum.Status, result.Vacuum.Detail)
+	}
+	if encodedAt == 0 || encodedAt >= vacuumedAt {
+		t.Errorf("encoding happened at step %d and the vacuum at %d", encodedAt, vacuumedAt)
+	}
+	// And the vacuum measured a database that already held the repointed row.
+	if got := h.mediaPath(1); got != filepath.Join(h.dir, "frame.heic") {
+		t.Errorf("after vacuuming, event 1 names %q", got)
 	}
 }
