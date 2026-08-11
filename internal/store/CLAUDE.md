@@ -37,10 +37,23 @@ lexicographically — any new time column must go through `FormatCapturedAt` or 
   attribution other than `unattributed` or name any source application. `internal/capture` decides the
   rule, but a guarantee this size cannot rest on one caller: a second writer would break it silently, and
   an invented speaker outlives its evidence once the WAV is pruned.
-- **Existing rows are deliberately not rewritten.** A migration rewriting `captured_at` would be an
-  irreversible edit of captured data and would fire the `events_au` FTS trigger once per row, for a
-  boundary flaw that predates this layout and has never been observed to bite. Legacy screen rows keep
-  their trimmed rendering; the ordering caveat above applies to them and only to them.
+- **Existing rows are deliberately not rewritten *by migrations*.** A migration rewriting `captured_at`
+  would be an irreversible edit of captured data and would fire the `events_au` FTS trigger once per row,
+  for a boundary flaw that predates this layout and has never been observed to bite. Legacy screen rows
+  keep their trimmed rendering; the ordering caveat above applies to them and only to them.
+- **`UpdateMediaPath` is the one statement here that rewrites an existing row, and its predicate is a
+  compare-and-swap.** Every reader of `media_path` resolves the path and *then* opens the file, so an
+  unconditional UPDATE would silently clobber a row another writer had already moved. Zero rows affected
+  means someone got there first and is **not** an error. It is a CAS on the row and not on the filesystem —
+  what keeps two writers off the same *file* is `internal/cli`'s single-instance lock.
+  It fires `events_au`, which deletes and reinserts the row's whole FTS entry naming `text`/`app`/`window`
+  even though a media-path rewrite changes none of them. That churn is an **accepted, measured** cost
+  rather than an oversight — it re-syncs to the same values, `TestUpdateMediaPathLeavesTheRowSearchable`
+  pins that, and it is one of the two reasons `lumi compress` runs `VACUUM` last.
+- **`Vacuum` reports a contended database as `ErrVacuumBusy`, which callers treat as a skipped step.**
+  Busy detection masks to the primary result code because SQLite reports extended codes in the high bits,
+  and it matches `SQLITE_BUSY` only: `SQLITE_LOCKED` is contention inside this connection, so reporting it
+  as "another process holds the file" would name the wrong cause.
 
 Facts about querying live here, not in callers: `DefaultSearchLimit` (20) / `MaxSearchLimit` (500),
 `HasSearchableTerms`, `HasEvents`, `EventByID` (with `ErrEventNotFound`), `ListAttribution`.
@@ -100,6 +113,12 @@ and `transcript.Segment` — shadow each other the way `internal/mcp`'s `Attribu
   missing only what the newer build added. Nothing errors, so a caller can only report it by comparing the
   two numbers itself. `internal/mcp` does, because a server process an agent holds for a whole session is
   exactly where the two drift apart.
+- **A row identity referenced from outside its own table must not depend on a mutable rowid.** `VACUUM`
+  renumbers the rowids of any table that does not declare an `INTEGER PRIMARY KEY`, and `lumi compress`
+  runs `VACUUM` in the same invocation that writes `media_path` references — so a table added later and
+  keyed on an implicit rowid would be renumbered by the very command that had just pointed at it, with no
+  error anywhere. `events.id` and `audio_segments.id` are already safe, being `INTEGER PRIMARY KEY` and
+  therefore rowid aliases; `TestVacuumPreservesEventIDs` pins it.
 - **`origin` is TEXT with no `CHECK`**, so distinguishing machine-side participants later is a value
   change rather than a migration. `silent` already uses that room, and is why the column could gain a
   fourth value without touching the schema.

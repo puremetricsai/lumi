@@ -174,6 +174,13 @@ Captured media stays on disk until `lumi prune` removes it — nothing is schedu
 size policies, the irreversible `--all` wipe, and dry-run previews:
 [docs/retention.md](docs/retention.md).
 
+## Compression
+
+`lumi compress` re-encodes media already on disk into smaller files without deleting any event —
+screenshots to HEIC, audio to lossless FLAC, then a database rebuild. Roughly 3x on a real index. The
+screenshot pass is a second lossy generation and is the one decision worth reading before you run it:
+[docs/compress.md](docs/compress.md).
+
 ## Architecture
 
 How capture, processing, storage, and query fit together, what each package owns, and how frame

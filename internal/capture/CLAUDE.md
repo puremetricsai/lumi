@@ -173,6 +173,15 @@ chunks over eight minutes, and the ratio scales with how much the user switches 
 
 ## Writing origin verdicts (`attributeChunk`)
 
+- **`ReadAudioEnvelope` is the single place that decides how a captured audio file is opened**, and both
+  the recorder and the backfill go through it. `internal/wav` reads mono 16-bit PCM RIFF and nothing else,
+  deliberately — it is pure Go, so it builds and tests anywhere — while `lumi compress` stores a chunk as
+  FLAC. So the split is by half rather than by package: `internal/macosnative` knows containers,
+  `internal/wav` measures samples, and this chooses between them on the extension (matched on `.wav`, so
+  any container stored later takes the native path instead of failing as a RIFF file). Two copies of that
+  choice would give the recorder and a backfill different bleed verdicts for the same audio, and *silently*
+  — both callers discard the error, so a chunk that could not be read simply reaches its verdict without an
+  envelope.
 - **A segment-write failure never costs an event.** Rows insert first; attribution is a second pass whose
   retry mechanism is the backfill's derived work queue, so no retry loop belongs in the recorder.
 - **The recorder and the backfill share every rule they both apply, rather than each stating it.**

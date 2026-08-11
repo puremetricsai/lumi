@@ -53,6 +53,7 @@ changing anything there** — the rationale lives with the code it constrains, n
 | `internal/transcript` | Pure: decides where captured sound came from (`internal`/`external`) and assembles turns. No database, cgo, or filesystem. |
 | `internal/wav` | Reads Lumi's mono 16-bit PCM WAVs and measures their energy. |
 | `internal/retention` | Age- and size-based pruning behind `lumi prune`. No background scheduler. |
+| `internal/compress` | Re-encodes indexed media in place behind `lumi compress` (HEIC, lossless FLAC), reconciles crash leftovers, then `VACUUM`s. Encoders injected as interfaces. No background scheduler. |
 | `internal/cli` | Cobra commands and all the wiring. |
 | `internal/mcp` | Stdio MCP server: four read-only tools over `internal/store` and nothing else of Lumi's. |
 | `internal/mcpsetup` | Registers `lumi mcp` with Claude Code, Claude Desktop, and Codex. |
@@ -65,6 +66,18 @@ changing anything there** — the rationale lives with the code it constrains, n
 - **Never lose captured media.** If Accessibility, Vision, comparison, or transcription fails after a file
   was written, preserve and index the event with diagnostic metadata. Never convert a downstream failure
   into an early return that drops the file. → `internal/capture/CLAUDE.md`
+  - **`lumi compress` is the one sanctioned exception, and only for screenshots.** Re-encoding a captured
+    JPEG as HEIC is a second lossy generation that cannot be undone. It was accepted deliberately — the OCR
+    text is already extracted and indexed, and no legible difference was found at the shipped quality — and
+    `docs/compress.md` is the record of that decision, including how to decline it. The rule stays absolute
+    everywhere else: audio compresses losslessly, the capture pipeline is untouched, and nothing may delete
+    an original before decoding its replacement and comparing the two.
+- **Media an event row points at has exactly two sanctioned deletion paths, whose orderings are opposite
+  and each correct.** `lumi prune` deletes rows before files, because an orphaned file is recoverable and a
+  row naming missing media is not. `lumi compress` writes and verifies a replacement, flushes it and its
+  directory, repoints the row, and only then unlinks the original, because there the unrecoverable state is
+  a row naming media that does not exist *yet*. Neither ordering is the general rule; describe them
+  together. → `internal/retention/CLAUDE.md`, `internal/compress/CLAUDE.md`
 - **A rule about a package lives in that package.** When a caller needs to know what another package will
   do, export the answer and read it. Two copies of a rule are correct only until one moves, and the drift
   is invisible to both test suites — that is why `store.HasSearchableTerms`, `transcript.IsSilent`,

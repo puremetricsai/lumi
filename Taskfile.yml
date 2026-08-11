@@ -162,6 +162,12 @@ tasks:
     cmds:
       - ./{{.BINARY}} record start --foreground --no-audio --duration 10s
 
+  compress:
+    desc: Re-encode indexed media and reclaim database space (e.g. task compress -- --dry-run)
+    deps: [build]
+    cmds:
+      - ./{{.BINARY}} compress {{.CLI_ARGS}}
+
   search:
     desc: 'Search captured events (e.g. task search -- "invoice")'
     deps: [build]
