@@ -13,9 +13,12 @@ Lumi deliberately targets a small surface: capture → process → store → que
 ## Requirements
 
 - Apple Silicon Mac running macOS 26 or newer (`darwin/arm64`)
-- Go 1.25 or newer (to build)
-- Xcode Command Line Tools and a Swift toolchain (`swiftc` compiles the SpeechAnalyzer bridge into a static archive that cgo links)
 - Screen Recording, Accessibility, Microphone, and Speech Recognition permissions for your terminal or the Lumi binary
+
+To build from source (not needed for `brew install`, which ships a prebuilt binary):
+
+- Go 1.25 or newer
+- Xcode Command Line Tools and a Swift toolchain (`swiftc` compiles the SpeechAnalyzer bridge into a static archive that cgo links)
 
 Transcription runs entirely on-device through Apple SpeechAnalyzer — no external processor or model file to install. The recognition assets for your locale (default `en-US`) download automatically on first use; override the locale with `record --speech-locale`.
 
@@ -31,7 +34,9 @@ lumi doctor
 lumi record start
 ```
 
-To install using `go install`:
+Homebrew downloads the prebuilt `darwin/arm64` binary from the [latest release](https://github.com/puremetricsai/lumi/releases), so no Go or Swift toolchain is involved. Upgrade with `brew upgrade lumi`.
+
+To build and install from source instead:
 
 ```sh
 task install # compiles the Swift SpeechAnalyzer bridge (task speech), then go install
