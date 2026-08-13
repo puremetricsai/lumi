@@ -176,8 +176,17 @@ Turn it off with `--vacuum=false`.
 
 ## How long it takes
 
-Roughly 170 ms per screenshot, most of it the verification decode rather than the encode. A 5,500-frame
-index takes about 15 minutes; audio is far faster. It is safe to interrupt and resume.
+Files are re-encoded several at a time — one per core, up to 8 — which is about 3.8x faster than doing them
+one after another. Measured over 180 real 3456×2234 frames on an 18-core machine: 37.6 s sequentially,
+9.9 s at 8 workers. Beyond 8 the gain stops (9.3 s at 18) while memory keeps climbing, which is why that is
+the ceiling.
+
+Budget roughly 55 ms per screenshot at the default concurrency, most of it the verification decode rather
+than the encode. A 5,500-frame index takes about 5 minutes; audio is far faster. It is safe to interrupt and
+resume.
+
+`--workers 1` goes back to one file at a time, and `--workers N` sets it explicitly. Peak memory is about
+90 MB per file in flight on top of a ~1.4 GB baseline, so lower it if you are short on RAM.
 
 Each pass reports where it is on stderr every few seconds, so a long run is visibly working rather than
 apparently hung:

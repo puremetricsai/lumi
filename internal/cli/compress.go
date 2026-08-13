@@ -24,6 +24,7 @@ func (a *app) compressCommand() *cobra.Command {
 		screens, audio string
 		quality        float64
 		minPSNR        float64
+		workers        int
 		vacuum         bool
 		whileRecording bool
 		dryRun, asJSON bool
@@ -104,6 +105,7 @@ func (a *app) compressCommand() *cobra.Command {
 				Audio:        audioCodec,
 				Quality:      quality,
 				MinPSNRDB:    minPSNR,
+				Workers:      workers,
 				Images:       compress.NativeImages{},
 				Sounds:       compress.NativeAudio{},
 				MediaDirs:    []string{paths.Screenshots, paths.Audio},
@@ -123,6 +125,9 @@ func (a *app) compressCommand() *cobra.Command {
 	flags.Float64Var(&quality, "quality", compress.DefaultQuality, "HEIC quality between 0 and 1")
 	flags.Float64Var(&minPSNR, "min-psnr", compress.DefaultMinPSNRDB,
 		"reject a re-encoded image below this PSNR in dB and keep the original")
+	flags.IntVar(&workers, "workers", 0,
+		fmt.Sprintf("re-encode this many files at once (0 picks one per core, up to %d; 1 is sequential)",
+			compress.MaxDefaultWorkers))
 	flags.BoolVar(&vacuum, "vacuum", true, "rebuild the database afterwards to reclaim free pages")
 	flags.BoolVar(&whileRecording, "while-recording", false, "run even though the recorder is active")
 	flags.BoolVar(&dryRun, "dry-run", false, "report what would be compressed without compressing")

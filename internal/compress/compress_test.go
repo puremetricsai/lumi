@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,9 +22,20 @@ import (
 // fakeImages writes a marker file and reports whatever verification the test
 // asked for, so every branch of the replacement sequence is reachable without an
 // encoder, a Mac, or a real image.
+//
+// Every field is touched under mu, because a pass keeps several encodes in flight
+// by default and this fake is therefore genuinely shared mutable state. A test
+// wanting one-at-a-time sets Workers: 1 rather than leaning on the fake to
+// serialise it.
 type fakeImages struct {
+	mu           sync.Mutex
 	verification macosnative.ImageVerification
 	err          error
+	// failFor fails only the named sources, keyed by basename, the way
+	// fakeAudio.decodeErr does. A test wanting one file of several to fail must use
+	// this rather than flipping err from observe: with several encodes in flight,
+	// which one reads which value is undefined.
+	failFor map[string]error
 	// writeNothing simulates an encoder that failed after creating its output.
 	writeNothing bool
 	// observe runs before the encode returns, which is how a test checks what
@@ -31,20 +44,33 @@ type fakeImages struct {
 	calls   int
 }
 
+// callCount reads the call counter under the lock, for tests that assert on it.
+func (f *fakeImages) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
 func (f *fakeImages) Transcode(_ context.Context, source, destination string, _ float64) (macosnative.ImageVerification, error) {
+	f.mu.Lock()
 	f.calls++
-	if f.observe != nil {
-		f.observe(source, destination)
+	verification, err, writeNothing, observe := f.verification, f.err, f.writeNothing, f.observe
+	if failure, named := f.failFor[filepath.Base(source)]; named {
+		err = failure
 	}
-	if !f.writeNothing {
-		if err := os.WriteFile(destination, []byte("compressed:"+filepath.Base(source)), 0o600); err != nil {
-			return macosnative.ImageVerification{}, err
+	f.mu.Unlock()
+	if observe != nil {
+		observe(source, destination)
+	}
+	if !writeNothing {
+		if writeErr := os.WriteFile(destination, []byte("compressed:"+filepath.Base(source)), 0o600); writeErr != nil {
+			return macosnative.ImageVerification{}, writeErr
 		}
 	}
-	if f.err != nil {
-		return macosnative.ImageVerification{}, f.err
+	if err != nil {
+		return macosnative.ImageVerification{}, err
 	}
-	return f.verification, nil
+	return verification, nil
 }
 
 func (f *fakeImages) Inspect(_ context.Context, path string) (macosnative.ImageVerification, error) {
@@ -64,7 +90,12 @@ func goodImage() macosnative.ImageVerification {
 
 // fakeAudio models a lossless codec: the "encoded" file records which samples it
 // holds, and decoding reads them back. corrupt makes it lossy instead.
+//
+// Guarded for the same reason as fakeImages. decodeErr is only written before a
+// run starts, but the lock covers it too, so there is one rule for this type
+// rather than a per-field judgement to get wrong later.
 type fakeAudio struct {
+	mu         sync.Mutex
 	samples    []int16
 	sampleRate int
 	corrupt    bool
@@ -73,31 +104,37 @@ type fakeAudio struct {
 }
 
 func (f *fakeAudio) Transcode(_ context.Context, source, destination string) error {
-	if f.err != nil {
-		return f.err
+	f.mu.Lock()
+	err := f.err
+	f.mu.Unlock()
+	if err != nil {
+		return err
 	}
 	return os.WriteFile(destination, []byte("flac:"+filepath.Base(source)), 0o600)
 }
 
 func (f *fakeAudio) Decode(_ context.Context, path string) ([]int16, int, error) {
-	if err := f.decodeErr[filepath.Base(path)]; err != nil {
-		return nil, 0, err
+	f.mu.Lock()
+	decodeErr := f.decodeErr[filepath.Base(path)]
+	samples, rate, corrupt := f.samples, f.sampleRate, f.corrupt
+	f.mu.Unlock()
+	if decodeErr != nil {
+		return nil, 0, decodeErr
 	}
 	if _, err := os.Stat(path); err != nil {
 		return nil, 0, err
 	}
-	rate := f.sampleRate
 	if rate == 0 {
 		rate = 16000
 	}
-	if f.corrupt && lowerExt(path) == extFLAC {
-		altered := append([]int16(nil), f.samples...)
+	if corrupt && lowerExt(path) == extFLAC {
+		altered := append([]int16(nil), samples...)
 		if len(altered) > 0 {
 			altered[0]++
 		}
 		return altered, rate, nil
 	}
-	return f.samples, rate, nil
+	return samples, rate, nil
 }
 
 type harness struct {
@@ -238,8 +275,8 @@ func TestCompressRepointsTheRowOnlyAfterTheFileIsWritten(t *testing.T) {
 		}
 	}
 	h.run(h.options())
-	if h.images.calls != 1 {
-		t.Fatalf("encoder ran %d times", h.images.calls)
+	if h.images.callCount() != 1 {
+		t.Fatalf("encoder ran %d times", h.images.callCount())
 	}
 }
 
@@ -324,13 +361,7 @@ func TestCompressContinuesPastAFailure(t *testing.T) {
 	h := newHarness(t)
 	h.seed(store.KindScreen, "bad.jpg", 3*time.Hour)
 	h.seed(store.KindScreen, "good.jpg", 2*time.Hour)
-	h.images.observe = func(source, _ string) {
-		if filepath.Base(source) == "bad.jpg" {
-			h.images.err = errors.New("encoder exploded")
-		} else {
-			h.images.err = nil
-		}
-	}
+	h.images.failFor = map[string]error{"bad.jpg": errors.New("encoder exploded")}
 
 	result := h.run(h.options())
 
@@ -451,7 +482,7 @@ func TestCompressRequiresUsableMediaDirectoriesBeforeDestructiveWork(t *testing.
 			if err == nil {
 				t.Fatal("destructive compression ran without a usable media directory")
 			}
-			if h.images.calls != 0 {
+			if h.images.callCount() != 0 {
 				t.Error("the media directory refusal came after the encoder ran")
 			}
 			if !exists(event.MediaPath) || h.mediaPath(event.ID) != event.MediaPath {
@@ -485,7 +516,7 @@ func TestCompressDryRunChangesNothing(t *testing.T) {
 	if result.Vacuum.Status != "skipped" {
 		t.Errorf("a dry run reported vacuum %q, want skipped", result.Vacuum.Status)
 	}
-	if h.images.calls != 0 {
+	if h.images.callCount() != 0 {
 		t.Error("a dry run ran the encoder")
 	}
 	if !exists(screen.MediaPath) || !exists(audio.MediaPath) || !exists(leftover) {
@@ -710,7 +741,7 @@ func TestCompressRefusesMediaOutsideItsDataDirectory(t *testing.T) {
 	if !exists(stray) {
 		t.Fatal("the refused run still deleted the file")
 	}
-	if h.images.calls != 0 {
+	if h.images.callCount() != 0 {
 		t.Error("the refusal came after the encoder had already run")
 	}
 }
@@ -744,7 +775,7 @@ func TestCompressResolvesSymlinksBeforeCheckingMediaRoots(t *testing.T) {
 	if got, readErr := os.ReadFile(source); readErr != nil || string(got) != "outside media" {
 		t.Fatalf("the escaped source changed: bytes=%q err=%v", got, readErr)
 	}
-	if exists(filepath.Join(outside, "frame.heic")) || h.images.calls != 0 {
+	if exists(filepath.Join(outside, "frame.heic")) || h.images.callCount() != 0 {
 		t.Error("the symlink refusal came after a destination was written outside the root")
 	}
 }
@@ -784,7 +815,7 @@ func TestCompressResolvesANonexistentDestinationParentBeforeCheckingRoots(t *tes
 	if got, readErr := os.ReadFile(actualSource); readErr != nil || string(got) != "inside media" {
 		t.Fatalf("the inside source changed: bytes=%q err=%v", got, readErr)
 	}
-	if exists(filepath.Join(outside, "frame.heic")) || h.images.calls != 0 {
+	if exists(filepath.Join(outside, "frame.heic")) || h.images.callCount() != 0 {
 		t.Error("the destination parent refusal came after encoding began")
 	}
 }
@@ -1192,13 +1223,16 @@ func TestCompressReportsProgressThroughALongPass(t *testing.T) {
 	output := log.String()
 	for _, want := range []string{
 		"compressing screenshots",
-		"finished compressing screenshots",
 		// Both passes report, in the words the final summary uses.
 		"compressing audio files",
 		// The denominator counts the files the pass will replace — not the three
 		// seeded rows, and not the two screen rows it examined to find them.
 		"of=2",
 		"done=1",
+		// The closing line must agree with the summary the CLI prints. It read
+		// done=0 for a while, because the workers were updating one copy of the
+		// counters and the final report was reading another.
+		`msg="finished compressing screenshots" done=2 of=2`,
 	} {
 		if !strings.Contains(output, want) {
 			t.Errorf("progress output does not mention %q:\n%s", want, output)
@@ -1300,5 +1334,136 @@ func TestCompressProgressCountsFilesNotRows(t *testing.T) {
 	}
 	if output := log.String(); !strings.Contains(output, "of=1") {
 		t.Errorf("progress counted rows rather than files:\n%s", output)
+	}
+}
+
+// Several workers must actually overlap, or the whole change is inert. This is
+// pinned with a rendezvous rather than a sleep: every encode blocks until
+// `workers` of them have arrived, so reaching that count proves they were in
+// flight together, and a pass that serialised them fails with a clear message
+// instead of hanging.
+func TestCompressKeepsSeveralFilesInFlight(t *testing.T) {
+	const workers = 4
+	h := newHarness(t)
+	for i := range workers {
+		h.seed(store.KindScreen, fmt.Sprintf("frame-%d.jpg", i), time.Hour)
+	}
+
+	var arrived atomic.Int64
+	var serialised atomic.Bool
+	var once sync.Once
+	release := make(chan struct{})
+	h.images.observe = func(_, _ string) {
+		if arrived.Add(1) >= workers {
+			once.Do(func() { close(release) })
+		}
+		select {
+		case <-release:
+		case <-time.After(10 * time.Second):
+			serialised.Store(true)
+		}
+	}
+
+	opts := h.options()
+	opts.Workers = workers
+	result := h.run(opts)
+
+	if serialised.Load() {
+		t.Fatalf("only %d of %d encodes were ever in flight at once", arrived.Load(), workers)
+	}
+	if result.Screens.Files != workers {
+		t.Errorf("compressed %d of %d files", result.Screens.Files, workers)
+	}
+}
+
+// --workers 1 is the escape hatch back to the old behaviour, so it must really
+// serialise. The sleep gives an overlap every chance to show up; the guarantee
+// that concurrency happens at all is pinned deterministically above.
+func TestCompressRunsOneFileAtATimeWhenAskedTo(t *testing.T) {
+	h := newHarness(t)
+	for i := range 4 {
+		h.seed(store.KindScreen, fmt.Sprintf("frame-%d.jpg", i), time.Hour)
+	}
+
+	var mu sync.Mutex
+	inFlight, most := 0, 0
+	h.images.observe = func(_, _ string) {
+		mu.Lock()
+		inFlight++
+		most = max(most, inFlight)
+		mu.Unlock()
+		time.Sleep(20 * time.Millisecond)
+		mu.Lock()
+		inFlight--
+		mu.Unlock()
+	}
+
+	opts := h.options()
+	opts.Workers = 1
+	result := h.run(opts)
+
+	if most != 1 {
+		t.Errorf("--workers 1 had %d encodes in flight at once", most)
+	}
+	if result.Screens.Files != 4 {
+		t.Errorf("compressed %d of 4 files", result.Screens.Files)
+	}
+}
+
+// Concurrency must not lose or double-count a file. Every row is repointed, every
+// original is gone, every replacement exists, and the counters add up to the work.
+func TestCompressAccountsForEveryFileUnderConcurrency(t *testing.T) {
+	const screens, audios = 25, 15
+	h := newHarness(t)
+	var seeded []store.Event
+	for i := range screens {
+		seeded = append(seeded, h.seed(store.KindScreen, fmt.Sprintf("frame-%d.jpg", i), time.Hour))
+	}
+	for i := range audios {
+		seeded = append(seeded, h.seed(store.KindAudio, fmt.Sprintf("chunk-%d.wav", i), time.Hour))
+	}
+
+	opts := h.options()
+	opts.Workers = 6
+	result := h.run(opts)
+
+	if result.Screens.Files != screens || result.Audio.Files != audios {
+		t.Fatalf("compressed %d screenshots and %d audio files, want %d and %d",
+			result.Screens.Files, result.Audio.Files, screens, audios)
+	}
+	if h.images.callCount() != screens {
+		t.Errorf("the encoder ran %d times for %d files", h.images.callCount(), screens)
+	}
+	for _, event := range seeded {
+		want := swapExtension(event.MediaPath, extHEIC)
+		if event.Kind == store.KindAudio {
+			want = swapExtension(event.MediaPath, extFLAC)
+		}
+		if got := h.mediaPath(event.ID); got != want {
+			t.Errorf("event %d names %q, want %q", event.ID, got, want)
+		}
+		if exists(event.MediaPath) {
+			t.Errorf("event %d kept its original %q", event.ID, event.MediaPath)
+		}
+		if !exists(want) {
+			t.Errorf("event %d is missing its replacement %q", event.ID, want)
+		}
+	}
+	// Nothing was left behind for reconcile to find, which is what an interrupted
+	// or double-encoded file would have produced.
+	if result.Reconciled.Removed != 0 || result.Reconciled.Recovered != 0 {
+		t.Errorf("reconcile had work to do after a clean run: %+v", result.Reconciled)
+	}
+}
+
+// A negative count would fall through workers()' "zero means unset" branch and
+// silently run at the default, which is the same quiet disagreement --quality 0
+// is refused for.
+func TestCompressRejectsANegativeWorkerCount(t *testing.T) {
+	h := newHarness(t)
+	opts := h.options()
+	opts.Workers = -1
+	if _, err := Compress(context.Background(), h.store, opts); err == nil {
+		t.Error("accepted a negative worker count")
 	}
 }

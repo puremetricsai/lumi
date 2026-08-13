@@ -28,11 +28,34 @@ how densely to keep it.
   file's *name* may not survive a power loss that the committed row update does, which reintroduces exactly
   the case the ordering prevents. Claiming a step is required and then continuing without it would be
   incoherent — a failed sync unlinks the destination and keeps the original.
-- **The crash-safety claim holds because exactly one compressor runs at a time, and it is only true with
-  that scope.** A lost compare-and-swap makes this package delete the file it just wrote; with a second
-  compressor running, that file can be the one the winner's row now names, which is unrecoverable. The
+- **The crash-safety claim holds because exactly one compressor *process* runs at a time, and it is only
+  true with that scope.** A lost compare-and-swap makes this package delete the file it just wrote; with a
+  second compressor running, that file can be the one the winner's row now names, which is unrecoverable. The
   single-instance lock lives in `internal/cli` (see its `CLAUDE.md`). State the scope wherever the claim is
   repeated.
+  - **"One compressor" is a statement about processes, and workers inside one pass are deliberately not one.**
+    The hazard is two agents deriving the same destination, and two *processes* can, because each builds its
+    own candidate list and can therefore both hold the same row. Workers cannot: the list is built once, each
+    item is dispatched to exactly one worker, and `findConflicts` has already skipped every row sharing a
+    source or a derived destination with another. So the property concurrency needs was established by
+    preflight before any of this was parallel — it is not a new assumption, which is exactly why the lock
+    still cannot be relaxed to cover it. A lost compare-and-swap inside a pass therefore still means a
+    genuinely external writer, and `Raced` still describes it correctly.
+    **Per-file ordering is untouched**: one worker carries one file through encode → verify → `fsync` → CAS →
+    unlink, and that ordering never depended on what other files were doing. What does change is the cost of
+    interruption — cancelling abandons up to `workers` files instead of one, each left exactly as an
+    interrupted sequential run leaves its single file, and all of them repaired by reconcile's one sibling
+    rule. More of the same recoverable state, not a new kind.
+    **`replaceOne` holds the sequence and `PassResult.record` holds the accounting**, split for this: with
+    several files in flight, "every file lands in exactly one counter" is only checkable if one place touches
+    the counters. One mutex covers the counters, the progress tracker and the first error, which is free
+    against ~100 ms of encoding per file.
+    **The concurrency is pinned by a rendezvous, not a sleep.** `TestCompressKeepsSeveralFilesInFlight`
+    blocks every encode until `workers` have arrived, so it can only pass if they genuinely overlap and it
+    fails with a diagnosis rather than hanging if a future change serialises the pass. The test fakes are
+    mutex-guarded for the same reason, and a test needing one file of several to fail must use
+    `fakeImages.failFor` rather than flipping a shared `err` from `observe` — which one encode reads which
+    value is undefined.
 - **Every pass is confined to `Options.MediaDirs`, and a run naming media outside them fails before it
   touches anything.** `media_path` is stored absolute, so pointing `--data-dir` at a *copy* of an index
   gives you the copy's database and the original's files — and this is the only command that rewrites and
@@ -162,6 +185,21 @@ how densely to keep it.
     of the pass, the other pass, and reconcile — stranding the originals of every file already replaced,
     none of which is reclaimed until somebody runs compress again. Both are logged and stepped over; a
     stranded original is exactly reconcile's owner-is-present case.
+
+## Concurrency
+
+`MaxDefaultWorkers` (8) is measured, not guessed. Over 180 real 3456x2234 frames on an 18-logical-core
+machine with 6 performance cores, wall time went 37.6 s at one worker → 22.5 s at 2 → 14.4 s at 4 → 11.4 s
+at 6 → 9.9 s at 8, and then stopped improving: 10.1 s at 10, 9.4 s at 12, 9.3 s at 18. The cap keeps 3.8x of
+the available 4.0x and declines the rest because it costs memory for nothing — peak RSS was 1.37 GB at one
+worker, 2.02 GB at 8 and 2.72 GB at 18, roughly 93 MB per additional file in flight, since verifying one
+image holds two full RGBA buffers plus both decoded images.
+
+The default is `min(GOMAXPROCS, MaxDefaultWorkers)`; `--workers 1` restores the strictly sequential
+behaviour, and a negative count is refused rather than read as unset, for the same reason `--quality 0` is.
+The large baseline is worth noticing separately: 1.37 GB at one worker is mostly `AllEvents` being
+materialised twice per run, with every row's OCR text. That is the thing to fix if this ever needs to be
+cheaper — not the worker count.
 
 ## Thresholds
 
