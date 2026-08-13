@@ -3,43 +3,33 @@ class Lumi < Formula
   homepage "https://github.com/puremetricsai/lumi"
   # The `url` and `sha256` lines below are rewritten on every tag by the
   # update-homebrew-formula job in .github/workflows/release-please.yml. Both must exist
-  # and stay well-formed: that job seds them in place, it does not insert them.
-  url "https://github.com/puremetricsai/lumi/archive/refs/tags/v0.4.0.tar.gz"
-  sha256 "d609f6829015888762c7a5844e2d7066195639ae2691c948976e36ee69af6336"
+  # and stay well-formed: that job seds them in place, it does not insert them, and it
+  # first asserts there is exactly one top-level line of each. A `head do`, `stable do`,
+  # or `resource` block would introduce a second `url`/`sha256` and fail that assertion.
+  url "https://github.com/puremetricsai/lumi/releases/download/v0.4.0/lumi-darwin-arm64.tar.gz"
+  sha256 "8e3ba01e158b9064b1ad7b2a0ff4a7f71d3ed77dbd0338144198fd31203ee5a9"
   license "MIT"
-  head "https://github.com/puremetricsai/lumi.git", branch: "main"
 
-  depends_on "go" => :build
+  # Nothing is built here. This is the release archive the build-binaries job produced on a
+  # macOS 26 runner, which is the only environment that can produce it: internal/macosnative
+  # is `darwin && arm64 && cgo` and links a static Swift archive compiled against the macOS
+  # 26 SDK for SpeechAnalyzer. Reproducing that locally is what used to drag the whole Go
+  # toolchain onto every installing machine. There is deliberately no `version` line --
+  # Homebrew reads 0.4.0 out of the `/download/v0.4.0/` path segment, and stating it again
+  # would add a third field the release job has to keep in sync.
   depends_on arch: :arm64
   # A versioned macOS requirement is satisfied on Linux by design, and so is arm64, so
-  # without a bare `depends_on :macos` a Linux/arm64 box happily starts the install,
-  # pulls the keg-only homebrew-core `swift`, and then dies at `system "swiftc"` with a
-  # message that hides the real reason: internal/macosnative is `darwin && arm64 && cgo`.
+  # without a bare `depends_on :macos` a Linux/arm64 box happily unpacks a Mach-O binary it
+  # can never execute and calls the install a success.
   depends_on :macos
-
-  # swiftc ships with the Command Line Tools that Homebrew already requires, so this only
-  # documents the toolchain and installs nothing. Do not use `depends_on xcode:` — it
-  # demands a full Xcode.app, which Lumi does not need.
-  uses_from_macos "swift" => :build
 
   on_macos do
     depends_on macos: :tahoe
   end
 
   def install
-    # internal/macosnative links `-L${SRCDIR} -llumispeech`, so the static Swift bridge
-    # must exist inside the source tree before cgo runs. Mirrors the Taskfile's
-    # `speech` -> `build` ordering.
-    system "swiftc", "-emit-library", "-static", "-O",
-           "-o", "internal/macosnative/liblumispeech.a",
-           "internal/macosnative/speech.swift"
-
-    ldflags = %W[
-      -s -w
-      -X github.com/puremetricsai/lumi/internal/cli.version=v#{version}
-    ]
-    ENV["CGO_ENABLED"] = "1"
-    system "go", "build", *std_go_args(ldflags: ldflags), "./cmd/lumi"
+    bin.install "lumi"
+    prefix.install "LICENSE"
   end
 
   def caveats
