@@ -198,8 +198,10 @@ level=INFO msg="rebuilding the database to reclaim free pages" database=… byte
 ```
 
 `of` counts the files that pass will actually replace — the same number `--dry-run` reports — not the rows
-it looked at to find them, most of which are aged-out or already compressed. A run short enough to finish
-inside one interval prints none of this.
+it looked at to find them, most of which are aged-out or already compressed. `done` counts the files it has
+finished with, whatever became of each one, so the line keeps moving even through files that are being
+rejected; the summary at the end is what breaks them down. A run short enough to finish inside one interval
+prints none of this.
 
 Prefer to know the size of the job first? `--dry-run` reports it in about a second and writes nothing.
 

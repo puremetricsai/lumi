@@ -1229,9 +1229,10 @@ func TestCompressReportsProgressThroughALongPass(t *testing.T) {
 		// seeded rows, and not the two screen rows it examined to find them.
 		"of=2",
 		"done=1",
-		// The closing line must agree with the summary the CLI prints. It read
-		// done=0 for a while, because the workers were updating one copy of the
-		// counters and the final report was reading another.
+		// The closing line counts attempted files, the same numerator the running
+		// line uses. It matches the summary's compressed count here only because
+		// every file succeeds; agreeing with that count is deliberately not the
+		// contract, which the all-rejected case below pins.
 		`msg="finished compressing screenshots" done=2 of=2`,
 	} {
 		if !strings.Contains(output, want) {
@@ -1334,6 +1335,32 @@ func TestCompressProgressCountsFilesNotRows(t *testing.T) {
 	}
 	if output := log.String(); !strings.Contains(output, "of=1") {
 		t.Errorf("progress counted rows rather than files:\n%s", output)
+	}
+}
+
+// The numerator counts files the pass has finished with, not files it replaced.
+// A --min-psnr above what the corpus can meet — or an encoder that is simply
+// broken — rejects every file, and that is precisely the run a user reads as a
+// hang: counting only successes would leave the line reading done=0 while the
+// elapsed time climbed, which is the one case this reporting exists for.
+func TestCompressProgressAdvancesThroughAPassThatReplacesNothing(t *testing.T) {
+	swapProgressInterval(t, 0)
+	h := newHarness(t)
+	for i := range 3 {
+		h.seed(store.KindScreen, fmt.Sprintf("frame-%d.jpg", i), time.Hour)
+	}
+	// Every encode is rejected by the PSNR gate, so no file is ever replaced.
+	h.images.verification = macosnative.ImageVerification{
+		Width: 1280, Height: 800, SourceWidth: 1280, SourceHeight: 800, PSNRDB: 12, HistogramSimilarity: 1}
+
+	var log bytes.Buffer
+	result := h.run(h.logging(&log))
+
+	if result.Screens.VerifyFailed != 3 || result.Screens.Files != 0 {
+		t.Fatalf("unexpected accounting: %+v", result.Screens)
+	}
+	if output := log.String(); !strings.Contains(output, `msg="finished compressing screenshots" done=3 of=3`) {
+		t.Errorf("progress stalled through a pass that replaced nothing:\n%s", output)
 	}
 }
 

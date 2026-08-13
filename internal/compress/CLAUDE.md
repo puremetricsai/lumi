@@ -132,6 +132,11 @@ how densely to keep it.
   so a user who reads the silence as a hang and presses Ctrl-C forfeits the *audio* pass entirely — the
   lossless one, which measures 7x. An interrupted index shows this exactly, with the screen rows part
   converted, every audio row still `.wav`, and no leftovers at all because the cancellation was clean.
+  - **The numerator counts files the pass has finished with, not files it replaced.** Reporting successes
+    would stall the line at `done=0` for a run whose every file fails verification — a `--min-psnr` above
+    what the corpus can meet, or a broken encoder — which is exactly the run a user reads as a hang and
+    interrupts, at the cost described above. Liveness is this line's whole job; which counter each file
+    landed in is the summary's. `TestCompressProgressAdvancesThroughAPassThatReplacesNothing` pins it.
   - **The denominator counts files, and getting an honest one is why the gates run in their own phase.**
     `selectWork` applies `done`, `conflicted`, `classify` and `stat` to every candidate row and returns the
     survivors; `runPass` then encodes that list. Counting *rows* instead would have been free, and would have

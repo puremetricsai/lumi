@@ -427,10 +427,10 @@ func runPass(ctx context.Context, s *store.Store, opts Options,
 	}
 
 	tracker := newProgress(logger, kind, int64(len(items)))
-	defer func() { tracker.done(result) }()
-	// result is threaded by pointer, not returned: with the counters living in one
-	// place, the deferred final report and the workers cannot end up reading
-	// different copies of them.
+	defer tracker.done()
+	// result is threaded by pointer, not returned, so that every worker folds its
+	// outcome into the same copy of the counters — which is what makes "every file
+	// lands in exactly one counter" checkable with several files in flight.
 	err = replaceFiles(ctx, s, opts, p, items, &result, tracker, logger)
 	return result, err
 }
@@ -609,7 +609,7 @@ func replaceFiles(parent context.Context, s *store.Store, opts Options, p pass,
 				} else {
 					result.record(produced, item.size)
 				}
-				tracker.step(*result)
+				tracker.step()
 				mu.Unlock()
 			}
 		}()
@@ -656,9 +656,15 @@ type progress struct {
 	logger *slog.Logger
 	noun   string
 	files  int64
-	seen   int64
-	start  time.Time
-	last   time.Time
+	// seen counts files the pass has finished with, whatever became of them. It is
+	// deliberately not the count of successful replacements: a run where every file
+	// fails verification — a --min-psnr set above what the corpus can meet, or an
+	// encoder that is simply broken — is exactly the run a user suspects of
+	// hanging, and a numerator that stood still there would fail at the one job
+	// this has. The outcome breakdown is the summary's business.
+	seen  int64
+	start time.Time
+	last  time.Time
 	// reported records whether this pass ever spoke, so done can stay quiet for a
 	// pass that finished inside one interval.
 	reported bool
@@ -676,7 +682,7 @@ func newProgress(logger *slog.Logger, kind store.Kind, files int64) *progress {
 // at a readable cadence whatever the media costs to encode — a 5K frame and a
 // silent audio chunk differ by two orders of magnitude — and so a pass can never
 // bury the warnings the logger is actually there for.
-func (p *progress) step(result PassResult) {
+func (p *progress) step() {
 	p.seen++
 	now := time.Now()
 	if now.Sub(p.last) < progressInterval {
@@ -684,18 +690,18 @@ func (p *progress) step(result PassResult) {
 	}
 	p.last = now
 	p.reported = true
-	p.logger.Info("compressing "+p.noun, "done", result.Files, "of", p.files,
+	p.logger.Info("compressing "+p.noun, "done", p.seen, "of", p.files,
 		"elapsed", now.Sub(p.start).Round(time.Second))
 }
 
 // done closes out a pass that had been reporting, including one that a cancelled
 // context ended early — where it is the only account of how far the run got
 // before the counters were returned.
-func (p *progress) done(result PassResult) {
+func (p *progress) done() {
 	if !p.reported {
 		return
 	}
-	p.logger.Info("finished compressing "+p.noun, "done", result.Files, "of", p.files,
+	p.logger.Info("finished compressing "+p.noun, "done", p.seen, "of", p.files,
 		"elapsed", time.Since(p.start).Round(time.Second))
 }
 
