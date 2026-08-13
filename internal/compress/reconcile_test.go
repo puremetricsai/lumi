@@ -41,6 +41,32 @@ func TestReconcileRemovesACompressedFileFromAnInterruptedRun(t *testing.T) {
 	}
 }
 
+// The passes match extensions case-insensitively and always write the lower-case
+// one, so a row naming frame.JPG is compressed to frame.heic. Pairing the two
+// therefore has to fold case as well: an exact-match lookup finds no owner for
+// the leftover, which then leaks on this run and every run after it.
+func TestReconcilePairsALeftoverWithARowWhoseExtensionIsUpperCase(t *testing.T) {
+	h := newHarness(t)
+	event := h.seed(store.KindScreen, "frame.JPG", time.Hour)
+	leftover := h.orphan("frame.heic")
+	opts := h.options()
+	opts.Screens = CodecNone
+	opts.Audio = CodecNone
+
+	result := h.run(opts)
+
+	if result.Reconciled.Removed != 1 {
+		t.Errorf("removed %d leftovers, want 1: the leftover found no owner and leaked",
+			result.Reconciled.Removed)
+	}
+	if exists(leftover) {
+		t.Error("the unverified leftover survived")
+	}
+	if !exists(event.MediaPath) || h.mediaPath(event.ID) != event.MediaPath {
+		t.Error("the row's own media was disturbed")
+	}
+}
+
 // A crash after the row update leaves the original behind while the row already
 // names the compressed file.
 func TestReconcileRemovesAnOriginalLeftAfterTheRowMoved(t *testing.T) {

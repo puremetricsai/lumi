@@ -390,17 +390,29 @@ func runPass(ctx context.Context, s *store.Store, opts Options,
 			continue
 		}
 
-		compressed, err := os.Stat(destination)
-		if err != nil {
-			return result, fmt.Errorf("stat compressed media %s: %w", destination, err)
-		}
+		// Past the compare-and-swap nothing below may end the run. The row is
+		// committed and names a file that exists, so every remaining failure is
+		// in the recoverable half of the ordering — and aborting here would strand
+		// the originals of every file this run had already replaced, none of which
+		// is reclaimed until somebody runs compress again.
 		result.Files++
 		result.BytesBefore += info.Size()
-		result.BytesAfter += compressed.Size()
+		if compressed, err := os.Stat(destination); err == nil {
+			result.BytesAfter += compressed.Size()
+		} else {
+			// Costs this file's contribution to the reported ratio and nothing
+			// else; the replacement itself is already committed.
+			logger.Warn("could not measure compressed media; it is missing from the reported ratio",
+				"event", event.ID, "media", destination, "error", err)
+		}
 
 		// Only now is the original redundant.
 		if err := os.Remove(event.MediaPath); err != nil && !os.IsNotExist(err) {
-			return result, fmt.Errorf("remove original media %s: %w", event.MediaPath, err)
+			// A stranded original is precisely reconcile's owner-is-present case:
+			// the row names the compressed file, the original is an unreferenced
+			// sibling, and the next run drops it.
+			logger.Warn("could not remove the original after repointing its event; a later run will sweep it",
+				"event", event.ID, "media", event.MediaPath, "error", err)
 		}
 	}
 	return result, nil
@@ -498,6 +510,13 @@ func swapExtension(path, extension string) string {
 
 func lowerExt(path string) string {
 	return strings.ToLower(filepath.Ext(path))
+}
+
+// foldPath is the key reconcile pairs a leftover with its row under. It folds
+// case because the passes do — they match on lowerExt and write a lower-case
+// extension — so an exact-match key would leave frame.JPG's leftover ownerless.
+func foldPath(path string) string {
+	return strings.ToLower(filepath.Clean(path))
 }
 
 // validate rejects settings that would silently disable a check rather than

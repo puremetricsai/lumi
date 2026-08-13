@@ -865,6 +865,68 @@ func TestCompressSkipsRowsWhoseMediaAnotherRowDependsOn(t *testing.T) {
 			t.Error("the conflicted source was deleted")
 		}
 	})
+
+	// The axis neither existing-media check covers: two rows whose *derived*
+	// destinations collide. Nothing on disk detects it, because neither
+	// destination exists when the run starts — the second encode simply
+	// overwrites the first, and both originals are unlinked afterwards.
+	//
+	// Left unchecked this destroyed one of the two pictures, pointed both rows at
+	// the survivor, and reported success. Reconcile cannot repair it either: with
+	// both originals gone there is no leftover to adopt and no copy to compare.
+	t.Run("two rows compressing to the same destination", func(t *testing.T) {
+		h := newHarness(t)
+		first := h.seed(store.KindScreen, "frame.jpg", time.Hour)
+		second := h.seed(store.KindScreen, "frame.jpeg", time.Hour)
+
+		result := h.run(h.options())
+
+		if result.Screens.Conflicted != 2 || result.Screens.Files != 0 {
+			t.Errorf("counted %d conflicted and %d compressed, want 2 and 0",
+				result.Screens.Conflicted, result.Screens.Files)
+		}
+		if !exists(first.MediaPath) || !exists(second.MediaPath) {
+			t.Error("an original was deleted for a destination two rows would have shared")
+		}
+		if h.mediaPath(first.ID) == h.mediaPath(second.ID) {
+			t.Errorf("both rows ended up naming one file: %s", h.mediaPath(first.ID))
+		}
+	})
+
+}
+
+// The colliding-destination axis is exercised directly as well, because the
+// interesting inputs are ones a filesystem cannot hold: on the case-insensitive
+// volumes macOS ships, chunk.wav and CHUNK.wav *are* one file, so an end-to-end
+// test would be caught by the shared-source check and never reach this code. The
+// axis has no filesystem to consult anyway — neither destination exists yet, so
+// os.SameFile has nothing to stat and the comparison is on folded strings.
+func TestFindConflictsCatchesDestinationsThatCollideWithEachOther(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		kind       store.Kind
+		first      string
+		second     string
+		wantShared bool
+	}{
+		{"jpg and jpeg derive one heic", store.KindScreen, "/m/frame.jpg", "/m/frame.jpeg", true},
+		{"extension case", store.KindAudio, "/m/chunk.wav", "/m/chunk.WAV", true},
+		{"stem case", store.KindAudio, "/m/chunk.wav", "/m/CHUNK.wav", true},
+		{"distinct stems do not collide", store.KindScreen, "/m/one.jpg", "/m/two.jpg", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conflicts := findConflicts([]store.Event{
+				{ID: 1, Kind: tc.kind, MediaPath: tc.first},
+				{ID: 2, Kind: tc.kind, MediaPath: tc.second},
+			})
+			_, first := conflicts[1]
+			_, second := conflicts[2]
+			if first != tc.wantShared || second != tc.wantShared {
+				t.Errorf("%s and %s: conflicted %v/%v, want %v for both",
+					tc.first, tc.second, first, second, tc.wantShared)
+			}
+		})
+	}
 }
 
 func TestCompressUsesAllEventsForDestinationOwnership(t *testing.T) {

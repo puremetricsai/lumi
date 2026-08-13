@@ -219,6 +219,15 @@ func findConflicts(events []store.Event) map[int64]string {
 		}
 	}
 
+	// Destinations are compared on two axes, and only the first was obvious.
+	// Against existing media, a destination another row already holds would be
+	// overwritten by the encode. Against each other, two rows deriving the *same*
+	// destination are the worse case: neither file exists yet, so nothing detects
+	// the collision, and the second encode overwrites the first before the first
+	// row's original has been unlinked. `.jpg` and `.jpeg` beside one another both
+	// derive `frame.heic`, which loses one picture and points both rows at the
+	// other, with every original deleted and the run reporting success.
+	destinations := make(map[string][]int64, len(events))
 	for _, event := range events {
 		if event.MediaPath == "" {
 			continue
@@ -237,6 +246,15 @@ func findConflicts(events []store.Event) map[int64]string {
 			if equivalentPath(destination, inspectOwnedPath(event)) {
 				continue
 			}
+			// Keyed lower-cased and compared as strings, because neither
+			// destination exists yet: os.SameFile has nothing to stat, so
+			// filesystem identity — which decides every other comparison here —
+			// is unavailable on this axis. Folding case is the safe direction:
+			// on a case-sensitive volume it can only pair two rows that would
+			// not have collided, and the cost of that is skipping compression.
+			destinations[strings.ToLower(destination.clean)] = append(
+				destinations[strings.ToLower(destination.clean)], event.ID)
+
 			visited := make(map[int]bool)
 			for _, key := range destination.keys() {
 				for _, index := range buckets[key] {
@@ -250,6 +268,18 @@ func findConflicts(events []store.Event) map[int64]string {
 					}
 					conflicts[event.ID] = fmt.Sprintf("event %d already holds the file this would be compressed to", other.event.ID)
 				}
+			}
+		}
+	}
+	for _, ids := range destinations {
+		if len(ids) < 2 {
+			continue
+		}
+		for _, id := range ids {
+			// A reason already recorded is the more specific one — it names the
+			// other event — so it is kept.
+			if _, already := conflicts[id]; !already {
+				conflicts[id] = "another event compresses to this same file"
 			}
 		}
 	}

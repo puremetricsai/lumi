@@ -41,8 +41,17 @@ developer's own Claude config.
   deletes the original while the second, having lost the compare-and-swap, unlinks the destination — which
   is by then the file the first run's row names. That is the one unrecoverable state
   `internal/compress`'s ordering exists to prevent, and its crash-safety claim is only true with this lock
-  in place. It is a pid file, not `flock`, because this package carries no build tag; a lock left by a
-  killed process is taken over the way `record start` treats a dead recorder.
+  in place. It is `flock`, behind the `unix`/`!unix` pair in `compress_lock_{unix,other}.go`, and the
+  non-Unix stub fails closed. A pid file cannot do this job: it must be created and then written, so a
+  contender reading it in between sees a file it cannot attribute to anybody, concludes the lock is stale,
+  and takes a second one — and the stale-takeover path needed to recover from a killed run is itself a
+  check-then-remove race. flock has no stale state to reason about, because the kernel drops the lock when
+  the holder dies however abruptly: a lock that exists is held by a process that exists.
+  **The lock file is deliberately never unlinked**, and that is not tidiness left undone. The lock is the
+  inode, not the name; unlinking on release frees the name and the inode's lock separately, so a contender
+  holding an already-opened fd acquires the old inode while a third process creates a fresh one at the same
+  path — two holders, the state this lock exists to make impossible. A leftover file carries no lock and
+  excludes nobody (`TestCompressIgnoresALockFileNobodyHolds`), so the pid inside it is expected to be stale.
 - **`compress`'s recorder gate is unconditional, unlike the backfill's.** The backfill gates only
   `--retranscribe` because its hazard is compute. Compress rewrites `media_path` under a live writer that
   resolves a path and then opens the file. It is contention rather than correctness — reconcile is

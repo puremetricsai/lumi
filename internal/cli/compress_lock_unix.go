@@ -35,14 +35,26 @@ func lockFile(path string) (func(), error) {
 		return nil, fmt.Errorf("lock %s: %w", path, err)
 	}
 	// Written for a human reading the data directory, never read back to decide
-	// anything — the lock itself is the state.
+	// anything — the lock itself is the state. Because the file outlives the run
+	// (see below), a pid found here after a clean exit is expected to be stale;
+	// it names whoever held the lock last, not whoever holds it now.
 	file.Truncate(0)
 	fmt.Fprintf(file, "%d\n", os.Getpid())
 	return func() {
-		// Unlink before closing: the reverse order leaves a window where the lock
-		// is free but the file is still there, and removes a file a new holder
-		// may by then have opened.
-		os.Remove(path)
+		// Close only — the file is deliberately never unlinked.
+		//
+		// Unlinking it reintroduces the double-holder state flock exists to
+		// prevent, because the lock is the *inode*, not the name. A contender
+		// that has opened the path but not yet flocked it holds a live fd on
+		// inode I; unlinking frees the name while closing frees I's lock, and
+		// from that moment they are two different locks. The contender then
+		// acquires I while a third process creates a fresh inode at the same
+		// path and acquires that — two holders, which is exactly the state
+		// internal/compress's crash-safety claim depends on being impossible.
+		//
+		// A leftover file is harmless for the same reason: it carries no lock,
+		// so it excludes nobody. TestCompressIgnoresALockFileNobodyHolds pins
+		// that, and it is why no stale-takeover logic is needed here.
 		file.Close()
 	}, nil
 }

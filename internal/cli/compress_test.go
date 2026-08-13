@@ -199,19 +199,26 @@ func TestCompressRefusesWhileAnEmptyLockIsHeld(t *testing.T) {
 	}
 }
 
+// The lock file deliberately outlives the run: unlinking it lets a contender
+// that already opened the path acquire the old inode while a third process
+// acquires a fresh one at the same name. What has to be released is the flock,
+// and the only observable consequence of releasing it is that the next run gets
+// in — which is what this asserts, rather than the file being gone.
 func TestCompressReleasesTheLock(t *testing.T) {
 	dataDir, run := newCompressTest(t)
 	if _, _, err := run("--screens", "none", "--audio", "none", "--vacuum=false"); err != nil {
 		t.Fatal(err)
 	}
-	paths := compressPaths(t, dataDir)
-	if _, err := os.Stat(filepath.Join(paths.Root, compressLockName)); !os.IsNotExist(err) {
-		t.Fatal("the lock survived the run, so the next one would refuse")
-	}
-	// Which means a second run works.
 	if _, _, err := run("--screens", "none", "--audio", "none", "--vacuum=false"); err != nil {
 		t.Fatalf("a second run was refused: %v", err)
 	}
+	// And the surviving file is still lockable, so it excludes nobody.
+	paths := compressPaths(t, dataDir)
+	release, err := lockFile(filepath.Join(paths.Root, compressLockName))
+	if err != nil {
+		t.Fatalf("the lock left behind by a finished run is still held: %v", err)
+	}
+	release()
 }
 
 // The result goes to the process stdout, matching prune, so --json has to be

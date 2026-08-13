@@ -59,9 +59,18 @@ func reconcile(ctx context.Context, s *store.Store, opts Options) (ReconcileResu
 	// Built here rather than passed in: a reference set assembled before the
 	// passes would not name anything they had just written, and reconcile would
 	// delete the entire run's output.
+	//
+	// Keyed case-insensitively, because the passes are: `classify` matches on
+	// lowerExt and always writes the lower-case extension, so a row naming
+	// frame.JPG is compressed to frame.heic while an exact-match lookup here
+	// would never pair the two — the leftover would find no owner and leak on
+	// every subsequent run. Folding is also the conservative direction for the
+	// is-this-referenced test below, where a false match only leaves a file
+	// alone. On the case-insensitive volumes macOS ships, the two spellings are
+	// the same file anyway.
 	referenced := make(map[string]store.Event, len(events))
 	for _, event := range events {
-		referenced[filepath.Clean(event.MediaPath)] = event
+		referenced[foldPath(event.MediaPath)] = event
 	}
 
 	logger := opts.logger()
@@ -86,7 +95,7 @@ func reconcile(ctx context.Context, s *store.Store, opts Options) (ReconcileResu
 				continue
 			}
 			path := filepath.Join(dir, entry.Name())
-			if _, ok := referenced[filepath.Clean(path)]; ok {
+			if _, ok := referenced[foldPath(path)]; ok {
 				continue
 			}
 			siblings, ok := compressionSiblings[lowerExt(path)]
@@ -96,7 +105,7 @@ func reconcile(ctx context.Context, s *store.Store, opts Options) (ReconcileResu
 				continue
 			}
 			for _, extension := range siblings {
-				owner, ok := referenced[filepath.Clean(swapExtension(path, extension))]
+				owner, ok := referenced[foldPath(swapExtension(path, extension))]
 				if !ok {
 					continue
 				}

@@ -61,6 +61,14 @@ func (a *app) compressCommand() *cobra.Command {
 			if cmd.Flags().Changed("quality") && quality == 0 {
 				return errors.New("--quality 0 is not meaningful; pass a small positive value such as 0.1")
 			}
+			// Same shape, and the same reason: a zero floor reads as "accept
+			// anything", but Options would treat it as unset and enforce 30 dB.
+			// Turning a gate the user asked to open back on, silently, is worse
+			// than refusing.
+			if cmd.Flags().Changed("min-psnr") && minPSNR == 0 {
+				return errors.New("--min-psnr 0 would be read as unset and enforced at the default; " +
+					"pass a small positive value such as 0.1 to accept almost anything")
+			}
 			before, err := parseTime(olderThan, true)
 			if err != nil {
 				return fmt.Errorf("parse --older-than: %w", err)
@@ -205,7 +213,10 @@ func finishCompress(out io.Writer, result compress.Result, dryRun, asJSON bool, 
 		encoder := json.NewEncoder(out)
 		encoder.SetIndent("", "  ")
 		if err := encoder.Encode(result); err != nil {
-			return err
+			// Joined rather than returned alone: this function exists so a
+			// cancelled or partly failed run still reports what it committed,
+			// and dropping runErr here would lose the very thing it guarantees.
+			return errors.Join(runErr, err)
 		}
 	} else {
 		printCompressResult(out, result, dryRun)
@@ -260,6 +271,17 @@ func printPass(out io.Writer, verb, noun string, pass compress.PassResult, dryRu
 	if pass.MissingFiles > 0 {
 		fmt.Fprintf(out, "%d %s referenced media that was already gone\n", pass.MissingFiles, noun)
 	}
+	if pass.Skipped > 0 {
+		fmt.Fprintf(out, "%d %s are in a format this build does not compress\n", pass.Skipped, noun)
+	}
+	// Not a failure of this run: it means two rows name media that would collide,
+	// which is an inconsistency in the index. Said out loud because otherwise a
+	// run in which *every* row conflicts prints nothing at all and reads as a run
+	// with nothing to do — the counters promise that a run which compressed
+	// nothing still says why, and the warnings behind these go to stderr.
+	if pass.Conflicted > 0 {
+		fmt.Fprintf(out, "%d %s share media with another event and were left alone\n", pass.Conflicted, noun)
+	}
 	// The failure counters print only when they fire. VerifyFailed is the one
 	// that matters: it means an encoder produced something wrong while reporting
 	// success, and the originals were kept because of it.
@@ -269,6 +291,10 @@ func printPass(out io.Writer, verb, noun string, pass compress.PassResult, dryRu
 	}
 	if pass.EncodeFailed > 0 {
 		fmt.Fprintf(out, "%d %s could not be encoded and were left untouched\n", pass.EncodeFailed, noun)
+	}
+	if pass.FlushFailed > 0 {
+		fmt.Fprintf(out, "%d %s encoded but could not be flushed to disk and were left untouched\n",
+			pass.FlushFailed, noun)
 	}
 	if pass.Raced > 0 {
 		fmt.Fprintf(out, "%d %s were changed by something else mid-run and were skipped\n", pass.Raced, noun)

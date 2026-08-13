@@ -41,12 +41,21 @@ how densely to keep it.
   than skipping the offending rows, because media outside the roots means the caller is not looking at the
   index they think they are. Note the asymmetry that allowed it: reconcile was always scoped to
   `MediaDirs`; the passes were not.
-- **One-to-one path ownership is checked, not assumed.** `events.media_path` has no uniqueness constraint,
-  and destinations are derived by swapping the extension, so two rows naming one file (the first
-  replacement deletes the second's media) or a row whose destination another row already holds (the encode
-  overwrites it — the FLAC writer truncates an existing destination outright) both break the sequence.
-  `findConflicts` skips and counts those rows instead. Neither arises in an index Lumi wrote, which is
-  exactly why it needs a check rather than a comment.
+- **One-to-one path ownership is checked, not assumed, on three axes.** `events.media_path` has no
+  uniqueness constraint, and destinations are derived by swapping the extension, so all of: two rows naming
+  one file (the first replacement deletes the second's media), a row whose destination another row already
+  holds (the encode overwrites it — the FLAC writer truncates an existing destination outright), and **two
+  rows deriving the same destination** break the sequence. `findConflicts` skips and counts those rows
+  instead. None arises in an index Lumi wrote, which is exactly why they need a check rather than a comment.
+  - **The third axis is the one with no filesystem behind it, and it was missed once.** Neither destination
+    exists when the run starts, so `os.SameFile` — which decides every other comparison here — has nothing
+    to stat, and the collision is invisible to any check made against what is on disk. `.jpg` and `.jpeg`
+    beside one another both derive `frame.heic`: the second encode overwrites the first, both originals are
+    then unlinked, and the run reports success having destroyed one picture and pointed both rows at the
+    other. Reconcile cannot repair it either — with both originals gone there is no leftover to adopt and
+    nothing to compare. So that axis compares **case-folded strings**, and folding is the safe direction:
+    on a case-sensitive volume it can only pair rows that would not have collided, and the cost of a false
+    pair is skipping compression.
 - **`reconcile` is sibling-scoped and must never become a general orphan sweep.** Captured media exists on
   disk *before* its row does — a frame is written, compared, then inserted; a WAV exists for a whole chunk
   plus transcription latency before its `Insert` — so removing any unreferenced file would delete media the
@@ -54,7 +63,10 @@ how densely to keep it.
   general sweep stays behind `prune --all`'s irreversible confirmation. Only a file whose extension-swapped
   sibling is named by a row may be touched; freshly captured media has no such sibling, so it is
   untouchable by construction rather than by a check. `TestReconcileNeverTouchesMediaThatHasNoIndexedSibling`
-  pins it.
+  pins it. **The pairing folds case, because the passes do**: `classify` matches on `lowerExt` and always
+  writes the lower-case extension, so a row naming `frame.JPG` is compressed to `frame.heic` and an
+  exact-match key would find no owner for the leftover — which then leaks on that run and every run after
+  it. Folding is conservative in the other direction too: a false match only leaves a file alone.
 - **"Could not stat" is not "is gone", and reconcile must keep them apart.** Routing every stat error to
   the adopt branch is the one single-process path in this package that destroys data: a transient EACCES or
   EIO on a *present* original adopts the unverified leftover, and the next run then sees the original as an
@@ -87,6 +99,13 @@ how densely to keep it.
   channel — so the two numbers stay commensurable, and that is as far as the sharing goes.
 - **A per-file failure never aborts the run.** It is counted, logged, its destination is unlinked, and the
   next file is attempted. Only a store error or a cancelled context stops a pass.
+  - **Past the compare-and-swap this stops being a policy and becomes a requirement, and the handling
+    inverts.** Before the swap a failure unlinks the destination; after it the row is committed and names
+    that file, so unlinking it would be the unrecoverable case rather than the cleanup. Nothing after the
+    swap may return either: a single `EIO` while measuring or unlinking one original would abandon the rest
+    of the pass, the other pass, and reconcile — stranding the originals of every file already replaced,
+    none of which is reclaimed until somebody runs compress again. Both are logged and stepped over; a
+    stranded original is exactly reconcile's owner-is-present case.
 
 ## Thresholds
 
