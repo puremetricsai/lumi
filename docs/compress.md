@@ -186,7 +186,9 @@ than the encode. A 5,500-frame index takes about 5 minutes; audio is far faster.
 resume.
 
 `--workers 1` goes back to one file at a time, and `--workers N` sets it explicitly. Peak memory is about
-90 MB per file in flight on top of a ~1.4 GB baseline, so lower it if you are short on RAM.
+90 MB per file in flight on top of a ~1.4 GB baseline, so lower it if you are short on RAM. The ceiling of 8
+applies to the number picked for you: a larger `--workers` is used as typed, and above 8 that buys memory
+rather than speed.
 
 Each pass reports where it is on stderr every few seconds, so a long run is visibly working rather than
 apparently hung:

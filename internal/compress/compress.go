@@ -177,6 +177,14 @@ const MaxDefaultWorkers = 8
 // workers resolves the concurrency for a run. Zero means unset, matching how
 // Quality and the two floors treat it; validate rejects a negative rather than
 // silently reading it as unset.
+//
+// An explicit count is honoured however large, deliberately. MaxDefaultWorkers
+// caps what this package picks on the caller's behalf, and clamping a number the
+// caller typed would be the same quiet disagreement as silently correcting
+// --quality: the flag would report a concurrency the run did not use. The cost of
+// an absurd one is memory — roughly 93 MB per file in flight — and it is bounded
+// below by the amount of work, since replaceFiles never starts more workers than
+// there are files.
 func (o Options) workers() int {
 	if o.Workers > 0 {
 		return o.Workers
@@ -589,7 +597,11 @@ func replaceFiles(parent context.Context, s *store.Store, opts Options, p pass,
 	var firstErr error
 	var wg sync.WaitGroup
 
-	for range opts.workers() {
+	// Never more workers than there is work: a goroutine past len(items) can only
+	// ever observe a closed channel, and spawning one for each of --workers 200 on
+	// a pass with three files makes the count in the flag read as something the run
+	// did. The concurrency an explicit count asks for is untouched.
+	for range min(opts.workers(), len(items)) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -840,7 +852,7 @@ func (o Options) validate() error {
 	// means unset" branch and silently run at the default, which is the same class
 	// of quiet disagreement as --quality 0.
 	if o.Workers < 0 {
-		return fmt.Errorf("workers must be a positive number, not %d", o.Workers)
+		return fmt.Errorf("workers cannot be negative; zero means the default, not %d", o.Workers)
 	}
 	return nil
 }

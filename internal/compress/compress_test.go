@@ -1483,6 +1483,26 @@ func TestCompressAccountsForEveryFileUnderConcurrency(t *testing.T) {
 	}
 }
 
+// An explicit count is honoured however large, rather than clamped to the cap on
+// the default: a flag reporting a concurrency the run did not use is the same
+// quiet disagreement --quality 0 is refused for. What the pass does bound is
+// workers against work, so a count far past the number of files still replaces
+// every one of them.
+func TestCompressHonoursAWorkerCountLargerThanTheWork(t *testing.T) {
+	h := newHarness(t)
+	for i := range 3 {
+		h.seed(store.KindScreen, fmt.Sprintf("frame-%d.jpg", i), time.Hour)
+	}
+
+	opts := h.options()
+	opts.Workers = 64
+	result := h.run(opts)
+
+	if result.Screens.Files != 3 {
+		t.Errorf("compressed %d of 3 files: %+v", result.Screens.Files, result.Screens)
+	}
+}
+
 // A negative count would fall through workers()' "zero means unset" branch and
 // silently run at the default, which is the same quiet disagreement --quality 0
 // is refused for.

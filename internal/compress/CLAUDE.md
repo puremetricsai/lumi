@@ -202,6 +202,14 @@ image holds two full RGBA buffers plus both decoded images.
 
 The default is `min(GOMAXPROCS, MaxDefaultWorkers)`; `--workers 1` restores the strictly sequential
 behaviour, and a negative count is refused rather than read as unset, for the same reason `--quality 0` is.
+`MaxDefaultWorkers` caps only what this package picks on the caller's behalf: **an explicit count is
+honoured however large, deliberately.** Clamping a number the caller typed is the same quiet disagreement as
+silently correcting `--quality` — the flag would name a concurrency the run did not use — and the ceiling to
+clamp it to would have to be invented rather than measured. The cost of an absurd one is memory at the ~93 MB
+per file in flight above, which is the user's own override of a measured default. The one bound that is
+applied is against the work: `replaceFiles` starts no more workers than there are files, since a goroutine
+past `len(items)` can only ever observe a closed channel.
+
 The large baseline is worth noticing separately: 1.37 GB at one worker is mostly `AllEvents` being
 materialised twice per run, with every row's OCR text. That is the thing to fix if this ever needs to be
 cheaper — not the worker count.
