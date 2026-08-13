@@ -280,7 +280,10 @@ func printPass(out io.Writer, verb, noun string, pass compress.PassResult, dryRu
 	// with nothing to do — the counters promise that a run which compressed
 	// nothing still says why, and the warnings behind these go to stderr.
 	if pass.Conflicted > 0 {
-		fmt.Fprintf(out, "%d %s share media with another event and were left alone\n", pass.Conflicted, noun)
+		// "Collide with" rather than "share media with": one of the three axes is
+		// rows that share a *destination*, whose media is distinct today.
+		fmt.Fprintf(out, "%d %s would collide with another event's media and were left alone\n",
+			pass.Conflicted, noun)
 	}
 	// The failure counters print only when they fire. VerifyFailed is the one
 	// that matters: it means an encoder produced something wrong while reporting

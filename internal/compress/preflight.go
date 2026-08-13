@@ -246,14 +246,23 @@ func findConflicts(events []store.Event) map[int64]string {
 			if equivalentPath(destination, inspectOwnedPath(event)) {
 				continue
 			}
-			// Keyed lower-cased and compared as strings, because neither
-			// destination exists yet: os.SameFile has nothing to stat, so
-			// filesystem identity — which decides every other comparison here —
-			// is unavailable on this axis. Folding case is the safe direction:
-			// on a case-sensitive volume it can only pair two rows that would
-			// not have collided, and the cost of that is skipping compression.
-			destinations[strings.ToLower(destination.clean)] = append(
-				destinations[strings.ToLower(destination.clean)], event.ID)
+			// Compared as strings, because neither destination exists yet:
+			// os.SameFile has nothing to stat, so filesystem identity — which
+			// decides every other comparison here — is unavailable on this axis.
+			//
+			// So the string has to be the resolved one. `resolvedPath` resolves
+			// the *existing parent* of an absent final component, which is what
+			// makes two spellings of one directory compare equal: without it
+			// /a/frame.jpg and /b/frame.jpeg with /b a symlink to /a key
+			// differently and collide on disk anyway. Folding case is the safe
+			// direction on top of that: on a case-sensitive volume it can only
+			// pair two rows that would not have collided, and the cost of that
+			// is skipping compression.
+			key := strings.ToLower(destination.clean)
+			if resolved, err := resolvedPath(destinationEvent.MediaPath); err == nil {
+				key = strings.ToLower(resolved)
+			}
+			destinations[key] = append(destinations[key], event.ID)
 
 			visited := make(map[int]bool)
 			for _, key := range destination.keys() {

@@ -68,9 +68,24 @@ func reconcile(ctx context.Context, s *store.Store, opts Options) (ReconcileResu
 	// is-this-referenced test below, where a false match only leaves a file
 	// alone. On the case-insensitive volumes macOS ships, the two spellings are
 	// the same file anyway.
+	//
+	// Folding makes two rows differing only by case share a key, and a plain map
+	// would resolve that by last-writer-wins — silently. The skip below tolerates
+	// that (either row's presence leaves the file alone), but `settle` does not:
+	// handed the surviving row it stats *that* row's media, and finding it
+	// present deletes a leftover that may be the other row's only copy. So a
+	// collided key owns nothing. Ambiguity here is unanswerable rather than
+	// merely awkward — nothing in a leftover's name says which of two rows wrote
+	// it — and this package does not delete what it cannot attribute.
 	referenced := make(map[string]store.Event, len(events))
+	collided := make(map[string]bool)
 	for _, event := range events {
-		referenced[foldPath(event.MediaPath)] = event
+		key := foldPath(event.MediaPath)
+		if existing, ok := referenced[key]; ok &&
+			filepath.Clean(existing.MediaPath) != filepath.Clean(event.MediaPath) {
+			collided[key] = true
+		}
+		referenced[key] = event
 	}
 
 	logger := opts.logger()
@@ -105,7 +120,13 @@ func reconcile(ctx context.Context, s *store.Store, opts Options) (ReconcileResu
 				continue
 			}
 			for _, extension := range siblings {
-				owner, ok := referenced[foldPath(swapExtension(path, extension))]
+				key := foldPath(swapExtension(path, extension))
+				if collided[key] {
+					logger.Warn("leaving a leftover whose sibling rows differ only by case; "+
+						"which one it belongs to cannot be told from its name", "leftover", path)
+					break
+				}
+				owner, ok := referenced[key]
 				if !ok {
 					continue
 				}

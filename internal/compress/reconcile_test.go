@@ -67,6 +67,54 @@ func TestReconcilePairsALeftoverWithARowWhoseExtensionIsUpperCase(t *testing.T) 
 	}
 }
 
+// Folding case to pair a leftover with its row makes two rows differing only by
+// case share a key, and a plain map would settle that by last-writer-wins. The
+// consequence is not symmetric: if the surviving row's media happens to be
+// present, the leftover is deleted as redundant — while it may be the *other*
+// row's only copy, whose original is already gone. Nothing in the leftover's
+// name says which row wrote it, so neither row owns it.
+//
+// A post-fix build cannot create this state, because findConflicts refuses to
+// compress two rows folding to one destination. It reaches reconcile only as a
+// leftover from an older build on a case-sensitive volume.
+// Both rows' media is absent here, which makes the assertion the same on either
+// kind of volume: the collision is decided by folding two stored strings, which
+// no filesystem is consulted for, while whether frame.JPG and frame.jpg are one
+// *file* is exactly what varies. Written the other way — one row's media present
+// — it would pin the data-loss case directly but skip on the case-insensitive
+// volumes macOS ships, which is where it would actually be run. Same guard
+// either way: a collided key owns nothing.
+func TestReconcileWillNotAdoptOrDeleteALeftoverTwoRowsCouldOwn(t *testing.T) {
+	h := newHarness(t)
+	for _, name := range []string{"frame.JPG", "frame.jpg"} {
+		event := store.Event{
+			Kind: store.KindScreen, CapturedAt: time.Now().UTC().Add(-time.Hour),
+			Text: name, MediaPath: filepath.Join(h.dir, name),
+		}
+		if err := h.store.Insert(context.Background(), &event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	leftover := h.orphan("frame.heic")
+	opts := h.options()
+	opts.Screens = CodecNone
+	opts.Audio = CodecNone
+
+	result := h.run(opts)
+
+	// Without the guard the map keeps whichever row it saw last, finds its media
+	// gone, and adopts — attributing the leftover to a row that may not have
+	// written it. With one row's media present instead, the same lookup deletes
+	// what can be the other row's only copy.
+	if result.Reconciled.Removed != 0 || result.Reconciled.Recovered != 0 {
+		t.Errorf("removed %d and recovered %d; a leftover two rows could own must be left alone",
+			result.Reconciled.Removed, result.Reconciled.Recovered)
+	}
+	if !exists(leftover) {
+		t.Error("a leftover that may be the only copy of a row's media was deleted")
+	}
+}
+
 // A crash after the row update leaves the original behind while the row already
 // names the compressed file.
 func TestReconcileRemovesAnOriginalLeftAfterTheRowMoved(t *testing.T) {

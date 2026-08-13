@@ -53,9 +53,11 @@ how densely to keep it.
     beside one another both derive `frame.heic`: the second encode overwrites the first, both originals are
     then unlinked, and the run reports success having destroyed one picture and pointed both rows at the
     other. Reconcile cannot repair it either — with both originals gone there is no leftover to adopt and
-    nothing to compare. So that axis compares **case-folded strings**, and folding is the safe direction:
-    on a case-sensitive volume it can only pair rows that would not have collided, and the cost of a false
-    pair is skipping compression.
+    nothing to compare. So that axis compares strings, and both normalisations are load-bearing: the string
+    is the **resolved** one, because `resolvedPath` resolves the existing *parent* of an absent final
+    component and without that `/a/frame.jpg` and `/b/frame.jpeg` with `/b → /a` key differently while
+    colliding on disk; and it is **case-folded**, which is the safe direction because on a case-sensitive
+    volume it can only pair rows that would not have collided, at a cost of skipping compression.
 - **`reconcile` is sibling-scoped and must never become a general orphan sweep.** Captured media exists on
   disk *before* its row does — a frame is written, compared, then inserted; a WAV exists for a whole chunk
   plus transcription latency before its `Insert` — so removing any unreferenced file would delete media the
@@ -66,7 +68,11 @@ how densely to keep it.
   pins it. **The pairing folds case, because the passes do**: `classify` matches on `lowerExt` and always
   writes the lower-case extension, so a row naming `frame.JPG` is compressed to `frame.heic` and an
   exact-match key would find no owner for the leftover — which then leaks on that run and every run after
-  it. Folding is conservative in the other direction too: a false match only leaves a file alone.
+  it. A false match on the *skip* test only leaves a file alone, but the **owner lookup is not symmetric
+  with it**: two rows folding to one key would resolve by last-writer-wins, and `settle` handed the
+  surviving row stats that row's media and deletes a leftover that may be the other row's only copy. So a
+  collided key owns nothing and its leftover is left alone with a log line. Nothing in a leftover's name
+  says which of two rows wrote it, and this package does not delete what it cannot attribute.
 - **"Could not stat" is not "is gone", and reconcile must keep them apart.** Routing every stat error to
   the adopt branch is the one single-process path in this package that destroys data: a transient EACCES or
   EIO on a *present* original adopts the unverified leftover, and the next run then sees the original as an

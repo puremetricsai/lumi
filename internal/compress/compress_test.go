@@ -893,6 +893,41 @@ func TestCompressSkipsRowsWhoseMediaAnotherRowDependsOn(t *testing.T) {
 		}
 	})
 
+	// The same collision reached through a symlinked parent rather than through
+	// the extension. Comparing the paths as written misses it — the two spellings
+	// differ as strings — while the files collide on disk exactly as before, so
+	// the destination key has to be the resolved one.
+	t.Run("destinations colliding through a symlinked parent", func(t *testing.T) {
+		h := newHarness(t)
+		alias := filepath.Join(filepath.Dir(h.dir), "alias")
+		if err := os.Symlink(h.dir, alias); err != nil {
+			t.Skipf("this environment cannot create symlinks: %v", err)
+		}
+		direct := h.seed(store.KindScreen, "frame.jpg", time.Hour)
+		// A second row reaching the same directory by its aliased name.
+		aliased := store.Event{
+			Kind: store.KindScreen, CapturedAt: time.Now().UTC().Add(-time.Hour),
+			Text: "aliased", MediaPath: filepath.Join(alias, "frame.jpeg"),
+		}
+		if err := os.WriteFile(filepath.Join(h.dir, "frame.jpeg"), []byte("second"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.store.Insert(context.Background(), &aliased); err != nil {
+			t.Fatal(err)
+		}
+
+		opts := h.options()
+		opts.MediaDirs = []string{h.dir, alias}
+		result := h.run(opts)
+
+		if result.Screens.Conflicted != 2 || result.Screens.Files != 0 {
+			t.Errorf("counted %d conflicted and %d compressed, want 2 and 0",
+				result.Screens.Conflicted, result.Screens.Files)
+		}
+		if !exists(direct.MediaPath) || !exists(filepath.Join(h.dir, "frame.jpeg")) {
+			t.Error("an original was deleted for a destination two rows would have shared")
+		}
+	})
 }
 
 // The colliding-destination axis is exercised directly as well, because the
