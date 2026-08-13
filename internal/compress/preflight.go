@@ -89,6 +89,11 @@ func pathWithinRoot(path, root string) bool {
 // outside the directories this run was given. Only the cutoff-bounded candidate
 // set belongs here; all events are used separately for ownership, because a
 // recent unrelated foreign path must not block valid old history.
+//
+// A path that will not resolve fails the whole run rather than being skipped,
+// and findConflicts borrows that: it keys colliding destinations on the resolved
+// path and falls back to the unresolved one, which is only safe while two
+// candidates cannot disagree about whether they resolved.
 func checkRoots(events []store.Event, mediaDirs []string) error {
 	roots, err := resolvedRoots(mediaDirs)
 	if err != nil {
@@ -258,6 +263,12 @@ func findConflicts(events []store.Event) map[int64]string {
 			// direction on top of that: on a case-sensitive volume it can only
 			// pair two rows that would not have collided, and the cost of that
 			// is skipping compression.
+			//
+			// The fallback to the unresolved path is safe only because
+			// checkRoots refuses a run holding a candidate that will not
+			// resolve: two candidates therefore either both resolve or the run
+			// never starts, so they cannot key differently and miss each other.
+			// Softening checkRoots into skipping such rows re-arms this.
 			key := strings.ToLower(destination.clean)
 			if resolved, err := resolvedPath(destinationEvent.MediaPath); err == nil {
 				key = strings.ToLower(resolved)

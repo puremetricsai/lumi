@@ -53,11 +53,27 @@ how densely to keep it.
     beside one another both derive `frame.heic`: the second encode overwrites the first, both originals are
     then unlinked, and the run reports success having destroyed one picture and pointed both rows at the
     other. Reconcile cannot repair it either — with both originals gone there is no leftover to adopt and
-    nothing to compare. So that axis compares strings, and both normalisations are load-bearing: the string
-    is the **resolved** one, because `resolvedPath` resolves the existing *parent* of an absent final
-    component and without that `/a/frame.jpg` and `/b/frame.jpeg` with `/b → /a` key differently while
-    colliding on disk; and it is **case-folded**, which is the safe direction because on a case-sensitive
-    volume it can only pair rows that would not have collided, at a cost of skipping compression.
+    nothing to compare. So that axis compares strings, and both normalisations are load-bearing, for
+    different reasons. The string is the **resolved** one — `resolvedPath` resolves the existing *parent* of
+    an absent final component, and without that `/a/frame.jpg` and `/b/frame.jpeg` with `/b → /a` key
+    differently while colliding on disk. Resolution cannot produce a false pair: two paths resolving to one
+    string *are* one destination, so it is not a proxy for the collision, it is the collision. Only the
+    **case fold** over-pairs, and that is the safe direction — on a case-sensitive volume it can pair rows
+    that would not have collided, at a cost of skipping compression.
+  - **The key's fallback to the unresolved path is safe only because `checkRoots` fails the run, and that
+    borrowed guarantee is why `checkRoots` may not be softened into skipping rows.** If one of two colliding
+    rows resolved and the other did not, they would key differently and the collision would be missed — the
+    exact loss above. It cannot happen today because `checkRoots` already calls `resolvedPath` on every
+    candidate's source *and* derived destination and returns the error, so two candidates either both
+    resolve or the run never starts. "Why abort a whole run over one bad path — just skip it" is the obvious
+    later improvement, and it silently re-arms this. A *non*-candidate partner that fails to resolve can
+    miss, but nothing is written for it this run, and by the run in which it becomes eligible its
+    destination exists on disk and the `os.SameFile`-backed axis catches it.
+  - **Resolution is best-effort, and everything it misses routes to that same hard failure.**
+    `EvalSymlinks` does not resolve APFS firmlinks, so `/Users/x/media/f.jpg` and
+    `/System/Volumes/Data/Users/x/media/f.jpg` are one file under two spellings that never compare equal.
+    It cannot reach this axis: `MediaDirs` come from config as `/Users/...`, so a firmlink-spelled row falls
+    outside the resolved roots and `checkRoots` refuses the run. Fails closed.
 - **`reconcile` is sibling-scoped and must never become a general orphan sweep.** Captured media exists on
   disk *before* its row does — a frame is written, compared, then inserted; a WAV exists for a whole chunk
   plus transcription latency before its `Insert` — so removing any unreferenced file would delete media the
