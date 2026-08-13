@@ -157,13 +157,29 @@ jobs:
           sha256sum -c SHA256SUMS.txt
 
   update-homebrew-formula:
-    # Depends on the tag existing and nothing else: the formula builds from source and
-    # consumes none of the uploaded assets. Chaining it behind build-binaries would make
-    # a runner-image or SDK failure skip it through the `needs` cascade, and job 1 has
-    # already cut the tag by then — release-please will not re-cut a version whose release
-    # exists, so a re-run sets release_created to false and the tap keeps the previous
-    # release's url and checksum forever.
-    needs: [release-please]
+    # The formula names a release asset now, so it must not be rewritten before that asset
+    # exists: a tap pointing at a 404 breaks every `brew install`, while a tap still
+    # pointing at the previous release keeps working. That inverts the ordering this job
+    # used to have, back when the formula built from source and consumed nothing the other
+    # jobs produced.
+    #
+    # A failed release must therefore leave the tap alone rather than advance it — that is
+    # the intent, not a side effect to engineer around. Fixing the release, or re-running it
+    # for a transient failure, is the developer's job; nothing here should try to publish a
+    # formula around a build that did not produce a binary.
+    #
+    # The recovery is worth writing down because it is not obvious. Job 1 cuts the tag before
+    # build-binaries runs, and release-please will not re-cut a version whose release already
+    # exists, so a *fresh* run (a new push to main, or workflow_dispatch) sets release_created
+    # to false and skips this job. Use GitHub's "Re-run failed jobs" on the *same* run
+    # instead — that reuses the completed release-please job's outputs, so release_created
+    # stays true and tag_name persists, and the cascade re-runs from the failed job forward.
+    #
+    # upload-release-assets is a sufficient barrier only because the sha256 step below
+    # downloads the asset and hashes the bytes itself. If that is ever reduced to reading
+    # the hash out of SHA256SUMS.txt, this job stops verifying its own input and the
+    # barrier has to move to verify-release.
+    needs: [release-please, upload-release-assets]
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
     runs-on: ubuntu-latest
     steps:
@@ -176,47 +192,75 @@ jobs:
           # rebase fails exactly in the race it exists to survive.
           fetch-depth: 0
 
-      - name: Compute source tarball SHA256
+      - name: Compute release archive SHA256
         id: sha256
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           TAG="${{ needs.release-please.outputs.tag_name }}"
-          # GitHub generates tag tarballs on demand and can 404 or 5xx briefly after the
-          # tag appears. `curl -s` without --fail exits 0 and writes the error body to
-          # stdout, so piping straight into sha256sum hashes an error page (or, on a reset
-          # connection, the empty string) into the formula. Download to a file, make curl's
-          # failure the step's failure, and prove the bytes are really a gzip stream.
-          curl -fsSL --retry 5 --retry-all-errors \
-            -o source.tar.gz \
-            "https://github.com/${{ github.repository }}/archive/refs/tags/${TAG}.tar.gz"
-          gzip -t source.tar.gz
-          SHA256="$(sha256sum source.tar.gz | awk '{print $1}')"
-          [ "${#SHA256}" -eq 64 ] || { echo "::error::bad source tarball sha256: '${SHA256}'"; exit 1; }
-          rm -f source.tar.gz
-          echo "source=${SHA256}" >> "$GITHUB_OUTPUT"
+          ARCHIVE="lumi-darwin-arm64.tar.gz"
+          # Download outside the checkout. The commit-and-push step below runs in this same
+          # working tree, and a stray 4MB archive there is one `git add -A` away from being
+          # committed.
+          WORK="${RUNNER_TEMP}/formula-asset"
+          rm -rf "$WORK"
+          # Stay in the checkout and address the downloads absolutely, rather than cd-ing
+          # into a directory this step then deletes out from under itself.
+          gh release download "$TAG" --repo "${{ github.repository }}" --clobber \
+            --dir "$WORK" --pattern "$ARCHIVE" --pattern SHA256SUMS.txt
+          # Hash the bytes brew will download rather than trusting the published list, and
+          # prove they are really a gzip stream first.
+          gzip -t "${WORK}/${ARCHIVE}"
+          SHA256="$(sha256sum "${WORK}/${ARCHIVE}" | awk '{print $1}')"
+          [ "${#SHA256}" -eq 64 ] || { echo "::error::bad ${ARCHIVE} sha256: '${SHA256}'"; exit 1; }
+          # Then cross-check it against what the release publishes for the same file. The
+          # hashed value is not in doubt — those are the bytes brew will download. What a
+          # disagreement means is that the release contradicts itself, and a release whose
+          # own manifest does not describe its own asset is not one to point users at;
+          # verify-release is failing on this same run for the same reason.
+          #
+          # `$2` is the bare filename because upload-release-assets already asserts the
+          # manifest is two-space, text-mode and unprefixed (`^[0-9a-f]{64}  [^/]+$`), which
+          # rejects binary-mode `*name` and any path. That guard and this awk are a pair.
+          # A filename absent from the manifest yields an empty PUBLISHED — awk still exits
+          # 0, so `set -e` does not fire and this comparison is what catches it.
+          PUBLISHED="$(awk -v f="$ARCHIVE" '$2 == f {print $1}' "${WORK}/SHA256SUMS.txt")"
+          [ "$PUBLISHED" = "$SHA256" ] || { echo "::error::SHA256SUMS.txt records '${PUBLISHED}' for ${ARCHIVE}, but the asset hashes to '${SHA256}'"; exit 1; }
+          rm -rf "$WORK"
+          echo "archive=${SHA256}" >> "$GITHUB_OUTPUT"
 
       - name: Update formula
         run: |
           set -euo pipefail
           TAG="${{ needs.release-please.outputs.tag_name }}"
           FORMULA="HomebrewFormula/lumi.rb"
-          URL="https://github.com/${{ github.repository }}/archive/refs/tags/${TAG}.tar.gz"
-          SHA256="${{ steps.sha256.outputs.source }}"
+          URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/lumi-darwin-arm64.tar.gz"
+          SHA256="${{ steps.sha256.outputs.archive }}"
           # These seds rewrite in place and cannot insert, so the formula must hold exactly
-          # one top-level `url`/`sha256` pair. A `resource` or `stable do` block would give
-          # them a second, wrong target; `^ *` and `[^"]*` keep them off a line like
-          # `url "...", tag: "...", revision: "..."`, which a greedy `.*` would collapse.
+          # one top-level `url`/`sha256` pair. A `resource`, `stable do`, or `head do` block
+          # would give them a second, wrong target; `^ *` and `[^"]*` keep them off a line
+          # like `url "...", tag: "...", revision: "..."`, which a greedy `.*` would collapse.
           for field in url sha256; do
             COUNT="$(grep -cE "^ *${field} \"[^\"]*\"$" "$FORMULA" || true)"
             [ "${COUNT}" = "1" ] || { echo "::error::${FORMULA} has ${COUNT} top-level \`${field} \"...\"\` lines, expected exactly 1"; exit 1; }
           done
-          sed -i -E "s|^( *)url \"[^\"]*\"|\1url \"${URL}\"|" "$FORMULA"
-          sed -i -E "s|^( *)sha256 \"[^\"]*\"|\1sha256 \"${SHA256}\"|" "$FORMULA"
+          # Anchored at both ends, exactly like the guard above. Without the trailing `$`
+          # these match the *prefix* of a line such as `url "...", branch: "main"` and
+          # rewrite it in place while leaving its trailing arguments attached — and the
+          # guard still counts 1, and the postconditions below still pass, so every check
+          # in this step reports success over a corrupted formula.
+          sed -i -E "s|^( *)url \"[^\"]*\"\$|\1url \"${URL}\"|" "$FORMULA"
+          sed -i -E "s|^( *)sha256 \"[^\"]*\"\$|\1sha256 \"${SHA256}\"|" "$FORMULA"
           # Assert the postcondition. `git diff --cached --quiet` below cannot tell "already
           # correct" from "matched nothing", so without this a missed regex is a green job
-          # that ships the previous release's tarball under the new tag.
-          grep -qF -- "url \"${URL}\"" "$FORMULA" || { echo "::error::the url rewrite did not take"; exit 1; }
-          grep -qF -- "sha256 \"${SHA256}\"" "$FORMULA" || { echo "::error::the sha256 rewrite did not take"; exit 1; }
+          # that ships the previous release's archive under the new tag. Compare whole
+          # lines, indentation stripped: a substring match would also accept a line the
+          # unanchored seds above had left trailing arguments on.
+          for expected in "url \"${URL}\"" "sha256 \"${SHA256}\""; do
+            sed -E 's|^ +||' "$FORMULA" | grep -qxF -- "$expected" \
+              || { echo "::error::${FORMULA} has no line \`${expected}\` after the rewrite"; exit 1; }
+          done
           cat "$FORMULA"
 
       - name: Commit and push
