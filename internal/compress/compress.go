@@ -311,15 +311,42 @@ type pass interface {
 	encode(ctx context.Context, opts Options, source, destination string) error
 }
 
-func runPass(ctx context.Context, s *store.Store, opts Options,
-	events []store.Event, kind store.Kind, p pass, report preflightReport) (PassResult, error) {
+// work is one file a pass has decided to replace.
+type work struct {
+	event       store.Event
+	destination string
+	// size is measured during selection but only *reported* once the row is
+	// committed, so a file that fails or loses the compare-and-swap still
+	// contributes nothing to the ratio.
+	size int64
+}
+
+// selectWork applies every eligibility gate exactly once and accounts for each
+// row that does not survive them.
+//
+// It is separate from the encoding so that a pass can say how many *files* it is
+// about to replace rather than how many rows it has looked at. That distinction
+// is the whole value of the progress line: on a real index the row count is
+// dominated by aged-out and already-compressed rows costing microseconds each, so
+// "6,024 of 13,211 rows" reads as 45% of a run that has barely started, while
+// "108 of 223 files" is the truth. Getting the honest denominator any other way
+// means a second copy of these gates, which is the drift this package's CLAUDE.md
+// warns about everywhere else.
+//
+// Nothing that was ordered moves. Every gate here is a read-only check, and the
+// per-file sequence — encode, verify, fsync, compare-and-swap, unlink — is
+// untouched and still strictly one file at a time. The single behavioural
+// difference is that a file something else deletes *during* the run is now
+// counted as an encode failure rather than as a missing file: a race that was
+// always present, and one that is only ever mislabelled by this, never
+// mishandled.
+func selectWork(ctx context.Context, events []store.Event, kind store.Kind,
+	p pass, report preflightReport, logger *slog.Logger) ([]work, PassResult, error) {
 	var result PassResult
-	logger := opts.logger()
+	var items []work
 	for _, event := range events {
 		if err := ctx.Err(); err != nil {
-			// Interrupting mid-run costs at most the file in flight, and leaves
-			// state a rerun reconciles. Everything committed stays committed.
-			return result, err
+			return nil, result, err
 		}
 		if event.Kind != kind {
 			continue
@@ -345,13 +372,38 @@ func runPass(ctx context.Context, s *store.Store, opts Options,
 			result.MissingFiles++
 			continue
 		}
-		if opts.DryRun {
-			// Stops before the encode, which is why a dry run cannot report a
-			// ratio: measuring one means doing the work.
+		items = append(items, work{event: event, destination: destination, size: info.Size()})
+	}
+	return items, result, nil
+}
+
+func runPass(ctx context.Context, s *store.Store, opts Options,
+	events []store.Event, kind store.Kind, p pass, report preflightReport) (PassResult, error) {
+	logger := opts.logger()
+	items, result, err := selectWork(ctx, events, kind, p, report, logger)
+	if err != nil {
+		return result, err
+	}
+	if opts.DryRun {
+		// Stops before the encode, which is why a dry run cannot report a ratio:
+		// measuring one means doing the work.
+		for _, item := range items {
 			result.Files++
-			result.BytesBefore += info.Size()
-			continue
+			result.BytesBefore += item.size
 		}
+		return result, nil
+	}
+
+	tracker := newProgress(logger, kind, int64(len(items)))
+	defer func() { tracker.done(result) }()
+	for _, item := range items {
+		if err := ctx.Err(); err != nil {
+			// Interrupting mid-run costs at most the file in flight, and leaves
+			// state a rerun reconciles. Everything committed stays committed.
+			return result, err
+		}
+		tracker.step(result)
+		event, destination := item.event, item.destination
 
 		if err := p.encode(ctx, opts, event.MediaPath, destination); err != nil {
 			if isVerificationError(err) {
@@ -396,7 +448,7 @@ func runPass(ctx context.Context, s *store.Store, opts Options,
 		// the originals of every file this run had already replaced, none of which
 		// is reclaimed until somebody runs compress again.
 		result.Files++
-		result.BytesBefore += info.Size()
+		result.BytesBefore += item.size
 		if compressed, err := os.Stat(destination); err == nil {
 			result.BytesAfter += compressed.Size()
 		} else {
@@ -416,6 +468,82 @@ func runPass(ctx context.Context, s *store.Store, opts Options,
 		}
 	}
 	return result, nil
+}
+
+// progressInterval is how often a running pass says where it has got to. It is
+// a package var purely as a test seam: the default has to be long enough that an
+// ordinary small run stays as quiet as it was before progress existed, which
+// makes the reporting path unreachable in a test that does not move it.
+var progressInterval = 5 * time.Second
+
+// progress reports a long pass's advance through the files selectWork gave it.
+//
+// The passes are silent by construction: every counter is returned at the end,
+// and the logger is otherwise reached only by a failure. A run over a full index
+// encodes thousands of frames at roughly a tenth of a second each and fsyncs each
+// replacement twice, so twenty minutes with nothing on screen was the normal,
+// healthy case — and indistinguishable from a hang. That is not a cosmetic
+// problem: interrupting costs far more than the file in flight, because screens
+// run before audio and a cancelled pass returns before the next one starts, so
+// giving up on a slow screen pass silently forfeits the audio pass too — and
+// audio is the lossless one, which measures 7x.
+//
+// It counts files rather than rows because selectWork has already applied the
+// gates; see there for why the honest denominator is worth a separate phase.
+type progress struct {
+	logger *slog.Logger
+	noun   string
+	files  int64
+	seen   int64
+	start  time.Time
+	last   time.Time
+	// reported records whether this pass ever spoke, so done can stay quiet for a
+	// pass that finished inside one interval.
+	reported bool
+}
+
+func newProgress(logger *slog.Logger, kind store.Kind, files int64) *progress {
+	now := time.Now()
+	return &progress{logger: logger, noun: passNoun(kind), files: files, start: now, last: now}
+}
+
+// step records one attempted file and reports where the pass is, at most once per
+// progressInterval.
+//
+// Rate-limited by elapsed time rather than by file count so that the line arrives
+// at a readable cadence whatever the media costs to encode — a 5K frame and a
+// silent audio chunk differ by two orders of magnitude — and so a pass can never
+// bury the warnings the logger is actually there for.
+func (p *progress) step(result PassResult) {
+	p.seen++
+	now := time.Now()
+	if now.Sub(p.last) < progressInterval {
+		return
+	}
+	p.last = now
+	p.reported = true
+	p.logger.Info("compressing "+p.noun, "done", result.Files, "of", p.files,
+		"elapsed", now.Sub(p.start).Round(time.Second))
+}
+
+// done closes out a pass that had been reporting, including one that a cancelled
+// context ended early — where it is the only account of how far the run got
+// before the counters were returned.
+func (p *progress) done(result PassResult) {
+	if !p.reported {
+		return
+	}
+	p.logger.Info("finished compressing "+p.noun, "done", result.Files, "of", p.files,
+		"elapsed", time.Since(p.start).Round(time.Second))
+}
+
+// passNoun names a kind the way `lumi compress`'s own summary does, so a
+// progress line and the final line describe the same thing in the same words.
+func passNoun(kind store.Kind) string {
+	if kind == store.KindAudio {
+		return "audio files"
+	}
+	return "screenshots"
 }
 
 // verificationError marks a result the checks rejected, as opposed to an encode
@@ -472,6 +600,13 @@ func runVacuum(ctx context.Context, s *store.Store, opts Options) VacuumResult {
 		return VacuumResult{Status: "skipped", Detail: "dry run"}
 	}
 	before := fileSize(opts.DatabasePath)
+	// Said before the call rather than after it: VACUUM rewrites the whole file
+	// under an exclusive lock and is the run's last step, so it is the stretch most
+	// easily read as a hang — the passes have stopped reporting and the summary has
+	// not been printed yet. One line, because unlike a pass there is no progress to
+	// have: SQLite does not report any.
+	opts.logger().Info("rebuilding the database to reclaim free pages",
+		"database", opts.DatabasePath, "bytes", before)
 	if err := s.Vacuum(ctx); err != nil {
 		if errors.Is(err, store.ErrVacuumBusy) {
 			return VacuumResult{Status: "busy", Detail: "the database is in use"}

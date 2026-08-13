@@ -179,6 +179,25 @@ Turn it off with `--vacuum=false`.
 Roughly 170 ms per screenshot, most of it the verification decode rather than the encode. A 5,500-frame
 index takes about 15 minutes; audio is far faster. It is safe to interrupt and resume.
 
+Each pass reports where it is on stderr every few seconds, so a long run is visibly working rather than
+apparently hung:
+
+```
+level=INFO msg="compressing screenshots" done=109 of=223 elapsed=20s
+level=INFO msg="finished compressing screenshots" done=223 of=223 elapsed=42s
+level=INFO msg="rebuilding the database to reclaim free pages" database=… bytes=111026176
+```
+
+`of` counts the files that pass will actually replace — the same number `--dry-run` reports — not the rows
+it looked at to find them, most of which are aged-out or already compressed. A run short enough to finish
+inside one interval prints none of this.
+
+Prefer to know the size of the job first? `--dry-run` reports it in about a second and writes nothing.
+
+Screenshots are compressed before audio, and interrupting stops the whole run — so a `Ctrl-C` during a slow
+screen pass gives up the audio pass too, which is the lossless one and the better ratio (around 7x against
+2.6x). If you only have a few minutes, `--screens none` does the cheap half.
+
 ## Machine-readable output
 
 ```sh

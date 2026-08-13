@@ -1,9 +1,11 @@
 package compress
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
@@ -1154,5 +1156,149 @@ func TestCompressVacuumsAfterThePasses(t *testing.T) {
 	// And the vacuum measured a database that already held the repointed row.
 	if got := h.mediaPath(1); got != filepath.Join(h.dir, "frame.heic") {
 		t.Errorf("after vacuuming, event 1 names %q", got)
+	}
+}
+
+// swapProgressInterval makes the reporting path reachable. The default is long
+// enough that no test's run would ever trip it, which is the point of the default
+// and the reason for the seam.
+func swapProgressInterval(t *testing.T, interval time.Duration) {
+	t.Helper()
+	previous := progressInterval
+	progressInterval = interval
+	t.Cleanup(func() { progressInterval = previous })
+}
+
+func (h *harness) logging(buffer *bytes.Buffer) Options {
+	opts := h.options()
+	opts.Logger = slog.New(slog.NewTextHandler(buffer, nil))
+	return opts
+}
+
+// A pass that says nothing until it finishes reads as a hang, and on a full index
+// it says nothing for twenty minutes. The cost of that is not cosmetic: screens
+// run before audio, so giving up on a slow screen pass forfeits the lossless
+// audio pass entirely.
+func TestCompressReportsProgressThroughALongPass(t *testing.T) {
+	swapProgressInterval(t, 0)
+	h := newHarness(t)
+	h.seed(store.KindScreen, "first.jpg", time.Hour)
+	h.seed(store.KindScreen, "second.jpg", time.Hour)
+	h.seed(store.KindAudio, "chunk.wav", time.Hour)
+
+	var log bytes.Buffer
+	h.run(h.logging(&log))
+
+	output := log.String()
+	for _, want := range []string{
+		"compressing screenshots",
+		"finished compressing screenshots",
+		// Both passes report, in the words the final summary uses.
+		"compressing audio files",
+		// The denominator counts the files the pass will replace — not the three
+		// seeded rows, and not the two screen rows it examined to find them.
+		"of=2",
+		"done=1",
+	} {
+		if !strings.Contains(output, want) {
+			t.Errorf("progress output does not mention %q:\n%s", want, output)
+		}
+	}
+}
+
+// The default interval has to leave an ordinary run exactly as quiet as it was
+// before progress existed, or every invocation pays for the twenty-minute case.
+func TestCompressStaysQuietThroughAShortPass(t *testing.T) {
+	h := newHarness(t)
+	h.seed(store.KindScreen, "frame.jpg", time.Hour)
+
+	var log bytes.Buffer
+	h.run(h.logging(&log))
+
+	if output := log.String(); strings.Contains(output, "compressing screenshots") {
+		t.Errorf("a pass that finished inside one interval reported progress:\n%s", output)
+	}
+}
+
+// A cancelled pass is the case where the account matters most: the counters stop
+// where the interruption did, and this line is the only record of how far a run
+// that a user gave up on had actually got.
+func TestCompressReportsWhereACancelledPassStopped(t *testing.T) {
+	swapProgressInterval(t, 0)
+	h := newHarness(t)
+	h.seed(store.KindScreen, "first.jpg", time.Hour)
+	h.seed(store.KindScreen, "second.jpg", time.Hour)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	h.images.observe = func(_, _ string) { cancel() }
+
+	var log bytes.Buffer
+	if _, err := Compress(ctx, h.store, h.logging(&log)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected a cancelled run, got %v", err)
+	}
+	if output := log.String(); !strings.Contains(output, "finished compressing screenshots") {
+		t.Errorf("a cancelled pass did not report where it stopped:\n%s", output)
+	}
+}
+
+// The vacuum is the run's last step, holds an exclusive lock, and reports no
+// progress of its own, so it announces itself instead.
+func TestCompressAnnouncesTheVacuum(t *testing.T) {
+	h := newHarness(t)
+	h.seed(store.KindScreen, "frame.jpg", time.Hour)
+
+	var log bytes.Buffer
+	opts := h.logging(&log)
+	opts.Vacuum = true
+	opts.DatabasePath = filepath.Join(filepath.Dir(h.dir), "lumi.db")
+	h.run(opts)
+
+	if output := log.String(); !strings.Contains(output, "rebuilding the database") {
+		t.Errorf("the vacuum ran without saying so:\n%s", output)
+	}
+}
+
+// A disabled vacuum must not announce one; the line is about a step that is
+// actually going to hold the lock.
+func TestCompressDoesNotAnnounceAVacuumItSkips(t *testing.T) {
+	h := newHarness(t)
+	h.seed(store.KindScreen, "frame.jpg", time.Hour)
+
+	var log bytes.Buffer
+	opts := h.logging(&log)
+	opts.Vacuum = false
+	h.run(opts)
+
+	if output := log.String(); strings.Contains(output, "rebuilding the database") {
+		t.Errorf("announced a vacuum that was disabled:\n%s", output)
+	}
+}
+
+// The denominator is the whole reason the gates run before the encoding: on a real
+// index most rows are aged-out or already compressed and cost microseconds, so
+// counting rows would report a run as half finished before it had encoded
+// anything. This pins the count to files the pass will actually replace.
+func TestCompressProgressCountsFilesNotRows(t *testing.T) {
+	swapProgressInterval(t, 0)
+	h := newHarness(t)
+	// One row to do, and four the gates reject for four different reasons.
+	h.seed(store.KindScreen, "todo.jpg", time.Hour)
+	h.seed(store.KindScreen, "already.heic", time.Hour)
+	h.seed(store.KindScreen, "unknown.png", time.Hour)
+	gone := h.seed(store.KindScreen, "gone.jpg", time.Hour)
+	if err := os.Remove(gone.MediaPath); err != nil {
+		t.Fatal(err)
+	}
+
+	var log bytes.Buffer
+	result := h.run(h.logging(&log))
+
+	// Every rejected row still landed in exactly one counter.
+	screens := result.Screens
+	if screens.Files != 1 || screens.AlreadyDone != 1 || screens.Skipped != 1 || screens.MissingFiles != 1 {
+		t.Fatalf("unexpected accounting: %+v", screens)
+	}
+	if output := log.String(); !strings.Contains(output, "of=1") {
+		t.Errorf("progress counted rows rather than files:\n%s", output)
 	}
 }

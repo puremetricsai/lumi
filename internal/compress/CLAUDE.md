@@ -99,6 +99,40 @@ how densely to keep it.
   unlink of the original persists. Deleting the survivor would destroy the last copy; repointing the row at
   it turns that tail case into a repair. It is checked for decodability first, which is the weakest check
   in the package and is applied only where the alternative is losing the data.
+- **A pass reports where it has got to, because a silent one is indistinguishable from a hung one and
+  interrupting costs a whole pass rather than a file.** Everything here is accounted for in counters that are
+  returned at the end, and the logger is otherwise reached only by a failure — so a full-index run, at
+  roughly 100 ms per HEIC encode plus two `fsync`s per replacement, printed nothing at all for twenty
+  minutes. That was measured, not guessed: 623 files took 75 s wall (59% CPU; the rest is the barrier), which
+  puts ~9,000 pending files near 20 minutes. The reason this is a correctness concern and not a cosmetic one
+  is the step order above: screens run before audio, and a cancelled pass returns before the next one starts,
+  so a user who reads the silence as a hang and presses Ctrl-C forfeits the *audio* pass entirely — the
+  lossless one, which measures 7x. An interrupted index shows this exactly, with the screen rows part
+  converted, every audio row still `.wav`, and no leftovers at all because the cancellation was clean.
+  - **The denominator counts files, and getting an honest one is why the gates run in their own phase.**
+    `selectWork` applies `done`, `conflicted`, `classify` and `stat` to every candidate row and returns the
+    survivors; `runPass` then encodes that list. Counting *rows* instead would have been free, and would have
+    lied: a real index is dominated by aged-out and already-compressed rows costing microseconds each, so
+    `6024 of 13211 rows` reads as 45% of a run that has encoded 108 files out of 223. The alternative —
+    counting eligible files in a second loop of the same gates — is the duplicated-rule drift this file warns
+    about everywhere else, and it would be invisible to both loops' tests.
+    **The split moves no ordering.** Every gate in `selectWork` is a read-only check, and the per-file
+    sequence is untouched and still strictly one file at a time. The one behavioural difference is that a
+    file something else deletes *during* the run now counts as an encode failure rather than a missing file:
+    a pre-existing race that this can only mislabel, never mishandle. `TestCompressProgressCountsFilesNotRows`
+    pins the count against one row rejected by each of the four gates.
+  - **Rate-limited by elapsed time, not by file count.** The per-file cost spans two orders of magnitude
+    between a 5K frame and a silent audio chunk, so a count-based trigger reports at an unpredictable cadence
+    and can bury the warnings the logger is actually there for. `progressInterval` is a package var only as a
+    test seam — the default must leave a short run exactly as quiet as it was before any of this existed,
+    which is what makes the reporting path otherwise unreachable in a test.
+  - **A pass that was reporting also reports where it stopped, including a cancelled one.** That line is the
+    only account of how far a run a user gave up on had actually got, and it fires from a `defer` so the
+    early return on `ctx.Err()` cannot skip it.
+  - **`VACUUM` announces itself instead of reporting progress**, because SQLite offers none. It is the last
+    step, it rewrites the whole file under an exclusive lock, and it runs after the passes have stopped
+    talking and before the summary is printed — the stretch most easily read as a hang. A disabled or
+    dry-run vacuum says nothing; the line is about a lock that is actually about to be held.
 - **Step order: passes → reconcile → vacuum, and each boundary is load-bearing.** Reconcile builds its
   reference set from `AllEvents` *at call time*; a set assembled before the passes would not name anything
   they had just written, so reconcile would delete the entire run's output. `VACUUM` is last because it
