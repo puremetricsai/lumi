@@ -3,11 +3,25 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+// newTestStore opens a store in a temp directory and closes it with the test,
+// mirroring internal/retention's helper of the same shape.
+func newTestStore(t *testing.T, ctx context.Context) *Store {
+	t.Helper()
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return s
+}
 
 func TestInsertAndSearch(t *testing.T) {
 	ctx := context.Background()
@@ -449,5 +463,245 @@ func TestHasEventsReportsWhetherTheIndexHoldsAnything(t *testing.T) {
 	}
 	if !has {
 		t.Fatal("an index holding one event reported that it is empty")
+	}
+}
+
+func TestUpdateMediaPathRepointsARow(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, ctx)
+	event := Event{Kind: KindScreen, CapturedAt: time.Now().UTC(), Text: "invoice total", MediaPath: "/media/frame.jpg"}
+	if err := s.Insert(ctx, &event); err != nil {
+		t.Fatal(err)
+	}
+
+	updated, err := s.UpdateMediaPath(ctx, event.ID, "/media/frame.jpg", "/media/frame.heic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated != 1 {
+		t.Fatalf("repointed %d rows, want 1", updated)
+	}
+	stored, err := s.EventByID(ctx, event.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.MediaPath != "/media/frame.heic" {
+		t.Errorf("media path is %q, want the new one", stored.MediaPath)
+	}
+}
+
+// The UPDATE fires events_au, which deletes and reinserts the row's whole FTS
+// entry naming text, app and window unconditionally — even though a media path
+// rewrite changes none of them. `lumi compress` accepts that churn; this is what
+// makes "it re-syncs to the same values" a checked claim rather than an assumed
+// one, because a search that stopped matching afterwards would be silent.
+func TestUpdateMediaPathLeavesTheRowSearchable(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, ctx)
+	event := Event{
+		Kind: KindScreen, CapturedAt: time.Now().UTC(),
+		Text: "quarterly revenue projection", App: "Numbers", Window: "Q3.numbers",
+		MediaPath: "/media/frame.jpg",
+	}
+	if err := s.Insert(ctx, &event); err != nil {
+		t.Fatal(err)
+	}
+	before, err := s.Search(ctx, SearchOptions{Query: "quarterly revenue"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(before) != 1 {
+		t.Fatalf("found %d events before repointing, want 1", len(before))
+	}
+
+	if _, err := s.UpdateMediaPath(ctx, event.ID, "/media/frame.jpg", "/media/frame.heic"); err != nil {
+		t.Fatal(err)
+	}
+
+	after, err := s.Search(ctx, SearchOptions{Query: "quarterly revenue"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != 1 {
+		t.Fatalf("found %d events after repointing, want 1 — the FTS re-sync lost the row", len(after))
+	}
+	if after[0].App != "Numbers" || after[0].Window != "Q3.numbers" {
+		t.Errorf("repointing changed app/window to %q/%q", after[0].App, after[0].Window)
+	}
+	if after[0].MediaPath != "/media/frame.heic" {
+		t.Errorf("search returned the old media path %q", after[0].MediaPath)
+	}
+}
+
+func TestUpdateMediaPathSkipsARowAnotherWriterMoved(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, ctx)
+	event := Event{Kind: KindScreen, CapturedAt: time.Now().UTC(), Text: "frame", MediaPath: "/media/frame.jpg"}
+	if err := s.Insert(ctx, &event); err != nil {
+		t.Fatal(err)
+	}
+	// Somebody else got there first.
+	if _, err := s.UpdateMediaPath(ctx, event.ID, "/media/frame.jpg", "/media/elsewhere.jpg"); err != nil {
+		t.Fatal(err)
+	}
+
+	updated, err := s.UpdateMediaPath(ctx, event.ID, "/media/frame.jpg", "/media/frame.heic")
+	if err != nil {
+		t.Fatalf("a lost compare-and-swap must not be an error: %v", err)
+	}
+	if updated != 0 {
+		t.Errorf("repointed %d rows, want 0", updated)
+	}
+	stored, err := s.EventByID(ctx, event.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.MediaPath != "/media/elsewhere.jpg" {
+		t.Errorf("the winner's path was clobbered; row now names %q", stored.MediaPath)
+	}
+}
+
+func TestUpdateMediaPathIgnoresAMissingRow(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, ctx)
+	updated, err := s.UpdateMediaPath(ctx, 4242, "/media/frame.jpg", "/media/frame.heic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated != 0 {
+		t.Errorf("repointed %d rows for an id that does not exist", updated)
+	}
+}
+
+func TestVacuumRebuildsAnIdleDatabase(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "lumi.db")
+	s, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	for i := 0; i < 200; i++ {
+		event := Event{
+			Kind: KindScreen, CapturedAt: time.Now().UTC().Add(time.Duration(i) * time.Second),
+			Text: strings.Repeat("indexed screen text ", 64), MediaPath: "/media/frame.jpg",
+		}
+		if err := s.Insert(ctx, &event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	all, err := s.AllEvents(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]int64, 0, len(all))
+	for _, event := range all[:150] {
+		ids = append(ids, event.ID)
+	}
+	if _, err := s.DeleteByIDs(ctx, ids); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.Vacuum(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Size() > before.Size() {
+		t.Errorf("vacuum grew the file from %d to %d bytes", before.Size(), after.Size())
+	}
+	// The rows that survived have to survive it.
+	remaining, err := s.AllEvents(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remaining) != 50 {
+		t.Errorf("%d events survived the vacuum, want 50", len(remaining))
+	}
+}
+
+// The ids `lumi compress` and `get_event` hold across a vacuum are safe only
+// because events.id is INTEGER PRIMARY KEY, which makes it an alias for the
+// rowid rather than a separate column. A table without that declaration would
+// have its rows renumbered here, invalidating every reference held outside it.
+//
+// Rows are deleted from the middle first, on purpose. Without gaps in the id
+// sequence a vacuum has nothing to renumber, so the test would pass just as
+// happily for a table that *is* renumbered — which is the whole thing it exists
+// to rule out.
+func TestVacuumPreservesEventIDs(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, ctx)
+	var ids []int64
+	for i := 0; i < 10; i++ {
+		event := Event{
+			Kind: KindScreen, CapturedAt: time.Now().UTC().Add(time.Duration(i) * time.Second),
+			Text: "frame", MediaPath: "/media/frame.jpg",
+		}
+		if err := s.Insert(ctx, &event); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, event.ID)
+	}
+	// Leave holes: drop four rows from the middle of the sequence.
+	if _, err := s.DeleteByIDs(ctx, []int64{ids[2], ids[3], ids[5], ids[6]}); err != nil {
+		t.Fatal(err)
+	}
+	survivors := []int64{ids[0], ids[1], ids[4], ids[7], ids[8], ids[9]}
+
+	if err := s.Vacuum(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, id := range survivors {
+		event, err := s.EventByID(ctx, id)
+		if err != nil {
+			t.Fatalf("event %d no longer resolves after a vacuum: %v", id, err)
+		}
+		if event.ID != id {
+			t.Errorf("event resolved to id %d, want %d", event.ID, id)
+		}
+	}
+	// And the gaps stay gaps rather than being filled by renumbered survivors.
+	for _, id := range []int64{ids[2], ids[3], ids[5], ids[6]} {
+		if _, err := s.EventByID(ctx, id); !errors.Is(err, ErrEventNotFound) {
+			t.Errorf("deleted id %d resolves after a vacuum, so rows were renumbered", id)
+		}
+	}
+}
+
+func TestVacuumBusyIsRecognisable(t *testing.T) {
+	// The classifier, not the lock: provoking a real SQLITE_BUSY needs a second
+	// process holding a write lock, and the property worth pinning is that a busy
+	// error is reported as ErrVacuumBusy rather than as a failed run.
+	if !errors.Is(fmt.Errorf("%w: x", ErrVacuumBusy), ErrVacuumBusy) {
+		t.Error("ErrVacuumBusy does not survive wrapping")
+	}
+	for _, tc := range []struct {
+		name string
+		code int
+		want bool
+	}{
+		{"SQLITE_BUSY", 5, true},
+		// Extended busy codes carry the primary code in their low byte;
+		// an equality test would miss every one of them.
+		{"SQLITE_BUSY_SNAPSHOT", 517, true},
+		{"SQLITE_BUSY_RECOVERY", 261, true},
+		// Contention inside this connection, not another process holding the file.
+		{"SQLITE_LOCKED", 6, false},
+		{"SQLITE_CORRUPT", 11, false},
+	} {
+		if got := tc.code&0xff == sqliteBusy; got != tc.want {
+			t.Errorf("%s (%d) classified as busy=%v, want %v", tc.name, tc.code, got, tc.want)
+		}
 	}
 }

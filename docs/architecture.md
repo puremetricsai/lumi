@@ -4,12 +4,15 @@
 ScreenCaptureKit displays ─→ Vision OCR (full screen) ─┐
                          └─→ Accessibility (attribution) ├─→ events + FTS5 ─→ search / mcp
 ScreenCaptureKit system + microphone ─→ WAV ─→ SpeechAnalyzer (in-process) ─┘
+
+(`lumi compress` later re-encodes the stored JPEGs as HEIC and the WAVs as lossless FLAC in place.)
 ```
 
 - `internal/macosnative`: cgo bridge to ScreenCaptureKit, Accessibility, Vision, and permission APIs
 - `internal/capture`: testable capture orchestration, perceptual deduplication, and transcription
 - `internal/store`: versioned SQLite migrations, FTS5 triggers, inserts, and filtered search
 - `internal/retention`: age-, size-, and wipe-based event/media pruning
+- `internal/compress`: re-encoding indexed media in place (HEIC, FLAC) and reclaiming database free pages
 - `internal/mcp`: the read-only MCP tool surface served over stdio
 - `internal/mcpsetup`: registering `lumi mcp` with installed MCP clients
 - `internal/selfexec`: replacing the running process when its binary is upgraded

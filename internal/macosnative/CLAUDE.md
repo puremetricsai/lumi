@@ -9,6 +9,27 @@ a session and stops, so `native-smoke` and the recorder share a single capture p
 Nothing links without `liblumispeech.a` — build with `task build`/`task test`, never raw `go build`/`go
 test`.
 
+## Media transcoding
+
+`TranscodeImageHEIC`, `EncodeAudioFLAC`, `DecodeMonoPCM16` and `InspectImage` back `lumi compress`. All are
+pure file-to-file work needing no TCC grant, so their tests are ordinary build-tagged tests rather than
+`LUMI_NATIVE_SMOKE` ones.
+
+- **The encoders verify by reopening what they wrote.** `CGImageDestinationFinalize` reporting success does
+  not establish that the bytes on disk decode to the right picture — a truncated write still finalises —
+  and compress deletes the source once these report success.
+- **`lumi_audio_decode_pcm16` returns a malloc'd buffer, not a C string**, the only entry point here that
+  does: a 30-second chunk is 480,000 samples. Go owns the pointer, validates the reported frame count and
+  sample rate *before* `C.GoBytes` (whose length is an `int`), and frees it. Anything else returning bulk
+  data should follow that shape rather than the `nativeString`/`nativeJSON` one.
+- **FLAC carries its source bit depth in the ASBD's `mFormatFlags`, and no `AVAudioFile` settings key
+  reaches it.** `AVFormatIDKey` alone yields a format reported as "UNKNOWN source bit depth" whose first
+  write fails, and `AVEncoderBitDepthHintKey` does not fill it in. There is no FLAC `AVFileType`, so
+  `AVAssetWriter` is not an alternative. The writer must also be released before the file is read or
+  stat'd — `AVAudioFile` finalises its header on deallocation, so anything earlier sees a 42-byte stub.
+- **Audio reads are bounded by the file's own `length`**, not run until a zero-length read, which
+  `AVAudioFile` does not reliably give for a compressed source.
+
 ## Attribution
 
 - **The frontmost pid resolves Accessibility → window list → `NSWorkspace`, and `NSWorkspace` coming last is

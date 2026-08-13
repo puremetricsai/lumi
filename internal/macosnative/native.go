@@ -33,14 +33,23 @@ char *lumi_transcribe_audio_string(const char *audio_path, const char *locale, d
 char *lumi_transcribe_audio_segments_json(const char *audio_path, const char *locale, double timeout_seconds, char **error_message);
 char *lumi_speech_ensure_assets(const char *locale, double timeout_seconds, char **error_message);
 int lumi_speech_assets_installed(const char *locale);
+char *lumi_image_inspect_json(const char *image_path, char **error_message);
+char *lumi_image_transcode_heic_json(const char *source_path, const char *destination_path,
+                                     double quality, char **error_message);
+char *lumi_audio_encode_flac_json(const char *source_path, const char *destination_path,
+                                  char **error_message);
+uint8_t *lumi_audio_decode_pcm16(const char *path, int64_t *frames, int32_t *sample_rate,
+                                 char **error_message);
 */
 import "C"
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 	"unsafe"
@@ -700,6 +709,152 @@ func SpeechAssetsInstalled(ctx context.Context, locale string) (bool, error) {
 	default:
 		return false, errors.New("inspect SpeechAnalyzer assets: timed out")
 	}
+}
+
+// ImageVerification is what a written image decodes back to, measured against
+// the source that produced it.
+//
+// Every field is read from the file on disk rather than from the encoder's
+// in-memory result, because a truncated write still finalises successfully.
+// Callers compare Width/Height against Source* to catch that, and use PSNRDB and
+// HistogramSimilarity to catch an encode that produced the wrong picture at the
+// right size. The two are independent on purpose: a colour-space or channel-order
+// mistake can pass one and fail the other.
+type ImageVerification struct {
+	Width       int `json:"width"`
+	Height      int `json:"height"`
+	SourceWidth int `json:"source_width"`
+	// SourceHeight, with SourceWidth, is the size of the image handed to the
+	// encoder. InspectImage reports it equal to Width/Height, since it has no
+	// second image to compare against.
+	SourceHeight        int     `json:"source_height"`
+	PSNRDB              float64 `json:"psnr_db"`
+	HistogramSimilarity float64 `json:"histogram_similarity"`
+	Bytes               int64   `json:"bytes"`
+}
+
+// TranscodeImageHEIC re-encodes an image as HEIC at the given quality (0..1) and
+// reports what the written file decodes back to. It does not delete the source.
+func TranscodeImageHEIC(ctx context.Context, sourcePath, destinationPath string, quality float64) (ImageVerification, error) {
+	if err := ctx.Err(); err != nil {
+		return ImageVerification{}, err
+	}
+	sourceC := C.CString(sourcePath)
+	defer C.free(unsafe.Pointer(sourceC))
+	destinationC := C.CString(destinationPath)
+	defer C.free(unsafe.Pointer(destinationC))
+	var nativeErr *C.char
+	raw, err := nativeJSON(
+		C.lumi_image_transcode_heic_json(sourceC, destinationC, C.double(quality), &nativeErr), nativeErr)
+	if err != nil {
+		return ImageVerification{}, fmt.Errorf("transcode %s to HEIC: %w", sourcePath, err)
+	}
+	var verification ImageVerification
+	if err := json.Unmarshal(raw, &verification); err != nil {
+		return ImageVerification{}, fmt.Errorf("decode HEIC verification: %w", err)
+	}
+	return verification, nil
+}
+
+// InspectImage reports what an existing image decodes to without re-encoding it.
+// It fills SourceWidth/SourceHeight from the same image and reports a perfect
+// PSNR and histogram, so a caller holding no original can apply one set of
+// checks to both cases.
+func InspectImage(ctx context.Context, path string) (ImageVerification, error) {
+	if err := ctx.Err(); err != nil {
+		return ImageVerification{}, err
+	}
+	pathC := C.CString(path)
+	defer C.free(unsafe.Pointer(pathC))
+	var nativeErr *C.char
+	raw, err := nativeJSON(C.lumi_image_inspect_json(pathC, &nativeErr), nativeErr)
+	if err != nil {
+		return ImageVerification{}, fmt.Errorf("inspect image %s: %w", path, err)
+	}
+	var verification ImageVerification
+	if err := json.Unmarshal(raw, &verification); err != nil {
+		return ImageVerification{}, fmt.Errorf("decode image inspection: %w", err)
+	}
+	return verification, nil
+}
+
+// AudioEncoding describes a file an encoder wrote.
+type AudioEncoding struct {
+	Bytes      int64 `json:"bytes"`
+	Frames     int64 `json:"frames"`
+	SampleRate int   `json:"sample_rate"`
+}
+
+// EncodeAudioFLAC re-encodes an audio file as lossless FLAC. It does not delete
+// the source, and it does not verify the result: FLAC being lossless, the
+// caller's comparison of decoded samples is exact and is the stronger check.
+func EncodeAudioFLAC(ctx context.Context, sourcePath, destinationPath string) (AudioEncoding, error) {
+	if err := ctx.Err(); err != nil {
+		return AudioEncoding{}, err
+	}
+	sourceC := C.CString(sourcePath)
+	defer C.free(unsafe.Pointer(sourceC))
+	destinationC := C.CString(destinationPath)
+	defer C.free(unsafe.Pointer(destinationC))
+	var nativeErr *C.char
+	raw, err := nativeJSON(C.lumi_audio_encode_flac_json(sourceC, destinationC, &nativeErr), nativeErr)
+	if err != nil {
+		return AudioEncoding{}, fmt.Errorf("encode %s as FLAC: %w", sourcePath, err)
+	}
+	var encoding AudioEncoding
+	if err := json.Unmarshal(raw, &encoding); err != nil {
+		return AudioEncoding{}, fmt.Errorf("decode FLAC encoding report: %w", err)
+	}
+	return encoding, nil
+}
+
+// DecodeMonoPCM16 decodes any file AVFoundation can open into mono 16-bit
+// samples at the file's own sample rate.
+//
+// It exists because internal/wav reads mono 16-bit PCM RIFF and nothing else, by
+// design — it is pure Go so it builds and tests anywhere. Once `lumi compress`
+// stores a chunk as FLAC, something still has to measure that chunk's energy;
+// this is the half that has to know about containers, and internal/wav keeps the
+// half that measures samples.
+func DecodeMonoPCM16(ctx context.Context, path string) ([]int16, int, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
+	pathC := C.CString(path)
+	defer C.free(unsafe.Pointer(pathC))
+	var frames C.int64_t
+	var sampleRate C.int32_t
+	var nativeErr *C.char
+	buffer := C.lumi_audio_decode_pcm16(pathC, &frames, &sampleRate, &nativeErr)
+	if buffer == nil {
+		if err := nativeError(nativeErr); err != nil {
+			return nil, 0, fmt.Errorf("decode %s: %w", path, err)
+		}
+		return nil, 0, fmt.Errorf("decode %s: native audio decode failed", path)
+	}
+	defer C.free(unsafe.Pointer(buffer))
+	if nativeErr != nil {
+		C.free(unsafe.Pointer(nativeErr))
+	}
+	// The bridge owns none of these numbers once it has returned, so they are
+	// checked here rather than trusted: C.GoBytes takes an int length, and a
+	// negative or overlarge count would read outside the buffer.
+	// Bounds are checked before the multiplication, not after: frames is int64
+	// and C.GoBytes takes an int length, so a count above MaxInt32/2 would wrap
+	// negative and slip past a check made on the product.
+	if frames < 0 || sampleRate <= 0 {
+		return nil, 0, fmt.Errorf("decode %s: native decoder reported %d frames at %d Hz", path, int64(frames), int32(sampleRate))
+	}
+	if int64(frames) > int64(math.MaxInt32)/2 {
+		return nil, 0, fmt.Errorf("decode %s: %d frames is too many to copy", path, int64(frames))
+	}
+	byteCount := int64(frames) * 2
+	raw := C.GoBytes(unsafe.Pointer(buffer), C.int(byteCount))
+	samples := make([]int16, frames)
+	for i := range samples {
+		samples[i] = int16(binary.LittleEndian.Uint16(raw[i*2:]))
+	}
+	return samples, int(sampleRate), nil
 }
 
 func nativeJSON(value, errorMessage *C.char) ([]byte, error) {

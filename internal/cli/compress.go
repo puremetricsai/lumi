@@ -1,0 +1,316 @@
+package cli
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
+
+	"github.com/spf13/cobra"
+
+	"github.com/puremetricsai/lumi/internal/compress"
+	"github.com/puremetricsai/lumi/internal/config"
+)
+
+// runCompress is a test seam for command-level cancellation after partial work.
+var runCompress = compress.Compress
+
+func (a *app) compressCommand() *cobra.Command {
+	var (
+		olderThan      string
+		screens, audio string
+		quality        float64
+		minPSNR        float64
+		vacuum         bool
+		whileRecording bool
+		dryRun, asJSON bool
+	)
+	cmd := &cobra.Command{
+		Use:   "compress",
+		Short: "Re-encode indexed media in place and reclaim database space",
+		Long: "Re-encode the screenshots and audio already on disk into smaller files, leaving every\n" +
+			"event exactly where it is. Screenshots become HEIC and audio becomes lossless FLAC,\n" +
+			"then the database is rebuilt to return the free pages a prune left behind.\n\n" +
+			"Compress and prune are complementary: prune decides what history to keep, compress\n" +
+			"decides how densely to keep it. Nothing here deletes an event.\n\n" +
+			"--older-than takes a Go duration (48h) or an RFC3339 timestamp; Go durations have no\n" +
+			"'d' unit. It defaults to 48h because recompressing what was captured a moment ago\n" +
+			"competes with the recorder for files it is still writing.\n\n" +
+			"Audio is lossless, so its samples are recoverable bit for bit. HEIC is not: it is a\n" +
+			"second lossy generation on top of the capture JPEG and cannot be undone. Use\n" +
+			"--screens none to decline it; docs/compress.md records the decision in full.\n\n" +
+			"A dry run reports what would be compressed but cannot report a ratio, because\n" +
+			"measuring one means doing the encode.",
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			screenCodec, err := parseScreenCodec(screens)
+			if err != nil {
+				return err
+			}
+			audioCodec, err := parseAudioCodec(audio)
+			if err != nil {
+				return err
+			}
+			// Options treats a zero quality as "unset", so an explicit zero would
+			// silently become the default rather than the minimum the user asked
+			// for. Reject it instead of quietly disagreeing with them.
+			if cmd.Flags().Changed("quality") && quality == 0 {
+				return errors.New("--quality 0 is not meaningful; pass a small positive value such as 0.1")
+			}
+			// Same shape, and the same reason: a zero floor reads as "accept
+			// anything", but Options would treat it as unset and enforce 30 dB.
+			// Turning a gate the user asked to open back on, silently, is worse
+			// than refusing.
+			if cmd.Flags().Changed("min-psnr") && minPSNR == 0 {
+				return errors.New("--min-psnr 0 would be read as unset and enforced at the default; " +
+					"pass a small positive value such as 0.1 to accept almost anything")
+			}
+			before, err := parseTime(olderThan, true)
+			if err != nil {
+				return fmt.Errorf("parse --older-than: %w", err)
+			}
+
+			paths, err := a.paths()
+			if err != nil {
+				return err
+			}
+			// A dry run writes nothing, so neither guard applies to it.
+			if !dryRun {
+				if !whileRecording {
+					if err := refuseCompressWhileRecording(paths); err != nil {
+						return err
+					}
+				}
+				release, err := lockCompress(paths)
+				if err != nil {
+					return err
+				}
+				defer release()
+			}
+
+			s, paths, err := a.openStore(cmd.Context())
+			if err != nil {
+				return err
+			}
+			defer s.Close()
+
+			result, err := runCompress(cmd.Context(), s, compress.Options{
+				Before:       before,
+				Screens:      screenCodec,
+				Audio:        audioCodec,
+				Quality:      quality,
+				MinPSNRDB:    minPSNR,
+				Images:       compress.NativeImages{},
+				Sounds:       compress.NativeAudio{},
+				MediaDirs:    []string{paths.Screenshots, paths.Audio},
+				Vacuum:       vacuum,
+				DatabasePath: paths.Database,
+				DryRun:       dryRun,
+				Logger:       slog.New(slog.NewTextHandler(cmd.ErrOrStderr(), nil)),
+			})
+			return finishCompress(os.Stdout, result, dryRun, asJSON, err)
+		},
+	}
+	flags := cmd.Flags()
+	flags.StringVar(&olderThan, "older-than", "48h",
+		"only compress events older than this duration (e.g. 48h) or RFC3339 time")
+	flags.StringVar(&screens, "screens", string(compress.CodecHEIC), "screenshot codec: heic or none")
+	flags.StringVar(&audio, "audio", string(compress.CodecFLAC), "audio codec: flac or none")
+	flags.Float64Var(&quality, "quality", compress.DefaultQuality, "HEIC quality between 0 and 1")
+	flags.Float64Var(&minPSNR, "min-psnr", compress.DefaultMinPSNRDB,
+		"reject a re-encoded image below this PSNR in dB and keep the original")
+	flags.BoolVar(&vacuum, "vacuum", true, "rebuild the database afterwards to reclaim free pages")
+	flags.BoolVar(&whileRecording, "while-recording", false, "run even though the recorder is active")
+	flags.BoolVar(&dryRun, "dry-run", false, "report what would be compressed without compressing")
+	flags.BoolVar(&asJSON, "json", false, "emit JSON")
+	return cmd
+}
+
+// parseScreenCodec rejects hevc by name rather than as an unknown value.
+//
+// The inter-frame video path is the obvious next thing to reach for — it is
+// worth another 2.7x — and it is deliberately absent: it needs a schema
+// migration, a frame-retrieval API, and reference-counted movie lifetimes,
+// because one file would then hold many events. "Invalid value" would read as a
+// typo and send someone looking for the right spelling.
+func parseScreenCodec(value string) (compress.Codec, error) {
+	switch compress.Codec(value) {
+	case compress.CodecHEIC, compress.CodecNone:
+		return compress.Codec(value), nil
+	case "hevc":
+		return "", errors.New("--screens hevc is not available yet: encoding runs of frames into one " +
+			"movie means many events sharing a file, which needs a schema change and a way to fetch " +
+			"a single frame back. Use --screens heic")
+	default:
+		return "", fmt.Errorf("--screens must be heic or none, not %q", value)
+	}
+}
+
+func parseAudioCodec(value string) (compress.Codec, error) {
+	switch compress.Codec(value) {
+	case compress.CodecFLAC, compress.CodecNone:
+		return compress.Codec(value), nil
+	default:
+		return "", fmt.Errorf("--audio must be flac or none, not %q", value)
+	}
+}
+
+// refuseCompressWhileRecording keeps compress off an index a recorder is
+// actively writing.
+//
+// Unlike the backfill's gate, which fires only for --retranscribe because its
+// hazard is compute, this one is unconditional: compress rewrites media_path
+// under a live writer that resolves a path and then opens the file, and its
+// VACUUM wants an exclusive lock. Neither is a correctness hazard any more —
+// reconcile is sibling-scoped and the row update is a compare-and-swap — so this
+// is contention avoidance, which is why --while-recording may override it.
+func refuseCompressWhileRecording(paths config.Paths) error {
+	state, ok, err := readRecordState(paths)
+	if err != nil || !ok || !processAlive(state.PID) {
+		return nil
+	}
+	return fmt.Errorf("recording is in progress (pid %d) and compress rewrites the media paths it is "+
+		"writing; stop it with `lumi record stop`, or pass --while-recording to override", state.PID)
+}
+
+// compressLockName is the file that makes compress single-instance. It lives
+// beside the recorder's state file for the same reason: any terminal can find it.
+const compressLockName = "compress.lock"
+
+// errHeld reports that another process already holds the compress lock.
+var errHeld = errors.New("the compress lock is held")
+
+// lockCompress refuses to start while another compress run holds the lock.
+//
+// This is not politeness about contention, it is what makes the crash-safety
+// story true. Destination paths are deterministic, so two runs collide on the
+// same file: the first can commit its row and delete the original while the
+// second, having lost the compare-and-swap, unlinks the destination — which is
+// by then the file the first run's row names. That leaves a row pointing at
+// nothing with no original left, the one state the whole ordering exists to
+// prevent.
+func lockCompress(paths config.Paths) (func(), error) {
+	if err := os.MkdirAll(paths.Root, 0o700); err != nil {
+		return nil, err
+	}
+	release, err := lockFile(filepath.Join(paths.Root, compressLockName))
+	if errors.Is(err, errHeld) {
+		return nil, errors.New("compression is already in progress; two runs would race for the same files")
+	}
+	return release, err
+}
+
+// finishCompress emits the result before returning a run error. Compression is
+// committed one file at a time, so cancellation or a later store failure can
+// accompany useful partial counters; JSON callers need those counters just as
+// much as human-readable callers do.
+func finishCompress(out io.Writer, result compress.Result, dryRun, asJSON bool, runErr error) error {
+	if asJSON {
+		encoder := json.NewEncoder(out)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(result); err != nil {
+			// Joined rather than returned alone: this function exists so a
+			// cancelled or partly failed run still reports what it committed,
+			// and dropping runErr here would lose the very thing it guarantees.
+			return errors.Join(runErr, err)
+		}
+	} else {
+		printCompressResult(out, result, dryRun)
+	}
+	return runErr
+}
+
+func printCompressResult(out io.Writer, result compress.Result, dryRun bool) {
+	verb := "compressed"
+	if dryRun {
+		verb = "would compress"
+	}
+	printPass(out, verb, "screenshots", result.Screens, dryRun)
+	printPass(out, verb, "audio files", result.Audio, dryRun)
+
+	if result.Reconciled.Removed > 0 {
+		fmt.Fprintf(out, "cleaned up %d leftover files from an interrupted run, %s\n",
+			result.Reconciled.Removed, mib(result.Reconciled.Bytes))
+	}
+	if result.Reconciled.Recovered > 0 {
+		// Worth its own line: it means an earlier run did not finish, and that the
+		// media it had already compressed was about to be orphaned.
+		fmt.Fprintf(out, "recovered %d events whose media an interrupted run had left unreferenced\n",
+			result.Reconciled.Recovered)
+	}
+
+	switch result.Vacuum.Status {
+	case "done":
+		fmt.Fprintf(out, "vacuum: %s → %s\n", mib(result.Vacuum.BytesBefore), mib(result.Vacuum.BytesAfter))
+	case "busy":
+		fmt.Fprintf(out, "vacuum: skipped, %s\n", result.Vacuum.Detail)
+	case "skipped":
+		if !dryRun {
+			fmt.Fprintf(out, "vacuum: skipped, %s\n", result.Vacuum.Detail)
+		}
+	}
+}
+
+func printPass(out io.Writer, verb, noun string, pass compress.PassResult, dryRun bool) {
+	if pass.Files > 0 {
+		if dryRun {
+			// No ratio: producing one means running the encoder.
+			fmt.Fprintf(out, "%s %d %s, %s\n", verb, pass.Files, noun, mib(pass.BytesBefore))
+		} else {
+			fmt.Fprintf(out, "%s %d %s, %s → %s (%s)\n", verb, pass.Files, noun,
+				mib(pass.BytesBefore), mib(pass.BytesAfter), ratio(pass.BytesBefore, pass.BytesAfter))
+		}
+	}
+	if pass.AlreadyDone > 0 {
+		fmt.Fprintf(out, "%d %s were already compressed\n", pass.AlreadyDone, noun)
+	}
+	if pass.MissingFiles > 0 {
+		fmt.Fprintf(out, "%d %s referenced media that was already gone\n", pass.MissingFiles, noun)
+	}
+	if pass.Skipped > 0 {
+		fmt.Fprintf(out, "%d %s are in a format this build does not compress\n", pass.Skipped, noun)
+	}
+	// Not a failure of this run: it means two rows name media that would collide,
+	// which is an inconsistency in the index. Said out loud because otherwise a
+	// run in which *every* row conflicts prints nothing at all and reads as a run
+	// with nothing to do — the counters promise that a run which compressed
+	// nothing still says why, and the warnings behind these go to stderr.
+	if pass.Conflicted > 0 {
+		// "Collide with" rather than "share media with": one of the three axes is
+		// rows that share a *destination*, whose media is distinct today.
+		fmt.Fprintf(out, "%d %s would collide with another event's media and were left alone\n",
+			pass.Conflicted, noun)
+	}
+	// The failure counters print only when they fire. VerifyFailed is the one
+	// that matters: it means an encoder produced something wrong while reporting
+	// success, and the originals were kept because of it.
+	if pass.VerifyFailed > 0 {
+		fmt.Fprintf(out, "%d %s failed verification and were left untouched; "+
+			"their originals are intact\n", pass.VerifyFailed, noun)
+	}
+	if pass.EncodeFailed > 0 {
+		fmt.Fprintf(out, "%d %s could not be encoded and were left untouched\n", pass.EncodeFailed, noun)
+	}
+	if pass.FlushFailed > 0 {
+		fmt.Fprintf(out, "%d %s encoded but could not be flushed to disk and were left untouched\n",
+			pass.FlushFailed, noun)
+	}
+	if pass.Raced > 0 {
+		fmt.Fprintf(out, "%d %s were changed by something else mid-run and were skipped\n", pass.Raced, noun)
+	}
+}
+
+func mib(bytes int64) string {
+	return fmt.Sprintf("%.1f MiB", float64(bytes)/(1024*1024))
+}
+
+func ratio(before, after int64) string {
+	if after <= 0 {
+		return "—"
+	}
+	return fmt.Sprintf("%.1fx", float64(before)/float64(after))
+}

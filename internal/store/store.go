@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
 )
 
 type Kind string
@@ -435,4 +435,68 @@ func (s *Store) DeleteByIDs(ctx context.Context, ids []int64) (int64, error) {
 		total += deleted
 	}
 	return total, nil
+}
+
+// UpdateMediaPath repoints one event at a file that has replaced its media,
+// but only while the row still names the file the caller worked from.
+//
+// The predicate is a compare-and-swap, not defensiveness. Every reader of
+// media_path resolves the path and *then* opens the file — retention and the
+// backfill both do — so a writer that moved a row in between would be silently
+// clobbered by an unconditional UPDATE. A zero return means someone got there
+// first and is not an error; `internal/compress` treats it as "skip this row"
+// and deletes the file it had written.
+//
+// This is the only statement in this package that rewrites an existing row, and
+// it fires the events_au trigger, which deletes and reinserts the row's whole
+// FTS entry even though text, app and window did not change. That churn is an
+// accepted cost here rather than an unnoticed one — it re-syncs to the same
+// values, and it is one of the two reasons `lumi compress` runs VACUUM last.
+func (s *Store) UpdateMediaPath(ctx context.Context, id int64, from, to string) (int64, error) {
+	result, err := s.db.ExecContext(ctx,
+		`UPDATE events SET media_path = ? WHERE id = ? AND media_path = ?`, to, id, from)
+	if err != nil {
+		return 0, fmt.Errorf("repoint event %d at %s: %w", id, to, err)
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("count repointed events: %w", err)
+	}
+	return updated, nil
+}
+
+// ErrVacuumBusy reports that VACUUM could not take the exclusive lock it needs.
+//
+// It is a skipped step rather than a failed run: whatever ran before it has
+// already committed, and reclaiming free pages is maintenance that the next
+// invocation can do just as well.
+var ErrVacuumBusy = errors.New("vacuum could not acquire an exclusive lock")
+
+// sqliteBusy is SQLITE_BUSY. Only the primary result code is compared, because
+// SQLite reports extended codes in the high bits (SQLITE_BUSY_SNAPSHOT is 261)
+// that an equality test would miss.
+//
+// SQLITE_LOCKED (6) is deliberately not treated as busy: it reports contention
+// within this connection or cache rather than another process holding the file,
+// so reporting it as "the database is in use" would name the wrong cause.
+const sqliteBusy = 5
+
+// Vacuum rebuilds the database file, returning free pages to the filesystem.
+//
+// SQLite never releases them on its own, and auto_vacuum cannot be enabled on an
+// existing database without a full rebuild anyway, so this is the only way an
+// index that has been pruned gets smaller. It needs up to twice the file size in
+// scratch space, cannot run inside a transaction, and needs an exclusive lock —
+// all of which are the caller's to surface rather than this function's to
+// prevent. Open already sets busy_timeout, so a contended vacuum waits before
+// reporting ErrVacuumBusy.
+func (s *Store) Vacuum(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, "VACUUM"); err != nil {
+		var sqliteErr *sqlite.Error
+		if errors.As(err, &sqliteErr) && sqliteErr.Code()&0xff == sqliteBusy {
+			return fmt.Errorf("%w: %v", ErrVacuumBusy, err)
+		}
+		return fmt.Errorf("vacuum: %w", err)
+	}
+	return nil
 }

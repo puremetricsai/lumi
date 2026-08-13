@@ -1,7 +1,7 @@
 # internal/cli
 
-Cobra commands (`record start`/`status`/`stop`, `search`, `mcp`, `prune`, `doctor`, `permissions`,
-`native-smoke`, `transcribe`, `transcript`, `version`). This package wires concrete processors into a
+Cobra commands (`record start`/`status`/`stop`, `search`, `mcp`, `prune`, `compress`, `doctor`,
+`permissions`, `native-smoke`, `transcribe`, `transcript`, `version`). This package wires concrete processors into a
 `capture.Recorder`; data flows one way from here and never back. `record start` detaches to the background
 by default (`--foreground` keeps it inline) as a re-exec tracked by a JSON state file and log under the data
 dir (`record_daemon.go`); `record stop` sends SIGTERM and waits for graceful shutdown. `search` offers exact
@@ -36,6 +36,29 @@ developer's own Claude config.
 - **`prune --all` is irreversible and requires an interactive `yes`** (`confirmPruneAll`); only `--yes` or
   `--dry-run` may skip it. Keep dry-run accounting equivalent to a real age-then-size run. The deletion
   ordering and orphan rules are `internal/retention/CLAUDE.md`.
+- **`lumi compress` is single-instance, and the lock is a correctness requirement rather than politeness.**
+  Destination paths are deterministic, so two runs collide on one file: the first commits its row and
+  deletes the original while the second, having lost the compare-and-swap, unlinks the destination — which
+  is by then the file the first run's row names. That is the one unrecoverable state
+  `internal/compress`'s ordering exists to prevent, and its crash-safety claim is only true with this lock
+  in place. It is `flock`, behind the `unix`/`!unix` pair in `compress_lock_{unix,other}.go`, and the
+  non-Unix stub fails closed. A pid file cannot do this job: it must be created and then written, so a
+  contender reading it in between sees a file it cannot attribute to anybody, concludes the lock is stale,
+  and takes a second one — and the stale-takeover path needed to recover from a killed run is itself a
+  check-then-remove race. flock has no stale state to reason about, because the kernel drops the lock when
+  the holder dies however abruptly: a lock that exists is held by a process that exists.
+  **The lock file is deliberately never unlinked**, and that is not tidiness left undone. The lock is the
+  inode, not the name; unlinking on release frees the name and the inode's lock separately, so a contender
+  holding an already-opened fd acquires the old inode while a third process creates a fresh one at the same
+  path — two holders, the state this lock exists to make impossible. A leftover file carries no lock and
+  excludes nobody (`TestCompressIgnoresALockFileNobodyHolds`), so the pid inside it is expected to be stale.
+- **`compress`'s recorder gate is unconditional, unlike the backfill's.** The backfill gates only
+  `--retranscribe` because its hazard is compute. Compress rewrites `media_path` under a live writer that
+  resolves a path and then opens the file. It is contention rather than correctness — reconcile is
+  sibling-scoped and the update is a CAS — which is what makes `--while-recording` defensible. A dry run
+  writes nothing, so neither guard applies to it. `--older-than` defaults to `48h` rather than empty, and
+  `--screens hevc` is rejected *by name* with an explanation instead of as an unknown value, so it does not
+  read as a typo. Everything about ordering and deletion is `internal/compress/CLAUDE.md`.
 - **`transcript`/`get_transcript` must offer `ResumeFrom`, never `CoveredUntil`** — the two have opposite
   inclusivity (`internal/store/CLAUDE.md`). **Both print local**, like every other time this package renders:
   `ResumeFrom` was UTC while the `CoveredUntil` in the sentence above it was local, so one paragraph named

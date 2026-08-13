@@ -14,7 +14,6 @@ import (
 	"github.com/puremetricsai/lumi/internal/macosnative"
 	"github.com/puremetricsai/lumi/internal/store"
 	"github.com/puremetricsai/lumi/internal/transcript"
-	"github.com/puremetricsai/lumi/internal/wav"
 )
 
 // retranscribeChunk is a package var purely as a test seam. Without it every
@@ -52,9 +51,9 @@ func (a *app) transcriptBackfillCommand() *cobra.Command {
 		Long: "Derive origin labels for audio chunks that have none, so `lumi transcript`\n" +
 			"and the get_transcript MCP tool can read them.\n\n" +
 			"By default this works from the transcripts already in the index and touches\n" +
-			"no audio files, which is fast and works even after the WAVs have been pruned.\n" +
+			"no audio files, which is fast and works even after the audio has been pruned.\n" +
 			"--retranscribe re-runs speech recognition to recover word-level timings,\n" +
-			"which is far slower and needs the WAVs to still exist.\n\n" +
+			"which is far slower and needs the audio files to still exist.\n\n" +
 			"Work is picked up from whatever is unattributed, so an interrupted run simply\n" +
 			"resumes: nothing is written twice and nothing is lost.",
 		Args:         cobra.NoArgs,
@@ -101,7 +100,7 @@ func (a *app) transcriptBackfillCommand() *cobra.Command {
 	flags.BoolVar(&dryRun, "dry-run", false, "report what would change without writing anything")
 	flags.BoolVar(&explain, "explain", false, "print the evidence behind each chunk's verdict")
 	flags.BoolVar(&retranscribe, "retranscribe", false,
-		"re-run speech recognition to recover word timings; much slower and needs the WAV files")
+		"re-run speech recognition to recover word timings; much slower and needs the audio files")
 	flags.BoolVar(&whileRecording, "while-recording", false,
 		"run even though the recorder is active")
 	flags.DurationVar(&pace, "pace", 0, "wait this long between chunks to leave headroom for the recorder")
@@ -265,7 +264,7 @@ func reportUntranscribed(out io.Writer, count int) {
 		return
 	}
 	fmt.Fprintf(out, "%d could not be transcribed, so they stay unattributed; "+
-		"their audio is still on disk and `lumi transcribe <file.wav>` can read it\n", count)
+		"their audio is still on disk and `lumi transcribe <file>` can read it\n", count)
 }
 
 // anySpeech reports whether a chunk's derived rows carry any words, which is
@@ -330,14 +329,14 @@ func attributeStoredChunk(ctx context.Context, s *store.Store, key string, opts 
 	method := "text"
 	if opts.Retranscribe {
 		if err := loadTimings(ctx, &chunk, paths, opts); err != nil {
-			// A missing or unreadable WAV is expected on an aged-out history, and
+			// A missing or unreadable audio file is expected on an aged-out history, and
 			// the text path still works, so this degrades rather than failing.
 			method = fmt.Sprintf("text (no timings: %v)", err)
 		} else {
 			method = "timed"
 		}
 	}
-	measureBackfillEnergy(&chunk, paths[transcript.TrackSystem])
+	measureBackfillEnergy(ctx, &chunk, paths[transcript.TrackSystem])
 
 	attributed := transcript.Attribute(chunk, transcript.Options{})
 	// Deferred rather than computed: --explain is off by default, and composing
@@ -419,11 +418,15 @@ func loadTimings(ctx context.Context, chunk *transcript.Chunk, paths map[string]
 // where the recorder did not would reach a different verdict for the same audio —
 // while reading a 960 KB WAV for every chunk of an afternoon's silence, the
 // common case by a wide margin.
-func measureBackfillEnergy(chunk *transcript.Chunk, systemPath string) {
+//
+// Which reader opens the file is capture.ReadAudioEnvelope's, for that same
+// reason: a chunk `lumi compress` has stored as FLAC has to measure the same as
+// one still stored as a WAV.
+func measureBackfillEnergy(ctx context.Context, chunk *transcript.Chunk, systemPath string) {
 	if systemPath == "" || !transcript.NeedsInternalEnergy(*chunk) {
 		return
 	}
-	envelope, _, err := wav.ReadEnvelope(systemPath, transcript.EnvelopeWindowMS)
+	envelope, _, err := capture.ReadAudioEnvelope(ctx, systemPath, transcript.EnvelopeWindowMS)
 	if err != nil {
 		return
 	}

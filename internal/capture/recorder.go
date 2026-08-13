@@ -14,7 +14,6 @@ import (
 	"github.com/puremetricsai/lumi/internal/config"
 	"github.com/puremetricsai/lumi/internal/store"
 	"github.com/puremetricsai/lumi/internal/transcript"
-	"github.com/puremetricsai/lumi/internal/wav"
 )
 
 // SegmentWriter stores one chunk's attributed segments. *store.Store satisfies
@@ -629,7 +628,7 @@ func (r *Recorder) attributeChunk(ctx context.Context, capturedAt time.Time, res
 			chunk.Microphone = buildTrack(result)
 		}
 	}
-	r.measureInternalEnergy(&chunk, systemPath)
+	r.measureInternalEnergy(ctx, &chunk, systemPath)
 
 	segments := transcript.Attribute(chunk, transcript.Options{})
 	if len(segments) == 0 {
@@ -698,15 +697,16 @@ func buildTrack(result audioChunkResult) *transcript.Track {
 	}
 }
 
-// measureInternalEnergy reads the system track's WAV when the verdict could turn
-// on whether it was silent or merely untranscribable, which is what
+// measureInternalEnergy reads the system track when the verdict could turn on
+// whether it was silent or merely untranscribable, which is what
 // transcript.NeedsInternalEnergy decides — the rule lives there so this and the
-// backfill skip exactly the same chunks.
-func (r *Recorder) measureInternalEnergy(chunk *transcript.Chunk, systemPath string) {
+// backfill skip exactly the same chunks. Which reader opens the file is
+// ReadAudioEnvelope's, for the same reason.
+func (r *Recorder) measureInternalEnergy(ctx context.Context, chunk *transcript.Chunk, systemPath string) {
 	if systemPath == "" || !transcript.NeedsInternalEnergy(*chunk) {
 		return
 	}
-	envelope, _, err := wav.ReadEnvelope(systemPath, transcript.EnvelopeWindowMS)
+	envelope, _, err := ReadAudioEnvelope(ctx, systemPath, transcript.EnvelopeWindowMS)
 	if err != nil {
 		// Without the measurement the microphone stays confidently external,
 		// which is the pre-existing behaviour rather than a new risk.

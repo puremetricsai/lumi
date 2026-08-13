@@ -10,3 +10,7 @@ opposite conclusions.
 - **Energy is measured as an envelope, never a whole-file RMS**, and it answers presence rather than
   loudness. The rule and the measurements behind it are `internal/transcript/CLAUDE.md`
   (`EnvelopeWindowMS`, `NeedsInternalEnergy`); this package only supplies the samples.
+- **This package reads Lumi's *WAVs*; anything else goes through `capture.ReadAudioEnvelope`**, which
+  decodes natively and hands the samples back to `Envelope` here. Keeping cgo out is the point: a package
+  that builds and tests anywhere must not gain a dependency on a Mac because `lumi compress` learned to
+  store FLAC.
