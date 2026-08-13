@@ -191,11 +191,14 @@ func TestReconcileDoesNotDeleteWhatThePassesJustWrote(t *testing.T) {
 	}
 }
 
-func TestReconcileToleratesAMissingMediaDirectory(t *testing.T) {
+func TestCompressRejectsAMissingMediaDirectory(t *testing.T) {
 	h := newHarness(t)
 	opts := h.options()
 	opts.MediaDirs = []string{filepath.Join(h.dir, "does-not-exist")}
-	if _, err := Compress(context.Background(), h.store, opts); err != nil {
-		t.Fatalf("a missing media directory failed the run: %v", err)
+	if _, err := Compress(context.Background(), h.store, opts); err == nil {
+		t.Fatal("destructive compression accepted a missing media directory")
+	}
+	if h.images.calls != 0 {
+		t.Error("the unusable media directory was rejected only after encoding began")
 	}
 }

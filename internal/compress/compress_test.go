@@ -437,6 +437,28 @@ func TestCompressRequiresACutoff(t *testing.T) {
 	}
 }
 
+func TestCompressRequiresUsableMediaDirectoriesBeforeDestructiveWork(t *testing.T) {
+	for _, mediaDirs := range [][]string{nil, {"", ""}} {
+		t.Run(fmt.Sprintf("%q", mediaDirs), func(t *testing.T) {
+			h := newHarness(t)
+			event := h.seed(store.KindScreen, "frame.jpg", time.Hour)
+			opts := h.options()
+			opts.MediaDirs = mediaDirs
+
+			_, err := Compress(context.Background(), h.store, opts)
+			if err == nil {
+				t.Fatal("destructive compression ran without a usable media directory")
+			}
+			if h.images.calls != 0 {
+				t.Error("the media directory refusal came after the encoder ran")
+			}
+			if !exists(event.MediaPath) || h.mediaPath(event.ID) != event.MediaPath {
+				t.Error("the refused run changed indexed media")
+			}
+		})
+	}
+}
+
 func TestCompressDryRunChangesNothing(t *testing.T) {
 	h := newHarness(t)
 	screen := h.seed(store.KindScreen, "frame.jpg", time.Hour)
@@ -691,6 +713,113 @@ func TestCompressRefusesMediaOutsideItsDataDirectory(t *testing.T) {
 	}
 }
 
+func TestCompressResolvesSymlinksBeforeCheckingMediaRoots(t *testing.T) {
+	h := newHarness(t)
+	outside := t.TempDir()
+	source := filepath.Join(outside, "frame.jpg")
+	if err := os.WriteFile(source, []byte("outside media"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(h.dir, "escape")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	event := store.Event{
+		Kind: store.KindScreen, CapturedAt: time.Now().UTC().Add(-time.Hour),
+		Text: "symlink escape", MediaPath: filepath.Join(link, "frame.jpg"),
+	}
+	if err := h.store.Insert(context.Background(), &event); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Compress(context.Background(), h.store, h.options())
+	if err == nil {
+		t.Fatal("compressed through a symlink escaping the media directory")
+	}
+	if !strings.Contains(err.Error(), "outside this data directory") {
+		t.Errorf("the refusal does not identify the root escape: %v", err)
+	}
+	if got, readErr := os.ReadFile(source); readErr != nil || string(got) != "outside media" {
+		t.Fatalf("the escaped source changed: bytes=%q err=%v", got, readErr)
+	}
+	if exists(filepath.Join(outside, "frame.heic")) || h.images.calls != 0 {
+		t.Error("the symlink refusal came after a destination was written outside the root")
+	}
+}
+
+func TestCompressResolvesANonexistentDestinationParentBeforeCheckingRoots(t *testing.T) {
+	h := newHarness(t)
+	outside := t.TempDir()
+	actualSource := filepath.Join(h.dir, "actual.jpg")
+	if err := os.WriteFile(actualSource, []byte("inside media"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The indexed source travels through an outside parent but links back to an
+	// inside file. Source-only containment therefore passes; the nonexistent
+	// destination's resolved parent is what exposes the escape.
+	if err := os.Symlink(actualSource, filepath.Join(outside, "frame.jpg")); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(h.dir, "escape")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	event := store.Event{
+		Kind: store.KindScreen, CapturedAt: time.Now().UTC().Add(-time.Hour),
+		Text: "destination parent escape", MediaPath: filepath.Join(link, "frame.jpg"),
+	}
+	if err := h.store.Insert(context.Background(), &event); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Compress(context.Background(), h.store, h.options())
+	if err == nil {
+		t.Fatal("accepted a nonexistent destination beneath a symlinked outside parent")
+	}
+	if !strings.Contains(err.Error(), "outside this data directory") {
+		t.Errorf("the refusal does not identify the destination escape: %v", err)
+	}
+	if got, readErr := os.ReadFile(actualSource); readErr != nil || string(got) != "inside media" {
+		t.Fatalf("the inside source changed: bytes=%q err=%v", got, readErr)
+	}
+	if exists(filepath.Join(outside, "frame.heic")) || h.images.calls != 0 {
+		t.Error("the destination parent refusal came after encoding began")
+	}
+}
+
+func TestRecentMediaOutsideTheRootsDoesNotBlockEligibleHistory(t *testing.T) {
+	h := newHarness(t)
+	old := h.seed(store.KindScreen, "old.jpg", 72*time.Hour)
+	outside := filepath.Join(t.TempDir(), "recent.jpg")
+	if err := os.WriteFile(outside, []byte("recent"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	recent := store.Event{
+		Kind: store.KindScreen, CapturedAt: time.Now().UTC().Add(-time.Minute),
+		Text: "recent foreign path", MediaPath: outside,
+	}
+	if err := h.store.Insert(context.Background(), &recent); err != nil {
+		t.Fatal(err)
+	}
+	opts := h.options()
+	opts.Before = ptr(time.Now().UTC().Add(-48 * time.Hour))
+
+	result := h.run(opts)
+
+	if result.Screens.Files != 1 {
+		t.Fatalf("compressed %d screenshots, want the eligible old row", result.Screens.Files)
+	}
+	if exists(old.MediaPath) || !exists(filepath.Join(h.dir, "old.heic")) {
+		t.Error("the eligible old row was not replaced")
+	}
+	if got := h.mediaPath(recent.ID); got != outside {
+		t.Errorf("recent row moved to %q", got)
+	}
+	if got, err := os.ReadFile(outside); err != nil || string(got) != "recent" {
+		t.Errorf("recent foreign media changed: bytes=%q err=%v", got, err)
+	}
+}
+
 // media_path carries no uniqueness constraint, so the one-to-one ownership the
 // replacement sequence assumes has to be checked rather than trusted.
 func TestCompressSkipsRowsWhoseMediaAnotherRowDependsOn(t *testing.T) {
@@ -734,6 +863,147 @@ func TestCompressSkipsRowsWhoseMediaAnotherRowDependsOn(t *testing.T) {
 		}
 		if !exists(source.MediaPath) {
 			t.Error("the conflicted source was deleted")
+		}
+	})
+}
+
+func TestCompressUsesAllEventsForDestinationOwnership(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		kind             store.Kind
+		oldName, newName string
+		result           func(Result) PassResult
+	}{
+		{"old JPG and recent HEIC", store.KindScreen, "frame.jpg", "frame.heic", func(r Result) PassResult { return r.Screens }},
+		{"old WAV and recent FLAC", store.KindAudio, "chunk.wav", "chunk.flac", func(r Result) PassResult { return r.Audio }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			old := h.seed(tc.kind, tc.oldName, 72*time.Hour)
+			recent := h.seed(tc.kind, tc.newName, time.Minute)
+			before, err := os.ReadFile(recent.MediaPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			opts := h.options()
+			opts.Before = ptr(time.Now().UTC().Add(-48 * time.Hour))
+
+			pass := tc.result(h.run(opts))
+
+			if pass.Conflicted != 1 || pass.Files != 0 {
+				t.Errorf("counted %d conflicts and %d files, want 1 and 0", pass.Conflicted, pass.Files)
+			}
+			if got := h.mediaPath(old.ID); got != old.MediaPath {
+				t.Errorf("old row moved to %q", got)
+			}
+			if got := h.mediaPath(recent.ID); got != recent.MediaPath {
+				t.Errorf("recent row moved to %q", got)
+			}
+			after, err := os.ReadFile(recent.MediaPath)
+			if err != nil || string(after) != string(before) {
+				t.Errorf("recent destination changed: before=%q after=%q err=%v", before, after, err)
+			}
+			if !exists(old.MediaPath) {
+				t.Error("conflicted old source was deleted")
+			}
+		})
+	}
+}
+
+func TestCompressUsesAllEventsForSharedSourceOwnership(t *testing.T) {
+	h := newHarness(t)
+	old := h.seed(store.KindScreen, "shared.jpg", 72*time.Hour)
+	recent := store.Event{
+		Kind: store.KindScreen, CapturedAt: time.Now().UTC().Add(-time.Minute),
+		Text: "recent shared owner", MediaPath: old.MediaPath,
+	}
+	if err := h.store.Insert(context.Background(), &recent); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(old.MediaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := h.options()
+	opts.Before = ptr(time.Now().UTC().Add(-48 * time.Hour))
+
+	result := h.run(opts)
+
+	if result.Screens.Conflicted != 1 || result.Screens.Files != 0 {
+		t.Errorf("counted %d conflicts and %d files, want 1 and 0",
+			result.Screens.Conflicted, result.Screens.Files)
+	}
+	for _, event := range []store.Event{old, recent} {
+		if got := h.mediaPath(event.ID); got != old.MediaPath {
+			t.Errorf("row %d moved to %q", event.ID, got)
+		}
+	}
+	after, err := os.ReadFile(old.MediaPath)
+	if err != nil || string(after) != string(before) {
+		t.Errorf("shared source changed: before=%q after=%q err=%v", before, after, err)
+	}
+}
+
+func TestCompressDetectsFilesystemEquivalentCaseVariants(t *testing.T) {
+	t.Run("shared source", func(t *testing.T) {
+		h := newHarness(t)
+		old := h.seed(store.KindScreen, "frame.jpg", 72*time.Hour)
+		variant := filepath.Join(h.dir, "FRAME.JPG")
+		oldInfo, oldErr := os.Stat(old.MediaPath)
+		variantInfo, variantErr := os.Stat(variant)
+		if oldErr != nil || variantErr != nil || !os.SameFile(oldInfo, variantInfo) {
+			t.Skip("test volume is case-sensitive")
+		}
+		recent := store.Event{
+			Kind: store.KindScreen, CapturedAt: time.Now().UTC().Add(-time.Minute),
+			Text: "case-variant owner", MediaPath: variant,
+		}
+		if err := h.store.Insert(context.Background(), &recent); err != nil {
+			t.Fatal(err)
+		}
+		opts := h.options()
+		opts.Before = ptr(time.Now().UTC().Add(-48 * time.Hour))
+
+		result := h.run(opts)
+
+		if result.Screens.Conflicted != 1 || result.Screens.Files != 0 {
+			t.Errorf("counted %d conflicts and %d files, want 1 and 0",
+				result.Screens.Conflicted, result.Screens.Files)
+		}
+		if !exists(old.MediaPath) || h.mediaPath(recent.ID) != variant {
+			t.Error("compressing a case variant damaged the shared source or its recent row")
+		}
+	})
+
+	t.Run("destination owner", func(t *testing.T) {
+		h := newHarness(t)
+		old := h.seed(store.KindScreen, "frame.jpg", 72*time.Hour)
+		recent := h.seed(store.KindScreen, "FRAME.HEIC", time.Minute)
+		candidate := filepath.Join(h.dir, "frame.heic")
+		candidateInfo, candidateErr := os.Stat(candidate)
+		ownerInfo, ownerErr := os.Stat(recent.MediaPath)
+		if candidateErr != nil || ownerErr != nil || !os.SameFile(candidateInfo, ownerInfo) {
+			t.Skip("test volume is case-sensitive")
+		}
+		before, err := os.ReadFile(recent.MediaPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		opts := h.options()
+		opts.Before = ptr(time.Now().UTC().Add(-48 * time.Hour))
+
+		result := h.run(opts)
+
+		if result.Screens.Conflicted != 1 || result.Screens.Files != 0 {
+			t.Errorf("counted %d conflicts and %d files, want 1 and 0",
+				result.Screens.Conflicted, result.Screens.Files)
+		}
+		after, err := os.ReadFile(recent.MediaPath)
+		if err != nil || string(after) != string(before) {
+			t.Errorf("case-variant destination owner changed: before=%q after=%q err=%v", before, after, err)
+		}
+		if !exists(old.MediaPath) || h.mediaPath(old.ID) != old.MediaPath || h.mediaPath(recent.ID) != recent.MediaPath {
+			t.Error("case-variant destination conflict changed a file or row")
 		}
 	})
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -251,6 +252,51 @@ func TestCompressJSONIsTheOnlyThingOnStdout(t *testing.T) {
 	}
 	if result.Screens.Skipped != 1 {
 		t.Errorf("reported %d skipped, want 1", result.Screens.Skipped)
+	}
+}
+
+func TestCompressJSONEmitsPartialResultBeforeReturningCancellation(t *testing.T) {
+	dataDir := t.TempDir()
+	a := &app{dataDir: dataDir}
+	original := runCompress
+	runCompress = func(context.Context, *store.Store, compress.Options) (compress.Result, error) {
+		return compress.Result{
+			Screens: compress.PassResult{Files: 7, BytesBefore: 700, BytesAfter: 350},
+		}, context.Canceled
+	}
+	t.Cleanup(func() { runCompress = original })
+
+	realStdout := os.Stdout
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = writer
+	t.Cleanup(func() { os.Stdout = realStdout })
+	captured := make(chan []byte, 1)
+	go func() {
+		data, _ := io.ReadAll(reader)
+		captured <- data
+	}()
+
+	cmd := a.compressCommand()
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&bytes.Buffer{})
+	cmd.SetArgs([]string{"--json", "--vacuum=false"})
+	runErr := cmd.ExecuteContext(context.Background())
+	os.Stdout = realStdout
+	writer.Close()
+	stdout := <-captured
+
+	if !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("returned %v, want context cancellation", runErr)
+	}
+	var got compress.Result
+	if decodeErr := json.Unmarshal(stdout, &got); decodeErr != nil {
+		t.Fatalf("partial stdout is not result JSON: %v\n%s", decodeErr, stdout)
+	}
+	if got.Screens.Files != 7 || got.Screens.BytesAfter != 350 {
+		t.Errorf("partial result was lost: %#v", got.Screens)
 	}
 }
 

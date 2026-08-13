@@ -14,6 +14,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -1077,6 +1078,92 @@ func TestInspectImageReportsDimensions(t *testing.T) {
 	if verification.SourceWidth != verification.Width || verification.SourceHeight != verification.Height {
 		t.Error("inspection reported a source size differing from the image it read")
 	}
+}
+
+func TestInspectImageRejectsAnIncompleteHEIC(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "frame.jpg")
+	complete := filepath.Join(dir, "complete.heic")
+	incomplete := filepath.Join(dir, "incomplete.heic")
+	writeTestJPEG(t, source, 320, 240)
+	if _, err := TranscodeImageHEIC(context.Background(), source, complete, 0.60); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(complete)
+	if err != nil {
+		t.Fatal(err)
+	}
+	length := len(data) / 20
+	if length < 1 {
+		length = 1
+	}
+	if err := os.WriteFile(incomplete, data[:length], 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := InspectImage(context.Background(), incomplete); err == nil {
+		t.Fatal("InspectImage accepted a severely truncated HEIC")
+	}
+}
+
+func TestInspectImageRejectsIncompleteHEICThatStillDecodes(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "frame.jpg")
+	complete := filepath.Join(dir, "complete.heic")
+	truncated := filepath.Join(dir, "truncated.heic")
+	writeTestJPEG(t, source, 320, 240)
+	if _, err := TranscodeImageHEIC(context.Background(), source, complete, 0.60); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(complete)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// ImageIO can return a CGImage from an incomplete source. Try a bounded set
+	// of tail truncations and require the native error to prove both facts about
+	// the fixture: ImageIO's status is incomplete, yet its decoder produced
+	// pixels. Before the status gate, that exact file was accepted as intact.
+	maxCut := len(data) - 1
+	cuts := make([]int, 0, 1280)
+	for cut := 1; cut <= maxCut && cut <= 256; cut++ {
+		cuts = append(cuts, cut)
+	}
+	// Sample the rest of the file, not only its tail: HEIC can place the primary
+	// image before substantial metadata, so even removing half the container may
+	// leave that indexed image complete.
+	for attempt := 1; attempt <= 1024 && maxCut > 256; attempt++ {
+		cuts = append(cuts, 256+attempt*(maxCut-256)/1024)
+	}
+	for _, cut := range cuts {
+		if err := os.WriteFile(truncated, data[:len(data)-cut], 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, inspectErr := InspectImage(context.Background(), truncated)
+		// A few tail bytes can be outside the indexed image, in which case
+		// ImageIO still correctly reports that image complete. Keep searching
+		// for the boundary where its status changes.
+		if inspectErr == nil {
+			continue
+		}
+		if strings.Contains(inspectErr.Error(), "decoder still produced pixels") {
+			t.Logf("HEIC truncated by %d bytes remained partially decodable: %v", cut, inspectErr)
+			return
+		}
+	}
+
+	// Keep a meaningful incomplete-image assertion even on an ImageIO version
+	// that offers no partially-decodable truncation in the bounded search.
+	incompleteLength := len(data) / 20
+	if incompleteLength < 1 {
+		incompleteLength = 1
+	}
+	if err := os.WriteFile(truncated, data[:incompleteLength], 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := InspectImage(context.Background(), truncated); err == nil {
+		t.Fatal("InspectImage accepted a severely truncated HEIC")
+	}
+	t.Skip("bounded truncation search found no incomplete HEIC for which ImageIO still returned pixels")
 }
 
 // writeTestWAV writes the exact format Lumi captures: 16 kHz mono 16-bit

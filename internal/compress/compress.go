@@ -236,6 +236,18 @@ func Compress(ctx context.Context, s *store.Store, opts Options) (Result, error)
 	if err := opts.validate(); err != nil {
 		return result, err
 	}
+	if !opts.DryRun {
+		usableMediaDir := false
+		for _, dir := range opts.MediaDirs {
+			if strings.TrimSpace(dir) != "" {
+				usableMediaDir = true
+				break
+			}
+		}
+		if !usableMediaDir {
+			return result, errors.New("destructive compression requires at least one usable media directory")
+		}
+	}
 	if opts.Screens == CodecHEIC && opts.Images == nil {
 		return result, errors.New("compressing screenshots needs an image transcoder")
 	}
@@ -243,25 +255,33 @@ func Compress(ctx context.Context, s *store.Store, opts Options) (Result, error)
 		return result, errors.New("compressing audio needs an audio transcoder")
 	}
 
-	events, err := s.Expired(ctx, *opts.Before, 0)
+	// The cutoff-bounded set is the only set passes and root containment may
+	// touch. Ownership is deliberately broader: a recent row can still own an
+	// old row's source or deterministic destination.
+	candidates, err := s.Expired(ctx, *opts.Before, 0)
 	if err != nil {
 		return result, err
 	}
-	// Before anything on disk is touched: refuse a run whose media does not
-	// belong to this data directory, and identify rows whose paths collide.
-	report, err := runPreflight(ctx, events, opts)
+	allEvents, err := s.AllEvents(ctx)
+	if err != nil {
+		return result, err
+	}
+	// Before anything on disk is touched: refuse a run whose candidate media
+	// does not belong to this data directory, and identify collisions against
+	// every row in the index.
+	report, err := runPreflight(ctx, candidates, allEvents, opts)
 	if err != nil {
 		return result, err
 	}
 
 	if opts.Screens == CodecHEIC {
-		result.Screens, err = runPass(ctx, s, opts, events, store.KindScreen, screenPass{}, report)
+		result.Screens, err = runPass(ctx, s, opts, candidates, store.KindScreen, screenPass{}, report)
 		if err != nil {
 			return result, err
 		}
 	}
 	if opts.Audio == CodecFLAC {
-		result.Audio, err = runPass(ctx, s, opts, events, store.KindAudio, audioPass{}, report)
+		result.Audio, err = runPass(ctx, s, opts, candidates, store.KindAudio, audioPass{}, report)
 		if err != nil {
 			return result, err
 		}

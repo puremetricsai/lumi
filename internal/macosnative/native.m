@@ -1894,8 +1894,22 @@ static CGImageRef LumiLoadImage(NSString *path, NSError **error) CF_RETURNS_RETA
         }
         return NULL;
     }
+    CGImageSourceStatus status = CGImageSourceGetStatusAtIndex(source, 0);
     CGImageRef image = CGImageSourceCreateImageAtIndex(source, 0, NULL);
     CFRelease(source);
+    if (status != kCGImageStatusComplete) {
+        BOOL producedPixels = image != NULL;
+        if (image != NULL) CGImageRelease(image);
+        if (error != NULL) {
+            NSString *detail = producedPixels ? @"; decoder still produced pixels" : @"";
+            *error = [NSError errorWithDomain:@"LumiNative" code:33
+                                     userInfo:@{NSLocalizedDescriptionKey:
+                                                    [NSString stringWithFormat:
+                                                         @"incomplete image %@ (ImageIO status %ld%@)",
+                                                         path, (long)status, detail]}];
+        }
+        return NULL;
+    }
     if (image == NULL && error != NULL) {
         *error = [NSError errorWithDomain:@"LumiNative" code:33
                                  userInfo:@{NSLocalizedDescriptionKey:
@@ -1914,10 +1928,10 @@ static long long LumiFileSize(NSString *path) {
 // file left behind by an interrupted run is intact enough to adopt, in the one
 // case where the original it would have been compared against is already gone.
 //
-// It draws the image rather than reading its header, because a truncated file
-// keeps an intact header: dimensions alone would declare a half-written frame
-// healthy and adopt it as an event's only surviving media. Drawing is the
-// strongest check available with no original to compare against.
+// It requires ImageIO to report the indexed image complete and then draws it
+// rather than trusting its header. A truncated file can keep an intact header
+// and even produce pixels; neither is enough to adopt it as an event's only
+// surviving media.
 char *lumi_image_inspect_json(const char *image_path, char **error_message) {
     @autoreleasepool {
         NSString *path = @(image_path);

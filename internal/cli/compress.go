@@ -15,6 +15,9 @@ import (
 	"github.com/puremetricsai/lumi/internal/config"
 )
 
+// runCompress is a test seam for command-level cancellation after partial work.
+var runCompress = compress.Compress
+
 func (a *app) compressCommand() *cobra.Command {
 	var (
 		olderThan      string
@@ -87,7 +90,7 @@ func (a *app) compressCommand() *cobra.Command {
 			}
 			defer s.Close()
 
-			result, err := compress.Compress(cmd.Context(), s, compress.Options{
+			result, err := runCompress(cmd.Context(), s, compress.Options{
 				Before:       before,
 				Screens:      screenCodec,
 				Audio:        audioCodec,
@@ -101,22 +104,7 @@ func (a *app) compressCommand() *cobra.Command {
 				DryRun:       dryRun,
 				Logger:       slog.New(slog.NewTextHandler(cmd.ErrOrStderr(), nil)),
 			})
-			if err != nil {
-				// Ctrl-C after thousands of files should not print only
-				// "context canceled": everything already compressed is committed,
-				// and the counters say so.
-				if !asJSON {
-					printCompressResult(os.Stdout, result, dryRun)
-				}
-				return err
-			}
-			if asJSON {
-				encoder := json.NewEncoder(os.Stdout)
-				encoder.SetIndent("", "  ")
-				return encoder.Encode(result)
-			}
-			printCompressResult(os.Stdout, result, dryRun)
-			return nil
+			return finishCompress(os.Stdout, result, dryRun, asJSON, err)
 		},
 	}
 	flags := cmd.Flags()
@@ -206,6 +194,23 @@ func lockCompress(paths config.Paths) (func(), error) {
 		return nil, errors.New("compression is already in progress; two runs would race for the same files")
 	}
 	return release, err
+}
+
+// finishCompress emits the result before returning a run error. Compression is
+// committed one file at a time, so cancellation or a later store failure can
+// accompany useful partial counters; JSON callers need those counters just as
+// much as human-readable callers do.
+func finishCompress(out io.Writer, result compress.Result, dryRun, asJSON bool, runErr error) error {
+	if asJSON {
+		encoder := json.NewEncoder(out)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(result); err != nil {
+			return err
+		}
+	} else {
+		printCompressResult(out, result, dryRun)
+	}
+	return runErr
 }
 
 func printCompressResult(out io.Writer, result compress.Result, dryRun bool) {

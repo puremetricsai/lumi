@@ -3,6 +3,7 @@ package compress
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -22,33 +23,76 @@ type preflightReport struct {
 	conflicts map[int64]string
 }
 
-// checkRoots reports events whose media lies outside the directories this run
-// was given.
-//
-// This is the check that would have prevented a real incident. `media_path` is
-// stored absolute, so copying a data directory and pointing `--data-dir` at the
-// copy gives you the copy's *database* and the original's *files* — and compress,
-// unlike every other command, rewrites and deletes what it reads. A copied index
-// therefore destroys the originals it was supposed to leave alone.
-//
-// It fails the whole run rather than skipping the offending rows: media outside
-// the roots means the caller is not looking at the index they think they are,
-// and quietly compressing the subset that happens to be inside would be acting
-// on that misunderstanding rather than reporting it.
-func checkRoots(events []store.Event, mediaDirs []string) error {
-	if len(mediaDirs) == 0 {
-		return nil
+// resolvedPath resolves an existing path in full. A missing final component is
+// allowed because old indexes routinely name aged-out media and destinations do
+// not exist yet; in that case its existing parent is resolved instead. Every
+// other resolution error is fatal rather than weakening containment.
+func resolvedPath(path string) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
 	}
+	resolved, err := filepath.EvalSymlinks(absolute)
+	if err == nil {
+		return filepath.Clean(resolved), nil
+	}
+	if !os.IsNotExist(err) {
+		return "", err
+	}
+	// A dangling final symlink is not an ordinary absent destination. Treating
+	// it as a basename inside the root would hide where it attempts to lead.
+	if info, lstatErr := os.Lstat(absolute); lstatErr == nil && info.Mode()&os.ModeSymlink != 0 {
+		return "", err
+	}
+	parent, parentErr := filepath.EvalSymlinks(filepath.Dir(absolute))
+	if parentErr != nil {
+		return "", parentErr
+	}
+	return filepath.Join(parent, filepath.Base(absolute)), nil
+}
+
+func resolvedRoots(mediaDirs []string) ([]string, error) {
 	roots := make([]string, 0, len(mediaDirs))
+	seen := make(map[string]bool, len(mediaDirs))
 	for _, dir := range mediaDirs {
-		if dir == "" {
+		if strings.TrimSpace(dir) == "" {
 			continue
 		}
-		absolute, err := filepath.Abs(dir)
+		root, err := resolvedPath(dir)
 		if err != nil {
-			return fmt.Errorf("resolve media directory %s: %w", dir, err)
+			return nil, fmt.Errorf("resolve media directory %s: %w", dir, err)
 		}
-		roots = append(roots, filepath.Clean(absolute)+string(filepath.Separator))
+		info, err := os.Stat(root)
+		if err != nil {
+			return nil, fmt.Errorf("inspect media directory %s: %w", dir, err)
+		}
+		if !info.IsDir() {
+			return nil, fmt.Errorf("media directory %s is not a directory", dir)
+		}
+		if !seen[root] {
+			seen[root] = true
+			roots = append(roots, root)
+		}
+	}
+	return roots, nil
+}
+
+func pathWithinRoot(path, root string) bool {
+	relative, err := filepath.Rel(root, path)
+	if err != nil || filepath.IsAbs(relative) {
+		return false
+	}
+	return relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
+}
+
+// checkRoots reports pass candidates whose source or possible destination lies
+// outside the directories this run was given. Only the cutoff-bounded candidate
+// set belongs here; all events are used separately for ownership, because a
+// recent unrelated foreign path must not block valid old history.
+func checkRoots(events []store.Event, mediaDirs []string) error {
+	roots, err := resolvedRoots(mediaDirs)
+	if err != nil {
+		return err
 	}
 	if len(roots) == 0 {
 		return nil
@@ -60,95 +104,161 @@ func checkRoots(events []store.Event, mediaDirs []string) error {
 		if event.MediaPath == "" {
 			continue
 		}
-		absolute, err := filepath.Abs(event.MediaPath)
-		if err != nil {
-			return fmt.Errorf("resolve media path %s: %w", event.MediaPath, err)
+		paths := []string{event.MediaPath}
+		switch lowerExt(event.MediaPath) {
+		case extJPG, extJPEG:
+			paths = append(paths, swapExtension(event.MediaPath, extHEIC))
+		case extWAV:
+			paths = append(paths, swapExtension(event.MediaPath, extFLAC))
 		}
-		path := filepath.Clean(absolute)
-		within := false
-		for _, root := range roots {
-			if strings.HasPrefix(path+string(filepath.Separator), root) {
-				within = true
-				break
+		for _, candidate := range paths {
+			path, err := resolvedPath(candidate)
+			if err != nil {
+				return fmt.Errorf("resolve media path %s: %w", candidate, err)
 			}
-		}
-		if within {
-			continue
-		}
-		count++
-		if len(outside) < 3 {
-			outside = append(outside, path)
+			within := false
+			for _, root := range roots {
+				if pathWithinRoot(path, root) {
+					within = true
+					break
+				}
+			}
+			if within {
+				continue
+			}
+			count++
+			if len(outside) < 3 {
+				outside = append(outside, path)
+			}
 		}
 	}
 	if count == 0 {
 		return nil
 	}
-	return fmt.Errorf("%d indexed events name media outside this data directory (for example %s); "+
+	return fmt.Errorf("%d indexed media paths lie outside this data directory (for example %s); "+
 		"compress rewrites and deletes the files it reads, so it will not touch media belonging to "+
 		"another index. media_path is stored absolute, so a copied data directory still names the "+
 		"original's files — see docs/compress.md",
 		count, strings.Join(outside, ", "))
 }
 
-// findConflicts reports events this run must not compress because another row
-// would lose its media if it did.
-//
-// `events.media_path` carries no uniqueness constraint, and destinations are
-// derived deterministically by swapping the extension, so two situations break
-// the one-to-one assumption the replacement sequence rests on:
-//
-//   - Two rows naming the same file. Compressing the first deletes the media the
-//     second still names.
-//   - A row whose destination is already named by a different row. Writing it
-//     overwrites that row's media, and the FLAC encoder truncates an existing
-//     destination outright.
-//
-// Neither occurs in an index Lumi wrote — capture names files uniquely per
-// display per instant, and per chunk per track — so this is a guard against an
-// index that has been edited or merged, not against ordinary operation. The
-// affected rows are skipped and counted rather than failing the run, because the
-// inconsistency belongs to those rows and not to the rest of the history.
+type ownedPath struct {
+	event    store.Event
+	clean    string
+	resolved string
+	info     os.FileInfo
+}
+
+func inspectOwnedPath(event store.Event) ownedPath {
+	clean, err := filepath.Abs(event.MediaPath)
+	if err != nil {
+		clean = filepath.Clean(event.MediaPath)
+	} else {
+		clean = filepath.Clean(clean)
+	}
+	resolved, _ := filepath.EvalSymlinks(clean)
+	info, _ := os.Stat(clean)
+	return ownedPath{event: event, clean: clean, resolved: filepath.Clean(resolved), info: info}
+}
+
+func (p ownedPath) keys() []string {
+	keys := []string{"path:" + strings.ToLower(p.clean)}
+	if p.resolved != "." && p.resolved != "" {
+		resolved := "resolved:" + strings.ToLower(p.resolved)
+		if resolved != keys[0] {
+			keys = append(keys, resolved)
+		}
+	}
+	return keys
+}
+
+// equivalentPath uses filesystem identity whenever both paths exist. Lower-case
+// keys merely select paths worth comparing; they never decide equivalence, so a
+// case-sensitive volume holding distinct frame.jpg and FRAME.JPG keeps both.
+func equivalentPath(a, b ownedPath) bool {
+	if a.clean == b.clean {
+		return true
+	}
+	return a.info != nil && b.info != nil && os.SameFile(a.info, b.info)
+}
+
+// findConflicts reports pass candidates that must not be compressed because any
+// event, including one newer than the cutoff, would lose media if they were.
 func findConflicts(events []store.Event) map[int64]string {
 	conflicts := make(map[int64]string)
-	owners := make(map[string][]store.Event, len(events))
+	owners := make([]ownedPath, 0, len(events))
+	buckets := make(map[string][]int, len(events))
 	for _, event := range events {
 		if event.MediaPath == "" {
 			continue
 		}
-		key := filepath.Clean(event.MediaPath)
-		owners[key] = append(owners[key], event)
-	}
-	for _, sharing := range owners {
-		if len(sharing) < 2 {
-			continue
-		}
-		for _, event := range sharing {
-			conflicts[event.ID] = fmt.Sprintf("%d events share this media file", len(sharing))
+		owner := inspectOwnedPath(event)
+		index := len(owners)
+		owners = append(owners, owner)
+		for _, key := range owner.keys() {
+			buckets[key] = append(buckets[key], index)
 		}
 	}
-	for _, event := range events {
-		if event.MediaPath == "" {
-			continue
-		}
-		for _, extension := range []string{extHEIC, extFLAC} {
-			destination := filepath.Clean(swapExtension(event.MediaPath, extension))
-			if destination == filepath.Clean(event.MediaPath) {
-				continue
-			}
-			for _, other := range owners[destination] {
-				if other.ID == event.ID {
+
+	seenPairs := make(map[[2]int]bool)
+	for _, bucket := range buckets {
+		for i := 0; i < len(bucket); i++ {
+			for j := i + 1; j < len(bucket); j++ {
+				pair := [2]int{bucket[i], bucket[j]}
+				if seenPairs[pair] {
 					continue
 				}
-				conflicts[event.ID] = fmt.Sprintf("event %d already holds the file this would be compressed to", other.ID)
+				seenPairs[pair] = true
+				first, second := owners[pair[0]], owners[pair[1]]
+				if !equivalentPath(first, second) {
+					continue
+				}
+				conflicts[first.event.ID] = "multiple events share this media file"
+				conflicts[second.event.ID] = "multiple events share this media file"
+			}
+		}
+	}
+
+	for _, event := range events {
+		if event.MediaPath == "" {
+			continue
+		}
+		var extensions []string
+		switch {
+		case event.Kind == store.KindScreen && (lowerExt(event.MediaPath) == extJPG || lowerExt(event.MediaPath) == extJPEG):
+			extensions = []string{extHEIC}
+		case event.Kind == store.KindAudio && lowerExt(event.MediaPath) == extWAV:
+			extensions = []string{extFLAC}
+		}
+		for _, extension := range extensions {
+			destinationEvent := event
+			destinationEvent.MediaPath = swapExtension(event.MediaPath, extension)
+			destination := inspectOwnedPath(destinationEvent)
+			if equivalentPath(destination, inspectOwnedPath(event)) {
+				continue
+			}
+			visited := make(map[int]bool)
+			for _, key := range destination.keys() {
+				for _, index := range buckets[key] {
+					if visited[index] {
+						continue
+					}
+					visited[index] = true
+					other := owners[index]
+					if other.event.ID == event.ID || !equivalentPath(destination, other) {
+						continue
+					}
+					conflicts[event.ID] = fmt.Sprintf("event %d already holds the file this would be compressed to", other.event.ID)
+				}
 			}
 		}
 	}
 	return conflicts
 }
 
-func runPreflight(_ context.Context, events []store.Event, opts Options) (preflightReport, error) {
-	if err := checkRoots(events, opts.MediaDirs); err != nil {
+func runPreflight(_ context.Context, candidates, allEvents []store.Event, opts Options) (preflightReport, error) {
+	if err := checkRoots(candidates, opts.MediaDirs); err != nil {
 		return preflightReport{}, err
 	}
-	return preflightReport{conflicts: findConflicts(events)}, nil
+	return preflightReport{conflicts: findConflicts(allEvents)}, nil
 }
