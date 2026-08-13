@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.4.0](https://github.com/puremetricsai/lumi/compare/v0.3.0...v0.4.0) (2026-08-13)
+
+
+### Features
+
+* add lumi compress ([22b9be5](https://github.com/puremetricsai/lumi/commit/22b9be5644b55c4f4bc49ebbc341622e1e7c8ef6))
+* **cli:** add lumi compress ([2ec30bf](https://github.com/puremetricsai/lumi/commit/2ec30bf57c1089e63bc3483c62719a07177d4eb2))
+* **compress:** add the media compression engine ([78d1b0e](https://github.com/puremetricsai/lumi/commit/78d1b0e45d1dbc4f1d48088a6c40f3f32dc6e30e))
+* **macosnative:** add HEIC transcode, FLAC encode, and PCM16 decode bridges ([a8d0c59](https://github.com/puremetricsai/lumi/commit/a8d0c5940fe29b7d3622d2037a565eaf5c7c523e))
+* **store:** add conditional UpdateMediaPath and Vacuum ([194ee94](https://github.com/puremetricsai/lumi/commit/194ee9423b9941f173ee60871fa9113d821f1094))
+
+
+### Bug Fixes
+
+* **compress:** close path-ownership and recovery safety holes from review ([0a770ff](https://github.com/puremetricsai/lumi/commit/0a770ffe827c874d7b12481891981edf5381e4c3))
+* **compress:** close the defects two independent reviews found ([09251f0](https://github.com/puremetricsai/lumi/commit/09251f04ae66edf484fac1b54891f3f21b9e34d3))
+* **compress:** close the destination axis over symlinks, and the ambiguity folding introduced ([e276eb1](https://github.com/puremetricsai/lumi/commit/e276eb1474aa9ea8b11cbb57c709b8da626033c3))
+* **compress:** close two data-loss holes a third review found ([5ae302f](https://github.com/puremetricsai/lumi/commit/5ae302f9c45dc4710edce6f9426227e9fe95d021))
+
 ## [0.3.0](https://github.com/puremetricsai/lumi/compare/v0.2.0...v0.3.0) (2026-08-07)
 
 
