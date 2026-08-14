@@ -272,7 +272,7 @@ func TestCompressRejectsAMissingMediaDirectory(t *testing.T) {
 	if _, err := Compress(context.Background(), h.store, opts); err == nil {
 		t.Fatal("destructive compression accepted a missing media directory")
 	}
-	if h.images.calls != 0 {
+	if h.images.callCount() != 0 {
 		t.Error("the unusable media directory was rejected only after encoding began")
 	}
 }

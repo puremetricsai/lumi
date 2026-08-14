@@ -22,7 +22,9 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/puremetricsai/lumi/internal/macosnative"
@@ -109,6 +111,10 @@ type Options struct {
 	MinPSNRDB              float64
 	MinHistogramSimilarity float64
 
+	// Workers is how many files may be re-encoded at once. Zero means the default
+	// below; 1 restores the strictly sequential behaviour.
+	Workers int
+
 	// Images and Sounds are injected so this package's sequencing, verification
 	// and accounting are testable with fakes on any machine — the same reason
 	// capture.Recorder takes its processors as interfaces.
@@ -150,6 +156,40 @@ func (o Options) minHistogram() float64 {
 		return DefaultMinHistogramSimilarity
 	}
 	return o.MinHistogramSimilarity
+}
+
+// MaxDefaultWorkers caps how many files the default concurrency will re-encode at
+// once, however many cores the machine has.
+//
+// Eight is where the measured curve flattens, not a guess. Over 180 real 3456x2234
+// frames on an 18-logical-core machine (6 performance cores), wall time went
+// 37.6s at 1 worker → 22.5s at 2 → 14.4s at 4 → 11.4s at 6 → 9.9s at 8, and then
+// stopped: 10.1s at 10, 9.4s at 12, 9.3s at 18. So the cap keeps 3.8x of the
+// available 4.0x.
+//
+// What it declines is memory for nothing. Peak RSS over the same runs was 1.37 GB
+// at 1 worker, 2.02 GB at 8 and 2.72 GB at 18 — about 93 MB per additional file in
+// flight, since verifying one image holds two full RGBA buffers plus both decoded
+// images. Past eight that buys ~4% of throughput, and the baseline is already
+// large because a run materialises every event twice.
+const MaxDefaultWorkers = 8
+
+// workers resolves the concurrency for a run. Zero means unset, matching how
+// Quality and the two floors treat it; validate rejects a negative rather than
+// silently reading it as unset.
+//
+// An explicit count is honoured however large, deliberately. MaxDefaultWorkers
+// caps what this package picks on the caller's behalf, and clamping a number the
+// caller typed would be the same quiet disagreement as silently correcting
+// --quality: the flag would report a concurrency the run did not use. The cost of
+// an absurd one is memory — roughly 93 MB per file in flight — and it is bounded
+// below by the amount of work, since replaceFiles never starts more workers than
+// there are files.
+func (o Options) workers() int {
+	if o.Workers > 0 {
+		return o.Workers
+	}
+	return min(runtime.GOMAXPROCS(0), MaxDefaultWorkers)
 }
 
 func (o Options) logger() *slog.Logger {
@@ -311,15 +351,42 @@ type pass interface {
 	encode(ctx context.Context, opts Options, source, destination string) error
 }
 
-func runPass(ctx context.Context, s *store.Store, opts Options,
-	events []store.Event, kind store.Kind, p pass, report preflightReport) (PassResult, error) {
+// work is one file a pass has decided to replace.
+type work struct {
+	event       store.Event
+	destination string
+	// size is measured during selection but only *reported* once the row is
+	// committed, so a file that fails or loses the compare-and-swap still
+	// contributes nothing to the ratio.
+	size int64
+}
+
+// selectWork applies every eligibility gate exactly once and accounts for each
+// row that does not survive them.
+//
+// It is separate from the encoding so that a pass can say how many *files* it is
+// about to replace rather than how many rows it has looked at. That distinction
+// is the whole value of the progress line: on a real index the row count is
+// dominated by aged-out and already-compressed rows costing microseconds each, so
+// "6,024 of 13,211 rows" reads as 45% of a run that has barely started, while
+// "108 of 223 files" is the truth. Getting the honest denominator any other way
+// means a second copy of these gates, which is the drift this package's CLAUDE.md
+// warns about everywhere else.
+//
+// Nothing that was ordered moves. Every gate here is a read-only check, and the
+// per-file sequence — encode, verify, fsync, compare-and-swap, unlink — is
+// untouched and still strictly one file at a time. The single behavioural
+// difference is that a file something else deletes *during* the run is now
+// counted as an encode failure rather than as a missing file: a race that was
+// always present, and one that is only ever mislabelled by this, never
+// mishandled.
+func selectWork(ctx context.Context, events []store.Event, kind store.Kind,
+	p pass, report preflightReport, logger *slog.Logger) ([]work, PassResult, error) {
 	var result PassResult
-	logger := opts.logger()
+	var items []work
 	for _, event := range events {
 		if err := ctx.Err(); err != nil {
-			// Interrupting mid-run costs at most the file in flight, and leaves
-			// state a rerun reconciles. Everything committed stays committed.
-			return result, err
+			return nil, result, err
 		}
 		if event.Kind != kind {
 			continue
@@ -345,77 +412,318 @@ func runPass(ctx context.Context, s *store.Store, opts Options,
 			result.MissingFiles++
 			continue
 		}
-		if opts.DryRun {
-			// Stops before the encode, which is why a dry run cannot report a
-			// ratio: measuring one means doing the work.
+		items = append(items, work{event: event, destination: destination, size: info.Size()})
+	}
+	return items, result, nil
+}
+
+func runPass(ctx context.Context, s *store.Store, opts Options,
+	events []store.Event, kind store.Kind, p pass, report preflightReport) (PassResult, error) {
+	logger := opts.logger()
+	items, result, err := selectWork(ctx, events, kind, p, report, logger)
+	if err != nil {
+		return result, err
+	}
+	if opts.DryRun {
+		// Stops before the encode, which is why a dry run cannot report a ratio:
+		// measuring one means doing the work.
+		for _, item := range items {
 			result.Files++
-			result.BytesBefore += info.Size()
-			continue
+			result.BytesBefore += item.size
 		}
+		return result, nil
+	}
 
-		if err := p.encode(ctx, opts, event.MediaPath, destination); err != nil {
-			if isVerificationError(err) {
-				result.VerifyFailed++
-				logger.Warn("compressed file failed verification; keeping the original",
-					"event", event.ID, "media", event.MediaPath, "error", err)
-			} else {
-				result.EncodeFailed++
-				logger.Warn("could not compress media; keeping the original",
-					"event", event.ID, "media", event.MediaPath, "error", err)
-			}
-			// A partial or rejected encode is never left on disk to be adopted
-			// later by reconcile.
-			os.Remove(destination)
-			continue
-		}
-		if err := flushDurably(destination); err != nil {
-			result.FlushFailed++
-			logger.Warn("could not flush compressed media to disk; keeping the original",
-				"event", event.ID, "media", destination, "error", err)
-			os.Remove(destination)
-			continue
-		}
+	tracker := newProgress(logger, kind, int64(len(items)))
+	defer tracker.done()
+	// result is threaded by pointer, not returned, so that every worker folds its
+	// outcome into the same copy of the counters — which is what makes "every file
+	// lands in exactly one counter" checkable with several files in flight.
+	err = replaceFiles(ctx, s, opts, p, items, &result, tracker, logger)
+	return result, err
+}
 
-		updated, err := s.UpdateMediaPath(ctx, event.ID, event.MediaPath, destination)
-		if err != nil {
-			os.Remove(destination)
-			return result, err
-		}
-		if updated == 0 {
-			// Another writer moved or deleted this row while we were encoding.
-			// The file just written is an instant orphan; remove it and leave
-			// whatever won alone.
-			result.Raced++
-			os.Remove(destination)
-			continue
-		}
+// outcomeKind is what the per-file sequence did with one file. It exists so the
+// sequence and the accounting are separate: every file lands in exactly one
+// counter, and with several files in flight that promise is only checkable if the
+// counters are touched in one place.
+type outcomeKind int
 
-		// Past the compare-and-swap nothing below may end the run. The row is
-		// committed and names a file that exists, so every remaining failure is
-		// in the recoverable half of the ordering — and aborting here would strand
-		// the originals of every file this run had already replaced, none of which
-		// is reclaimed until somebody runs compress again.
-		result.Files++
-		result.BytesBefore += info.Size()
-		if compressed, err := os.Stat(destination); err == nil {
-			result.BytesAfter += compressed.Size()
+const (
+	outcomeReplaced outcomeKind = iota
+	outcomeEncodeFailed
+	outcomeVerifyFailed
+	outcomeFlushFailed
+	outcomeRaced
+)
+
+type outcome struct {
+	kind outcomeKind
+	// bytesAfter is set only for outcomeReplaced, and is zero when the committed
+	// replacement could not be measured.
+	bytesAfter int64
+}
+
+// record folds one file's outcome into a pass's counters. BytesBefore is added
+// here rather than at selection so a file that failed or lost the compare-and-swap
+// still contributes nothing to the reported ratio.
+func (r *PassResult) record(produced outcome, size int64) {
+	switch produced.kind {
+	case outcomeReplaced:
+		r.Files++
+		r.BytesBefore += size
+		r.BytesAfter += produced.bytesAfter
+	case outcomeEncodeFailed:
+		r.EncodeFailed++
+	case outcomeVerifyFailed:
+		r.VerifyFailed++
+	case outcomeFlushFailed:
+		r.FlushFailed++
+	case outcomeRaced:
+		r.Raced++
+	}
+}
+
+// replaceOne runs the crash-safe replacement sequence for a single file: encode,
+// verify, flush the file and its parent directory, repoint the row with a
+// compare-and-swap, and only then unlink the original.
+//
+// Every step and its ordering is unchanged from when this ran inline; it was
+// lifted out so that several files can be in flight without the sequence itself
+// being written more than once. A returned error is fatal for the pass — only a
+// store failure qualifies — and everything else is an outcome the caller counts.
+func replaceOne(ctx context.Context, s *store.Store, opts Options, p pass,
+	item work, logger *slog.Logger) (outcome, error) {
+	event, destination := item.event, item.destination
+
+	if err := p.encode(ctx, opts, event.MediaPath, destination); err != nil {
+		kind := outcomeEncodeFailed
+		if isVerificationError(err) {
+			kind = outcomeVerifyFailed
+			logger.Warn("compressed file failed verification; keeping the original",
+				"event", event.ID, "media", event.MediaPath, "error", err)
 		} else {
-			// Costs this file's contribution to the reported ratio and nothing
-			// else; the replacement itself is already committed.
-			logger.Warn("could not measure compressed media; it is missing from the reported ratio",
-				"event", event.ID, "media", destination, "error", err)
-		}
-
-		// Only now is the original redundant.
-		if err := os.Remove(event.MediaPath); err != nil && !os.IsNotExist(err) {
-			// A stranded original is precisely reconcile's owner-is-present case:
-			// the row names the compressed file, the original is an unreferenced
-			// sibling, and the next run drops it.
-			logger.Warn("could not remove the original after repointing its event; a later run will sweep it",
+			logger.Warn("could not compress media; keeping the original",
 				"event", event.ID, "media", event.MediaPath, "error", err)
 		}
+		// A partial or rejected encode is never left on disk to be adopted later
+		// by reconcile.
+		os.Remove(destination)
+		return outcome{kind: kind}, nil
 	}
-	return result, nil
+	if err := flushDurably(destination); err != nil {
+		logger.Warn("could not flush compressed media to disk; keeping the original",
+			"event", event.ID, "media", destination, "error", err)
+		os.Remove(destination)
+		return outcome{kind: outcomeFlushFailed}, nil
+	}
+
+	updated, err := s.UpdateMediaPath(ctx, event.ID, event.MediaPath, destination)
+	if err != nil {
+		os.Remove(destination)
+		return outcome{}, err
+	}
+	if updated == 0 {
+		// Another writer moved or deleted this row while we were encoding. The
+		// file just written is an instant orphan; remove it and leave whatever won
+		// alone. No sibling worker can be that writer: each item is dispatched
+		// once, and preflight has already established that no two of them share a
+		// source or a destination.
+		os.Remove(destination)
+		return outcome{kind: outcomeRaced}, nil
+	}
+
+	// Past the compare-and-swap nothing below may end the pass. The row is
+	// committed and names a file that exists, so every remaining failure is in the
+	// recoverable half of the ordering — and aborting here would strand the
+	// originals of every file already replaced, none of which is reclaimed until
+	// somebody runs compress again.
+	produced := outcome{kind: outcomeReplaced}
+	if compressed, err := os.Stat(destination); err == nil {
+		produced.bytesAfter = compressed.Size()
+	} else {
+		// Costs this file's contribution to the reported ratio and nothing else;
+		// the replacement itself is already committed.
+		logger.Warn("could not measure compressed media; it is missing from the reported ratio",
+			"event", event.ID, "media", destination, "error", err)
+	}
+
+	// Only now is the original redundant.
+	if err := os.Remove(event.MediaPath); err != nil && !os.IsNotExist(err) {
+		// A stranded original is precisely reconcile's owner-is-present case: the
+		// row names the compressed file, the original is an unreferenced sibling,
+		// and the next run drops it.
+		logger.Warn("could not remove the original after repointing its event; a later run will sweep it",
+			"event", event.ID, "media", event.MediaPath, "error", err)
+	}
+	return produced, nil
+}
+
+// replaceFiles runs the replacement sequence over items with up to
+// opts.workers() files in flight.
+//
+// Concurrency here is safe for a reason that does not extend to a second
+// *process*, and the distinction is the whole of it. The hazard the
+// single-instance lock in internal/cli exists to prevent is two agents deriving
+// the same destination: the loser of the compare-and-swap unlinks a file the
+// winner's row already names, which is unrecoverable. Two processes each build
+// their own candidate list and can therefore both hold the same row. Workers
+// inside one pass cannot: the list is built once, each item is dispatched to
+// exactly one worker, and findConflicts has already skipped any row sharing a
+// source or a derived destination with another. So the property parallelism needs
+// was already established by preflight, and is not a new assumption.
+//
+// Nothing about a single file's ordering changes — one worker carries one file
+// through the whole sequence — and the per-file crash safety that ordering buys
+// is untouched, because it never depended on what other files were doing.
+//
+// What does change is the cost of interruption: cancelling now abandons up to
+// workers files rather than one. Each is left exactly as an interrupted
+// sequential run leaves its single file, and reconcile repairs all of them by the
+// same sibling rule, so this is a larger amount of the same recoverable state.
+func replaceFiles(parent context.Context, s *store.Store, opts Options, p pass,
+	items []work, result *PassResult, tracker *progress, logger *slog.Logger) error {
+	// A derived context so the first store failure stops the other workers.
+	// parent.Err() stays the authority on cancellation, which is why it is kept
+	// separate rather than read back off this one.
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+
+	jobs := make(chan work)
+	// One mutex covers the counters, the progress tracker and the first error.
+	// Contention is immaterial against ~100ms of encoding per file, and a single
+	// lock keeps "every file lands in exactly one counter" true by construction.
+	var mu sync.Mutex
+	var firstErr error
+	var wg sync.WaitGroup
+
+	// Never more workers than there is work: a goroutine past len(items) can only
+	// ever observe a closed channel, and spawning one for each of --workers 200 on
+	// a pass with three files makes the count in the flag read as something the run
+	// did. The concurrency an explicit count asks for is untouched.
+	for range min(opts.workers(), len(items)) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Workers drain rather than return, because a feeder blocked mid-send
+			// would otherwise wait on a channel nobody is reading.
+			for item := range jobs {
+				if ctx.Err() != nil {
+					continue
+				}
+				produced, err := replaceOne(ctx, s, opts, p, item, logger)
+				mu.Lock()
+				if err != nil {
+					if firstErr == nil {
+						firstErr = err
+						cancel()
+					}
+				} else {
+					result.record(produced, item.size)
+				}
+				tracker.step()
+				mu.Unlock()
+			}
+		}()
+	}
+
+	for _, item := range items {
+		if ctx.Err() != nil {
+			// Interrupting mid-pass costs at most the files in flight, and leaves
+			// state a rerun reconciles. Everything committed stays committed.
+			break
+		}
+		jobs <- item
+	}
+	close(jobs)
+	wg.Wait()
+
+	if firstErr != nil {
+		return firstErr
+	}
+	return parent.Err()
+}
+
+// progressInterval is how often a running pass says where it has got to. It is
+// a package var purely as a test seam: the default has to be long enough that an
+// ordinary small run stays as quiet as it was before progress existed, which
+// makes the reporting path unreachable in a test that does not move it.
+var progressInterval = 5 * time.Second
+
+// progress reports a long pass's advance through the files selectWork gave it.
+//
+// The passes are silent by construction: every counter is returned at the end,
+// and the logger is otherwise reached only by a failure. A run over a full index
+// encodes thousands of frames at roughly a tenth of a second each and fsyncs each
+// replacement twice, so twenty minutes with nothing on screen was the normal,
+// healthy case — and indistinguishable from a hang. That is not a cosmetic
+// problem: interrupting costs far more than the file in flight, because screens
+// run before audio and a cancelled pass returns before the next one starts, so
+// giving up on a slow screen pass silently forfeits the audio pass too — and
+// audio is the lossless one, which measures 7x.
+//
+// It counts files rather than rows because selectWork has already applied the
+// gates; see there for why the honest denominator is worth a separate phase.
+type progress struct {
+	logger *slog.Logger
+	noun   string
+	files  int64
+	// seen counts files the pass has finished with, whatever became of them. It is
+	// deliberately not the count of successful replacements: a run where every file
+	// fails verification — a --min-psnr set above what the corpus can meet, or an
+	// encoder that is simply broken — is exactly the run a user suspects of
+	// hanging, and a numerator that stood still there would fail at the one job
+	// this has. The outcome breakdown is the summary's business.
+	seen  int64
+	start time.Time
+	last  time.Time
+	// reported records whether this pass ever spoke, so done can stay quiet for a
+	// pass that finished inside one interval.
+	reported bool
+}
+
+func newProgress(logger *slog.Logger, kind store.Kind, files int64) *progress {
+	now := time.Now()
+	return &progress{logger: logger, noun: passNoun(kind), files: files, start: now, last: now}
+}
+
+// step records one attempted file and reports where the pass is, at most once per
+// progressInterval.
+//
+// Rate-limited by elapsed time rather than by file count so that the line arrives
+// at a readable cadence whatever the media costs to encode — a 5K frame and a
+// silent audio chunk differ by two orders of magnitude — and so a pass can never
+// bury the warnings the logger is actually there for.
+func (p *progress) step() {
+	p.seen++
+	now := time.Now()
+	if now.Sub(p.last) < progressInterval {
+		return
+	}
+	p.last = now
+	p.reported = true
+	p.logger.Info("compressing "+p.noun, "done", p.seen, "of", p.files,
+		"elapsed", now.Sub(p.start).Round(time.Second))
+}
+
+// done closes out a pass that had been reporting, including one that a cancelled
+// context ended early — where it is the only account of how far the run got
+// before the counters were returned.
+func (p *progress) done() {
+	if !p.reported {
+		return
+	}
+	p.logger.Info("finished compressing "+p.noun, "done", p.seen, "of", p.files,
+		"elapsed", time.Since(p.start).Round(time.Second))
+}
+
+// passNoun names a kind the way `lumi compress`'s own summary does, so a
+// progress line and the final line describe the same thing in the same words.
+func passNoun(kind store.Kind) string {
+	if kind == store.KindAudio {
+		return "audio files"
+	}
+	return "screenshots"
 }
 
 // verificationError marks a result the checks rejected, as opposed to an encode
@@ -472,6 +780,13 @@ func runVacuum(ctx context.Context, s *store.Store, opts Options) VacuumResult {
 		return VacuumResult{Status: "skipped", Detail: "dry run"}
 	}
 	before := fileSize(opts.DatabasePath)
+	// Said before the call rather than after it: VACUUM rewrites the whole file
+	// under an exclusive lock and is the run's last step, so it is the stretch most
+	// easily read as a hang — the passes have stopped reporting and the summary has
+	// not been printed yet. One line, because unlike a pass there is no progress to
+	// have: SQLite does not report any.
+	opts.logger().Info("rebuilding the database to reclaim free pages",
+		"database", opts.DatabasePath, "bytes", before)
 	if err := s.Vacuum(ctx); err != nil {
 		if errors.Is(err, store.ErrVacuumBusy) {
 			return VacuumResult{Status: "busy", Detail: "the database is in use"}
@@ -532,6 +847,12 @@ func (o Options) validate() error {
 	}
 	if math.IsNaN(o.MinHistogramSimilarity) || o.MinHistogramSimilarity < 0 || o.MinHistogramSimilarity > 1 {
 		return fmt.Errorf("the histogram floor must be between 0 and 1, not %v", o.MinHistogramSimilarity)
+	}
+	// Rejected rather than clamped: a negative would fall through workers()' "zero
+	// means unset" branch and silently run at the default, which is the same class
+	// of quiet disagreement as --quality 0.
+	if o.Workers < 0 {
+		return fmt.Errorf("workers cannot be negative; zero means the default, not %d", o.Workers)
 	}
 	return nil
 }

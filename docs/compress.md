@@ -176,8 +176,40 @@ Turn it off with `--vacuum=false`.
 
 ## How long it takes
 
-Roughly 170 ms per screenshot, most of it the verification decode rather than the encode. A 5,500-frame
-index takes about 15 minutes; audio is far faster. It is safe to interrupt and resume.
+Files are re-encoded several at a time — one per core, up to 8 — which is about 3.8x faster than doing them
+one after another. Measured over 180 real 3456×2234 frames on an 18-core machine: 37.6 s sequentially,
+9.9 s at 8 workers. Beyond 8 the gain stops (9.3 s at 18) while memory keeps climbing, which is why that is
+the ceiling.
+
+Budget roughly 55 ms per screenshot at the default concurrency, most of it the verification decode rather
+than the encode. A 5,500-frame index takes about 5 minutes; audio is far faster. It is safe to interrupt and
+resume.
+
+`--workers 1` goes back to one file at a time, and `--workers N` sets it explicitly. Peak memory is about
+90 MB per file in flight on top of a ~1.4 GB baseline, so lower it if you are short on RAM. The ceiling of 8
+applies to the number picked for you: a larger `--workers` is used as typed, and above 8 that buys memory
+rather than speed.
+
+Each pass reports where it is on stderr every few seconds, so a long run is visibly working rather than
+apparently hung:
+
+```
+level=INFO msg="compressing screenshots" done=109 of=223 elapsed=20s
+level=INFO msg="finished compressing screenshots" done=223 of=223 elapsed=42s
+level=INFO msg="rebuilding the database to reclaim free pages" database=… bytes=111026176
+```
+
+`of` counts the files that pass will actually replace — the same number `--dry-run` reports — not the rows
+it looked at to find them, most of which are aged-out or already compressed. `done` counts the files it has
+finished with, whatever became of each one, so the line keeps moving even through files that are being
+rejected; the summary at the end is what breaks them down. A run short enough to finish inside one interval
+prints none of this.
+
+Prefer to know the size of the job first? `--dry-run` reports it in about a second and writes nothing.
+
+Screenshots are compressed before audio, and interrupting stops the whole run — so a `Ctrl-C` during a slow
+screen pass gives up the audio pass too, which is the lossless one and the better ratio (around 7x against
+2.6x). If you only have a few minutes, `--screens none` does the cheap half.
 
 ## Machine-readable output
 

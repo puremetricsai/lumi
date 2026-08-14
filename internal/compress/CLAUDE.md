@@ -28,11 +28,34 @@ how densely to keep it.
   file's *name* may not survive a power loss that the committed row update does, which reintroduces exactly
   the case the ordering prevents. Claiming a step is required and then continuing without it would be
   incoherent — a failed sync unlinks the destination and keeps the original.
-- **The crash-safety claim holds because exactly one compressor runs at a time, and it is only true with
-  that scope.** A lost compare-and-swap makes this package delete the file it just wrote; with a second
-  compressor running, that file can be the one the winner's row now names, which is unrecoverable. The
+- **The crash-safety claim holds because exactly one compressor *process* runs at a time, and it is only
+  true with that scope.** A lost compare-and-swap makes this package delete the file it just wrote; with a
+  second compressor running, that file can be the one the winner's row now names, which is unrecoverable. The
   single-instance lock lives in `internal/cli` (see its `CLAUDE.md`). State the scope wherever the claim is
   repeated.
+  - **"One compressor" is a statement about processes, and workers inside one pass are deliberately not one.**
+    The hazard is two agents deriving the same destination, and two *processes* can, because each builds its
+    own candidate list and can therefore both hold the same row. Workers cannot: the list is built once, each
+    item is dispatched to exactly one worker, and `findConflicts` has already skipped every row sharing a
+    source or a derived destination with another. So the property concurrency needs was established by
+    preflight before any of this was parallel — it is not a new assumption, which is exactly why the lock
+    still cannot be relaxed to cover it. A lost compare-and-swap inside a pass therefore still means a
+    genuinely external writer, and `Raced` still describes it correctly.
+    **Per-file ordering is untouched**: one worker carries one file through encode → verify → `fsync` → CAS →
+    unlink, and that ordering never depended on what other files were doing. What does change is the cost of
+    interruption — cancelling abandons up to `workers` files instead of one, each left exactly as an
+    interrupted sequential run leaves its single file, and all of them repaired by reconcile's one sibling
+    rule. More of the same recoverable state, not a new kind.
+    **`replaceOne` holds the sequence and `PassResult.record` holds the accounting**, split for this: with
+    several files in flight, "every file lands in exactly one counter" is only checkable if one place touches
+    the counters. One mutex covers the counters, the progress tracker and the first error, which is free
+    against ~100 ms of encoding per file.
+    **The concurrency is pinned by a rendezvous, not a sleep.** `TestCompressKeepsSeveralFilesInFlight`
+    blocks every encode until `workers` have arrived, so it can only pass if they genuinely overlap and it
+    fails with a diagnosis rather than hanging if a future change serialises the pass. The test fakes are
+    mutex-guarded for the same reason, and a test needing one file of several to fail must use
+    `fakeImages.failFor` rather than flipping a shared `err` from `observe` — which one encode reads which
+    value is undefined.
 - **Every pass is confined to `Options.MediaDirs`, and a run naming media outside them fails before it
   touches anything.** `media_path` is stored absolute, so pointing `--data-dir` at a *copy* of an index
   gives you the copy's database and the original's files — and this is the only command that rewrites and
@@ -99,6 +122,45 @@ how densely to keep it.
   unlink of the original persists. Deleting the survivor would destroy the last copy; repointing the row at
   it turns that tail case into a repair. It is checked for decodability first, which is the weakest check
   in the package and is applied only where the alternative is losing the data.
+- **A pass reports where it has got to, because a silent one is indistinguishable from a hung one and
+  interrupting costs a whole pass rather than a file.** Everything here is accounted for in counters that are
+  returned at the end, and the logger is otherwise reached only by a failure — so a full-index run, at
+  roughly 100 ms per HEIC encode plus two `fsync`s per replacement, printed nothing at all for twenty
+  minutes. That was measured, not guessed: 623 files took 75 s wall (59% CPU; the rest is the barrier), which
+  puts ~9,000 pending files near 20 minutes. The reason this is a correctness concern and not a cosmetic one
+  is the step order above: screens run before audio, and a cancelled pass returns before the next one starts,
+  so a user who reads the silence as a hang and presses Ctrl-C forfeits the *audio* pass entirely — the
+  lossless one, which measures 7x. An interrupted index shows this exactly, with the screen rows part
+  converted, every audio row still `.wav`, and no leftovers at all because the cancellation was clean.
+  - **The numerator counts files the pass has finished with, not files it replaced.** Reporting successes
+    would stall the line at `done=0` for a run whose every file fails verification — a `--min-psnr` above
+    what the corpus can meet, or a broken encoder — which is exactly the run a user reads as a hang and
+    interrupts, at the cost described above. Liveness is this line's whole job; which counter each file
+    landed in is the summary's. `TestCompressProgressAdvancesThroughAPassThatReplacesNothing` pins it.
+  - **The denominator counts files, and getting an honest one is why the gates run in their own phase.**
+    `selectWork` applies `done`, `conflicted`, `classify` and `stat` to every candidate row and returns the
+    survivors; `runPass` then encodes that list. Counting *rows* instead would have been free, and would have
+    lied: a real index is dominated by aged-out and already-compressed rows costing microseconds each, so
+    `6024 of 13211 rows` reads as 45% of a run that has encoded 108 files out of 223. The alternative —
+    counting eligible files in a second loop of the same gates — is the duplicated-rule drift this file warns
+    about everywhere else, and it would be invisible to both loops' tests.
+    **The split moves no ordering.** Every gate in `selectWork` is a read-only check, and the per-file
+    sequence is untouched and still strictly one file at a time. The one behavioural difference is that a
+    file something else deletes *during* the run now counts as an encode failure rather than a missing file:
+    a pre-existing race that this can only mislabel, never mishandle. `TestCompressProgressCountsFilesNotRows`
+    pins the count against one row rejected by each of the four gates.
+  - **Rate-limited by elapsed time, not by file count.** The per-file cost spans two orders of magnitude
+    between a 5K frame and a silent audio chunk, so a count-based trigger reports at an unpredictable cadence
+    and can bury the warnings the logger is actually there for. `progressInterval` is a package var only as a
+    test seam — the default must leave a short run exactly as quiet as it was before any of this existed,
+    which is what makes the reporting path otherwise unreachable in a test.
+  - **A pass that was reporting also reports where it stopped, including a cancelled one.** That line is the
+    only account of how far a run a user gave up on had actually got, and it fires from a `defer` so the
+    early return on `ctx.Err()` cannot skip it.
+  - **`VACUUM` announces itself instead of reporting progress**, because SQLite offers none. It is the last
+    step, it rewrites the whole file under an exclusive lock, and it runs after the passes have stopped
+    talking and before the summary is printed — the stretch most easily read as a hang. A disabled or
+    dry-run vacuum says nothing; the line is about a lock that is actually about to be held.
 - **Step order: passes → reconcile → vacuum, and each boundary is load-bearing.** Reconcile builds its
   reference set from `AllEvents` *at call time*; a set assembled before the passes would not name anything
   they had just written, so reconcile would delete the entire run's output. `VACUUM` is last because it
@@ -128,6 +190,29 @@ how densely to keep it.
     of the pass, the other pass, and reconcile — stranding the originals of every file already replaced,
     none of which is reclaimed until somebody runs compress again. Both are logged and stepped over; a
     stranded original is exactly reconcile's owner-is-present case.
+
+## Concurrency
+
+`MaxDefaultWorkers` (8) is measured, not guessed. Over 180 real 3456x2234 frames on an 18-logical-core
+machine with 6 performance cores, wall time went 37.6 s at one worker → 22.5 s at 2 → 14.4 s at 4 → 11.4 s
+at 6 → 9.9 s at 8, and then stopped improving: 10.1 s at 10, 9.4 s at 12, 9.3 s at 18. The cap keeps 3.8x of
+the available 4.0x and declines the rest because it costs memory for nothing — peak RSS was 1.37 GB at one
+worker, 2.02 GB at 8 and 2.72 GB at 18, roughly 93 MB per additional file in flight, since verifying one
+image holds two full RGBA buffers plus both decoded images.
+
+The default is `min(GOMAXPROCS, MaxDefaultWorkers)`; `--workers 1` restores the strictly sequential
+behaviour, and a negative count is refused rather than read as unset, for the same reason `--quality 0` is.
+`MaxDefaultWorkers` caps only what this package picks on the caller's behalf: **an explicit count is
+honoured however large, deliberately.** Clamping a number the caller typed is the same quiet disagreement as
+silently correcting `--quality` — the flag would name a concurrency the run did not use — and the ceiling to
+clamp it to would have to be invented rather than measured. The cost of an absurd one is memory at the ~93 MB
+per file in flight above, which is the user's own override of a measured default. The one bound that is
+applied is against the work: `replaceFiles` starts no more workers than there are files, since a goroutine
+past `len(items)` can only ever observe a closed channel.
+
+The large baseline is worth noticing separately: 1.37 GB at one worker is mostly `AllEvents` being
+materialised twice per run, with every row's OCR text. That is the thing to fix if this ever needs to be
+cheaper — not the worker count.
 
 ## Thresholds
 
