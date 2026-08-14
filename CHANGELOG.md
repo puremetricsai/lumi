@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.5.0](https://github.com/puremetricsai/lumi/compare/v0.4.0...v0.5.0) (2026-08-14)
+
+
+### Features
+
+* **compress:** report progress so a long run is not mistaken for a hang ([402daf7](https://github.com/puremetricsai/lumi/commit/402daf7b1897220ef0320785d0fd998ea3630dfc))
+* **compress:** report progress, and re-encode several files at once for a measured 3.8x ([5c1373b](https://github.com/puremetricsai/lumi/commit/5c1373b671368e05e48d95731f5caa26b41dc5de))
+
+
+### Bug Fixes
+
+* **ci:** rewrite the formula from the release archive, not the source tarball ([17bc58b](https://github.com/puremetricsai/lumi/commit/17bc58b066a26a3c08e8540349f17f37af3c5f59))
+* **compress:** bound workers by the work, and say what --workers does not do ([970364d](https://github.com/puremetricsai/lumi/commit/970364df704718a417091c37e36a7142b4ff2413))
+* **compress:** report attempted files so a rejecting pass still moves ([6fb8201](https://github.com/puremetricsai/lumi/commit/6fb82014910c1cdd76b46b9dda76f9a83f15ca3d))
+* **homebrew:** install the released binary instead of building from source ([cbdaf67](https://github.com/puremetricsai/lumi/commit/cbdaf674a8900541330f9e0508dce4df840cee55))
+* **homebrew:** install the released binary instead of building from source ([855f6bb](https://github.com/puremetricsai/lumi/commit/855f6bbfc936556e88e1477dadfaafa685bb5cc7))
+
+
+### Performance Improvements
+
+* **compress:** re-encode several files at once for a measured 3.8x ([336ecba](https://github.com/puremetricsai/lumi/commit/336ecba005254cc40d7079a13cbd8055f577eb9c))
+
 ## [0.4.0](https://github.com/puremetricsai/lumi/compare/v0.3.0...v0.4.0) (2026-08-13)
 
 
