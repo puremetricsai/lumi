@@ -28,6 +28,7 @@ ScreenCaptureKit captures system output and the default microphone directly; no 
 
 ```sh
 brew tap puremetricsai/lumi https://github.com/puremetricsai/lumi
+brew trust --formula puremetricsai/lumi/lumi
 brew install lumi
 lumi permissions --request
 lumi doctor
