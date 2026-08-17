@@ -24,6 +24,15 @@ how densely to keep it.
   PSNR, histogram similarity), independent because a colour-space or channel-order mistake can pass one and
   fail another. Encode and verify failures are counted apart: one means a broken input, the other means an
   encoder producing something wrong while reporting success.
+  - **Audio below `macosnative.MinFLACFrames` is declined, not failed.** The FLAC encoder writes an
+    unreadable header stub for any input under 4608 frames (see that package's `CLAUDE.md`), so the verifying
+    reopen fails with an "unsupported file type" indistinguishable from a genuinely botched encode. That is a
+    hard codec limit rather than a broken encoder, so `audioPass.encode` checks the decoded frame count and
+    returns a `skipError` **before writing anything** — counted as `Skipped` (left alone, the WAV kept) with
+    no per-file log, because naming every sub-second tail chunk is exactly the spam this avoids. It is the one
+    eligibility decision made in `encode` rather than `selectWork`: the others key on the path, and this one
+    needs the decoded length, which only the per-file sequence has. So the file counts into the progress
+    denominator and then lands in `Skipped` — honest, since the pass did decode it.
 - **The directory `fsync` is load-bearing, so its failure is fatal for that file.** Without it the new
   file's *name* may not survive a power loss that the committed row update does, which reintroduces exactly
   the case the ordering prevents. Claiming a step is required and then continuing without it would be
