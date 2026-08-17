@@ -84,6 +84,17 @@ func (audioPass) encode(ctx context.Context, opts Options, source, destination s
 	if err != nil {
 		return err
 	}
+	// A chunk shorter than the encoder's minimum block cannot be turned into a
+	// readable FLAC — AVFoundation writes a bare header with no audio and the
+	// verifying reopen then fails with an "unsupported file type" that reads as a
+	// broken encoder. It is a hard property of the codec, not a fidelity call, so
+	// the input is declined before anything is written and left as the WAV it is.
+	// The sub-second tail chunks a stopped recording leaves behind are where this
+	// bites. → internal/macosnative MinFLACFrames.
+	if len(original) < macosnative.MinFLACFrames {
+		return skipError{fmt.Errorf("audio is %d frames, below the %d-frame FLAC minimum",
+			len(original), macosnative.MinFLACFrames)}
+	}
 	if err := opts.Sounds.Transcode(ctx, source, destination); err != nil {
 		return err
 	}

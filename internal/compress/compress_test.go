@@ -137,6 +137,19 @@ func (f *fakeAudio) Decode(_ context.Context, path string) ([]int16, int, error)
 	return samples, rate, nil
 }
 
+// realisticChunk is a fake sample slice long enough that the audio pass actually
+// attempts the encode. The pass declines anything below macosnative.MinFLACFrames
+// up front, which every real captured chunk clears by orders of magnitude — a
+// 30-second chunk is 480,000 frames. The values vary so that a corruption test
+// altering one sample changes the hash the verification compares.
+func realisticChunk() []int16 {
+	samples := make([]int16, macosnative.MinFLACFrames+64)
+	for i := range samples {
+		samples[i] = int16(i%617 - 300)
+	}
+	return samples
+}
+
 type harness struct {
 	t      *testing.T
 	store  *store.Store
@@ -163,7 +176,7 @@ func newHarness(t *testing.T) *harness {
 	return &harness{
 		t: t, store: s, dir: media,
 		images: &fakeImages{verification: goodImage()},
-		audio:  &fakeAudio{samples: []int16{1, -2, 3, -4, 0, 0, 7}},
+		audio:  &fakeAudio{samples: realisticChunk()},
 	}
 }
 
@@ -334,6 +347,57 @@ func TestCompressRejectsAudioThatDoesNotRoundTrip(t *testing.T) {
 	}
 	if h.mediaPath(event.ID) != event.MediaPath {
 		t.Error("the row was repointed to audio that does not match")
+	}
+}
+
+// A chunk shorter than the FLAC encoder's minimum block cannot be losslessly
+// encoded: it must be left as the WAV it is and counted as skipped — not as the
+// verification failure it would silently be if fed to the encoder, which produces
+// an unreadable header stub for such inputs. Both sides of the exact 4608-frame
+// boundary are pinned so an accidental `<` → `<=` drift is caught: one frame short
+// is skipped, and exactly the minimum is compressed.
+func TestCompressBoundaryOfTheFLACMinimum(t *testing.T) {
+	cases := []struct {
+		name    string
+		frames  int
+		skipped bool
+	}{
+		{"one frame short is skipped", macosnative.MinFLACFrames - 1, true},
+		{"exactly the minimum is compressed", macosnative.MinFLACFrames, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.audio.samples = realisticChunk()[:tc.frames]
+			event := h.seed(store.KindAudio, "chunk.wav", time.Hour)
+
+			result := h.run(h.options())
+
+			if tc.skipped {
+				if result.Audio.Skipped != 1 || result.Audio.Files != 0 {
+					t.Fatalf("short audio: skipped=%d files=%d, want 1 and 0",
+						result.Audio.Skipped, result.Audio.Files)
+				}
+				if result.Audio.VerifyFailed != 0 || result.Audio.EncodeFailed != 0 {
+					t.Errorf("short audio counted as a failure: verify_failed=%d encode_failed=%d",
+						result.Audio.VerifyFailed, result.Audio.EncodeFailed)
+				}
+				if !exists(event.MediaPath) || h.mediaPath(event.ID) != event.MediaPath {
+					t.Error("the original WAV was not left in place")
+				}
+				if exists(filepath.Join(h.dir, "chunk.flac")) {
+					t.Error("a FLAC stub was left on disk")
+				}
+				return
+			}
+			if result.Audio.Files != 1 || result.Audio.Skipped != 0 {
+				t.Fatalf("minimum-length audio: files=%d skipped=%d, want 1 and 0",
+					result.Audio.Files, result.Audio.Skipped)
+			}
+			if got := h.mediaPath(event.ID); got != filepath.Join(h.dir, "chunk.flac") {
+				t.Errorf("row names %q, want the compressed FLAC", got)
+			}
+		})
 	}
 }
 

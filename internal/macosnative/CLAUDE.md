@@ -29,6 +29,14 @@ pure file-to-file work needing no TCC grant, so their tests are ordinary build-t
   stat'd — `AVAudioFile` finalises its header on deallocation, so anything earlier sees a 42-byte stub.
 - **Audio reads are bounded by the file's own `length`**, not run until a zero-length read, which
   `AVAudioFile` does not reliably give for a compressed source.
+- **The FLAC encoder emits nothing below `MinFLACFrames` (4608), and it does not flush the shorter tail on
+  close.** It buffers one block plus its lookahead (4096 + 512) before writing a frame, so a shorter input
+  finalises as a bare 42-byte STREAMINFO header whose reopen fails with `kAudioFileUnsupportedFileTypeError`
+  (`'typ?'`) — a *silent* loss, since the encode itself reports success. The threshold is exact and
+  rate-independent (measured at 8/16/48 kHz). `EncodeAudioFLAC` does not guard it because it does not decode
+  its input; the frame count is known to `internal/compress`, which reads `MinFLACFrames` and declines the
+  round trip rather than write a stub and mislabel it a verification failure. The sub-second tail chunks a
+  stopped recording leaves are the real inputs this catches.
 
 ## Attribution
 

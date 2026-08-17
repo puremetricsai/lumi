@@ -212,7 +212,9 @@ type PassResult struct {
 	// AlreadyDone counts rows whose media is already in the target format, which
 	// is what makes a rerun a no-op without any stored state.
 	AlreadyDone int64 `json:"already_done"`
-	// Skipped counts rows in a format this pass does not handle. Not a failure.
+	// Skipped counts rows the pass left alone by choice rather than by failure:
+	// a format it does not handle, or a handled one whose contents the codec
+	// cannot represent — audio shorter than the FLAC encoder's minimum block.
 	Skipped int64 `json:"skipped"`
 	// MissingFiles counts rows whose media is already gone, which an aged-out
 	// history is full of.
@@ -426,7 +428,11 @@ func runPass(ctx context.Context, s *store.Store, opts Options,
 	}
 	if opts.DryRun {
 		// Stops before the encode, which is why a dry run cannot report a ratio:
-		// measuring one means doing the work.
+		// measuring one means doing the work. For the same reason Files here counts
+		// path-eligible candidates, not what a real run will replace: a real run
+		// decodes each one and may reclassify it — a short audio chunk into Skipped
+		// (below the FLAC minimum), or any file into a failure counter. Applying
+		// those gates would mean the decode a dry run exists to avoid.
 		for _, item := range items {
 			result.Files++
 			result.BytesBefore += item.size
@@ -455,6 +461,11 @@ const (
 	outcomeVerifyFailed
 	outcomeFlushFailed
 	outcomeRaced
+	// outcomeSkipped is a file the pass declined to encode after looking at its
+	// contents — an input the codec cannot represent rather than one it botched.
+	// It reaches record here rather than selectWork because deciding it needs the
+	// decoded frame count, which only the per-file sequence has.
+	outcomeSkipped
 )
 
 type outcome struct {
@@ -477,6 +488,8 @@ func (r *PassResult) record(produced outcome, size int64) {
 		r.EncodeFailed++
 	case outcomeVerifyFailed:
 		r.VerifyFailed++
+	case outcomeSkipped:
+		r.Skipped++
 	case outcomeFlushFailed:
 		r.FlushFailed++
 	case outcomeRaced:
@@ -497,17 +510,26 @@ func replaceOne(ctx context.Context, s *store.Store, opts Options, p pass,
 	event, destination := item.event, item.destination
 
 	if err := p.encode(ctx, opts, event.MediaPath, destination); err != nil {
-		kind := outcomeEncodeFailed
-		if isVerificationError(err) {
+		var kind outcomeKind
+		switch {
+		case isSkipError(err):
+			// A declined input, not a failure: the pass looked at the contents and
+			// found something this codec cannot represent. Left alone and counted as
+			// Skipped, without a per-file line — naming every sub-second clip would
+			// be the log spam this decision exists to remove, and the summary's
+			// Skipped count is the honest aggregate.
+			kind = outcomeSkipped
+		case isVerificationError(err):
 			kind = outcomeVerifyFailed
 			logger.Warn("compressed file failed verification; keeping the original",
 				"event", event.ID, "media", event.MediaPath, "error", err)
-		} else {
+		default:
+			kind = outcomeEncodeFailed
 			logger.Warn("could not compress media; keeping the original",
 				"event", event.ID, "media", event.MediaPath, "error", err)
 		}
-		// A partial or rejected encode is never left on disk to be adopted later
-		// by reconcile.
+		// A partial, rejected or declined encode is never left on disk to be adopted
+		// later by reconcile.
 		os.Remove(destination)
 		return outcome{kind: kind}, nil
 	}
@@ -734,6 +756,19 @@ type verificationError struct{ error }
 
 func isVerificationError(err error) bool {
 	var target verificationError
+	return errors.As(err, &target)
+}
+
+// skipError marks an input a pass has decided not to attempt at all, as opposed
+// to one it tried and failed on. It is counted as Skipped, the same bucket as an
+// unhandled format, because both mean "left alone, not a failure" — the audio
+// pass raises it for a chunk shorter than macosnative.MinFLACFrames, which the
+// FLAC encoder cannot represent, so encoding it would write a stub, fail to
+// reopen, and be miscounted as an encoder producing something wrong.
+type skipError struct{ error }
+
+func isSkipError(err error) bool {
+	var target skipError
 	return errors.As(err, &target)
 }
 
