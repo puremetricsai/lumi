@@ -216,3 +216,10 @@ chunks over eight minutes, and the ratio scales with how much the user switches 
   system track still attributes. These chunks are the one thing the derived queue cannot drain, which is
   what `store.ChunksFailedTranscription` exists to count — `lumi transcript` and `get_transcript` name them
   apart from real gaps so neither recommends a backfill that would reach the same dead end.
+- **`Recorder.Levels` is nil by default, and nil means the measurement is never taken.** It costs a file
+  read per captured track and nothing in the pipeline needs it — only a supervising app drawing a meter
+  (`levels.go`, `lumi record start --emit-levels`). Emission happens *after* the insert, never before: the row is
+  what must not be lost, and a level is only a readout of media that is already safe. The figures come from
+  `ReadAudioEnvelope` at `transcript.EnvelopeWindowMS`, the same envelope that decides silence, so a meter
+  and a silence verdict cannot disagree about what was heard — and the resolution is one finished chunk,
+  because that is when audio reaches Go at all. The sink runs on the audio goroutine and must not block.
