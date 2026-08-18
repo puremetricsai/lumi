@@ -209,37 +209,100 @@ struct LumiWindow: View {
             // current capture mode, never a fixed count.
             VStack(spacing: 7) {
                 ForEach(requiredRows) { row in
-                    HStack {
-                        Text(row.service.title)
-                            .font(.system(size: 13))
-                        Spacer()
-                        StatePill(text: row.state.label, state: row.state)
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 9)
-                    .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.05)))
-                    .accessibilityElement(children: .combine)
+                    permissionRow(row)
                 }
+            }
+
+            // Said plainly, because the alternative is the user waiting for a
+            // dialog that is never coming. Screen Recording and Accessibility
+            // do not re-prompt once macOS holds a decision for this build, and
+            // an unsigned rebuild is a new build every time. The measurement is
+            // docs/research/2026-08-17-tcc-spike.md, Result 6.
+            if hasSettingsOnlyService {
+                Text("Screen Recording and Accessibility never ask twice. "
+                     + "Switch them on in System Settings, then come back.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             // Explained before requested, never the other way round: the app
             // must not raise a system prompt the user has had no chance to
             // understand.
-            Button("Open System Settings") {
-                Task {
-                    await recorder.requestPermissions()
-                    if let url = recorder.missingPermissions.first?.service.settingsURL {
-                        NSWorkspace.shared.open(url)
-                    }
-                }
+            //
+            // This runs the request flows, which is what Microphone and Speech
+            // Recognition need — they answer with a dialog. It no longer opens
+            // a pane afterwards. It used to open the *first* missing service's
+            // pane, which meant that with both Screen Recording and
+            // Accessibility missing, the second one had no route at all: the
+            // user granted the first, came back, and the same button sent them
+            // to the same place. Each row carries its own route now.
+            Button("Request access") {
+                Task { await recorder.requestPermissions() }
             }
             .buttonStyle(.borderedProminent)
             .tint(Theme.accent)
+            .help("Ask macOS for the permissions that answer with a dialog")
         }
         .padding(.horizontal, 24)
         .padding(.top, 20)
         .padding(.bottom, 24)
     }
+
+    /// permissionRow is one service. An ungranted one is a button that opens
+    /// its own pane in System Settings.
+    ///
+    /// Per service, not one button for the set. Two of these services can only
+    /// ever be fixed in System Settings, and they live in two different panes;
+    /// a single destination leaves whichever one is not first unreachable.
+    @ViewBuilder
+    private func permissionRow(_ row: PermissionRow) -> some View {
+        let body = HStack {
+            Text(row.service.title)
+                .font(.system(size: 13))
+            Spacer()
+            StatePill(text: row.state.label, state: row.state)
+            if !row.state.isGranted, row.service.settingsURL != nil {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.05)))
+
+        if !row.state.isGranted, let url = row.service.settingsURL {
+            Button {
+                NSWorkspace.shared.open(url)
+            } label: {
+                body
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("\(row.service.title), \(row.state.label). Open it in System Settings")
+            .help("Open \(row.service.title) in System Settings")
+        } else {
+            body.accessibilityElement(children: .combine)
+        }
+    }
+
+    /// hasSettingsOnlyService reports whether anything missing is one macOS
+    /// will not re-prompt for. Screen Recording and Accessibility are the two;
+    /// both are reached only through System Settings once a decision exists.
+    private var hasSettingsOnlyService: Bool {
+        recorder.missingPermissions.contains {
+            $0.service == .screenRecording || $0.service == .accessibility
+        }
+    }
+
+    // There is deliberately no "can this still prompt?" test. Screen Recording
+    // and Accessibility report `denied_or_not_determined`, and that conflation
+    // is on purpose: `lumi_permissions_json` says splitting the two needs Full
+    // Disk Access or a call that prompts as a side effect. So "never asked" and
+    // "already refused" are indistinguishable here, and disabling the button on
+    // that guess would suppress a prompt that would have worked. Running the
+    // flows again costs nothing when there is nothing to ask.
 
     /// requiredRows is every service the current capture mode needs, with the
     /// ungranted ones first so the thing to fix is at the top.

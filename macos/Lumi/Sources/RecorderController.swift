@@ -269,7 +269,20 @@ final class RecorderController {
     /// requestPermissions runs the native request flows as a child of this
     /// bundle, which is what makes the prompts name Lumi.
     func requestPermissions() async {
-        _ = try? await LumiCLI.run(["permissions", "--request"], includeDataDirectory: false)
+        do {
+            // `permissions --request` exits non-zero when something is still
+            // ungranted after the flows run, which is the ordinary outcome for
+            // Screen Recording and Accessibility. That is not a failure to
+            // report — only a binary that could not run at all is.
+            _ = try await LumiCLI.run(["permissions", "--request"], includeDataDirectory: false)
+            lastError = nil
+        } catch let failure as LumiCLI.Failure {
+            if case .launch = failure {
+                lastError = failure.errorDescription
+            }
+        } catch {
+            lastError = error.localizedDescription
+        }
         await refreshPermissions()
     }
 
