@@ -7,8 +7,9 @@ Guidance for Claude Code (claude.ai/code) when working in this repository.
 A local-first memory CLI for Apple Silicon Macs: continuously capture all displays plus system and
 microphone audio, extract screen text locally (full-display Apple Vision OCR, with Accessibility for
 focused-app attribution), transcribe audio with in-process Apple SpeechAnalyzer, store media on disk, index
-text in SQLite FTS5, and query it. Inspired by screenpipe but deliberately narrower — no GUI, server, or
-plugins.
+text in SQLite FTS5, and query it. Inspired by screenpipe but deliberately narrower — no server
+or plugins. The `lumi` CLI is the whole of the functionality; a native menu-bar `Lumi.app` (`macos/`)
+supervises that CLI and adds nothing of its own.
 
 ## Commands
 
@@ -19,6 +20,8 @@ task check                                  # fmt → vet → test; the verifica
 task speech && go test ./internal/store -run TestSearch -v   # single test
 task test:native                            # permission-gated native smoke test
 task mcp                                    # hand-fed MCP handshake smoke test
+task app | task app:install | task app:run  # build, install (~/Applications), launch Lumi.app
+./scripts/restart-lumi-app.sh               # the app dev loop: quit, rebuild, reset TCC, relaunch
 ```
 
 Run `task build`/`task test`, never raw `go build`/`go test` — nothing links without `liblumispeech.a`,
@@ -60,6 +63,8 @@ changing anything there** — the rationale lives with the code it constrains, n
 | `internal/selfexec` | Watches the running binary and replaces the process image (`syscall.Exec`) when it changes, so an upgrade reaches a live `lumi mcp` session. |
 | `internal/config` | Resolves `Paths` from `--data-dir`, else `LUMI_HOME`, else `~/Library/Application Support/Lumi`; directories 0700. |
 | `internal/platform` | The `darwin/arm64` gate. |
+| `macos/` | Swift menu-bar app (`Lumi.app`): SwiftUI shell, Lumi window, six Settings tabs, `build-app.sh`. Drives the CLI as a child process and owns no capture logic. |
+| `scripts/` | Local development helpers. `restart-lumi-app.sh` is the `Lumi.app` rebuild loop. |
 
 ## Rules that span packages
 
@@ -95,6 +100,11 @@ changing anything there** — the rationale lives with the code it constrains, n
   actually bites: the agent holds it across the user's `brew upgrade`. `internal/mcp` reports both skews in
   every tool's `notice` and replaces its own image to fix the first.
   → `internal/mcp/CLAUDE.md`, `internal/selfexec/CLAUDE.md`
+- **`Lumi.app` is a supervisor, never a second implementation.** It spawns the embedded `lumi` binary and
+  reads its `--json` output; every rule about capture, ownership, retention, or MCP registration stays in Go.
+  Swift restating one — parsing `record.json`, rendering a client's MCP snippet, deciding what is silent — is
+  the same drift as two copies of a rule, made invisible by a language boundary as well as a file one.
+  → `macos/CLAUDE.md`, `internal/cli/CLAUDE.md`
 - **Real captured conversation never becomes a test fixture.** Harnesses that need real audio read a path
   from the environment and skip without it. The measured numbers belong in the repository; the words do not.
 
