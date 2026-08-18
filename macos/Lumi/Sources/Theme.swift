@@ -71,8 +71,8 @@ struct LevelMeter: View {
 
     private var fractions: [Double] {
         guard let level, isFresh else { return [0, 0, 0] }
-        let peak = AudioLevel.normalized(level.peakDBFS)
-        let median = AudioLevel.normalized(level.medianDBFS)
+        let peak = AudioLevel.normalized(level.peakDbfs)
+        let median = AudioLevel.normalized(level.medianDbfs)
         // Three bars from two figures: the typical level, the midpoint, and the
         // loudest moment. Reading outward from the median is what keeps a quiet
         // chunk with one loud noise from looking like continuous speech.
@@ -93,35 +93,9 @@ struct LevelMeter: View {
     }
 }
 
-/// StatePill is the Required / Granted badge used on permission rows.
-struct StatePill: View {
-    var text: String
-    var state: PermissionState
-
-    /// Three tones, not two. "Not requested" is neither granted nor blocking —
-    /// nobody has asked yet — and colouring it like a denial tells the user
-    /// something is wrong when nothing is.
-    private var tint: Color {
-        switch state {
-        case .granted: return Theme.live
-        case .notDetermined: return .secondary
-        case .denied, .deniedOrNotDetermined, .restricted: return Theme.recording
-        }
-    }
-
-    var body: some View {
-        Text(text)
-            .font(.system(size: 11, weight: .semibold))
-            .padding(.horizontal, 8)
-            .padding(.vertical, 2)
-            .foregroundStyle(tint)
-            .background(Capsule().fill(tint.opacity(0.14)))
-    }
-}
-
-/// Badge is StatePill's shape for everything that is not a TCC permission —
-/// MCP registration, mostly. Same three tones, chosen by the caller rather than
-/// derived from a permission state.
+/// Badge is the small capsule used for every status: TCC permissions, MCP
+/// registration, whatever else. A permission derives its tone through
+/// `PermissionState.tone`; everything else names one.
 struct Badge: View {
     enum Tone { case ok, neutral, warn, bad }
 
@@ -144,6 +118,19 @@ struct Badge: View {
             .padding(.vertical, 2)
             .foregroundStyle(tint)
             .background(Capsule().fill(tint.opacity(0.14)))
+    }
+}
+
+extension PermissionState {
+    /// Three tones, not two. "Not requested" is neither granted nor blocking —
+    /// nobody has asked yet — and colouring it like a denial tells the user
+    /// something is wrong when nothing is.
+    var tone: Badge.Tone {
+        switch self {
+        case .granted: return .ok
+        case .notDetermined: return .neutral
+        case .denied, .deniedOrNotDetermined, .restricted: return .bad
+        }
     }
 }
 

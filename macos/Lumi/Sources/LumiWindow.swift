@@ -268,7 +268,7 @@ struct LumiWindow: View {
             Text(row.service.title)
                 .font(.system(size: 13))
             Spacer()
-            StatePill(text: row.state.label, state: row.state)
+            Badge(text: row.state.label, tone: row.state.tone)
             if !row.state.isGranted, row.service.settingsURL != nil {
                 Image(systemName: "chevron.right")
                     .font(.system(size: 10, weight: .semibold))
@@ -325,23 +325,10 @@ struct LumiWindow: View {
 /// StatusRow is one source's line in the recording card.
 private struct StatusRow: View {
     var title: String
-    var detail: String?
-    var level: AudioLevel?
+    var detail: String? = nil
+    var level: AudioLevel? = nil
     var isFresh: Bool = false
     var healthy: Bool
-
-    init(title: String, detail: String, healthy: Bool) {
-        self.title = title
-        self.detail = detail
-        self.healthy = healthy
-    }
-
-    init(title: String, level: AudioLevel?, isFresh: Bool, healthy: Bool) {
-        self.title = title
-        self.level = level
-        self.isFresh = isFresh
-        self.healthy = healthy
-    }
 
     var body: some View {
         HStack(spacing: 10) {
@@ -367,7 +354,7 @@ private struct StatusRow: View {
     private var accessibilityLabel: String {
         if let detail { return "\(title), \(detail)" }
         guard let level, isFresh else { return "\(title), no recent measurement" }
-        return "\(title), peak \(Int(level.peakDBFS)) decibels full scale"
+        return "\(title), peak \(Int(level.peakDbfs)) decibels full scale"
     }
 }
 

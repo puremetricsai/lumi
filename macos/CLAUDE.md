@@ -17,6 +17,11 @@ The app is a supervisor and nothing else — root `CLAUDE.md` states that rule; 
   client's config, `Result.manual_hint` rather than rendering a client's JSON or TOML
   (`internal/mcpsetup/CLAUDE.md`). Every invocation passes the app's `--data-dir`, because a child inherits
   no shell environment.
+- **`LumiCLI.decoder` maps keys with `.convertFromSnakeCase`, so `Models.swift` carries no key tables.**
+  A model that needs a `CodingKeys` enum anyway must spell its cases in the *converted* names — a case
+  written `= "manual_hint"` matches nothing once the strategy has already produced `manualHint`, and the
+  field decodes as absent with no error anywhere. Go's field name is the contract; spell it in camelCase
+  and it lands.
 - **The app-owned recorder is a `record start --foreground --register-state` child, held for its whole
   life.** Not a detached start: launchd would become the TCC responsible process instead of the bundle, and
   the grants belong to the bundle. `--register-state` is what makes it visible to `record status`, `record

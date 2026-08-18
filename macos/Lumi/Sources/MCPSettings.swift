@@ -306,9 +306,8 @@ struct MCPSettings: View {
         case .unchanged: return .ok
         case .added, .replaced: return .warn
         case .conflict, .failed: return .bad
-        // Not installed is not a problem, and a status this build has never
-        // heard of is not one either.
-        case .skipped, .unknown: return .neutral
+        // Not installed is not a problem.
+        case .skipped: return .neutral
         }
     }
 
@@ -343,7 +342,7 @@ struct MCPSettings: View {
         // more precisely than the error does, so they are left to the switch.
         if !result.succeeded, result.status == .added || result.status == .replaced
             || result.status == .unchanged {
-            return "\(result.displayName): nothing was written — \(result.failure ?? "")"
+            return "\(result.displayName): nothing was written — \(result.error ?? "")"
         }
         switch result.status {
         case .added: return "\(result.displayName): registered."
@@ -354,7 +353,6 @@ struct MCPSettings: View {
         case .skipped: return "\(result.displayName): not installed."
         case .failed:
             return "\(result.displayName): its config could not be read. Nothing was written."
-        case .unknown: return "\(result.displayName): unknown result."
         }
     }
 }

@@ -16,11 +16,6 @@ struct RecordStatus: Decodable {
     /// no log of its own, its output goes to the pipe this app holds.
     var log: String?
 
-    enum CodingKeys: String, CodingKey {
-        case recording, pid, screen, audio, log
-        case startedAt = "started_at"
-    }
-
     static let notRecording = RecordStatus(recording: false)
 }
 
@@ -51,16 +46,6 @@ enum PermissionState: String, Decodable {
     }
 }
 
-extension PermissionState {
-    /// An unknown value is treated as not-determined rather than as a decode
-    /// failure: a newer `lumi` reporting a state this build has never heard of
-    /// must not take the whole permissions screen down with it.
-    init(from decoder: Decoder) throws {
-        let raw = try decoder.singleValueContainer().decode(String.self)
-        self = PermissionState(rawValue: raw) ?? .notDetermined
-    }
-}
-
 /// Permissions is `lumi permissions --json`, decoded.
 struct Permissions: Decodable {
     var screenRecording: PermissionState = .notDetermined
@@ -68,14 +53,6 @@ struct Permissions: Decodable {
     var inputMonitoring: PermissionState = .notDetermined
     var microphone: PermissionState = .notDetermined
     var speechRecognition: PermissionState = .notDetermined
-
-    enum CodingKeys: String, CodingKey {
-        case screenRecording = "screen_recording"
-        case accessibility
-        case inputMonitoring = "input_monitoring"
-        case microphone
-        case speechRecognition = "speech_recognition"
-    }
 
     /// One row per service, in the order `lumi permissions` prints them. The
     /// order is part of the contract the Permissions tab mirrors.
@@ -165,19 +142,10 @@ struct AudioLevel: Decodable {
     var event: String
     var source: String
     var capturedAt: Date
-    var peakDBFS: Double
-    var medianDBFS: Double
-    var windowMS: Int
-    var durationMS: Int
-
-    enum CodingKeys: String, CodingKey {
-        case event, source
-        case capturedAt = "captured_at"
-        case peakDBFS = "peak_dbfs"
-        case medianDBFS = "median_dbfs"
-        case windowMS = "window_ms"
-        case durationMS = "duration_ms"
-    }
+    var peakDbfs: Double
+    var medianDbfs: Double
+    var windowMs: Int
+    var durationMs: Int
 
     /// Digital silence, as `internal/wav.SilenceFloorDBFS` defines it. A level
     /// at the floor is a real measurement — nothing was playing — not a missing
@@ -217,12 +185,6 @@ struct MCPSetupReport: Decodable {
     var commandLine: String
     var dryRun: Bool
     var results: [MCPSetupResult]
-
-    enum CodingKeys: String, CodingKey {
-        case name, command, args, results
-        case commandLine = "command_line"
-        case dryRun = "dry_run"
-    }
 }
 
 /// MCPSetupResult is one client's row in the report.
@@ -248,21 +210,15 @@ struct MCPSetupResult: Decodable, Identifiable {
     /// `added` *before* it attempts the write and returns that same result when
     /// the write fails. So a row with `status == .added` and a non-empty error
     /// registered nothing. Read `failure` before believing `status`.
-    var failure: String?
+    var error: String?
 
     var id: String { target }
-
-    enum CodingKeys: String, CodingKey {
-        case target, status, detail, current, manual, changed
-        case manualHint = "manual_hint"
-        case failure = "error"
-    }
 
     /// succeeded reports whether this client ended up holding what Lumi asked
     /// for. Under `--dry-run` it reports whether the same run would have
     /// succeeded: a conflict fails in both modes, deliberately, so a preview
     /// stays a faithful preview.
-    var succeeded: Bool { failure == nil || failure?.isEmpty == true }
+    var succeeded: Bool { error == nil || error?.isEmpty == true }
 
     /// The client's display name. The raw values are `internal/mcpsetup`'s
     /// target names; an unrecognised one is shown as-is rather than dropped, so
@@ -292,12 +248,6 @@ enum MCPSetupStatus: String, Decodable {
     /// know what it holds. Deliberately distinct from conflict: nothing is in
     /// the way, so "replace it" is advice that cannot work.
     case failed
-    case unknown
-
-    init(from decoder: Decoder) throws {
-        let raw = try decoder.singleValueContainer().decode(String.self)
-        self = MCPSetupStatus(rawValue: raw) ?? .unknown
-    }
 
     /// isRegistered reports whether the client will launch Lumi today.
     /// Only an identical existing entry means that; everything else is either a
@@ -312,7 +262,6 @@ enum MCPSetupStatus: String, Decodable {
         case .conflict: return "Conflict"
         case .skipped: return "Not installed"
         case .failed: return "Unreadable"
-        case .unknown: return "Unknown"
         }
     }
 }
@@ -329,12 +278,6 @@ struct PruneResult: Decodable {
     /// Files removed by the `--all` sweep that no row referenced. Their bytes
     /// are already counted in `bytes`.
     var orphanFiles: Int
-
-    enum CodingKeys: String, CodingKey {
-        case events, bytes
-        case missingFiles = "missing_files"
-        case orphanFiles = "orphan_files"
-    }
 }
 
 /// CompressResult is `lumi compress --json`, decoded — `compress.Result`.
@@ -366,17 +309,6 @@ struct CompressResult: Decodable {
         var untouched: Int64 {
             skipped + missingFiles + encodeFailed + verifyFailed + raced + conflicted + flushFailed
         }
-
-        enum CodingKeys: String, CodingKey {
-            case files, skipped, raced, conflicted
-            case bytesBefore = "bytes_before"
-            case bytesAfter = "bytes_after"
-            case alreadyDone = "already_done"
-            case missingFiles = "missing_files"
-            case encodeFailed = "encode_failed"
-            case verifyFailed = "verify_failed"
-            case flushFailed = "flush_failed"
-        }
     }
 
     /// Reconciled is what an interrupted earlier run left behind.
@@ -391,12 +323,6 @@ struct CompressResult: Decodable {
         var detail: String?
         var bytesBefore: Int64?
         var bytesAfter: Int64?
-
-        enum CodingKeys: String, CodingKey {
-            case status, detail
-            case bytesBefore = "bytes_before"
-            case bytesAfter = "bytes_after"
-        }
     }
 
     var screens: Pass

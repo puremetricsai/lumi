@@ -291,13 +291,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func openSettingsWindow() {
         NSApp.activate(ignoringOtherApps: true)
-        // The selector differs by OS generation; both are tried so a rename
-        // costs nothing at runtime.
-        if NSApp.responds(to: Selector(("showSettingsWindow:"))) {
-            NSApp.perform(Selector(("showSettingsWindow:")), with: nil)
-        } else {
-            NSApp.perform(Selector(("showPreferencesWindow:")), with: nil)
-        }
+        NSApp.perform(Selector(("showSettingsWindow:")), with: nil)
     }
 
     func showWindow() {

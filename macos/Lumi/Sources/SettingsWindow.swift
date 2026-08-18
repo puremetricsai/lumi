@@ -47,10 +47,7 @@ struct RecordingSettings: View {
                 Toggle("Capture screen", isOn: Binding(
                     get: { preferences.captureScreen },
                     set: { preferences.captureScreen = $0; restart() }))
-                    .help("All connected displays, hot-plug aware")
-                Text("All connected displays, hot-plug aware")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                SettingsCaption("All connected displays, hot-plug aware")
 
                 Picker("Capture interval", selection: Binding(
                     get: { preferences.intervalSeconds },
@@ -59,18 +56,14 @@ struct RecordingSettings: View {
                         Text(Self.label(seconds)).tag(seconds)
                     }
                 }
-                Text("How often a changed frame is saved")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                SettingsCaption("How often a changed frame is saved")
             }
 
             Section("Audio") {
                 Toggle("Record audio", isOn: Binding(
                     get: { preferences.captureAudio },
                     set: { preferences.captureAudio = $0; restart() }))
-                Text("System output + microphone")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                SettingsCaption("System output + microphone")
 
                 Picker("Audio chunk length", selection: Binding(
                     get: { preferences.audioChunkSeconds },
@@ -79,9 +72,7 @@ struct RecordingSettings: View {
                         Text(Self.label(seconds)).tag(seconds)
                     }
                 }
-                Text("Length of each transcribed WAV segment. Level meters refresh once per segment.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                SettingsCaption("Length of each transcribed WAV segment. Level meters refresh once per segment.")
 
                 Picker("Speech locale", selection: Binding(
                     get: { preferences.speechLocale },
@@ -90,9 +81,7 @@ struct RecordingSettings: View {
                         Text(Self.localeLabel(locale)).tag(locale)
                     }
                 }
-                Text("On-device transcription language")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                SettingsCaption("On-device transcription language")
             }
         }
         .formStyle(.grouped)

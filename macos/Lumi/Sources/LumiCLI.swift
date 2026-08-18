@@ -124,6 +124,11 @@ enum LumiCLI {
 
     static let decoder: JSONDecoder = {
         let decoder = JSONDecoder()
+        // Go writes snake_case and every model here spells the same names in
+        // camelCase, so the mapping is a rule rather than eight key tables. A
+        // model that still needs a CodingKeys enum must spell its cases in the
+        // *converted* names, or it silently stops decoding.
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
         // Go's encoding/json writes RFC 3339 with nanoseconds, which
         // .iso8601 refuses. Both precisions are accepted here.
         let full = ISO8601DateFormatter()

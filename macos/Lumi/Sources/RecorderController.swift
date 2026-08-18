@@ -323,7 +323,7 @@ final class RecorderController {
     /// bar height would be a claim about sound nobody measured.
     func hasFreshLevel(for source: String) -> Bool {
         guard let level = levels[source] else { return false }
-        let staleAfter = TimeInterval(level.durationMS) / 1000 * 2
+        let staleAfter = TimeInterval(level.durationMs) / 1000 * 2
         return Date().timeIntervalSince(level.capturedAt) < max(staleAfter, 10)
     }
 }

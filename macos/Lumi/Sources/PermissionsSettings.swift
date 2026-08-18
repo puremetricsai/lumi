@@ -77,7 +77,7 @@ struct PermissionsSettings: View {
                     SettingsCaption(row.service.subtitle)
                 }
                 Spacer(minLength: 12)
-                StatePill(text: pillText(row), state: pillState(row))
+                Badge(text: pillText(row), tone: pillState(row).tone)
             }
             // The title, subtitle and status read as one item. The chevron sits
             // outside that group so VoiceOver can still reach the button.
@@ -97,7 +97,7 @@ struct PermissionsSettings: View {
         }
     }
 
-    /// PermissionState.label is written for a service capture needs, so a
+    /// `PermissionState.label` is written for a service capture needs, so a
     /// denied one reads "Required" in red. Input Monitoring is never required —
     /// `Permissions.missingFor` never asks for it — and the spike's Result 6
     /// shows it lands on `denied` after every rebuild. A red "Required" there
