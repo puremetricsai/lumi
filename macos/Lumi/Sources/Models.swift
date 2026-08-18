@@ -336,3 +336,77 @@ struct PruneResult: Decodable {
         case orphanFiles = "orphan_files"
     }
 }
+
+/// CompressResult is `lumi compress --json`, decoded — `compress.Result`.
+///
+/// The app runs the command and reads the counters back; what compression means
+/// — which codecs, what quality, when a re-encode is rejected — is
+/// `internal/compress`'s and stays there. The two passes are summed for display
+/// because the user pressed one button, not two.
+struct CompressResult: Decodable {
+    /// Pass is `compress.PassResult`. Every field is emitted unconditionally by
+    /// the CLI, so none is optional here.
+    struct Pass: Decodable {
+        var files: Int64
+        var bytesBefore: Int64
+        var bytesAfter: Int64
+        var alreadyDone: Int64
+        var skipped: Int64
+        var missingFiles: Int64
+        var encodeFailed: Int64
+        var verifyFailed: Int64
+        var raced: Int64
+        var conflicted: Int64
+        var flushFailed: Int64
+
+        /// Every file the run declined to replace. They are counted together
+        /// because the answer is the same for all of them: the original is
+        /// still on disk and still indexed. The per-reason breakdown is the
+        /// CLI's own output, which stays the fuller report.
+        var untouched: Int64 {
+            skipped + missingFiles + encodeFailed + verifyFailed + raced + conflicted + flushFailed
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case files, skipped, raced, conflicted
+            case bytesBefore = "bytes_before"
+            case bytesAfter = "bytes_after"
+            case alreadyDone = "already_done"
+            case missingFiles = "missing_files"
+            case encodeFailed = "encode_failed"
+            case verifyFailed = "verify_failed"
+            case flushFailed = "flush_failed"
+        }
+    }
+
+    /// Reconciled is what an interrupted earlier run left behind.
+    struct Reconciled: Decodable {
+        var removed: Int64
+        var recovered: Int64
+    }
+
+    /// Vacuum is the database rebuild. Only `status` is always present.
+    struct Vacuum: Decodable {
+        var status: String
+        var detail: String?
+        var bytesBefore: Int64?
+        var bytesAfter: Int64?
+
+        enum CodingKeys: String, CodingKey {
+            case status, detail
+            case bytesBefore = "bytes_before"
+            case bytesAfter = "bytes_after"
+        }
+    }
+
+    var screens: Pass
+    var audio: Pass
+    var reconciled: Reconciled
+    var vacuum: Vacuum
+
+    var files: Int64 { screens.files + audio.files }
+    var bytesBefore: Int64 { screens.bytesBefore + audio.bytesBefore }
+    var bytesAfter: Int64 { screens.bytesAfter + audio.bytesAfter }
+    var alreadyDone: Int64 { screens.alreadyDone + audio.alreadyDone }
+    var untouched: Int64 { screens.untouched + audio.untouched }
+}
