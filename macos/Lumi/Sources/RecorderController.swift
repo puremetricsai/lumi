@@ -24,7 +24,9 @@ final class RecorderController {
         case needsPermissions
     }
 
-    private(set) var state: State = .idle
+    private(set) var state: State = .idle {
+        didSet { if state != oldValue { statusDidChange?() } }
+    }
     private(set) var permissions = Permissions()
     private(set) var status: RecordStatus = .notRecording
     private(set) var displayCount: Int = max(1, NSScreen.screens.count)
@@ -37,7 +39,13 @@ final class RecorderController {
     /// True while a stop is in flight, so the UI can stay honest during the
     /// graceful-shutdown window rather than claiming the recorder is already
     /// gone.
-    private(set) var isStopping = false
+    private(set) var isStopping = false {
+        didSet { if isStopping != oldValue { statusDidChange?() } }
+    }
+
+    /// AppKit's menu is not part of SwiftUI's observation tree, so it uses this
+    /// hook to redraw immediately when the recorder's visible status changes.
+    var statusDidChange: (() -> Void)?
 
     private var process: Process?
     private var stderrPipe: Pipe?

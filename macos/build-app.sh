@@ -45,6 +45,7 @@ echo "--- Lumi.app version $VERSION (CFBundleVersion $BUILD_VERSION)"
 sed -e "s|<key>CFBundleShortVersionString</key><string>0.0.0</string>|<key>CFBundleShortVersionString</key><string>${VERSION}</string>|" \
     -e "s|<key>CFBundleVersion</key><string>0</string>|<key>CFBundleVersion</key><string>${BUILD_VERSION}</string>|" \
     "$HERE/Lumi/Resources/Info.plist" > "$CONTENTS/Info.plist"
+plutil -lint "$CONTENTS/Info.plist" >/dev/null
 
 # The menu bar glyph ships as a template image, so it follows the menu bar's own
 # light/dark appearance instead of carrying its own colour.
@@ -77,6 +78,13 @@ fi
 codesign --force --sign - --timestamp=none "$CONTENTS/MacOS/lumi"
 codesign --force --sign - --timestamp=none "$CONTENTS/MacOS/LumiApp"
 codesign --force --sign - --timestamp=none "$APP"
+
+codesign --verify --deep --strict "$APP"
+
+# Both executables must remain native arm64 binaries. This also catches the
+# case-insensitive-name collision above on a case-sensitive build volume.
+lipo "$CONTENTS/MacOS/LumiApp" -verify_arch arm64
+lipo "$CONTENTS/MacOS/lumi" -verify_arch arm64
 
 echo "--- built $APP"
 codesign -dvvv "$APP" 2>&1 | grep -E 'Identifier=|CDHash=|Signature='

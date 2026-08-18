@@ -8,7 +8,7 @@ Lumi is a minimal, open source AI memory of everything you do. It sees your scre
 
 Everything runs on your Mac. Nothing is uploaded, and it's completely free.
 
-Lumi deliberately targets a small surface: capture → process → store → query, with no GUI, server, or plugins.
+Lumi deliberately targets a small surface: capture → process → store → query. The `lumi` CLI remains the core interface; a native menu-bar `Lumi.app` is also available when building from source.
 
 ## Requirements
 
@@ -46,6 +46,16 @@ task install # compiles the Swift SpeechAnalyzer bridge (task speech), then go i
 `task install` places the `lumi` binary in your Go bin directory — `go env GOBIN` if set, otherwise `$(go env GOPATH)/bin` — and prints the path it used. Add that directory to your `PATH` if it isn't there already. Remove the binary with `task uninstall`.
 
 macOS grants capture permissions to a specific binary, so re-run `lumi permissions --request` after installing if you had previously granted them to a `./lumi` built in the repository.
+
+### Native menu-bar app
+
+```sh
+task app          # build build/Lumi.app
+task app:install  # install ~/Applications/Lumi.app
+task app:run      # install and launch it
+```
+
+The app embeds the same `lumi` binary and offers to symlink it into a writable directory on your shell's `PATH`; it never replaces an existing `lumi` command. The local bundle is ad-hoc signed, so every rebuild changes its TCC identity and requires Screen Recording, Accessibility, Microphone, and Speech Recognition to be granted again. Developer ID signing, notarization, DMG packaging, and automatic updates remain out of scope.
 
 ## Build and run (Development)
 

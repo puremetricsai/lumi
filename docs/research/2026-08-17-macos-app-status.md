@@ -1,10 +1,10 @@
 # Lumi.app — build status and decisions
 
-**Date:** 2026-08-17 (updated after deliverable 5)
+**Date:** 2026-08-17 (updated after deliverable 6)
 **Purpose:** Hand-off note for the macOS menu-bar app work. It records what is done, what is
 deliberately not done, and the decisions that are not recoverable from the code.
 
-The plan being followed has six deliverables. **1–5 are complete. 6 is partly done.**
+The plan's six deliverables are complete.
 
 ## Where things stand
 
@@ -15,7 +15,7 @@ The plan being followed has six deliverables. **1–5 are complete. 6 is partly 
 | 3 | `lumi app` + `--register-state` + app-aware refusal | Done, tested, reviewed |
 | 4 | Menu bar item + Lumi window, three states | Done, tested, reviewed |
 | 5 | Settings window, six tabs | Done — all six tabs exist and are wired |
-| 6 | Packaging (`task app` polish, install paths) | Partly done — `task app`/`app:install`/`app:run` work |
+| 6 | Packaging (`task app` polish, install paths) | Done — bundle validation, app/CLI install paths, and spike cleanup verified |
 
 ## What exists
 
@@ -31,7 +31,9 @@ The plan being followed has six deliverables. **1–5 are complete. 6 is partly 
 - `internal/capture`: optional `Recorder.Levels` sink (`internal/capture/levels.go`).
 
 **Swift** — `macos/Lumi/Sources/`, built by `macos/build-app.sh` via `task app`. Fourteen files: the
-menu bar shell, the Lumi window, and one file per Settings tab.
+menu bar shell, the Lumi window, and one file per Settings tab. On first launch the app offers to
+symlink its bundled CLI into the first writable directory on the login-shell `PATH`, unless a `lumi`
+command already exists; it never replaces one.
 
 ## Decisions that are not visible in the code
 
@@ -117,8 +119,6 @@ menu bar shell, the Lumi window, and one file per Settings tab.
 
 ## Outstanding
 
-- **Deliverable 6**: cleanup of the throwaway `~/Applications/LumiTCCSpike.app` and its TCC rows
-  is owed; see the `lumi-tcc-spike-cleanup` memory.
 - **The app runs and captures end to end, verified on 2026-08-17.** Permissions were granted by hand
   after a `tccutil reset`, and `lumi record status` from a terminal saw the app-owned recorder — pid,
   `screen=true audio=true` — which is `--register-state` working across the two interfaces.
