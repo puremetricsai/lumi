@@ -72,7 +72,7 @@ struct RecordingSettings: View {
                         Text(Self.label(seconds)).tag(seconds)
                     }
                 }
-                SettingsCaption("Length of each transcribed WAV segment. Level meters refresh once per segment.")
+                SettingsCaption("Length of each transcribed WAV segment. The level meters are live and do not depend on it.")
 
                 Picker("Speech locale", selection: Binding(
                     get: { preferences.speechLocale },

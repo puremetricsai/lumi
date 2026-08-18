@@ -134,18 +134,34 @@ struct PermissionRow: Identifiable {
 /// AudioLevel is one `{"event":"audio_level",...}` line from the recorder's
 /// stderr, produced by `--emit-levels`.
 ///
-/// It arrives once per finished chunk, because that is when audio reaches Go at
-/// all. A meter drawn from it refreshes at `--audio-chunk`, and the figures are
-/// the same windowed dBFS the capture pipeline uses to decide whether a chunk
-/// was silent — there is no second definition of "level" anywhere in this app.
+/// It arrives several times a second, per track, for as long as capture runs:
+/// the recorder sums sound inside the capture callback and drains it on a
+/// ticker, so a meter drawn from this moves with the room. The figures are the
+/// same windowed dBFS the capture pipeline uses to decide whether a chunk was
+/// silent — there is no second definition of "level" anywhere in this app.
 struct AudioLevel: Decodable {
     var event: String
     var source: String
-    var capturedAt: Date
     var peakDbfs: Double
     var medianDbfs: Double
     var windowMs: Int
     var durationMs: Int
+
+    /// When this app read the measurement, which is what staleness is counted
+    /// from. The default is evaluated during decoding, so it is receipt time and
+    /// not an accident of struct initialisation.
+    ///
+    /// Deliberately not the line's `captured_at`: that names the start of the
+    /// sound the figures summarise, not when the app learned of it, and the two
+    /// are what staleness must not confuse.
+    var receivedAt = Date()
+
+    /// `receivedAt` is not in the JSON, so the keys are named rather than
+    /// synthesised. Everything the recorder sends that is absent here — most of
+    /// all `captured_at` — is ignored on purpose.
+    private enum CodingKeys: String, CodingKey {
+        case event, source, peakDbfs, medianDbfs, windowMs, durationMs
+    }
 
     /// Digital silence, as `internal/wav.SilenceFloorDBFS` defines it. A level
     /// at the floor is a real measurement — nothing was playing — not a missing

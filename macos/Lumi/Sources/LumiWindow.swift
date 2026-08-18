@@ -115,16 +115,8 @@ struct LumiWindow: View {
                         healthy: true)
                 }
                 if Preferences.shared.captureAudio {
-                    StatusRow(
-                        title: "Microphone",
-                        level: recorder.level(for: "microphone"),
-                        isFresh: recorder.hasFreshLevel(for: "microphone"),
-                        healthy: true)
-                    StatusRow(
-                        title: "System audio",
-                        level: recorder.level(for: "system"),
-                        isFresh: recorder.hasFreshLevel(for: "system"),
-                        healthy: true)
+                    AudioStatusRow(title: "Microphone", level: recorder.level(for: "microphone"))
+                    AudioStatusRow(title: "System audio", level: recorder.level(for: "system"))
                 }
             }
 
@@ -322,12 +314,35 @@ struct LumiWindow: View {
     }
 }
 
+/// AudioStatusRow is one audio track's line in the recording card.
+///
+/// A missing level is drawn as a missing level. `RecorderController` prunes a
+/// measurement the recorder has stopped refreshing, so nil here means one of
+/// two things — capture has only just started, or the track has stopped
+/// reporting because the microphone is denied, absent, or gone — and neither is
+/// "sound was heard". Bars at their floor beside a green dot said the opposite
+/// of both, and a dead microphone was indistinguishable from a quiet room.
+///
+/// Levels are live, so this clears within a second of capture starting. A row
+/// still reading "No signal yet" after that is a real answer about that track.
+private struct AudioStatusRow: View {
+    var title: String
+    var level: AudioLevel?
+
+    var body: some View {
+        StatusRow(
+            title: title,
+            detail: level == nil ? "No signal yet" : nil,
+            level: level,
+            healthy: level != nil)
+    }
+}
+
 /// StatusRow is one source's line in the recording card.
 private struct StatusRow: View {
     var title: String
     var detail: String? = nil
     var level: AudioLevel? = nil
-    var isFresh: Bool = false
     var healthy: Bool
 
     var body: some View {
@@ -340,7 +355,7 @@ private struct StatusRow: View {
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
             } else {
-                LevelMeter(level: level, isFresh: isFresh)
+                LevelMeter(level: level)
             }
             StatusDot(color: healthy ? Theme.live : Theme.attention, diameter: 7)
         }
@@ -353,7 +368,7 @@ private struct StatusRow: View {
 
     private var accessibilityLabel: String {
         if let detail { return "\(title), \(detail)" }
-        guard let level, isFresh else { return "\(title), no recent measurement" }
+        guard let level else { return "\(title), no recent measurement" }
         return "\(title), peak \(Int(level.peakDbfs)) decibels full scale"
     }
 }

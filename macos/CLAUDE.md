@@ -26,8 +26,21 @@ The app is a supervisor and nothing else — root `CLAUDE.md` states that rule; 
   life.** Not a detached start: launchd would become the TCC responsible process instead of the bundle, and
   the grants belong to the bundle. `--register-state` is what makes it visible to `record status`, `record
   stop`, `compress`, `transcript backfill`, and the duplicate-start refusal in a terminal — and what makes
-  the app refuse to start a second one over a terminal's. `--emit-levels` feeds the meters, one JSON line
-  per finished chunk on stderr (`internal/capture/CLAUDE.md`).
+  the app refuse to start a second one over a terminal's. `--emit-levels` feeds the meters, several JSON
+  lines a second per track on stderr, measured live inside the capture callback
+  (`internal/capture/CLAUDE.md`).
+- **A level's staleness is counted from when the app received it, and a stale one is pruned rather than
+  tested at draw time.** Freshness turns on wall-clock, which `@Observable` cannot track: nothing else in
+  the recording card changes while capture is healthy, so a draw-time check never re-ran and the meters held
+  their last height for as long as the window stayed open — a claim about sound nobody measured.
+  `RecorderController.dropStaleLevels` prunes on the existing poll, which makes presence in `levels` *be*
+  freshness, so no reader asks twice. Levels arrive continuously now, silence included, so a track going
+  stale means capture stopped rather than the room going quiet.
+- **A missing level is drawn as missing — "No signal yet" and an amber dot, never floor bars and a green
+  one.** A track that wrote no file is never an event (`internal/macosnative`), so a denied or absent
+  microphone produces no level at all, and bars at their floor beside a hardcoded `healthy: true` rendered
+  that identically to a quiet room. Levels are live, so this clears within a second of capture starting: a
+  row still reading "No signal yet" after that is a real answer about that track.
 - **Stopping is SIGTERM then wait (`stopTimeout`, 20s), never SIGKILL** — in-flight media is still being
   written and indexed. This is also the app-quit path: `AppDelegate` returns `.terminateLater` while a
   child is held, so ⌘Q asks first and then shuts down gracefully.

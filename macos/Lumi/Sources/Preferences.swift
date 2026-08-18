@@ -56,9 +56,8 @@ final class Preferences {
         set { defaults.set(newValue, forKey: Key.intervalSeconds) }
     }
 
-    /// Seconds, matching `--audio-chunk` (default 30s). This is also how often
-    /// the level meters can refresh, since audio reaches the app only when a
-    /// chunk closes.
+    /// Seconds, matching `--audio-chunk` (default 30s). It sets transcription
+    /// granularity only — the level meters are live and do not depend on it.
     var audioChunkSeconds: Double {
         get { defaults.double(forKey: Key.audioChunkSeconds) }
         set { defaults.set(newValue, forKey: Key.audioChunkSeconds) }

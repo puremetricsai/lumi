@@ -61,16 +61,17 @@ struct StatusDot: View {
 ///
 /// The bars are heights, never an animation loop. A meter that animates on a
 /// timer claims sound was heard when nothing measured it, and the whole reason
-/// the recorder emits levels at all is so this can be true. When no fresh
-/// measurement exists the bars sit at their floor rather than moving.
+/// the recorder emits levels at all is so this can be true. With no measurement
+/// the bars sit at their floor rather than moving — and the row draws "No signal
+/// yet" instead, because floor bars alone read as "measured, and quiet".
 struct LevelMeter: View {
     /// Peak and median of the most recent chunk, in dBFS, or nil when nothing
-    /// recent has been measured.
+    /// recent has been measured. `RecorderController` prunes a stale
+    /// measurement, so a non-nil level here is a recent one by construction.
     var level: AudioLevel?
-    var isFresh: Bool
 
     private var fractions: [Double] {
-        guard let level, isFresh else { return [0, 0, 0] }
+        guard let level else { return [0, 0, 0] }
         let peak = AudioLevel.normalized(level.peakDbfs)
         let median = AudioLevel.normalized(level.medianDbfs)
         // Three bars from two figures: the typical level, the midpoint, and the
@@ -84,11 +85,20 @@ struct LevelMeter: View {
             ForEach(Array(fractions.enumerated()), id: \.offset) { _, fraction in
                 Capsule()
                     .fill(Theme.accent)
-                    .frame(width: 2.5, height: max(3, 13 * fraction))
+                    // 3 + 10·f, not max(3, 13·f): the latter pinned every bar at
+                    // the 3pt floor until f passed 0.23, so nothing under about
+                    // -46 dBFS moved at all. That silently cost the median bar,
+                    // which is room tone in a normal room and therefore always
+                    // below that — leaving the one figure that separates speech
+                    // from a door slam flat whatever was heard.
+                    .frame(width: 2.5, height: 3 + 10 * fraction)
             }
         }
         .frame(width: 13, height: 13, alignment: .center)
-        .animation(.easeInOut(duration: 0.35), value: fractions)
+        // Short enough to keep up with a live reading several times a
+        // second. At 0.35s the easing was still travelling when the next
+        // measurement replaced it, which reads as lag rather than as sound.
+        .animation(.easeOut(duration: 0.12), value: fractions)
         .accessibilityHidden(true)
     }
 }

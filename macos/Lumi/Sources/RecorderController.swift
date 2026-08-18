@@ -217,6 +217,7 @@ final class RecorderController {
     /// recorder started from a terminal.
     func refreshStatus() async {
         displayCount = max(1, NSScreen.screens.count)
+        dropStaleLevels()
         guard let fresh = try? await LumiCLI.json(RecordStatus.self, ["record", "status", "--json"]) else {
             return
         }
@@ -318,12 +319,23 @@ final class RecorderController {
     /// protect media that is written but not yet indexed.
     private(set) var stopFailed = false
 
-    /// hasFreshLevel reports whether a measurement is recent enough to draw.
-    /// Older than two chunks means the recorder has not reported in, and a stale
-    /// bar height would be a claim about sound nobody measured.
-    func hasFreshLevel(for source: String) -> Bool {
-        guard let level = levels[source] else { return false }
-        let staleAfter = TimeInterval(level.durationMs) / 1000 * 2
-        return Date().timeIntervalSince(level.capturedAt) < max(staleAfter, 10)
+    /// dropStaleLevels removes measurements the recorder has stopped refreshing,
+    /// so presence in `levels` *is* freshness and no reader has to ask twice.
+    ///
+    /// It is a prune on a timer rather than a check at draw time because a check
+    /// at draw time never runs: freshness turns on wall-clock, `@Observable`
+    /// cannot track a clock, and nothing else in the recording card changes
+    /// while capture is healthy. Meters therefore held their last height for as
+    /// long as the window stayed open — a claim about sound nobody measured,
+    /// which is the one thing the meter exists not to do.
+    ///
+    /// Two chunks is the budget: one missed chunk is tolerated, a second means
+    /// the source has stopped reporting.
+    private func dropStaleLevels() {
+        let now = Date()
+        let kept = levels.filter { now.timeIntervalSince($0.value.receivedAt) < TimeInterval($0.value.durationMs) / 1000 * 2 }
+        // Guarded because `levels` is not Equatable, so an unconditional assign
+        // would invalidate the window every five seconds for nothing.
+        if kept.count != levels.count { levels = kept }
     }
 }
