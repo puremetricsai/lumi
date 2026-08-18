@@ -65,22 +65,18 @@ struct LumiWindow: View {
         }
     }
 
+    /// The footer carries the local-first guarantee and nothing else.
+    ///
+    /// Quit used to sit here. It lives in the menu bar menu now, which is where
+    /// a menu bar app is quit from, and it is the only place: two routes out of
+    /// the app would be two places to keep the graceful-stop confirmation
+    /// right.
     private var footer: some View {
         HStack {
             Text("On-device · nothing leaves your Mac")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
             Spacer()
-            // Plain, and the same weight and colour as the line beside it. The
-            // link style rendered it accent-blue, which read as a hyperlink and
-            // gave the one destructive action in the window more emphasis than
-            // anything else on screen.
-            Button("Quit") { LumiApp.confirmQuit() }
-                .buttonStyle(.plain)
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-                .pointerStyle(.link)
-                .accessibilityLabel("Quit Lumi")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 9)

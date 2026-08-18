@@ -25,18 +25,6 @@ struct LumiApp: App {
     }
 
     static let windowID = "lumi-main"
-
-    /// confirmQuit is the only path out of the app, and it always goes through
-    /// the recorder's graceful stop. Quitting mid-chunk without the SIGTERM
-    /// wait would discard media that was written but not yet indexed.
-    @MainActor
-    static func confirmQuit() {
-        guard let delegate = NSApp.delegate as? AppDelegate else {
-            NSApp.terminate(nil)
-            return
-        }
-        Task { await delegate.quit() }
-    }
 }
 
 @MainActor
@@ -125,8 +113,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         item.menu = buildMenu()
     }
 
-    /// buildMenu builds the plain menu the brief specifies: a status line, and
-    /// the two things worth opening. Quit lives in the window footer, not here.
+    /// buildMenu builds the plain menu: a status line, the two things worth
+    /// opening, and Quit last behind a separator.
+    ///
+    /// Quit is the one destructive item here, so it is separated from the two
+    /// that merely open a window — the separator is what stops it being hit by
+    /// a click aimed at Open Settings. It still goes through
+    /// `AppDelegate.quit()`, which asks first while capture is live and always
+    /// takes the graceful SIGTERM-then-wait path; a menu item that terminated
+    /// directly would discard media that was written but not yet indexed.
     private func buildMenu() -> NSMenu {
         let menu = NSMenu()
 
@@ -143,6 +138,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let settings = NSMenuItem(title: "Open Settings", action: #selector(openSettingsWindow), keyEquivalent: ",")
         settings.target = self
         menu.addItem(settings)
+
+        menu.addItem(.separator())
+
+        // ⌘Q, because that is what someone types to quit an app and this menu
+        // is the only place the app can be quit from. It is routed to `quit`
+        // rather than to NSApp.terminate: terminate would still reach the
+        // graceful path through applicationShouldTerminate, but it would skip
+        // the confirmation that stops an accidental ⌘Q ending a live capture.
+        let quit = NSMenuItem(title: "Quit Lumi", action: #selector(quitApp), keyEquivalent: "q")
+        quit.target = self
+        menu.addItem(quit)
         return menu
     }
 
@@ -175,6 +181,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Actions and deep links
 
     @objc private func openWindow() { showWindow() }
+
+    @objc private func quitApp() { Task { await quit() } }
 
     @objc private func openSettingsWindow() {
         NSApp.activate(ignoringOtherApps: true)
