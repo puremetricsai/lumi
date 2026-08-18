@@ -197,3 +197,142 @@ struct AudioLevel: Decodable {
         return (clamped - meterFloorDBFS) / (0 - meterFloorDBFS)
     }
 }
+
+/// MCPSetupReport is `lumi mcp setup --json`, decoded.
+///
+/// Read with `--dry-run` it is the read-only status query `internal/mcpsetup`
+/// does not otherwise offer: every entry point there writes unless DryRun is
+/// set, so the app asks what a run *would* do rather than what is registered.
+/// Read without it, it is the outcome of the Set up button.
+///
+/// Lumi never runs or supervises an MCP server. Clients launch `lumi mcp`
+/// themselves over stdio, so there is no pid here, and nothing to restart.
+struct MCPSetupReport: Decodable {
+    /// The name the entry is registered under, default "lumi".
+    var name: String
+    /// The absolute path to the binary clients are pointed at.
+    var command: String
+    var args: [String]
+    /// command and args rendered as one line, the way the CLI shows it.
+    var commandLine: String
+    var dryRun: Bool
+    var results: [MCPSetupResult]
+
+    enum CodingKeys: String, CodingKey {
+        case name, command, args, results
+        case commandLine = "command_line"
+        case dryRun = "dry_run"
+    }
+}
+
+/// MCPSetupResult is one client's row in the report.
+struct MCPSetupResult: Decodable, Identifiable {
+    var target: String
+    var status: MCPSetupStatus
+    var detail: String
+    var current: String
+    /// A paste-able config snippet in the client's own format — JSON for the
+    /// Claude clients, TOML for Codex. It arrives on every result, whatever the
+    /// status. Never build this in Swift: `internal/mcpsetup` owns what each of
+    /// the three foreign config formats looks like, and a second renderer here
+    /// would drift the moment one of them changed.
+    var manual: String
+    /// The sentence introducing `manual`, e.g. `add this under "mcpServers"`.
+    /// It travels with the snippet because one hardcoded sentence would tell a
+    /// Codex user to paste TOML into a JSON object.
+    var manualHint: String
+    var changed: Bool
+    /// The failure this client reported, absent when it succeeded.
+    ///
+    /// The status alone cannot say whether a write landed: a target sets
+    /// `added` *before* it attempts the write and returns that same result when
+    /// the write fails. So a row with `status == .added` and a non-empty error
+    /// registered nothing. Read `failure` before believing `status`.
+    var failure: String?
+
+    var id: String { target }
+
+    enum CodingKeys: String, CodingKey {
+        case target, status, detail, current, manual, changed
+        case manualHint = "manual_hint"
+        case failure = "error"
+    }
+
+    /// succeeded reports whether this client ended up holding what Lumi asked
+    /// for. Under `--dry-run` it reports whether the same run would have
+    /// succeeded: a conflict fails in both modes, deliberately, so a preview
+    /// stays a faithful preview.
+    var succeeded: Bool { failure == nil || failure?.isEmpty == true }
+
+    /// The client's display name. The raw values are `internal/mcpsetup`'s
+    /// target names; an unrecognised one is shown as-is rather than dropped, so
+    /// a newer lumi that knows a fourth client still lists it.
+    var displayName: String {
+        switch target {
+        case "claude-code": return "Claude Code"
+        case "claude-desktop": return "Claude Desktop"
+        case "codex": return "Codex CLI"
+        default: return target
+        }
+    }
+}
+
+/// MCPSetupStatus mirrors `mcpsetup.Status`.
+enum MCPSetupStatus: String, Decodable {
+    /// No entry existed and one was written — or, under --dry-run, would be.
+    case added
+    /// An identical entry already exists. This is what "registered" looks like.
+    case unchanged
+    case replaced
+    /// A different entry is in the way and Lumi will not overwrite it.
+    case conflict
+    /// The client is not installed on this machine.
+    case skipped
+    /// The client is installed but could not be inspected, so Lumi does not
+    /// know what it holds. Deliberately distinct from conflict: nothing is in
+    /// the way, so "replace it" is advice that cannot work.
+    case failed
+    case unknown
+
+    init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = MCPSetupStatus(rawValue: raw) ?? .unknown
+    }
+
+    /// isRegistered reports whether the client will launch Lumi today.
+    /// Only an identical existing entry means that; everything else is either a
+    /// change waiting to be made or a reason it cannot be.
+    var isRegistered: Bool { self == .unchanged }
+
+    /// The badge text, in the same three tones the permission pills use.
+    var label: String {
+        switch self {
+        case .unchanged: return "Registered"
+        case .added, .replaced: return "Not registered"
+        case .conflict: return "Conflict"
+        case .skipped: return "Not installed"
+        case .failed: return "Unreadable"
+        case .unknown: return "Unknown"
+        }
+    }
+}
+
+/// PruneResult is `lumi prune --json`, decoded — `retention.Result`.
+///
+/// The app never deletes a row or a file itself. Row-before-file ordering is
+/// `internal/retention`'s rule and stays there; this is only how the result of
+/// asking is read back.
+struct PruneResult: Decodable {
+    var events: Int64
+    var bytes: Int64
+    var missingFiles: Int
+    /// Files removed by the `--all` sweep that no row referenced. Their bytes
+    /// are already counted in `bytes`.
+    var orphanFiles: Int
+
+    enum CodingKeys: String, CodingKey {
+        case events, bytes
+        case missingFiles = "missing_files"
+        case orphanFiles = "orphan_files"
+    }
+}

@@ -2,15 +2,30 @@ import SwiftUI
 
 /// SettingsWindow is the standard Settings scene.
 ///
-/// Only the Recording tab exists so far; the remaining five arrive with the
-/// Settings deliverable. Every value here is stored in the app's own
-/// UserDefaults and translated into recorder flags — Lumi has no configuration
-/// file and this does not add one.
+/// Every capture value here is stored in the app's own UserDefaults and
+/// translated into recorder flags — Lumi has no configuration file and this
+/// does not add one. The other tabs store nothing at all: they read the CLI and
+/// show what it says.
+///
+/// The tab order is the brief's, and it runs from the setting people change
+/// most often to the one they read once. Danger sits between MCP and
+/// Permissions rather than last, so an irreversible action is never the tab a
+/// stray click lands on.
 struct SettingsWindow: View {
     var body: some View {
         TabView {
             RecordingSettings()
                 .tabItem { Label("Recording", systemImage: "record.circle") }
+            StorageSettings()
+                .tabItem { Label("Storage", systemImage: "internaldrive") }
+            MCPSettings()
+                .tabItem { Label("MCP", systemImage: "point.3.connected.trianglepath.dotted") }
+            DangerSettings()
+                .tabItem { Label("Danger", systemImage: "exclamationmark.triangle") }
+            PermissionsSettings()
+                .tabItem { Label("Permissions", systemImage: "lock.shield") }
+            AboutSettings()
+                .tabItem { Label("About", systemImage: "info.circle") }
         }
         .frame(width: Theme.settingsWidth)
     }
@@ -88,7 +103,12 @@ struct RecordingSettings: View {
     /// changing one replaces the child. The restart goes through the same
     /// graceful stop as everything else — never a kill.
     private func restart() {
-        guard recorder.state == .recording else { return }
+        // isSupervisingRecorder, not `state == .recording`: a permission
+        // revoked mid-capture moves the UI to .needsPermissions while the child
+        // is still running and still writing. Gating on the UI state there
+        // would save the setting and leave the live recorder using the old
+        // flags, with nothing to say the two had diverged.
+        guard recorder.isSupervisingRecorder else { return }
         Task { await recorder.restart() }
     }
 

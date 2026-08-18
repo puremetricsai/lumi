@@ -112,3 +112,66 @@ struct StatePill: View {
             .background(Capsule().fill(tint.opacity(0.14)))
     }
 }
+
+/// Badge is StatePill's shape for everything that is not a TCC permission —
+/// MCP registration, mostly. Same three tones, chosen by the caller rather than
+/// derived from a permission state.
+struct Badge: View {
+    enum Tone { case ok, neutral, warn, bad }
+
+    var text: String
+    var tone: Tone
+
+    private var tint: Color {
+        switch tone {
+        case .ok: return Theme.live
+        case .neutral: return .secondary
+        case .warn: return Theme.attention
+        case .bad: return Theme.recording
+        }
+    }
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 11, weight: .semibold))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 2)
+            .foregroundStyle(tint)
+            .background(Capsule().fill(tint.opacity(0.14)))
+    }
+}
+
+/// SettingsCaption is the grey line of explanation under a control. Every tab
+/// draws them the same way, so the styling lives here rather than being
+/// repeated per row.
+struct SettingsCaption: View {
+    var text: String
+
+    init(_ text: String) { self.text = text }
+
+    var body: some View {
+        Text(text)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+/// Format holds the two number renderings the settings tabs share, so a byte
+/// count reads identically in Storage and in Danger.
+enum Format {
+    /// Bytes as macOS itself writes them — decimal GB, matching Finder.
+    static func bytes(_ count: Int64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        formatter.allowedUnits = [.useKB, .useMB, .useGB, .useTB]
+        return formatter.string(fromByteCount: max(0, count))
+    }
+
+    /// A grouped item count: 48,102.
+    static func count(_ value: Int) -> String {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        return formatter.string(from: NSNumber(value: value)) ?? "\(value)"
+    }
+}
