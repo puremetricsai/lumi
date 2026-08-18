@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// Theme holds the few colours Lumi defines for itself. Everything not named
@@ -21,6 +22,11 @@ enum Theme {
     /// The band the system draws the window buttons in. The custom title row
     /// matches it so the title sits on their line rather than below them.
     static let titleBarHeight: CGFloat = 38
+    /// The height macOS reserves above a window's content for the title bar,
+    /// asked of AppKit rather than written down: it has changed between
+    /// releases, and the window's layout depends on it being right.
+    static let systemTitleBarHeight: CGFloat =
+        NSWindow.frameRect(forContentRect: .zero, styleMask: [.titled]).height
     static let settingsWidth: CGFloat = 660
 }
 

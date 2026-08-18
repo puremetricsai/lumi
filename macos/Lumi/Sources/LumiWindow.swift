@@ -13,10 +13,8 @@ struct LumiWindow: View {
     var body: some View {
         VStack(spacing: 0) {
             titleBar
-            Divider()
             content
                 .frame(maxWidth: .infinity)
-            Divider()
             footer
         }
         .frame(width: Theme.windowWidth)
@@ -26,6 +24,11 @@ struct LumiWindow: View {
         // the title bar's height above the content, and the title lands well
         // below the buttons it is supposed to line up with.
         .ignoresSafeArea(.container, edges: .top)
+        // …and the window still sizes itself as if that band were above the
+        // content, which left the band's height as dead space under the footer.
+        // The negative padding gives it back. It is the measured band rather
+        // than a constant: the height changes between macOS releases.
+        .padding(.bottom, -Theme.systemTitleBarHeight)
     }
 
     // MARK: - Chrome
@@ -42,14 +45,21 @@ struct LumiWindow: View {
                 } label: {
                     Image(systemName: "gearshape")
                         .font(.system(size: 12, weight: .medium))
-                        .frame(width: 24, height: 24)
                 }
                 .buttonStyle(.accessoryBar)
                 .accessibilityLabel("Open Settings")
                 .help("Settings")
             }
         }
-        .padding(.horizontal, 14)
+        // No padding on either side. The gear used to sit 14pt in from an
+        // already generously padded .accessoryBar button, which left its glyph
+        // 32pt from the right edge while the close button sits 10pt from the
+        // left. Flush, the glyph lands ~13pt in — the same band the traffic
+        // lights occupy — and the title centres on the window rather than on a
+        // padded row. The explicit 24pt square around the glyph went with the
+        // padding: .accessoryBar draws its own hit area, and the square only
+        // pushed the gear further from the edge.
+        //
         // Height rather than padding, so the row's centre — and with it the
         // title and the gear — falls on the same line as the close, minimise,
         // and zoom buttons the system draws over it.
