@@ -1,10 +1,10 @@
 # Lumi.app — build status and decisions
 
-**Date:** 2026-08-17
+**Date:** 2026-08-17 (updated after deliverable 5)
 **Purpose:** Hand-off note for the macOS menu-bar app work. It records what is done, what is
 deliberately not done, and the decisions that are not recoverable from the code.
 
-The plan being followed has six deliverables. **1–4 are complete. 5 and 6 are not started.**
+The plan being followed has six deliverables. **1–5 are complete. 6 is partly done.**
 
 ## Where things stand
 
@@ -14,7 +14,7 @@ The plan being followed has six deliverables. **1–4 are complete. 5 and 6 are 
 | 2 | TCC spike | Done → `docs/research/2026-08-17-tcc-spike.md` |
 | 3 | `lumi app` + `--register-state` + app-aware refusal | Done, tested, reviewed |
 | 4 | Menu bar item + Lumi window, three states | Done, tested, reviewed |
-| 5 | Settings window, six tabs | **Not started** — only the Recording tab exists |
+| 5 | Settings window, six tabs | Done — all six tabs exist and are wired |
 | 6 | Packaging (`task app` polish, install paths) | Partly done — `task app`/`app:install`/`app:run` work |
 
 ## What exists
@@ -22,6 +22,7 @@ The plan being followed has six deliverables. **1–4 are complete. 5 and 6 are 
 **Go (additive only; no existing behavior moved).**
 
 - `lumi app` (alias `open`), with `--settings` and `--quit` — `internal/cli/app.go`.
+- `mcp setup --json`, orthogonal to `--dry-run` — `internal/cli/mcp_setup.go`.
 - `record start --register-state` (requires `--foreground`), which publishes an app-owned
   recorder in `record.json`.
 - `record start --emit-levels`, one JSON line per captured track on stderr.
@@ -29,7 +30,8 @@ The plan being followed has six deliverables. **1–4 are complete. 5 and 6 are 
 - `recordState.Executable`, and an app-aware duplicate-start refusal.
 - `internal/capture`: optional `Recorder.Levels` sink (`internal/capture/levels.go`).
 
-**Swift** — `macos/Lumi/Sources/`, built by `macos/build-app.sh` via `task app`.
+**Swift** — `macos/Lumi/Sources/`, built by `macos/build-app.sh` via `task app`. Fourteen files: the
+menu bar shell, the Lumi window, and one file per Settings tab.
 
 ## Decisions that are not visible in the code
 
@@ -48,8 +50,60 @@ The plan being followed has six deliverables. **1–4 are complete. 5 and 6 are 
 - **The app executable is `LumiApp`, not `Lumi`.** macOS filesystems are case-insensitive, so
   `Contents/MacOS/Lumi` and `Contents/MacOS/lumi` are one file and the CLI silently replaced the
   app. `build-app.sh` compares inodes and fails loudly if that recurs.
-- **`macOS-design-files/` is gitignored** by the developer's decision, as is `build/`.
+- **`macOS-design-files/` is gone from the working tree**, and its ignore rule with it; the mockups
+  had served their purpose once the six tabs existed. `build/` stays ignored. The canvas is still at
+  <https://claude.ai/design/p/ceb31d83-b57f-434b-bb9f-5de1da013218?via=share> if a later change needs
+  to check a layout against it.
 - **The bundle identifier is `com.puremetricsai.lumi`.**
+- **`mcp setup --dry-run --json` is the MCP tab's status query, because there is no other one.**
+  `internal/mcpsetup` exposes `Target.Apply` and nothing else, and `Apply` writes unless `DryRun` is set.
+  So the tab asks what a run *would* do rather than asking what is registered. `--json` is deliberately
+  orthogonal to `--dry-run`: the Set up button wants the same document back from a real run.
+- **`Result.Manual`/`ManualHint` are now filled in on every result, not only where Lumi declines to
+  write.** The "Copy client config" button is unconditional, and Swift must never render a client's JSON
+  or TOML itself. The human output is unchanged — it still prints the snippet only on a skip or a conflict.
+- **The Permissions tab follows `lumi permissions`' order, not the mockup's.** The mockup lists Microphone
+  second. `Permissions.rows` is the contract and it wins; the file says so, so nobody "fixes" it back.
+- **A denied *optional* service reads "Off", not red "Required".** Input Monitoring is never in
+  `Permissions.missingFor`, and the spike's Result 6 shows it lands on `denied` after every rebuild.
+- **Storage never migrates data.** Changing the directory re-spawns the recorder with the new
+  `--data-dir` and names where the previous store stays. Moving it is the user's action.
+- **"Delete all data" is refused while anything is capturing, app-owned or terminal-owned.** `prune
+  --all` is the only policy that also sweeps the media directories, so it races a live recorder in the
+  one direction the repository forbids: a file written just before the sweep is indexed just after it,
+  leaving a row that names media which is gone. The app refuses rather than stopping capture for the
+  user. Age-based prune has no such race — it never sweeps directories, and new events are never older
+  than the cutoff.
+- **A settings change restarts on `isSupervisingRecorder`, not on `state == .recording`.** A permission
+  revoked mid-capture moves the UI to `.needsPermissions` while the child keeps running and keeps
+  writing; gating on the UI state saved the setting and left the live recorder on the old flags.
+- **`mcp setup --json` carries the per-client error, because the status cannot.** A target sets
+  `added` *before* it attempts the write and returns that same result when the write fails. A human
+  sees the error on stderr and a non-zero exit; a reader of stdout alone saw `"status": "added"` and
+  rendered "registered" for a run that registered nothing.
+- **The MCP tab's "run this in a terminal" advice names `--data-dir` when the app holds a custom
+  one.** The app passes it on every invocation; a shell knows nothing about the app's UserDefaults, so
+  the plain command would register the CLI's default root instead.
+- **Quit lives in the menu bar menu, last, behind a separator — not in the window footer.** The brief
+  (§4.1, §4.2) says the opposite; the developer asked for this on 2026-08-17 and it supersedes both. It
+  is the only route out of the app, it carries ⌘Q, and it goes through `AppDelegate.quit()` so a live
+  capture still asks first and still gets the graceful SIGTERM-then-wait. `LumiApp.confirmQuit()` was
+  removed with the footer button that was its only caller.
+- **Each ungranted permission row is its own button, and the primary button no longer opens a pane.**
+  It used to open `missingPermissions.first`, which left the *second* missing service unreachable: with
+  Screen Recording and Accessibility both missing, granting the first and returning sent the user to the
+  same pane again. The two live in different panes, so one destination cannot serve both.
+- **"No prompt appeared" is Result 6 of the spike, not a bug.** Screen Recording and Accessibility land
+  on `denied` after a rebuild, and a denied service does not re-prompt. The window now says so. When the
+  row reads enabled and the app still reads denied, that is Result 5 — `tccutil reset ScreenCapture
+  com.puremetricsai.lumi` and the same for `Accessibility`, then re-enable by hand.
+- **Nothing tests whether a service could still prompt.** `denied_or_not_determined` conflates "never
+  asked" with "already refused" on purpose — `lumi_permissions_json` says splitting them needs Full Disk
+  Access or a call that prompts as a side effect — so gating the request button on that guess would
+  suppress a prompt that would have worked.
+- **The Danger tab always passes `--yes` to `prune --all`.** The app gives its children
+  `FileHandle.nullDevice` for stdin, so the CLI's own prompt could not be answered; the app's typed
+  confirmation sheet is the gate.
 
 ## Things a future session must not get wrong
 
@@ -63,10 +117,13 @@ The plan being followed has six deliverables. **1–4 are complete. 5 and 6 are 
 
 ## Outstanding
 
-- **Deliverable 5**: Storage, MCP, Danger, Permissions, and About tabs. The MCP tab needs
-  `--json` on `lumi mcp setup`, which the developer approved but which is **not yet written** —
-  `internal/mcpsetup` has no read-only status path, so the tab must read
-  `mcp setup --dry-run --json`.
 - **Deliverable 6**: cleanup of the throwaway `~/Applications/LumiTCCSpike.app` and its TCC rows
   is owed; see the `lumi-tcc-spike-cleanup` memory.
-- **Nothing is committed to git yet.** The whole of deliverables 2–4 is uncommitted working tree.
+- **The app runs and captures end to end, verified on 2026-08-17.** Permissions were granted by hand
+  after a `tccutil reset`, and `lumi record status` from a terminal saw the app-owned recorder — pid,
+  `screen=true audio=true` — which is `--register-state` working across the two interfaces.
+- **The six Settings tabs have still not been driven by hand.** The Storage walk over a large store, the
+  MCP tab's several-second load, and both Danger confirmations are the three worth exercising first.
+- **The app cannot move to `-swift-version 6` yet.** `Preferences.shared` is a `static let` on a
+  non-Sendable `@Observable` class, which is an error in that mode, and `LumiCLI` captures non-Sendable
+  values across its pipe reads. The shipped build uses the default mode, so neither is a defect today.
