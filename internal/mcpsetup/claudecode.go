@@ -141,12 +141,16 @@ func (c *ClaudeCode) existingEntry(name string) (existing entry, found, readable
 
 func (c *ClaudeCode) Apply(ctx context.Context, spec Spec, opts Options) (Result, error) {
 	result := Result{Target: claudeCodeName}
+	// The paste-able snippet is filled in before anything else can go
+	// wrong, so every result carries it. It costs a string on the happy
+	// path and it is what lets a caller offer "copy client config"
+	// unconditionally instead of only after Lumi has declined to write.
+	result.manualJSON(spec)
 
 	cli := c.resolveCLI()
 	if cli == "" {
 		result.Status = StatusSkipped
 		result.Detail = "the claude CLI was not found on PATH"
-		result.manualJSON(spec)
 		if c.Required {
 			return result, notInstalledErr(claudeCodeName, result.Detail)
 		}
@@ -159,7 +163,6 @@ func (c *ClaudeCode) Apply(ctx context.Context, spec Spec, opts Options) (Result
 		result.Status = StatusConflict
 		result.Detail = "an entry already exists that Lumi cannot read"
 		result.Current = unreadableEntry
-		result.manualJSON(spec)
 		return result, conflictErr(claudeCodeName, spec.Name)
 	case found && existing.matches(spec):
 		result.Status = StatusUnchanged
@@ -169,7 +172,6 @@ func (c *ClaudeCode) Apply(ctx context.Context, spec Spec, opts Options) (Result
 		result.Status = StatusConflict
 		result.Detail = "an entry with different settings already exists"
 		result.Current = existing.commandLine()
-		result.manualJSON(spec)
 		return result, conflictErr(claudeCodeName, spec.Name)
 	}
 

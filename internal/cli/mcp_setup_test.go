@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -471,5 +472,176 @@ func TestIsTemporaryBinary(t *testing.T) {
 				t.Errorf("isTemporaryBinary(%q) = %v, want %v", tc.path, got, tc.want)
 			}
 		})
+	}
+}
+
+// --json is what the macOS app reads, paired with --dry-run as the read-only
+// status query this package otherwise has no path for. So the payload has to
+// carry everything the app shows — the resolved binary, the argv, and a
+// paste-able snippet per client — and stdout has to stay pure JSON.
+func TestMCPSetupJSONCarriesTheWholeReport(t *testing.T) {
+	registered := &fakeTarget{
+		name: "claude-code",
+		result: mcpsetup.Result{
+			Status:     mcpsetup.StatusUnchanged,
+			Detail:     "already configured",
+			Manual:     `  "lumi": {}`,
+			ManualHint: `add this under "mcpServers"`,
+		},
+	}
+	skipped := &fakeTarget{
+		name: "codex",
+		result: mcpsetup.Result{
+			Status:     mcpsetup.StatusSkipped,
+			Detail:     "the codex CLI was not found on PATH",
+			Manual:     "[mcp_servers.lumi]",
+			ManualHint: "add this to ~/.codex/config.toml",
+		},
+	}
+	dataDir, run := newSetupTest(t, registered, skipped)
+
+	stdout, stderr, err := run("--dry-run", "--json")
+	if err != nil {
+		t.Fatalf("setup --dry-run --json: %v", err)
+	}
+	if stderr != "" {
+		t.Errorf("--json wrote to stderr:\n%s", stderr)
+	}
+
+	var report mcpSetupReport
+	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
+		t.Fatalf("stdout is not JSON (%v):\n%s", err, stdout)
+	}
+	if report.Name != "lumi" {
+		t.Errorf("name = %q, want lumi", report.Name)
+	}
+	if report.Command != "/usr/local/bin/lumi" {
+		t.Errorf("command = %q, want the resolved binary", report.Command)
+	}
+	if want := []string{"mcp", "--data-dir", dataDir}; !slices.Equal(report.Args, want) {
+		t.Errorf("args = %v, want %v", report.Args, want)
+	}
+	if !strings.Contains(report.CommandLine, dataDir) {
+		t.Errorf("command_line = %q, want the absolute data dir", report.CommandLine)
+	}
+	if !report.DryRun {
+		t.Error("dry_run = false under --dry-run")
+	}
+	if len(report.Results) != 2 {
+		t.Fatalf("got %d results, want 2", len(report.Results))
+	}
+	if report.Results[0].Target != "claude-code" || report.Results[0].Status != mcpsetup.StatusUnchanged {
+		t.Errorf("first result = %+v", report.Results[0])
+	}
+	// The snippet travels with every result, including the one that needs no
+	// action: the app's "Copy client config" button is unconditional, and Swift
+	// must never build the JSON or TOML itself.
+	for _, r := range report.Results {
+		if r.Manual == "" || r.ManualHint == "" {
+			t.Errorf("%s carries no manual snippet: %+v", r.Target, r)
+		}
+	}
+}
+
+// A conflict still has to produce a complete document, because the app decodes
+// the payload first and only consults the exit status when there was nothing to
+// read.
+func TestMCPSetupJSONPrintsThePayloadEvenWhenItFails(t *testing.T) {
+	conflicted := &fakeTarget{
+		name: "claude-code",
+		result: mcpsetup.Result{
+			Status:  mcpsetup.StatusConflict,
+			Detail:  "an entry with different settings already exists",
+			Current: "/opt/homebrew/bin/lumi mcp",
+		},
+		err: errors.New("refusing to overwrite"),
+	}
+	_, run := newSetupTest(t, conflicted)
+
+	stdout, _, err := run("--json")
+	if err == nil {
+		t.Fatal("setup returned nil despite a conflict")
+	}
+	var report mcpSetupReport
+	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
+		t.Fatalf("stdout is not JSON (%v):\n%s", err, stdout)
+	}
+	if len(report.Results) != 1 || report.Results[0].Status != mcpsetup.StatusConflict {
+		t.Fatalf("report does not describe the conflict: %+v", report)
+	}
+	if report.Results[0].Current != "/opt/homebrew/bin/lumi mcp" {
+		t.Errorf("current = %q, want the existing entry", report.Results[0].Current)
+	}
+	if report.DryRun {
+		t.Error("dry_run = true without --dry-run")
+	}
+}
+
+// The human output is the shipped contract and --json must not have moved it.
+func TestMCPSetupWithoutJSONIsUnchanged(t *testing.T) {
+	target := &fakeTarget{
+		name:   "claude-code",
+		result: mcpsetup.Result{Status: mcpsetup.StatusAdded, Detail: "/usr/local/bin/lumi mcp", Changed: true},
+	}
+	_, run := newSetupTest(t, target)
+
+	stdout, _, err := run()
+	if err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	if strings.HasPrefix(strings.TrimSpace(stdout), "{") {
+		t.Errorf("the default run emitted JSON:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "claude-code") || !strings.Contains(stdout, "added") {
+		t.Errorf("the default run lost its results line:\n%s", stdout)
+	}
+}
+
+// A target sets StatusAdded before it attempts the write and returns that same
+// result when the write fails. Without the error travelling in the payload, a
+// reader of stdout alone renders "registered" for a run that registered
+// nothing.
+func TestMCPSetupJSONCarriesTheFailureWithTheResult(t *testing.T) {
+	failed := &fakeTarget{
+		name: "claude-code",
+		result: mcpsetup.Result{
+			Status:  mcpsetup.StatusAdded,
+			Detail:  "/usr/local/bin/lumi mcp",
+			Changed: false,
+		},
+		err: errors.New("claude mcp add failed: exit status 1"),
+	}
+	succeeded := &fakeTarget{
+		name: "codex",
+		result: mcpsetup.Result{
+			Status:  mcpsetup.StatusAdded,
+			Detail:  "/usr/local/bin/lumi mcp",
+			Changed: true,
+		},
+	}
+	_, run := newSetupTest(t, failed, succeeded)
+
+	stdout, _, err := run("--json")
+	if err == nil {
+		t.Fatal("setup returned nil despite a failed write")
+	}
+	var report mcpSetupReport
+	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
+		t.Fatalf("stdout is not JSON (%v):\n%s", err, stdout)
+	}
+	if len(report.Results) != 2 {
+		t.Fatalf("got %d results, want 2", len(report.Results))
+	}
+	// The error is on the client that produced it, and only on that one.
+	if !strings.Contains(report.Results[0].Error, "claude mcp add failed") {
+		t.Errorf("the failing client carries no error: %+v", report.Results[0])
+	}
+	if report.Results[1].Error != "" {
+		t.Errorf("the succeeding client carries an error: %+v", report.Results[1])
+	}
+	// The status is still what the target reported. Correcting it here would
+	// hide which step failed; the error is what says the write did not land.
+	if report.Results[0].Status != mcpsetup.StatusAdded {
+		t.Errorf("status = %q, want the target's own status", report.Results[0].Status)
 	}
 }

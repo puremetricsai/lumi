@@ -80,6 +80,13 @@ developer's own Claude config.
   function of (binary, root), which is what lets the "already configured?" check be an exact comparison. It
   deliberately does not `EvalSymlinks`: a packaged install is reached through a stable symlink whose target
   moves every version bump.
+- **`mcp setup --dry-run --json` is the read-only status query `internal/mcpsetup` does not otherwise
+  have.** `Target.Apply` is the only entry point and it writes unless `DryRun` is set, so the macOS app's
+  MCP tab asks what a run *would* do rather than asking what is registered. `--json` is orthogonal to
+  `--dry-run` — the app's Set up button wants the same document back from a real run. The payload names the
+  resolved binary and the full argv because `lumiBinaryPath` and the absolute `--data-dir` are precisely
+  what a reader cannot rebuild, and it carries `manual`/`manual_hint` on *every* result so the app can
+  offer "copy client config" without ever constructing a client's JSON or TOML in Swift.
 - **`Recorder.AudioOutputs` and `Recorder.AudioMarkers` are always wired here.** Leaving either nil changes
   what an absent source list *means* in every row written — "no source was found" rather than "no source
   was looked for" — and nothing downstream can tell those apart (`internal/capture/CLAUDE.md`).

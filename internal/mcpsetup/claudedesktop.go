@@ -54,6 +54,11 @@ func (d *ClaudeDesktop) configPath() (string, error) {
 // Apply takes no context: it does only local file I/O and spawns nothing.
 func (d *ClaudeDesktop) Apply(_ context.Context, spec Spec, opts Options) (Result, error) {
 	result := Result{Target: claudeDesktopName}
+	// The paste-able snippet is filled in before anything else can go
+	// wrong, so every result carries it. It costs a string on the happy
+	// path and it is what lets a caller offer "copy client config"
+	// unconditionally instead of only after Lumi has declined to write.
+	result.manualJSON(spec)
 
 	path, err := d.configPath()
 	if err != nil {
@@ -68,7 +73,6 @@ func (d *ClaudeDesktop) Apply(_ context.Context, spec Spec, opts Options) (Resul
 	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
 		result.Status = StatusSkipped
 		result.Detail = "Claude Desktop is not installed"
-		result.manualJSON(spec)
 		if d.Required {
 			return result, notInstalledErr(claudeDesktopName, result.Detail)
 		}
@@ -98,7 +102,6 @@ func (d *ClaudeDesktop) Apply(_ context.Context, spec Spec, opts Options) (Resul
 		result.Status = StatusConflict
 		result.Detail = "an entry already exists that Lumi cannot read"
 		result.Current = unreadableEntry
-		result.manualJSON(spec)
 		return result, conflictErr(claudeDesktopName, spec.Name)
 	case found && existing.matches(spec):
 		result.Status = StatusUnchanged
@@ -108,7 +111,6 @@ func (d *ClaudeDesktop) Apply(_ context.Context, spec Spec, opts Options) (Resul
 		result.Status = StatusConflict
 		result.Detail = "an entry with different settings already exists"
 		result.Current = existing.commandLine()
-		result.manualJSON(spec)
 		return result, conflictErr(claudeDesktopName, spec.Name)
 	}
 

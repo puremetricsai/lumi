@@ -90,30 +90,36 @@ const (
 )
 
 // Result describes what one Target did.
+//
+// The json tags are the machine-readable contract `lumi mcp setup --json`
+// prints; the field names are this package's and the wire names are fixed here
+// so a rename cannot silently break a reader.
 type Result struct {
 	// Target is the client's display name, e.g. "claude-code".
-	Target string
+	Target string `json:"target"`
 	// Status is the outcome.
-	Status Status
+	Status Status `json:"status"`
 	// Detail is a short phrase for the results line: the rendered command line
 	// on a write, a reason on a skip.
-	Detail string
+	Detail string `json:"detail"`
 	// Current is the existing entry rendered as a command line. Set only on
 	// StatusConflict, so the caller can show current against desired.
-	Current string
-	// Manual is a paste-able config snippet, set on skip and conflict so a user
-	// who cannot or will not let Lumi write the file still has the answer. Its
-	// format follows the client — JSON for the Claude targets, TOML for Codex.
-	Manual string
+	Current string `json:"current"`
+	// Manual is a paste-able config snippet, set on every result so a caller
+	// can offer it unprompted and a user who cannot or will not let Lumi write
+	// the file still has the answer. Its format follows the client — JSON for
+	// the Claude targets, TOML for Codex — which is why it is built here and
+	// never by a caller.
+	Manual string `json:"manual"`
 	// ManualHint is the sentence fragment introducing Manual, e.g. `add this
 	// under "mcpServers"`. It travels with Manual because the two formats need
 	// different instructions, and a caller printing one hardcoded sentence for
 	// all clients would tell a Codex user to paste TOML into a JSON object.
-	ManualHint string
+	ManualHint string `json:"manual_hint"`
 	// Changed reports whether this run actually modified the client's config.
 	// It is false under DryRun even when Status is Added or Replaced, which is
 	// what keeps "restart the app" reminders honest.
-	Changed bool
+	Changed bool `json:"changed"`
 }
 
 // Target is one MCP client Lumi knows how to configure.
