@@ -37,11 +37,15 @@ command already exists; it never replaces one.
 
 ## Decisions that are not visible in the code
 
-- **Levels are measured per finished chunk, not continuously.** The developer chose the
-  low-resistance option over adding a native sampling path through `internal/macosnative`.
-  Audio only reaches Go when a chunk closes, so the meters refresh once per `--audio-chunk`
-  (30s by default). The figures come from the same windowed envelope that decides silence, so
-  there is exactly one definition of "level" and it lives in `internal/wav`.
+- **Levels were measured per finished chunk, not continuously — superseded on 2026-08-18.** The
+  original choice was the low-resistance one: audio reaches Go only when a chunk closes, so the
+  meters refreshed once per `--audio-chunk` (30s by default). The developer required live meters
+  on 2026-08-18 — a meter that answers "is my microphone working" cannot lag half a minute — and
+  the native sampling path deferred here was built. Sound is now summed inside the
+  ScreenCaptureKit callback and drained on a ticker; `--audio-chunk` no longer affects the meters
+  at all. The figures still come from the same windowed envelope that decides silence, and there
+  is still exactly one definition of "level", in `internal/wav` — the native side accumulates
+  energy and never decibels. See `internal/capture/CLAUDE.md`.
 - **The handoff is a `lumi://` URL, not `open -a … --args`.** LaunchServices drops arguments to
   an already-running app, which is the normal state for a menu bar app. It also gives `--quit`
   a path that costs no Automation TCC prompt, which AppleScript would.
