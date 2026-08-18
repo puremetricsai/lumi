@@ -10,7 +10,9 @@
 #import <Speech/Speech.h>
 #import <Vision/Vision.h>
 
+#include <os/lock.h>
 #include <stdlib.h>
+#include <string.h>
 #include <stdbool.h>
 #include <unistd.h>
 
@@ -1129,6 +1131,197 @@ char *lumi_audio_processes_json(char **error_message) {
     }
 }
 
+// LumiLevelMeter accumulates how loud a track is *while it is being captured*,
+// so a supervising app can draw a meter that moves with the sound in the room
+// rather than once per finished chunk.
+//
+// It is fed from the ScreenCaptureKit output callback, which is also the path
+// every captured sample takes to the writer. That is the whole reason it is
+// written the way it is:
+//
+//   - It never allocates, never logs, never calls Objective-C, and takes its
+//     lock for the few nanoseconds it needs to add to two doubles. Capture must
+//     not slow down because somebody is looking at a meter.
+//   - Anything it does not understand — an unexpected sample format, a buffer it
+//     cannot address — is skipped silently. A missing measurement is a bar that
+//     does not move; a dropped buffer is lost media, and the two are not
+//     comparable. It must fail towards no measurement, always.
+//   - Full windows accumulate into a small ring that drops the *oldest* entry
+//     when it overflows. A reader that stopped draining is showing a stale
+//     meter, and the newest sound is what it wants back when it returns.
+//
+// Energy leaves here as a mean square of normalised samples, never as decibels.
+// The dBFS formula and the silence floor belong to internal/wav and stay there —
+// `wav.DBFSFromMeanSquare` is the other half of this — because a second copy in
+// Objective-C is exactly the drift the repository forbids, and a language
+// boundary would hide it from both test suites.
+// LUMI_LEVEL_WINDOWS is the ring's depth: 64 windows, so a caller polling as
+// slowly as once a second still loses nothing. The window *length* is not
+// defined here on purpose — it is transcript.EnvelopeWindowMS, passed in when
+// the session opens, because a second answer to "at what resolution" is the
+// drift this file must not introduce.
+#define LUMI_LEVEL_WINDOWS 64
+
+typedef struct {
+    os_unfair_lock lock;
+    // The window still filling.
+    double sumSquares;
+    int64_t samples;
+    int64_t windowSamples;
+    // Completed windows, oldest first, as mean squares.
+    double windows[LUMI_LEVEL_WINDOWS];
+    int count;
+    int head;
+} LumiLevelMeter;
+
+static void LumiLevelMeterInit(LumiLevelMeter *meter) {
+    memset(meter, 0, sizeof(*meter));
+    meter->lock = OS_UNFAIR_LOCK_INIT;
+}
+
+// LumiLevelMeterPush appends one completed window, dropping the oldest when the
+// ring is full. The caller holds the lock.
+static void LumiLevelMeterPush(LumiLevelMeter *meter, double meanSquare) {
+    int slot = (meter->head + meter->count) % LUMI_LEVEL_WINDOWS;
+    meter->windows[slot] = meanSquare;
+    if (meter->count < LUMI_LEVEL_WINDOWS) {
+        meter->count++;
+    } else {
+        meter->head = (meter->head + 1) % LUMI_LEVEL_WINDOWS;
+    }
+}
+
+// LumiLevelMeterAdd folds one buffer's samples in, closing off windows as they
+// fill. windowMS is the resolution the measurement is taken at, which the caller
+// passes down from transcript.EnvelopeWindowMS so there is one answer to it.
+static void LumiLevelMeterAdd(LumiLevelMeter *meter, CMSampleBufferRef sampleBuffer, int windowMS) {
+    if (meter == NULL || sampleBuffer == NULL || windowMS <= 0) return;
+    CMFormatDescriptionRef format = CMSampleBufferGetFormatDescription(sampleBuffer);
+    if (format == NULL) return;
+    const AudioStreamBasicDescription *asbd =
+        CMAudioFormatDescriptionGetStreamBasicDescription((CMAudioFormatDescriptionRef)format);
+    if (asbd == NULL || asbd->mSampleRate <= 0 || asbd->mChannelsPerFrame == 0) return;
+    if (asbd->mFormatID != kAudioFormatLinearPCM) return;
+
+    // ScreenCaptureKit does not deliver one format. Measured on macOS 26.5: the
+    // system track arrives as non-interleaved 32-bit float at 16kHz, and the
+    // microphone as *interleaved 24-bit packed signed integer, stereo, at
+    // 48kHz*. An accumulator that assumed float — or assumed the two tracks
+    // matched — measured the system track and silently rejected every
+    // microphone buffer, which is a meter that never moves for the one source
+    // the user is most likely to be testing.
+    BOOL isFloat = (asbd->mFormatFlags & kAudioFormatFlagIsFloat) != 0;
+    BOOL isSignedInt = (asbd->mFormatFlags & kAudioFormatFlagIsSignedInteger) != 0;
+    UInt32 bits = asbd->mBitsPerChannel;
+    if (isFloat) {
+        if (bits != 32 && bits != 64) return;
+    } else if (isSignedInt) {
+        // Packed is required because an unpacked sample's bits are not where
+        // this arithmetic would look for them.
+        if ((asbd->mFormatFlags & kAudioFormatFlagIsPacked) == 0) return;
+        if (bits != 16 && bits != 24 && bits != 32) return;
+    } else {
+        return;
+    }
+
+    CMBlockBufferRef block = NULL;
+    size_t listSize = 0;
+    if (CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer, &listSize, NULL, 0, NULL, NULL, 0, &block) != noErr) {
+        return;
+    }
+    AudioBufferList *list = (AudioBufferList *)malloc(listSize);
+    if (list == NULL) {
+        if (block != NULL) CFRelease(block);
+        return;
+    }
+    if (CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer, &listSize, list, listSize, NULL, NULL, 0, &block) != noErr) {
+        free(list);
+        if (block != NULL) CFRelease(block);
+        return;
+    }
+
+    // Every channel folds into one figure. The stored track is a mono downmix,
+    // and a meter answers "is sound arriving", not "from which channel".
+    // Samples are normalised to -1…1 here so that what crosses back into Go is
+    // scale-free, whatever width the hardware chose.
+    const double intScale = (bits >= 32) ? 2147483648.0 : (double)(1u << (bits - 1));
+    const size_t sampleBytes = bits / 8;
+    double sum = 0;
+    int64_t counted = 0;
+    for (UInt32 i = 0; i < list->mNumberBuffers; i++) {
+        const AudioBuffer buffer = list->mBuffers[i];
+        if (buffer.mData == NULL || buffer.mDataByteSize == 0) continue;
+        const uint8_t *bytes = (const uint8_t *)buffer.mData;
+        size_t n = buffer.mDataByteSize / sampleBytes;
+        for (size_t sample = 0; sample < n; sample++) {
+            const uint8_t *at = bytes + sample * sampleBytes;
+            double value = 0;
+            if (isFloat) {
+                value = (bits == 32) ? (double)(*(const float *)at) : *(const double *)at;
+            } else if (bits == 16) {
+                value = (double)(*(const int16_t *)at) / intScale;
+            } else if (bits == 32) {
+                value = (double)(*(const int32_t *)at) / intScale;
+            } else {
+                // 24-bit packed, little-endian, sign extended by hand: there is
+                // no int24_t to load it into.
+                int32_t raw = (int32_t)((uint32_t)at[0] | ((uint32_t)at[1] << 8) | ((uint32_t)at[2] << 16));
+                if (raw & 0x800000) raw |= ~0xFFFFFF;
+                value = (double)raw / intScale;
+            }
+            sum += value * value;
+        }
+        counted += (int64_t)n;
+    }
+    free(list);
+    if (block != NULL) CFRelease(block);
+    if (counted <= 0) return;
+
+    // Windows are counted in frames, so a window is the same span of time
+    // whatever the channel count.
+    int64_t windowSamples = (int64_t)llround(asbd->mSampleRate * (double)windowMS / 1000.0) *
+                            (int64_t)asbd->mChannelsPerFrame;
+    if (windowSamples <= 0) windowSamples = counted;
+
+    os_unfair_lock_lock(&meter->lock);
+    meter->windowSamples = windowSamples;
+    meter->sumSquares += sum;
+    meter->samples += counted;
+    // One buffer can complete several windows. Splitting the energy evenly
+    // across them is an approximation: within a buffer this coarse the exact
+    // sample-by-sample boundary is not worth carrying, and a meter is a readout,
+    // not a verdict — the stored file's envelope remains the measured truth.
+    while (meter->samples >= meter->windowSamples && meter->windowSamples > 0) {
+        double share = meter->sumSquares * (double)meter->windowSamples / (double)meter->samples;
+        LumiLevelMeterPush(meter, share / (double)meter->windowSamples);
+        meter->sumSquares -= share;
+        meter->samples -= meter->windowSamples;
+    }
+    os_unfair_lock_unlock(&meter->lock);
+}
+
+// LumiLevelMeterDrain hands over every completed window and empties the ring, so
+// each measurement is reported exactly once. The partial window in progress
+// stays behind to finish.
+static NSArray<NSNumber *> *LumiLevelMeterDrain(LumiLevelMeter *meter) {
+    double drained[LUMI_LEVEL_WINDOWS];
+    int count = 0;
+    os_unfair_lock_lock(&meter->lock);
+    count = meter->count;
+    for (int i = 0; i < count; i++) {
+        drained[i] = meter->windows[(meter->head + i) % LUMI_LEVEL_WINDOWS];
+    }
+    meter->count = 0;
+    meter->head = 0;
+    os_unfair_lock_unlock(&meter->lock);
+
+    NSMutableArray *out = [NSMutableArray arrayWithCapacity:(NSUInteger)count];
+    for (int i = 0; i < count; i++) [out addObject:@(drained[i])];
+    return out;
+}
+
 @interface LumiAudioWriter : NSObject
 @property(nonatomic, strong) AVAssetWriter *writer;
 @property(nonatomic, strong) AVAssetWriterInput *input;
@@ -1293,6 +1486,8 @@ static NSMutableDictionary *LumiAudioFrameDictionary(NSString *path, NSString *s
 @property(nonatomic, copy) NSString *directory;
 @property(nonatomic, copy) NSString *prefix;
 @property(nonatomic, assign) double chunkSeconds;
+// levelWindowMS is transcript.EnvelopeWindowMS, handed down by the caller.
+@property(nonatomic, assign) int levelWindowMS;
 @property(nonatomic, assign) CMTime chunkDuration;
 @property(nonatomic, strong) LumiAudioWriter *systemWriter;
 @property(nonatomic, strong) LumiAudioWriter *microphoneWriter;
@@ -1315,16 +1510,27 @@ static NSMutableDictionary *LumiAudioFrameDictionary(NSString *path, NSString *s
 @property(atomic, strong) NSError *streamError;
 @end
 
-@implementation LumiAudioSession
+@implementation LumiAudioSession {
+    // One live meter per track, fed from the capture callback and drained by
+    // whoever is drawing a meter. Instance variables rather than properties:
+    // they are addressed by pointer from a lock-free-ish accumulator and must
+    // not be boxed or copied.
+    LumiLevelMeter _systemLevels;
+    LumiLevelMeter _microphoneLevels;
+}
 
 - (instancetype)initWithDirectory:(NSString *)directory
                            prefix:(NSString *)prefix
-                     chunkSeconds:(double)chunkSeconds {
+                     chunkSeconds:(double)chunkSeconds
+                    levelWindowMS:(int)levelWindowMS {
     self = [super init];
     if (self == nil) return nil;
     self.directory = directory;
     self.prefix = prefix;
     self.chunkSeconds = MAX(0.1, chunkSeconds);
+    self.levelWindowMS = levelWindowMS;
+    LumiLevelMeterInit(&_systemLevels);
+    LumiLevelMeterInit(&_microphoneLevels);
     // A rational CMTime keeps the boundary exact across thousands of rotations;
     // accumulating a Float64 would drift the chunk grid over a long recording.
     self.chunkDuration = CMTimeMakeWithSeconds(self.chunkSeconds, 90000);
@@ -1423,6 +1629,21 @@ static NSMutableDictionary *LumiAudioFrameDictionary(NSString *path, NSString *s
     // every sample on exactly one side of it.
     while (CMTimeCompare(pts, self.nextBoundary) >= 0) [self rotate];
     [(microphone ? self.microphoneWriter : self.systemWriter) appendSampleBuffer:sampleBuffer];
+    // After the writer, never before: the media is what must not be lost, and a
+    // level is only ever a readout of sound that has already been handed over.
+    LumiLevelMeterAdd(microphone ? &_microphoneLevels : &_systemLevels, sampleBuffer,
+                      self.levelWindowMS);
+}
+
+// drainLevels reports the sound each track has received since the last call.
+// Empty arrays are legitimate and mean "nothing completed a window yet", which
+// is not the same as silence — silence completes windows too, at the floor.
+- (NSDictionary *)drainLevels {
+    return @{
+        @"window_ms": @(self.levelWindowMS),
+        @"system": LumiLevelMeterDrain(&_systemLevels),
+        @"microphone": LumiLevelMeterDrain(&_microphoneLevels),
+    };
 }
 
 - (void)stream:(SCStream *)stream didStopWithError:(NSError *)error {
@@ -1710,12 +1931,13 @@ static LumiAudioSession *LumiAudioSessionForHandle(int64_t handle) {
 // *error_message set. Chunks are collected with lumi_audio_session_next_json
 // while the stream keeps running.
 int64_t lumi_audio_session_start(const char *directory, const char *prefix, double chunk_seconds,
-                                 char **error_message) {
+                                 int32_t level_window_ms, char **error_message) {
     @autoreleasepool {
         LumiAudioSession *session =
             [[LumiAudioSession alloc] initWithDirectory:[NSString stringWithUTF8String:directory]
                                                  prefix:[NSString stringWithUTF8String:prefix]
-                                           chunkSeconds:chunk_seconds];
+                                           chunkSeconds:chunk_seconds
+                                          levelWindowMS:(int)level_window_ms];
         NSError *error = nil;
         if (![session start:&error]) {
             if (error_message != NULL) *error_message = LumiCopyError(error);
@@ -1746,6 +1968,30 @@ char *lumi_audio_session_next_json(int64_t handle, double timeout_seconds, char 
         NSDictionary *chunk = [session nextChunkWithTimeout:MAX(0.0, timeout_seconds)];
         NSError *jsonError = nil;
         NSString *json = LumiJSONString(chunk, &jsonError);
+        if (json == nil) {
+            if (error_message != NULL) *error_message = LumiCopyError(jsonError);
+            return NULL;
+        }
+        return LumiCopyUTF8(json);
+    }
+}
+
+// lumi_audio_session_levels_json reports how loud each track has been since the
+// last call, as {"window_ms":N,"system":[meanSquare,...],"microphone":[...]}.
+//
+// Mean squares of normalised samples, not decibels: internal/wav owns the dBFS
+// formula and the silence floor, and this must not hold a second copy of either.
+// Each window is reported exactly once, so a caller that polls slowly sees every
+// measurement rather than a sample of them, up to the ring's depth.
+char *lumi_audio_session_levels_json(int64_t handle, char **error_message) {
+    @autoreleasepool {
+        LumiAudioSession *session = LumiAudioSessionForHandle(handle);
+        if (session == nil) {
+            if (error_message != NULL) *error_message = LumiCopyUTF8(@"audio capture session is not open");
+            return NULL;
+        }
+        NSError *jsonError = nil;
+        NSString *json = LumiJSONString([session drainLevels], &jsonError);
         if (json == nil) {
             if (error_message != NULL) *error_message = LumiCopyError(jsonError);
             return NULL;

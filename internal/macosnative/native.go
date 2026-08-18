@@ -24,7 +24,9 @@ char *lumi_request_permissions_json(bool input_monitoring, char **error_message)
 char *lumi_audio_processes_json(char **error_message);
 char *lumi_audio_marker_windows_json(char **error_message);
 char *lumi_audio_marker_windows_in_json(const char *windows_json, char **error_message);
-int64_t lumi_audio_session_start(const char *directory, const char *prefix, double chunk_seconds, char **error_message);
+int64_t lumi_audio_session_start(const char *directory, const char *prefix, double chunk_seconds,
+                                 int32_t level_window_ms, char **error_message);
+char *lumi_audio_session_levels_json(int64_t handle, char **error_message);
 char *lumi_audio_session_next_json(int64_t handle, double timeout_seconds, char **error_message);
 void lumi_audio_session_stop(int64_t handle);
 void lumi_audio_session_close(int64_t handle);
@@ -51,8 +53,11 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
+
+	"github.com/puremetricsai/lumi/internal/transcript"
 )
 
 // ScreenFrame describes one display image produced atomically by
@@ -581,6 +586,22 @@ type AudioChunk struct {
 	CaptureError string `json:"capture_error,omitempty"`
 }
 
+// TrackLevels is one drain of the live meters: the energy each track received
+// since the previous call, window by window.
+//
+// The figures are mean squares of samples normalised so that full scale is 1.0,
+// which is what wav.DBFSFromMeanSquare consumes. They are measured on the stream
+// as it arrives — before the writer downmixes it to Lumi's mono 16kHz WAV — so a
+// live reading and the stored file's envelope will differ slightly. That is the
+// signal genuinely being different, not the measurement disagreeing: the formula
+// and the floor are the same one, in internal/wav.
+type TrackLevels struct {
+	WindowMS   int                  `json:"window_ms"`
+	System     []float64            `json:"system"`
+	Microphone []float64            `json:"microphone"`
+	Diag       map[string][]float64 `json:"diag"`
+}
+
 // AudioSession is one continuously open ScreenCaptureKit audio stream, sliced
 // into chunks by presentation timestamp. Holding the stream open is the whole
 // point: stopping and restarting it per chunk left roughly two seconds of every
@@ -588,8 +609,12 @@ type AudioChunk struct {
 type AudioSession struct {
 	handle C.int64_t
 
-	mu     sync.Mutex
-	closed bool
+	mu sync.Mutex
+	// closed is atomic rather than guarded by mu, so Levels never contends for
+	// it. Next holds mu for the whole of its 250ms wait, and a level poll that
+	// queued behind that wait would be exactly the stutter live metering exists
+	// to remove.
+	closed atomic.Bool
 }
 
 // StartAudioSession opens the stream. Files are named by chunk ordinal under
@@ -603,7 +628,8 @@ func StartAudioSession(ctx context.Context, directory, prefix string, chunkSecon
 	defer C.free(unsafe.Pointer(directoryC))
 	defer C.free(unsafe.Pointer(prefixC))
 	var nativeErr *C.char
-	handle := C.lumi_audio_session_start(directoryC, prefixC, C.double(chunkSeconds), &nativeErr)
+	handle := C.lumi_audio_session_start(directoryC, prefixC, C.double(chunkSeconds),
+		C.int32_t(transcript.EnvelopeWindowMS), &nativeErr)
 	if handle == 0 {
 		if err := nativeError(nativeErr); err != nil {
 			return nil, fmt.Errorf("start ScreenCaptureKit audio session: %w", err)
@@ -619,7 +645,7 @@ func StartAudioSession(ctx context.Context, directory, prefix string, chunkSecon
 func (s *AudioSession) Next(timeout time.Duration) (AudioChunk, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	if s.closed.Load() {
 		return AudioChunk{Closed: true}, nil
 	}
 	var nativeErr *C.char
@@ -635,12 +661,52 @@ func (s *AudioSession) Next(timeout time.Duration) (AudioChunk, error) {
 	return chunk, nil
 }
 
+// Levels reports the sound each track has received since the last call, as a
+// windowed energy envelope per track at transcript.EnvelopeWindowMS.
+//
+// It returns energy, not decibels, and the conversion is wav.DBFSFromMeanSquare
+// — the native side holds no copy of the formula or the silence floor. Each
+// window is handed over exactly once, so polling slowly loses resolution but
+// never loses sound, up to the native ring's depth.
+//
+// An empty envelope for a track is not silence. It means no window finished in
+// the interval, which is what a caller polling faster than the window length
+// sees; silence completes windows too, at the floor.
+//
+// Deliberately does not take mu: see the field's comment. Close sets closed
+// before it releases the handle, so this can still be in flight when the handle
+// goes — and that is left as a race on purpose. The native side answers an
+// unknown handle with an error rather than touching freed memory, handles are
+// never reused, and the caller logs a level failure at debug and carries on.
+// Taking mu to close the window would put a level poll behind Next's 250ms wait,
+// which costs the smooth meter this exists for.
+func (s *AudioSession) Levels() (TrackLevels, error) {
+	if s.closed.Load() {
+		return TrackLevels{}, nil
+	}
+	var nativeErr *C.char
+	result, err := nativeJSON(C.lumi_audio_session_levels_json(s.handle, &nativeErr), nativeErr)
+	if err != nil {
+		return TrackLevels{}, err
+	}
+	var levels TrackLevels
+	if err := json.Unmarshal(result, &levels); err != nil {
+		return TrackLevels{}, fmt.Errorf("decode native audio levels: %w", err)
+	}
+	if levels.WindowMS != transcript.EnvelopeWindowMS {
+		return TrackLevels{}, fmt.Errorf(
+			"native audio levels were measured at %dms, want transcript.EnvelopeWindowMS (%dms)",
+			levels.WindowMS, transcript.EnvelopeWindowMS)
+	}
+	return levels, nil
+}
+
 // Stop ends capture and finalises the chunk in flight, which then arrives from
 // Next like any other. It is safe to call more than once.
 func (s *AudioSession) Stop() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	if s.closed.Load() {
 		return
 	}
 	C.lumi_audio_session_stop(s.handle)
@@ -651,10 +717,10 @@ func (s *AudioSession) Stop() {
 func (s *AudioSession) Close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	if s.closed.Load() {
 		return
 	}
-	s.closed = true
+	s.closed.Store(true)
 	C.lumi_audio_session_close(s.handle)
 }
 
