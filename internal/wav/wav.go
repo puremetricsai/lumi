@@ -243,11 +243,35 @@ func RMSDBFS(samples []int16) float64 {
 	}
 	var sum float64
 	for _, sample := range samples {
-		value := float64(sample)
+		value := float64(sample) / fullScale
 		sum += value * value
 	}
-	return dbfs(math.Sqrt(sum / float64(len(samples))))
+	return DBFSFromMeanSquare(sum / float64(len(samples)))
 }
+
+// DBFSFromMeanSquare reports the level of a window whose samples have already
+// been reduced to a mean square, with samples normalised so that full scale is
+// 1.0. It is clamped at SilenceFloorDBFS exactly as RMSDBFS is.
+//
+// It exists so that a caller holding energy rather than samples still gets *this
+// package's* answer. The live audio meter is the caller: sound is summed as it
+// arrives, inside the ScreenCaptureKit callback where the samples are, and only
+// the running total crosses back into Go. Without this the decibel formula and
+// the silence floor would need a second copy in Objective-C — the drift this
+// repository forbids, made harder to see by a language boundary.
+//
+// It carries RMSDBFS's warning with it: this is a *presence* measure and never a
+// speech detector.
+func DBFSFromMeanSquare(meanSquare float64) float64 {
+	if meanSquare <= 0 || math.IsNaN(meanSquare) {
+		return SilenceFloorDBFS
+	}
+	return dbfs(math.Sqrt(meanSquare) * fullScale)
+}
+
+// fullScale is the magnitude of a full-scale 16-bit sample, and the divisor that
+// puts a sample in the normalised -1…1 domain DBFSFromMeanSquare expects.
+const fullScale = 32768.0
 
 // Envelope reports the level in dBFS of each fixed-length window of the stream,
 // in order. The final partial window is included so the tail of a stream is
@@ -297,10 +321,10 @@ func envelopeBytes(data []byte, sampleRate, windowMS int) []float64 {
 		}
 		var sum float64
 		for i := start; i < end; i++ {
-			value := float64(int16(binary.LittleEndian.Uint16(data[i*2 : i*2+2])))
+			value := float64(int16(binary.LittleEndian.Uint16(data[i*2:i*2+2]))) / fullScale
 			sum += value * value
 		}
-		envelope = append(envelope, dbfs(math.Sqrt(sum/float64(end-start))))
+		envelope = append(envelope, DBFSFromMeanSquare(sum/float64(end-start)))
 	}
 	return envelope
 }
@@ -309,7 +333,7 @@ func dbfs(rms float64) float64 {
 	if rms <= 0 {
 		return SilenceFloorDBFS
 	}
-	value := 20 * math.Log10(rms/32768.0)
+	value := 20 * math.Log10(rms/fullScale)
 	if value < SilenceFloorDBFS || math.IsNaN(value) {
 		return SilenceFloorDBFS
 	}
