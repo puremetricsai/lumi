@@ -2,6 +2,7 @@ package capture
 
 import (
 	"context"
+	"errors"
 	"math"
 	"sort"
 	"time"
@@ -82,11 +83,7 @@ func summarizeEnvelope(envelope []float64) (peak, median float64, err error) {
 }
 
 // errNoEnvelope reports a file that produced no measurable windows.
-var errNoEnvelope = errNoEnvelopeType{}
-
-type errNoEnvelopeType struct{}
-
-func (errNoEnvelopeType) Error() string { return "audio file produced no energy windows" }
+var errNoEnvelope = errors.New("audio file produced no energy windows")
 
 // emitLevel measures one stored track and hands the result to the sink, off the
 // capture path entirely.
@@ -117,11 +114,9 @@ func (r *Recorder) emitLevel(ctx context.Context, source, path string, capturedA
 	if r.Levels == nil || path == "" {
 		return
 	}
-	select {
-	case r.levelSlot() <- struct{}{}:
-	default:
-		// A measurement is still in flight. Skipping is the correct answer:
-		// the next chunk brings a fresher reading anyway.
+	// A measurement already in flight means this one is skipped, which is the
+	// correct answer: the next chunk brings a fresher reading anyway.
+	if !r.levelBusy.CompareAndSwap(false, true) {
 		r.Logger.Debug("skipped an audio level measurement; the previous one is still running",
 			"source", source)
 		return
@@ -129,7 +124,7 @@ func (r *Recorder) emitLevel(ctx context.Context, source, path string, capturedA
 	sink, logger := r.Levels, r.Logger
 	go func() {
 		defer func() {
-			<-r.levelSlot()
+			r.levelBusy.Store(false)
 			if recovered := recover(); recovered != nil {
 				logger.Error("audio level sink panicked; capture is unaffected",
 					"source", source, "panic", recovered)
@@ -149,11 +144,4 @@ func (r *Recorder) emitLevel(ctx context.Context, source, path string, capturedA
 			DurationMS: durationMS,
 		})
 	}()
-}
-
-// levelSlot is a one-deep semaphore, created on first use so a Recorder built
-// as a bare struct literal — which every test does — needs no constructor.
-func (r *Recorder) levelSlot() chan struct{} {
-	r.levelSlotOnce.Do(func() { r.levelSlotCh = make(chan struct{}, 1) })
-	return r.levelSlotCh
 }

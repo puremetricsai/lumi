@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/puremetricsai/lumi/internal/config"
@@ -58,9 +59,10 @@ type Recorder struct {
 	// measurement is taken at all — the read costs a file open per track, and
 	// nothing in the capture pipeline needs it.
 	Levels LevelSink
-	// levelSlotCh bounds level measurement to one in flight; see levelSlot.
-	levelSlotOnce sync.Once
-	levelSlotCh   chan struct{}
+	// levelBusy bounds level measurement to one in flight; see emitLevel. Its
+	// zero value is ready to use, so a Recorder built as a bare struct literal
+	// — which every test does — needs no constructor.
+	levelBusy atomic.Bool
 
 	// attribution is owned by the screen goroutine alone; captureScreen is the
 	// only reader and writer, so it needs no lock.
