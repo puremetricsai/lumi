@@ -55,7 +55,17 @@ task app:install  # install ~/Applications/Lumi.app
 task app:run      # install and launch it
 ```
 
-The app embeds the same `lumi` binary and offers to symlink it into a writable directory on your shell's `PATH`; it never replaces an existing `lumi` command. The local bundle is ad-hoc signed, so every rebuild changes its TCC identity and requires Screen Recording, Accessibility, Microphone, and Speech Recognition to be granted again. Developer ID signing, notarization, DMG packaging, and automatic updates remain out of scope.
+The app embeds the same `lumi` binary and offers to symlink it into a writable directory on your shell's `PATH`; it never replaces an existing `lumi` command. It supervises that CLI rather than capturing anything itself: the menu bar item shows capture state, and Settings holds recording, storage, permissions, MCP, and data-deletion controls. A recorder the app owns is visible to `lumi record status` in a terminal, and vice versa — either interface refuses to start a second one.
+
+The `lumi` CLI reaches the app in the other direction:
+
+```sh
+lumi app             # open it, or bring it to the front (alias: lumi open)
+lumi app --settings  # open its Settings window
+lumi app --quit      # quit it, stopping the recorder it owns
+```
+
+The local bundle is ad-hoc signed, so every rebuild changes its TCC identity and requires Screen Recording, Accessibility, Microphone, and Speech Recognition to be granted again. `./scripts/restart-lumi-app.sh` is the development loop that does the rebuild, the TCC reset, and the relaunch in one step. Developer ID signing, notarization, DMG packaging, and automatic updates remain out of scope.
 
 ## Build and run (Development)
 
