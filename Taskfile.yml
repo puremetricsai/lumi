@@ -59,6 +59,39 @@ tasks:
     cmds:
       - rm -f {{if .GOBIN}}{{.GOBIN}}{{else}}{{.GOPATH}}/bin{{end}}/{{.BINARY}}
 
+  app:
+    desc: Build Lumi.app, the menu bar shell around the lumi binary
+    platforms: [darwin]
+    deps: [build]
+    sources:
+      - macos/Lumi/Sources/*.swift
+      - macos/Lumi/Resources/Info.plist
+      - macos/build-app.sh
+      - '{{.BINARY}}'
+    generates:
+      - build/Lumi.app/Contents/MacOS/LumiApp
+    cmds:
+      - ./macos/build-app.sh
+
+  app:install:
+    desc: Build Lumi.app and install it into ~/Applications
+    platforms: [darwin]
+    deps: [app]
+    cmds:
+      # Replaced in place at one stable path. The path is not what TCC keys on,
+      # but keeping one copy stops System Settings accumulating a row per build.
+      - rm -rf "$HOME/Applications/Lumi.app"
+      - mkdir -p "$HOME/Applications"
+      - cp -R build/Lumi.app "$HOME/Applications/Lumi.app"
+      - 'echo "installed $HOME/Applications/Lumi.app"'
+
+  app:run:
+    desc: Build, install, and launch Lumi.app
+    platforms: [darwin]
+    deps: [app:install]
+    cmds:
+      - open -a "$HOME/Applications/Lumi.app"
+
   test:
     desc: Run all tests
     deps: [speech]
@@ -131,7 +164,7 @@ tasks:
   clean:
     desc: Remove build artifacts and coverage output
     cmds:
-      - rm -f {{.BINARY}} coverage.out internal/macosnative/liblumispeech.a
+      - rm -rf {{.BINARY}} coverage.out internal/macosnative/liblumispeech.a build
 
   doctor:
     desc: Report native permissions, speech assets, and the data directory
