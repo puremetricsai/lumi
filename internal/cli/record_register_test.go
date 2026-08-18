@@ -281,7 +281,7 @@ func TestRecordStatusStillPrintsTheLogLineForADetachedRecorder(t *testing.T) {
 	}
 	// Compared in full, not by substring: an added or reordered line is a
 	// change to output that scripts read.
-	want := "recording\tpid " + itoa(os.Getpid()) + "\n" +
+	want := "recording\tpid " + strconv.Itoa(os.Getpid()) + "\n" +
 		"started\t" + startedAt.Local().Format("2006-01-02 15:04:05") + " (0s ago)\n" +
 		"capturing\tscreen=true audio=true\n" +
 		"log\t" + paths.RecordLog + "\n"
@@ -348,6 +348,3 @@ func TestRecordStatusStillPrintsTheLogLineForADetachedRecorder(t *testing.T) {
 		t.Errorf("json recording = %v, want true", payload["recording"])
 	}
 }
-
-// itoa keeps the exact-output comparison above readable.
-func itoa(n int) string { return strconv.Itoa(n) }

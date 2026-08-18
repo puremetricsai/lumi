@@ -181,21 +181,23 @@ func (a *app) runMCPSetup(cmd *cobra.Command, f mcpSetupFlags) error {
 
 	targets := newSetupTargets(selection)
 	results := make([]mcpsetup.Result, 0, len(targets))
-	// Kept alongside results by index rather than only joined, so --json can
-	// say which client failed. errs stays the joined return value.
-	failures := make([]string, 0, len(targets))
+	// Never nil: a JSON null here would make every reader special-case "no
+	// clients" separately from "no results".
+	rows := make([]mcpSetupResultJSON, 0, len(targets))
 	var errs []error
 	for _, target := range targets {
 		// One client's failure must never stop the others from being
 		// configured; the errors are joined and returned once at the end.
 		result, err := target.Apply(cmd.Context(), spec, opts)
 		results = append(results, result)
-		failure := ""
+		row := mcpSetupResultJSON{Result: result}
 		if err != nil {
 			errs = append(errs, err)
-			failure = err.Error()
+			// Carried with the result rather than only joined, so --json can
+			// say which client failed.
+			row.Error = err.Error()
 		}
-		failures = append(failures, failure)
+		rows = append(rows, row)
 	}
 
 	if f.asJSON {
@@ -204,7 +206,7 @@ func (a *app) runMCPSetup(cmd *cobra.Command, f mcpSetupFlags) error {
 		// exits non-zero — the same shape `permissions --json` has, and what
 		// lets a reader decode the payload first and consult the status only
 		// when there was nothing to read.
-		if err := writeSetupJSON(cmd.OutOrStdout(), spec, results, failures, f.dryRun); err != nil {
+		if err := writeSetupJSON(cmd.OutOrStdout(), spec, rows, f.dryRun); err != nil {
 			return err
 		}
 		return errors.Join(errs...)
@@ -298,18 +300,7 @@ func verifyBinary(ctx context.Context, exe string) error {
 // stderr — a skip's manual snippet, a conflict's current entry, whether Claude
 // Desktop actually changed — is a field of the payload, and a second rendering
 // of it on stderr would be a copy that can drift.
-func writeSetupJSON(w io.Writer, spec mcpsetup.Spec, results []mcpsetup.Result,
-	failures []string, dryRun bool) error {
-	// Never nil: a JSON null here would make every reader special-case "no
-	// clients" separately from "no results".
-	rows := make([]mcpSetupResultJSON, 0, len(results))
-	for i, r := range results {
-		row := mcpSetupResultJSON{Result: r}
-		if i < len(failures) {
-			row.Error = failures[i]
-		}
-		rows = append(rows, row)
-	}
+func writeSetupJSON(w io.Writer, spec mcpsetup.Spec, rows []mcpSetupResultJSON, dryRun bool) error {
 	encoder := json.NewEncoder(w)
 	encoder.SetIndent("", "  ")
 	return encoder.Encode(mcpSetupReport{
