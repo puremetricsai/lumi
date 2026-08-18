@@ -9,7 +9,6 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/puremetricsai/lumi/internal/config"
@@ -53,17 +52,11 @@ type Recorder struct {
 	CaptureScreen   bool
 	CaptureAudio    bool
 	Logger          *slog.Logger
-	// Levels is optional. When set, each captured track is measured after it is
-	// indexed and reported here, so a supervising app can draw a level meter
-	// without opening media or defining "level" a second time. Nil means no
-	// measurement is taken at all — the read costs a file open per track, and
-	// nothing in the capture pipeline needs it.
+	// Levels is optional. When set, and when the audio stream can report its own
+	// sound (LevelSampler), each track's level is drained live and reported here
+	// so a supervising app can draw a meter that moves with the room. Nil means
+	// no measurement is taken at all — nothing in the capture pipeline needs it.
 	Levels LevelSink
-	// levelBusy bounds level measurement to one in flight; see emitLevel. Its
-	// zero value is ready to use, so a Recorder built as a bare struct literal
-	// — which every test does — needs no constructor.
-	levelBusy atomic.Bool
-
 	// attribution is owned by the screen goroutine alone; captureScreen is the
 	// only reader and writer, so it needs no lock.
 	attribution attributionHealth
@@ -517,6 +510,14 @@ func (r *Recorder) consumeAudio(ctx context.Context, stream AudioStream) {
 			r.Logger.Error("close audio capture stream", "error", err)
 		}
 	}()
+	// The meters live exactly as long as this stream does, so a stream reopened
+	// after a capture failure gets a fresh sampler and a stream that closed
+	// stops reporting sound nobody is capturing.
+	if sampler, ok := stream.(LevelSampler); ok && r.Levels != nil {
+		levelCtx, stopLevels := context.WithCancel(ctx)
+		defer stopLevels()
+		go r.sampleLevels(levelCtx, sampler)
+	}
 	for {
 		chunk, err := stream.Next(ctx)
 		if err != nil {
@@ -586,9 +587,6 @@ func (r *Recorder) storeAudioChunk(ctx context.Context, chunk AudioChunk) {
 		}
 		r.Logger.Info("captured audio", "id", event.ID, "source", frame.Source,
 			"characters", len(transcription.Text), "segments", len(transcription.Segments))
-		// After the insert, never before: the row is what must not be lost, and
-		// a level is only ever a readout of media that is already safe.
-		r.emitLevel(ctx, frame.Source, frame.Path, capturedAt, frame.DurationMS)
 		if processErr != nil {
 			r.Logger.Warn("transcription failed; audio was still indexed", "source", frame.Source, "error", processErr)
 		}

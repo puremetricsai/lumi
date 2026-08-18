@@ -286,9 +286,11 @@ func levelEmitter(enabled bool, out io.Writer) capture.LevelSink {
 	encoder := json.NewEncoder(out)
 	var mu sync.Mutex
 	return func(level capture.AudioLevel) {
-		// Both tracks of a chunk are measured in the same goroutine today, but
-		// the sink is documented as callable from the audio goroutine and a
-		// half-written JSON line is unparseable rather than merely out of order.
+		// One level goroutine calls this today, in order. The lock stays
+		// because the sink is documented as callable from the recorder's own
+		// goroutines and a half-written JSON line is unparseable rather than
+		// merely out of order — this is several lines a second now, so a
+		// second caller would find the interleaving quickly and expensively.
 		mu.Lock()
 		defer mu.Unlock()
 		_ = encoder.Encode(struct {
