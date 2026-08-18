@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -54,7 +55,7 @@ func newRootCommand() *cobra.Command {
 	cmd.PersistentFlags().StringVar(&a.dataDir, "data-dir", "", "data directory (default: $LUMI_HOME or ~/Library/Application Support/Lumi)")
 	cmd.AddCommand(a.recordCommand(), a.searchCommand(), a.transcriptCommand(), a.pruneCommand(),
 		a.compressCommand(), a.doctorCommand(), a.permissionsCommand(), a.nativeSmokeCommand(),
-		a.mcpCommand(), a.transcribeCommand())
+		a.mcpCommand(), a.transcribeCommand(), a.appCommand())
 	cmd.AddCommand(&cobra.Command{Use: "version", Short: "Print the Lumi version", Run: func(*cobra.Command, []string) {
 		fmt.Fprintln(os.Stdout, version)
 	}})
@@ -138,6 +139,7 @@ type recordFlags struct {
 	interval, audioChunk, duration time.Duration
 	noScreen, noAudio              bool
 	speechLocale                   string
+	emitLevels                     bool
 }
 
 func (f *recordFlags) bind(cmd *cobra.Command) {
@@ -148,14 +150,36 @@ func (f *recordFlags) bind(cmd *cobra.Command) {
 	flags.BoolVar(&f.noScreen, "no-screen", false, "disable screen capture and text extraction")
 	flags.BoolVar(&f.noAudio, "no-audio", false, "disable audio capture and transcription")
 	flags.StringVar(&f.speechLocale, "speech-locale", "en-US", "SpeechAnalyzer recognition locale")
+	// Off by default, and off means the measurement is never taken: it costs a
+	// file read per captured track, and nothing in the capture pipeline needs
+	// it. Only a supervisor drawing a level meter does.
+	flags.BoolVar(&f.emitLevels, "emit-levels", false,
+		"report each captured track's energy as a JSON line on stderr")
 }
 
 // runForeground runs the capture pipeline in the current process until the
 // context is cancelled (signal or --duration). This is the worker that the
 // detached child executes.
-func (a *app) runForeground(cmd *cobra.Command, f recordFlags) error {
+func (a *app) runForeground(cmd *cobra.Command, f recordFlags, registerState bool) error {
+	emitLevels := f.emitLevels
 	if f.noScreen && f.noAudio {
 		return errors.New("--no-screen and --no-audio cannot be used together")
+	}
+	// A registered recorder is subject to the single-writer rule the detached
+	// one already enforces, and refuses for the same reason: two recorders on
+	// one store both write it. Checked before the permission preflight and the
+	// speech-asset download, so a refusal costs nothing — the same order
+	// startBackground uses.
+	if registerState {
+		paths, err := a.paths()
+		if err != nil {
+			return err
+		}
+		if state, ok, err := readRecordState(paths); err != nil {
+			return err
+		} else if ok && processAlive(state.PID) {
+			return alreadyRecordingError(state)
+		}
 	}
 	if err := requireRecordingPermissions(cmd.Context(), !f.noScreen, !f.noAudio, !f.noAudio); err != nil {
 		return err
@@ -192,9 +216,86 @@ func (a *app) runForeground(cmd *cobra.Command, f recordFlags) error {
 		AudioOutputs: capture.NativeAudioOutputs{},
 		AudioMarkers: capture.NativeAudioMarkers{},
 		Transcriber:  capture.NativeSpeech{Locale: f.speechLocale},
+		Levels:       levelEmitter(emitLevels, cmd.ErrOrStderr()),
+	}
+	// Registered last, so the file names a recorder that is actually about to
+	// run: everything above this can still fail, and a state file left behind
+	// by a start that never happened makes `record status` report a recording
+	// that does not exist.
+	if registerState {
+		release, err := registerForegroundRecorder(paths, a.dataDir, f)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if err := release(); err != nil {
+				logger.Warn("could not clear the record state file",
+					"path", paths.RecordState, "error", err)
+			}
+		}()
 	}
 	logger.Info("recording started", "database", paths.Database, "screen", !f.noScreen, "audio", !f.noAudio)
 	return recorder.Run(ctx)
+}
+
+// registerForegroundRecorder writes this process's registration and returns the
+// call that retires it.
+//
+// The duplicate check is repeated here even though runForeground already made
+// it. The first check is early on purpose — it costs a refused start nothing —
+// but everything between the two can take a long time, most of all the
+// speech-asset download, and a recorder that checked minutes ago has not
+// checked at all. Neither check makes this atomic; the state file is advisory,
+// and a lock is the one thing this design will not add.
+func registerForegroundRecorder(paths config.Paths, dataDir string, f recordFlags) (func() error, error) {
+	if state, ok, err := readRecordState(paths); err != nil {
+		return nil, err
+	} else if ok && processAlive(state.PID) {
+		return nil, alreadyRecordingError(state)
+	}
+	// A binary that cannot name itself costs the app-aware wording in a later
+	// refusal and nothing else, so it is not worth failing a start over.
+	exe, _ := os.Executable()
+	if err := writeRecordState(paths, recordState{
+		PID:       os.Getpid(),
+		StartedAt: time.Now().UTC(),
+		Screen:    !f.noScreen,
+		Audio:     !f.noAudio,
+		// Log stays empty: this recorder's output goes to whatever its parent
+		// gave it, not to a file it opened.
+		Args:       append(childArgs(dataDir, f), "--register-state"),
+		Executable: exe,
+	}); err != nil {
+		return nil, fmt.Errorf("record state: %w", err)
+	}
+	return func() error { return removeOwnRecordState(paths) }, nil
+}
+
+// levelEmitter returns the recorder's level sink, or nil when levels were not
+// asked for — nil is what stops the measurement being taken at all.
+//
+// It writes to stderr because stdout belongs to command results, and because
+// the one caller that wants this is a supervisor already reading the recorder's
+// stderr for its log. Each measurement is one self-delimiting JSON object on its
+// own line, so a reader interleaving it with the slog stream can simply ignore
+// every line that does not parse.
+func levelEmitter(enabled bool, out io.Writer) capture.LevelSink {
+	if !enabled {
+		return nil
+	}
+	encoder := json.NewEncoder(out)
+	var mu sync.Mutex
+	return func(level capture.AudioLevel) {
+		// Both tracks of a chunk are measured in the same goroutine today, but
+		// the sink is documented as callable from the audio goroutine and a
+		// half-written JSON line is unparseable rather than merely out of order.
+		mu.Lock()
+		defer mu.Unlock()
+		_ = encoder.Encode(struct {
+			Event string `json:"event"`
+			capture.AudioLevel
+		}{Event: "audio_level", AudioLevel: level})
+	}
 }
 
 func (a *app) searchCommand() *cobra.Command {
@@ -461,7 +562,7 @@ func formatPercent(part, total int64) string {
 }
 
 func (a *app) permissionsCommand() *cobra.Command {
-	var request, inputMonitoring bool
+	var request, inputMonitoring, asJSON bool
 	cmd := &cobra.Command{
 		Use:   "permissions",
 		Short: "Show or request native macOS capture permissions",
@@ -476,23 +577,45 @@ func (a *app) permissionsCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// The JSON is macosnative.Permissions as it stands, not a shape
+			// invented here: that type already carries the field names, and a
+			// second spelling of them would be one more thing to keep in step.
+			// The human output below is unchanged, including the error that
+			// follows a --request that did not finish.
+			if asJSON {
+				encoder := json.NewEncoder(cmd.OutOrStdout())
+				encoder.SetIndent("", "  ")
+				if err := encoder.Encode(permissions); err != nil {
+					return err
+				}
+				return permissionsRequestIncomplete(request, permissions)
+			}
 			fmt.Fprintf(cmd.OutOrStdout(), "Screen Recording\t%s\n", permissions.ScreenRecording)
 			fmt.Fprintf(cmd.OutOrStdout(), "Accessibility\t%s\n", permissions.Accessibility)
 			fmt.Fprintf(cmd.OutOrStdout(), "Input Monitoring\t%s\n", permissions.InputMonitoring)
 			fmt.Fprintf(cmd.OutOrStdout(), "Microphone\t%s\n", permissions.Microphone)
 			fmt.Fprintf(cmd.OutOrStdout(), "Speech Recognition\t%s\n", permissions.SpeechRecognition)
-			if request && (permissions.ScreenRecording != "granted" ||
-				permissions.Accessibility != "granted" || permissions.Microphone != "granted" ||
-				permissions.SpeechRecognition != "granted") {
-				return errors.New("finish approving Lumi in System Settings, then restart the command")
-			}
-			return nil
+			return permissionsRequestIncomplete(request, permissions)
 		},
 	}
 	cmd.Flags().BoolVar(&request, "request", false, "open the native macOS permission request flows")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "emit JSON")
 	cmd.Flags().BoolVar(&inputMonitoring, "input-monitoring", false,
 		"also request optional Input Monitoring permission")
 	return cmd
+}
+
+// permissionsRequestIncomplete reports the error that follows a --request which
+// left something ungranted. It is one function so the JSON and human paths
+// cannot drift on which permissions count as required, or on the exit code.
+// Input Monitoring is absent deliberately: it is optional everywhere else too.
+func permissionsRequestIncomplete(requested bool, permissions macosnative.Permissions) error {
+	if requested && (permissions.ScreenRecording != "granted" ||
+		permissions.Accessibility != "granted" || permissions.Microphone != "granted" ||
+		permissions.SpeechRecognition != "granted") {
+		return errors.New("finish approving Lumi in System Settings, then restart the command")
+	}
+	return nil
 }
 
 func (a *app) nativeSmokeCommand() *cobra.Command {

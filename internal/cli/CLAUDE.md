@@ -1,7 +1,7 @@
 # internal/cli
 
 Cobra commands (`record start`/`status`/`stop`, `search`, `mcp`, `prune`, `compress`, `doctor`,
-`permissions`, `native-smoke`, `transcribe`, `transcript`, `version`). This package wires concrete processors into a
+`permissions`, `native-smoke`, `transcribe`, `transcript`, `version`, `app`). This package wires concrete processors into a
 `capture.Recorder`; data flows one way from here and never back. `record start` detaches to the background
 by default (`--foreground` keeps it inline) as a re-exec tracked by a JSON state file and log under the data
 dir (`record_daemon.go`); `record stop` sends SIGTERM and waits for graceful shutdown. `search` offers exact
@@ -87,4 +87,28 @@ developer's own Claude config.
   label alone reads as a speaker to anyone summarising the output, and the WAV it came from is deleted on
   the retention schedule while a summary built from it survives — so a speaker inferred there becomes
   permanent. Any future summary or roll-up command must carry the same marker through.
+- **`record.json` is the only capture-ownership mechanism, and `--register-state` is what lets a
+  supervisor join it rather than work around it.** Only `startBackground` used to write that file, so a
+  foreground recorder was invisible to five things that consult it: the duplicate-start refusal,
+  `record status`, `record stop`, `compress`, and `transcript backfill`. `Lumi.app` deliberately holds
+  `record start --foreground` as a child — a detached re-exec risks launchd becoming the TCC responsible
+  process instead of the bundle — so without registration an app-owned recorder would defeat all five.
+  The flag defaults off, which is what keeps every existing `--foreground` caller exactly as it was.
+  **Swift never writes or parses `record.json`**: this package owns the `recordState` format, and a second
+  copy of it in another language is the drift the root `CLAUDE.md` forbids. The app reads
+  `record status --json` instead.
+- **Removal of `record.json` is always scoped to a pid** (`removeRecordStateFor`). Two writers now clear
+  it — the recorder retiring its own registration on the way out, and `record stop` after the process it
+  signalled has gone — and a new recorder may legitimately register between those two moments, because the
+  pid it checked is genuinely dead. An unconditional removal at either site deletes the newcomer's
+  registration and makes a live recorder invisible, which is the failure registration exists to prevent.
+  Neither the scoped removal nor the duplicate check is atomic, and that is accepted: the state file is
+  advisory, and a lock would be a second ownership mechanism.
+- **`lumi app` resolves a bundle by path and hands off with `open -a <bundle> <url>`.** Never a bare URL:
+  LaunchServices answers a scheme from its own index, so a stale or duplicate copy receives the request
+  instead of the bundle that was just resolved and reported on — and under `--quit` that would confirm one
+  bundle is running and then launch a different one to deliver the quit. The URL scheme is used rather than
+  `--args` because LaunchServices drops arguments to an already-running app, which is the normal state for
+  a menu bar app. `openURL` and `appIsRunning` are test seams for the same reason `resolveLumiBinary` is
+  one: without them a test run would launch or quit the developer's own copy.
 - **The CLI refuses to run on anything but `darwin/arm64`** (`platform.Validate` in `PersistentPreRunE`).

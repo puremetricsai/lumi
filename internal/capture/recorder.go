@@ -52,6 +52,15 @@ type Recorder struct {
 	CaptureScreen   bool
 	CaptureAudio    bool
 	Logger          *slog.Logger
+	// Levels is optional. When set, each captured track is measured after it is
+	// indexed and reported here, so a supervising app can draw a level meter
+	// without opening media or defining "level" a second time. Nil means no
+	// measurement is taken at all — the read costs a file open per track, and
+	// nothing in the capture pipeline needs it.
+	Levels LevelSink
+	// levelSlotCh bounds level measurement to one in flight; see levelSlot.
+	levelSlotOnce sync.Once
+	levelSlotCh   chan struct{}
 
 	// attribution is owned by the screen goroutine alone; captureScreen is the
 	// only reader and writer, so it needs no lock.
@@ -575,6 +584,9 @@ func (r *Recorder) storeAudioChunk(ctx context.Context, chunk AudioChunk) {
 		}
 		r.Logger.Info("captured audio", "id", event.ID, "source", frame.Source,
 			"characters", len(transcription.Text), "segments", len(transcription.Segments))
+		// After the insert, never before: the row is what must not be lost, and
+		// a level is only ever a readout of media that is already safe.
+		r.emitLevel(ctx, frame.Source, frame.Path, capturedAt, frame.DurationMS)
 		if processErr != nil {
 			r.Logger.Warn("transcription failed; audio was still indexed", "source", frame.Source, "error", processErr)
 		}
