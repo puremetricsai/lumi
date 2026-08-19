@@ -160,6 +160,9 @@ tasks:
       - task: fmt
       - task: vet
       - task: test
+      # The bundle's version stamping and its ad-hoc-by-default signing are
+      # decided in shell, so nothing above covers them.
+      - ./macos/build-app.sh --self-test
 
   clean:
     desc: Remove build artifacts and coverage output
