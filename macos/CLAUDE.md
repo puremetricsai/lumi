@@ -50,11 +50,14 @@ The app is a supervisor and nothing else — root `CLAUDE.md` states that rule; 
   gating on the UI state saves the setting and leaves the live recorder on the old flags.
 - **Children get `FileHandle.nullDevice` for stdin, so no CLI prompt can ever be answered.** Anything
   interactive must be pre-answered — `prune --all --yes`, gated by the app's own typed confirmation sheet.
-- **Every rebuild destroys the app's TCC grants.** The bundle is ad-hoc signed (`codesign -s -`), so its
-  code identity changes each build and Screen Recording and Accessibility land on `denied`, which does not
-  re-prompt. Measured in `docs/research/2026-08-17-tcc-spike.md`; batch UI changes into single builds, and
-  reach for `tccutil reset <service> com.puremetricsai.lumi` when a System Settings row reads enabled while
-  the app reads denied. Not a bug to fix in code.
+- **Every *development* rebuild destroys the app's TCC grants.** A local bundle is ad-hoc signed
+  (`codesign -s -`), so its code identity changes each build and Screen Recording and Accessibility land on
+  `denied`, which does not re-prompt. Measured in `docs/research/2026-08-17-tcc-spike.md`; batch UI changes
+  into single builds, and reach for `tccutil reset <service> com.puremetricsai.lumi` when a System Settings
+  row reads enabled while the app reads denied. Not a bug to fix in code, and not what a released bundle
+  does: `build-app.sh` signs with `CODESIGN_IDENTITY`, ad-hoc only by default, and a release passes a real
+  identity whose designated requirement is the certificate rather than the hash — so those grants survive
+  an upgrade. `docs/release.md` owns that half.
 - **The executable is `Contents/MacOS/LumiApp`, beside the embedded `Contents/MacOS/lumi`.** macOS
   filesystems are case-insensitive, so naming it `Lumi` makes it the same file as `lumi` and the CLI
   silently overwrites the app. `build-app.sh` compares inodes and fails loudly if that returns.
