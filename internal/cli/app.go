@@ -34,8 +34,13 @@ const (
 // errNoAppBundle is returned when no Lumi.app is installed. `lumi app` is the
 // one command whose whole job is to reach the bundle, so this is a failure
 // rather than a notice, and the exit code says so.
+//
+// The cask is named first because it is how everyone who did not clone the
+// repository gets the app, and it installs the bundle where this command looks
+// for it. `task app` stays as the developer's path and says so.
 var errNoAppBundle = fmt.Errorf(
-	"%s is not installed; build it with `task app` and move it to /Applications", appBundleName)
+	"%s is not installed; install it with `brew install --cask puremetricsai/lumi/lumi`, or build it from a checkout with `task app`",
+	appBundleName)
 
 // openURL and appIsRunning are package vars purely as test seams, for the same
 // reason resolveLumiBinary is one: without them a test run would launch or quit

@@ -61,17 +61,17 @@ struct AboutSettings: View {
             }
 
             Section("Updates") {
-                // The mockup showed an "Automatic updates" toggle. Lumi has no
-                // update mechanism and cannot have one: an ad-hoc signature is
-                // a different application to the system on every build, and
-                // without notarization there is nothing safe to install
-                // unattended. The row keeps its shape, but it promises only
-                // what it does — it opens the releases page.
+                // The mockup showed an "Automatic updates" toggle. The app has
+                // no updater and is not getting one: Homebrew is the update
+                // mechanism, so a second one would race it and leave the cask's
+                // record of what is installed wrong. The row keeps its shape,
+                // but it promises only what it does — it opens the releases
+                // page.
                 LabeledContent("Check for new releases") {
                     Button("Check now") { open(Self.releases) }
                         .accessibilityLabel("Open the Lumi releases page on GitHub")
                 }
-                SettingsCaption("Lumi does not update itself. Check now opens the releases page in your browser; new versions are installed by hand.")
+                SettingsCaption("Lumi does not update itself. Check now opens the GitHub releases page, which lists what each release changed. An install from Homebrew upgrades with brew upgrade --cask puremetricsai/lumi/lumi.")
             }
 
             Section("Links") {

@@ -117,6 +117,14 @@ func TestAppCommandReportsAMissingBundle(t *testing.T) {
 	if len(*sent) != 0 {
 		t.Errorf("sent %v with no bundle installed; want nothing", *sent)
 	}
+	// The message is the only thing a user gets here, and it is the one place
+	// the CLI names an install command. A README that has moved on from
+	// `task app` cannot fix a binary that still tells people to run it.
+	for _, want := range []string{"brew install --cask puremetricsai/lumi/lumi", "task app"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
 }
 
 func TestAppCommandSendsTheRightURL(t *testing.T) {
