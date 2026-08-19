@@ -2,7 +2,7 @@ class Lumi < Formula
   desc "Local-first AI memory CLI for Apple Silicon Macs"
   homepage "https://github.com/puremetricsai/lumi"
   # The `url` and `sha256` lines below are rewritten on every tag by the
-  # update-homebrew-formula job in .github/workflows/release-please.yml. Both must exist
+  # update-homebrew-packages job in .github/workflows/release-please.yml. Both must exist
   # and stay well-formed: that job seds them in place, it does not insert them, and it
   # first asserts there is exactly one top-level line of each. A `head do`, `stable do`,
   # or `resource` block would introduce a second `url`/`sha256` and fail that assertion.
