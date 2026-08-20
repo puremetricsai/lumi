@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/puremetricsai/lumi/compare/v0.6.0...v0.6.1) (2026-08-20)
+
+
+### Miscellaneous Chores
+
+* release ([d90763d](https://github.com/puremetricsai/lumi/commit/d90763d4f5e19c1ac10ed8ecb39c62b3b2ea528a))
+
 ## [0.6.0](https://github.com/puremetricsai/lumi/compare/v0.5.0...v0.6.0) (2026-08-20)
 
 
