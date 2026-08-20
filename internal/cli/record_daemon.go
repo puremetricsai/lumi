@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -18,8 +19,13 @@ import (
 // preservation window so in-flight media finishes indexing.
 const stopTimeout = 20 * time.Second
 
-// recordState is the on-disk record of a background recorder. It lives at
-// Paths.RecordState so `status`/`stop` can find the process from any terminal.
+// recordState is the on-disk record of the running recorder, whichever way it
+// was started: a detached background recorder registered by startBackground, or
+// a foreground one that registered itself under --register-state — which is how
+// a supervisor holding the recorder as a child, such as Lumi.app, stays visible
+// to `record status`, `record stop`, `compress`, and `transcript backfill`.
+// It lives at Paths.RecordState so those commands can find the process from any
+// terminal.
 type recordState struct {
 	PID       int       `json:"pid"`
 	StartedAt time.Time `json:"started_at"`
@@ -27,8 +33,15 @@ type recordState struct {
 	Audio     bool      `json:"audio"`
 	// Args is the child argv (after the binary name), kept for diagnostics.
 	Args []string `json:"args"`
-	// Log is the file the recorder's output is redirected to.
+	// Log is the file the recorder's output is redirected to. It is empty for a
+	// foreground recorder, whose output goes wherever its parent put it.
 	Log string `json:"log"`
+	// Executable is the binary running the recorder. It exists so a refused
+	// start can say *what* holds the recorder, which a pid alone cannot: a
+	// recorder owned by Lumi.app is stopped by quitting the app, and telling
+	// that user to run `lumi record stop` sends them to the wrong place.
+	// Omitted when empty so states written by older builds stay readable.
+	Executable string `json:"executable,omitempty"`
 }
 
 func writeRecordState(paths config.Paths, state recordState) error {
@@ -66,6 +79,49 @@ func removeRecordState(paths config.Paths) error {
 // processAlive reports whether a process with the given pid is running. It uses
 // signal 0, which performs error checking without delivering a signal: nil
 // means alive, EPERM means alive-but-not-ours, ESRCH means gone.
+// removeRecordStateFor clears the state file only while it still names pid.
+//
+// Unconditional removal is wrong once a recorder can retire its own
+// registration. Two writers now clear this file — the recorder on its way out,
+// and `record stop` after the process it signalled has gone — and between those
+// two moments a *new* recorder can legitimately register, because the pid it
+// checked is genuinely dead. Removing whatever happens to be at the path then
+// deletes the newcomer's registration and leaves a live recorder invisible to
+// `record status`, `record stop`, `compress`, and `transcript backfill`: the
+// exact failure registration exists to prevent.
+//
+// The read and the unlink are not one atomic step, so this narrows the window
+// rather than closing it. Closing it would take a lock, and a second ownership
+// mechanism is precisely what this design refuses to add — the state file is
+// advisory, as it has always been.
+func removeRecordStateFor(paths config.Paths, pid int) error {
+	state, ok, err := readRecordState(paths)
+	if err != nil {
+		return err
+	}
+	if !ok || state.PID != pid {
+		return nil
+	}
+	return removeRecordState(paths)
+}
+
+// removeOwnRecordState retires this process's own registration.
+func removeOwnRecordState(paths config.Paths) error {
+	return removeRecordStateFor(paths, os.Getpid())
+}
+
+// alreadyRecordingError explains a refused start, naming the app when the
+// recorder belongs to a bundle. See recordState.Executable.
+func alreadyRecordingError(state recordState) error {
+	if bundle := enclosingAppBundle(state.Executable); bundle != "" {
+		return fmt.Errorf(
+			"recording is already in progress under %s (pid %d); quit the app, "+
+				"or run `lumi record stop` first",
+			filepath.Base(bundle), state.PID)
+	}
+	return fmt.Errorf("recording is already in progress (pid %d); run `lumi record stop` first", state.PID)
+}
+
 func processAlive(pid int) bool {
 	if pid <= 0 {
 		return false
@@ -80,19 +136,32 @@ func processAlive(pid int) bool {
 
 func (a *app) recordStartCommand() *cobra.Command {
 	var f recordFlags
-	var foreground bool
+	var foreground, registerState bool
 	cmd := &cobra.Command{
 		Use:   "start",
 		Short: "Start recording (in the background, or with --foreground in this terminal)",
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if registerState && !foreground {
+				// The detached path already registers, from the parent, before
+				// the child exists. Registering again from the child would give
+				// one recorder two writers of one file.
+				return errors.New("--register-state requires --foreground")
+			}
 			if foreground {
-				return a.runForeground(cmd, f)
+				return a.runForeground(cmd, f, registerState)
 			}
 			return a.startBackground(cmd, f)
 		},
 	}
 	f.bind(cmd)
 	cmd.Flags().BoolVar(&foreground, "foreground", false, "run in this terminal instead of detaching to the background")
+	// Default off, so today's --foreground is byte-for-byte what it was: a
+	// recorder that registers nothing and refuses nobody. It is on for a
+	// supervisor that holds the recorder as a child — Lumi.app — which needs
+	// `record status`, `record stop`, `compress`, and `transcript backfill` to
+	// see the recorder it owns.
+	cmd.Flags().BoolVar(&registerState, "register-state", false,
+		"record this recorder in record.json so `record status`/`stop` can see it (requires --foreground)")
 	return cmd
 }
 
@@ -113,7 +182,7 @@ func (a *app) startBackground(cmd *cobra.Command, f recordFlags) error {
 	if state, ok, err := readRecordState(paths); err != nil {
 		return err
 	} else if ok && processAlive(state.PID) {
-		return fmt.Errorf("recording is already in progress (pid %d); run `lumi record stop` first", state.PID)
+		return alreadyRecordingError(state)
 	}
 	// Surface missing-permission errors to this terminal, not the log file.
 	if err := requireRecordingPermissions(cmd.Context(), !f.noScreen, !f.noAudio, !f.noAudio); err != nil {
@@ -124,13 +193,18 @@ func (a *app) startBackground(cmd *cobra.Command, f recordFlags) error {
 	if err != nil {
 		return err
 	}
+	// The error is dropped deliberately: an unresolvable executable costs the
+	// app-aware wording in a later refusal and nothing else, and failing a
+	// start over it would trade a working recorder for a better message.
+	exe, _ := os.Executable()
 	state := recordState{
-		PID:       pid,
-		StartedAt: time.Now().UTC(),
-		Screen:    !f.noScreen,
-		Audio:     !f.noAudio,
-		Args:      childArgs(a.dataDir, f),
-		Log:       paths.RecordLog,
+		PID:        pid,
+		StartedAt:  time.Now().UTC(),
+		Screen:     !f.noScreen,
+		Audio:      !f.noAudio,
+		Args:       childArgs(a.dataDir, f),
+		Log:        paths.RecordLog,
+		Executable: exe,
 	}
 	if err := writeRecordState(paths, state); err != nil {
 		return fmt.Errorf("record state: %w", err)
@@ -166,6 +240,9 @@ func childArgs(dataDir string, f recordFlags) []string {
 	}
 	if f.noAudio {
 		args = append(args, "--no-audio")
+	}
+	if f.emitLevels {
+		args = append(args, "--emit-levels")
 	}
 	return args
 }
@@ -241,7 +318,11 @@ func (a *app) recordStatusCommand() *cobra.Command {
 					payload["started_at"] = state.StartedAt
 					payload["screen"] = state.Screen
 					payload["audio"] = state.Audio
-					payload["log"] = state.Log
+					// Omitted rather than empty for a foreground recorder,
+					// which writes no log of its own.
+					if state.Log != "" {
+						payload["log"] = state.Log
+					}
 				}
 				enc := json.NewEncoder(cmd.OutOrStdout())
 				enc.SetIndent("", "  ")
@@ -260,7 +341,9 @@ func (a *app) recordStatusCommand() *cobra.Command {
 			fmt.Fprintf(out, "recording\tpid %d\n", state.PID)
 			fmt.Fprintf(out, "started\t%s (%s ago)\n", state.StartedAt.Local().Format("2006-01-02 15:04:05"), uptime)
 			fmt.Fprintf(out, "capturing\tscreen=%t audio=%t\n", state.Screen, state.Audio)
-			fmt.Fprintf(out, "log\t%s\n", state.Log)
+			if state.Log != "" {
+				fmt.Fprintf(out, "log\t%s\n", state.Log)
+			}
 			return nil
 		},
 	}
@@ -295,7 +378,11 @@ func (a *app) recordStopCommand() *cobra.Command {
 			if err := stopProcess(state.PID, stopTimeout); err != nil {
 				return err
 			}
-			if err := removeRecordState(paths); err != nil {
+			// Scoped to the pid that was actually stopped. A recorder that
+			// retires its own registration frees the path the instant it
+			// exits, so an unconditional removal here can delete the
+			// registration of a recorder started in the gap.
+			if err := removeRecordStateFor(paths, state.PID); err != nil {
 				return err
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "recording stopped (pid %d)\n", state.PID)

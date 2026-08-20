@@ -181,12 +181,16 @@ func (c *Codex) existingEntry(ctx context.Context, runner Runner, cli, name stri
 
 func (c *Codex) Apply(ctx context.Context, spec Spec, opts Options) (Result, error) {
 	result := Result{Target: codexName}
+	// The paste-able snippet is filled in before anything else can go
+	// wrong, so every result carries it. It costs a string on the happy
+	// path and it is what lets a caller offer "copy client config"
+	// unconditionally instead of only after Lumi has declined to write.
+	result.manualTOML(spec)
 
 	cli := c.resolveCLI()
 	if cli == "" {
 		result.Status = StatusSkipped
 		result.Detail = "the codex CLI was not found on PATH"
-		result.manualTOML(spec)
 		if c.Required {
 			return result, notInstalledErr(codexName, result.Detail)
 		}
@@ -204,7 +208,6 @@ func (c *Codex) Apply(ctx context.Context, spec Spec, opts Options) (Result, err
 		// telling the truth about what a real run would face.
 		result.Status = StatusFailed
 		result.Detail = "codex cannot read its own configuration"
-		result.manualTOML(spec)
 		return result, err
 	}
 
@@ -213,7 +216,6 @@ func (c *Codex) Apply(ctx context.Context, spec Spec, opts Options) (Result, err
 		result.Status = StatusConflict
 		result.Detail = "an entry already exists that Lumi cannot read"
 		result.Current = existing.currentLine()
-		result.manualTOML(spec)
 		return result, conflictErr(codexName, spec.Name)
 	case existing.matches(spec):
 		result.Status = StatusUnchanged
@@ -223,13 +225,11 @@ func (c *Codex) Apply(ctx context.Context, spec Spec, opts Options) (Result, err
 		result.Status = StatusConflict
 		result.Detail = "the entry already exists but codex has it disabled"
 		result.Current = existing.currentLine()
-		result.manualTOML(spec)
 		return result, conflictErr(codexName, spec.Name)
 	case existing.found && !opts.Force:
 		result.Status = StatusConflict
 		result.Detail = "an entry with different settings already exists"
 		result.Current = existing.currentLine()
-		result.manualTOML(spec)
 		return result, conflictErr(codexName, spec.Name)
 	}
 

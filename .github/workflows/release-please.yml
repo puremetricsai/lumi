@@ -80,6 +80,111 @@ jobs:
           path: lumi-darwin-arm64.tar.gz
           retention-days: 1
 
+      # Lumi.app is built around the binary the steps above produced and verified,
+      # never around a second one: the app and the CLI it embeds are one version by
+      # construction, not by two builds agreeing.
+      - name: Import the release signing identity
+        env:
+          P12_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_P12_PASSWORD }}
+          IDENTITY: ${{ secrets.MACOS_DEVELOPER_IDENTITY }}
+        run: |
+          set -euo pipefail
+          # A secret cannot be read in a job- or step-level `if:`, so the branch lives
+          # in the script. With no certificate configured the release still ships and
+          # the bundle is ad-hoc signed; docs/release.md is what that costs the people
+          # installing it, and why it should be configured before the first cask
+          # release rather than after.
+          if [ -z "${P12_BASE64}" ]; then
+            # Before the cask exists, an ad-hoc bundle reaches nobody and the release
+            # ships. Once it exists it does reach people, and README.md tells them their
+            # Gatekeeper approval and TCC grants survive upgrades — which is true of a
+            # stable certificate and false of an ad-hoc signature, whose designated
+            # requirement is a fresh hash every build. So the promise is enforced where
+            # it is made rather than left to a maintainer remembering docs/release.md.
+            if [ -f Casks/lumi.rb ]; then
+              echo "::error::Casks/lumi.rb ships Lumi.app to users, but no signing certificate is configured. Set MACOS_DEVELOPER_ID_P12_BASE64, MACOS_DEVELOPER_ID_P12_PASSWORD and MACOS_DEVELOPER_IDENTITY (docs/release.md), or an ad-hoc release will cost every user their permissions."
+              exit 1
+            fi
+            echo "::warning::no signing certificate configured; Lumi.app will be ad-hoc signed"
+            exit 0
+          fi
+          [ -n "${IDENTITY}" ] || { echo "::error::MACOS_DEVELOPER_ID_P12_BASE64 is set but MACOS_DEVELOPER_IDENTITY is not"; exit 1; }
+          KEYCHAIN="${RUNNER_TEMP}/lumi-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN}"
+          # Default settings re-lock the keychain after five idle minutes, in the
+          # middle of a build that takes longer than that.
+          security set-keychain-settings -lut 3600 "${KEYCHAIN}"
+          security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN}"
+          printf '%s' "${P12_BASE64}" | base64 --decode > "${RUNNER_TEMP}/certificate.p12"
+          security import "${RUNNER_TEMP}/certificate.p12" -k "${KEYCHAIN}" \
+            -P "${P12_PASSWORD}" -T /usr/bin/codesign -f pkcs12
+          rm -f "${RUNNER_TEMP}/certificate.p12"
+          # Without a partition list codesign blocks on a GUI prompt no one can answer,
+          # and the job hangs until it times out rather than failing.
+          security set-key-partition-list -S apple-tool:,apple: -s -k "${KEYCHAIN_PASSWORD}" "${KEYCHAIN}" >/dev/null
+          # Prepend rather than replace: dropping the login keychain off the search
+          # list takes every other credential on the runner with it.
+          security list-keychains -d user -s "${KEYCHAIN}" $(security list-keychains -d user | tr -d '"')
+          # No `-v`. A self-signed certificate is untrusted, so `find-identity -v`
+          # reports "0 valid identities found" for a keychain codesign then signs with
+          # perfectly well — measured on macOS 26.5.2. Gating a release on `-v` would
+          # fail every run that uses the interim certificate. This lists and counts
+          # without asserting, and without printing the certificate itself.
+          security find-identity -p codesigning "${KEYCHAIN}" | tail -2
+
+      - name: Build Lumi.app
+        env:
+          # Empty when no identity is configured, which build-app.sh resolves to
+          # ad-hoc — the same path `task app` takes locally.
+          CODESIGN_IDENTITY: ${{ secrets.MACOS_DEVELOPER_IDENTITY }}
+        run: ./macos/build-app.sh
+
+      - name: Verify Lumi.app
+        env:
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          APP=build/Lumi.app
+          # The bundle states the version twice and both must agree with the tag, in
+          # the two spellings that are correct for them: the CLI prints the tag it was
+          # linked with, and CFBundleShortVersionString is that tag without its `v`,
+          # which is also what the cask's `version` field carries.
+          ACTUAL="$("${APP}/Contents/MacOS/lumi" version)"
+          [ "${ACTUAL}" = "${TAG}" ] || { echo "::error::the embedded lumi reports '${ACTUAL}', expected '${TAG}'"; exit 1; }
+          SHORT="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "${APP}/Contents/Info.plist")"
+          [ "${SHORT}" = "${TAG#v}" ] || { echo "::error::CFBundleShortVersionString is '${SHORT}', expected '${TAG#v}'"; exit 1; }
+          codesign --verify --deep --strict --verbose=2 "${APP}"
+          lipo "${APP}/Contents/MacOS/LumiApp" -verify_arch arm64
+          lipo "${APP}/Contents/MacOS/lumi" -verify_arch arm64
+          # Notarization, stapling, `stapler validate`, `spctl --assess`, and the
+          # assertion that the authority is a Developer ID all wait on a certificate
+          # that does not exist yet. Each of them fails by design on an un-notarized
+          # bundle, so running them here would fail every release rather than report
+          # anything. .claude/commands/lumi-developer-id-signing.md restores them.
+          codesign -dvvv "${APP}" 2>&1 | grep -E 'Identifier=|Signature=|Authority=' || true
+
+      # ditto, not zip: it preserves the extended attributes, symlinks, and resource
+      # forks a signed bundle is sealed over, and --keepParent keeps Lumi.app itself
+      # as the archive's top-level entry, which is what the cask's `app` stanza names.
+      - name: Archive Lumi.app
+        run: /usr/bin/ditto -c -k --keepParent build/Lumi.app lumi-macos-arm64.zip
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: lumi-macos-arm64.zip
+          path: lumi-macos-arm64.zip
+          retention-days: 1
+
+      - name: Delete the temporary keychain
+        if: always()
+        run: |
+          # delete-keychain also takes it off the search list, so there is nothing to
+          # restore. Both paths are removed unconditionally: this step runs after a
+          # failure too, and that is the run most likely to have left them behind.
+          security delete-keychain "${RUNNER_TEMP}/lumi-signing.keychain-db" 2>/dev/null || true
+          rm -f "${RUNNER_TEMP}/lumi-signing.keychain-db" "${RUNNER_TEMP}/certificate.p12"
+
   upload-release-assets:
     needs: [release-please, build-binaries]
     runs-on: ubuntu-latest
@@ -102,19 +207,20 @@ jobs:
           set -euo pipefail
           TAG="${{ needs.release-please.outputs.tag_name }}"
           cd artifacts
-          # nullglob so a missing archive is caught by the count below with a message
-          # naming the job that should have produced it, not by sha256sum failing on a
-          # file literally called '*.tar.gz'.
-          shopt -s nullglob
-          ARCHIVES=(*.tar.gz)
-          if [ "${#ARCHIVES[@]}" -eq 0 ]; then
-            echo "::error::build-binaries produced no *.tar.gz archive"
-            ls -R
-            exit 1
-          fi
-          # Hashing the bare glob rather than a `find` path keeps the names in
+          # Named, not globbed. A release is incomplete unless it carries both, and a
+          # glob cannot tell "the app job produced nothing" from "there is nothing to
+          # produce" -- it would publish a CLI-only release and call it a success.
+          # These same two names are what verify-release checks for, what
+          # SHA256SUMS.txt lists, and what update-homebrew-packages looks up in it.
+          ARCHIVES=(lumi-darwin-arm64.tar.gz lumi-macos-arm64.zip)
+          for file in "${ARCHIVES[@]}"; do
+            [ -f "$file" ] || { echo "::error::build-binaries produced no ${file}"; ls -R; exit 1; }
+          done
+          # Hashing the bare names rather than a `find` path keeps the names in
           # SHA256SUMS.txt relative and unprefixed, which is what `sha256sum -c` in
-          # verify-release needs: it resolves every name against its own cwd.
+          # verify-release needs: it resolves every name against its own cwd, and what
+          # update-homebrew-packages' `awk '$2 == f'` lookup needs, which matches a bare
+          # filename and silently yields nothing for a prefixed one.
           sha256sum "${ARCHIVES[@]}" > SHA256SUMS.txt
           cat SHA256SUMS.txt
           if grep -qvE '^[0-9a-f]{64}  [^/]+$' SHA256SUMS.txt; then
@@ -137,7 +243,7 @@ jobs:
           set -euo pipefail
           TAG="${{ needs.release-please.outputs.tag_name }}"
           ASSETS=$(gh release view "$TAG" --json assets --jq '.assets[].name' --repo ${{ github.repository }})
-          for asset in lumi-darwin-arm64.tar.gz SHA256SUMS.txt; do
+          for asset in lumi-darwin-arm64.tar.gz lumi-macos-arm64.zip SHA256SUMS.txt; do
             echo "$ASSETS" | grep -q "^${asset}$" && echo "✓ $asset" || { echo "✗ Missing: $asset"; exit 1; }
           done
 
@@ -156,30 +262,67 @@ jobs:
           cat SHA256SUMS.txt
           sha256sum -c SHA256SUMS.txt
 
-  update-homebrew-formula:
-    # The formula names a release asset now, so it must not be rewritten before that asset
-    # exists: a tap pointing at a 404 breaks every `brew install`, while a tap still
-    # pointing at the previous release keeps working. That inverts the ordering this job
-    # used to have, back when the formula built from source and consumed nothing the other
-    # jobs produced.
-    #
-    # A failed release must therefore leave the tap alone rather than advance it — that is
-    # the intent, not a side effect to engineer around. Fixing the release, or re-running it
-    # for a transient failure, is the developer's job; nothing here should try to publish a
-    # formula around a build that did not produce a binary.
-    #
-    # The recovery is worth writing down because it is not obvious. Job 1 cuts the tag before
-    # build-binaries runs, and release-please will not re-cut a version whose release already
-    # exists, so a *fresh* run (a new push to main, or workflow_dispatch) sets release_created
-    # to false and skips this job. Use GitHub's "Re-run failed jobs" on the *same* run
-    # instead — that reuses the completed release-please job's outputs, so release_created
-    # stays true and tag_name persists, and the cascade re-runs from the failed job forward.
-    #
-    # upload-release-assets is a sufficient barrier only because the sha256 step below
-    # downloads the asset and hashes the bytes itself. If that is ever reduced to reading
-    # the hash out of SHA256SUMS.txt, this job stops verifying its own input and the
-    # barrier has to move to verify-release.
+  # Linux can prove the published bytes are the bytes that were built. Only macOS
+  # can prove they are a bundle it will run, and a cask installs a bundle. So this
+  # repeats the build-time assertions against what a user actually downloads.
+  verify-macos-app:
     needs: [release-please, upload-release-assets]
+    runs-on: macos-26
+    steps:
+      - name: Verify the published app bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p appcheck
+          cd appcheck
+          gh release download "$TAG" --clobber --repo ${{ github.repository }} \
+            --pattern lumi-macos-arm64.zip
+          # ditto both ways. `unzip` drops the extended attributes and resource forks
+          # the signature is sealed over, so it can fail a bundle that is in fact
+          # intact -- and this step's whole job is to tell those two apart.
+          /usr/bin/ditto -x -k lumi-macos-arm64.zip .
+          APP=Lumi.app
+          ACTUAL="$("${APP}/Contents/MacOS/lumi" version)"
+          [ "${ACTUAL}" = "${TAG}" ] || { echo "::error::the published app's lumi reports '${ACTUAL}', expected '${TAG}'"; exit 1; }
+          SHORT="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "${APP}/Contents/Info.plist")"
+          [ "${SHORT}" = "${TAG#v}" ] || { echo "::error::the published app's CFBundleShortVersionString is '${SHORT}', expected '${TAG#v}'"; exit 1; }
+          codesign --verify --deep --strict --verbose=2 "${APP}"
+          lipo "${APP}/Contents/MacOS/LumiApp" -verify_arch arm64
+          lipo "${APP}/Contents/MacOS/lumi" -verify_arch arm64
+          # `xcrun stapler validate` and `spctl --assess --type execute` belong here and
+          # are absent for one reason: there is no notarization ticket to staple yet, so
+          # both fail by design rather than reporting anything.
+          # .claude/commands/lumi-developer-id-signing.md restores them with the
+          # certificate.
+          codesign -dvvv "${APP}" 2>&1 | grep -E 'Identifier=|Signature=|Authority=' || true
+
+  update-homebrew-packages:
+    # The formula and the cask both name a release asset now, so neither may be
+    # rewritten before that asset exists: a tap pointing at a 404 breaks every
+    # `brew install`, while a tap still pointing at the previous release keeps
+    # working. That inverts the ordering this job used to have, back when the formula
+    # built from source and consumed nothing the other jobs produced.
+    #
+    # A failed release must therefore leave the tap alone rather than advance it — that
+    # is the intent, not a side effect to engineer around. Fixing the release, or
+    # re-running it for a transient failure, is the developer's job; nothing here should
+    # try to publish a package definition around a build that did not produce a binary.
+    #
+    # The recovery is worth writing down because it is not obvious. Job 1 cuts the tag
+    # before build-binaries runs, and release-please will not re-cut a version whose
+    # release already exists, so a *fresh* run (a new push to main, or workflow_dispatch)
+    # sets release_created to false and skips this job. Use GitHub's "Re-run failed jobs"
+    # on the *same* run instead — that reuses the completed release-please job's outputs,
+    # so release_created stays true and tag_name persists, and the cascade re-runs from
+    # the failed job forward.
+    #
+    # Both verification jobs are barriers, not just upload-release-assets. The sha256
+    # step below hashes the bytes itself, so upload alone would be sufficient for the
+    # formula's own safety — but a bundle that fails `codesign --verify` after download
+    # is a release users must not be pointed at, and only verify-macos-app can see that.
+    needs: [release-please, upload-release-assets, verify-release, verify-macos-app]
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
     runs-on: ubuntu-latest
     steps:
@@ -192,76 +335,135 @@ jobs:
           # rebase fails exactly in the race it exists to survive.
           fetch-depth: 0
 
-      - name: Compute release archive SHA256
+      - name: Compute release asset SHA256s
         id: sha256
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           TAG="${{ needs.release-please.outputs.tag_name }}"
-          ARCHIVE="lumi-darwin-arm64.tar.gz"
           # Download outside the checkout. The commit-and-push step below runs in this same
-          # working tree, and a stray 4MB archive there is one `git add -A` away from being
+          # working tree, and a stray archive there is one `git add -A` away from being
           # committed.
-          WORK="${RUNNER_TEMP}/formula-asset"
+          WORK="${RUNNER_TEMP}/release-assets"
           rm -rf "$WORK"
           # Stay in the checkout and address the downloads absolutely, rather than cd-ing
           # into a directory this step then deletes out from under itself.
           gh release download "$TAG" --repo "${{ github.repository }}" --clobber \
-            --dir "$WORK" --pattern "$ARCHIVE" --pattern SHA256SUMS.txt
-          # Hash the bytes brew will download rather than trusting the published list, and
-          # prove they are really a gzip stream first.
-          gzip -t "${WORK}/${ARCHIVE}"
-          SHA256="$(sha256sum "${WORK}/${ARCHIVE}" | awk '{print $1}')"
-          [ "${#SHA256}" -eq 64 ] || { echo "::error::bad ${ARCHIVE} sha256: '${SHA256}'"; exit 1; }
-          # Then cross-check it against what the release publishes for the same file. The
-          # hashed value is not in doubt — those are the bytes brew will download. What a
-          # disagreement means is that the release contradicts itself, and a release whose
-          # own manifest does not describe its own asset is not one to point users at;
-          # verify-release is failing on this same run for the same reason.
+            --dir "$WORK" \
+            --pattern lumi-darwin-arm64.tar.gz \
+            --pattern lumi-macos-arm64.zip \
+            --pattern SHA256SUMS.txt
+          # Sets SHA. Hash the bytes brew will download rather than trusting the published
+          # list, then cross-check against what the release publishes for the same file.
+          # The hashed value is not in doubt — those are the bytes brew will download. What
+          # a disagreement means is that the release contradicts itself, and a release whose
+          # own manifest does not describe its own asset is not one to point users at.
           #
           # `$2` is the bare filename because upload-release-assets already asserts the
           # manifest is two-space, text-mode and unprefixed (`^[0-9a-f]{64}  [^/]+$`), which
-          # rejects binary-mode `*name` and any path. That guard and this awk are a pair.
-          # A filename absent from the manifest yields an empty PUBLISHED — awk still exits
-          # 0, so `set -e` does not fire and this comparison is what catches it.
-          PUBLISHED="$(awk -v f="$ARCHIVE" '$2 == f {print $1}' "${WORK}/SHA256SUMS.txt")"
-          [ "$PUBLISHED" = "$SHA256" ] || { echo "::error::SHA256SUMS.txt records '${PUBLISHED}' for ${ARCHIVE}, but the asset hashes to '${SHA256}'"; exit 1; }
+          # rejects binary-mode `*name` and any path. That guard and this awk are a pair, and
+          # so is the named-asset list there: a filename absent from the manifest yields an
+          # empty PUBLISHED — awk still exits 0, so `set -e` does not fire and this
+          # comparison is what catches it.
+          #
+          # Not a command substitution: `exit 1` inside `$( )` leaves the subshell, and the
+          # assignment around it succeeds, so a mismatch would be reported and then ignored.
+          hash_asset() {
+            local asset="$1" published
+            SHA="$(sha256sum "${WORK}/${asset}" | awk '{print $1}')"
+            [ "${#SHA}" -eq 64 ] || { echo "::error::bad ${asset} sha256: '${SHA}'"; exit 1; }
+            published="$(awk -v f="$asset" '$2 == f {print $1}' "${WORK}/SHA256SUMS.txt")"
+            [ "$published" = "$SHA" ] || { echo "::error::SHA256SUMS.txt records '${published}' for ${asset}, but the asset hashes to '${SHA}'"; exit 1; }
+          }
+          # Prove each file is really the container it claims to be before hashing it.
+          gzip -t "${WORK}/lumi-darwin-arm64.tar.gz"
+          unzip -qt "${WORK}/lumi-macos-arm64.zip"
+          hash_asset lumi-darwin-arm64.tar.gz
+          echo "archive=${SHA}" >> "$GITHUB_OUTPUT"
+          hash_asset lumi-macos-arm64.zip
+          echo "app=${SHA}" >> "$GITHUB_OUTPUT"
           rm -rf "$WORK"
-          echo "archive=${SHA256}" >> "$GITHUB_OUTPUT"
 
-      - name: Update formula
+      - name: Update the formula and the cask
         run: |
           set -euo pipefail
           TAG="${{ needs.release-please.outputs.tag_name }}"
+          VERSION="${TAG#v}"
           FORMULA="HomebrewFormula/lumi.rb"
-          URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/lumi-darwin-arm64.tar.gz"
-          SHA256="${{ steps.sha256.outputs.archive }}"
-          # These seds rewrite in place and cannot insert, so the formula must hold exactly
-          # one top-level `url`/`sha256` pair. A `resource`, `stable do`, or `head do` block
-          # would give them a second, wrong target; `^ *` and `[^"]*` keep them off a line
-          # like `url "...", tag: "...", revision: "..."`, which a greedy `.*` would collapse.
-          for field in url sha256; do
-            COUNT="$(grep -cE "^ *${field} \"[^\"]*\"$" "$FORMULA" || true)"
-            [ "${COUNT}" = "1" ] || { echo "::error::${FORMULA} has ${COUNT} top-level \`${field} \"...\"\` lines, expected exactly 1"; exit 1; }
-          done
-          # Anchored at both ends, exactly like the guard above. Without the trailing `$`
-          # these match the *prefix* of a line such as `url "...", branch: "main"` and
-          # rewrite it in place while leaving its trailing arguments attached — and the
-          # guard still counts 1, and the postconditions below still pass, so every check
-          # in this step reports success over a corrupted formula.
-          sed -i -E "s|^( *)url \"[^\"]*\"\$|\1url \"${URL}\"|" "$FORMULA"
-          sed -i -E "s|^( *)sha256 \"[^\"]*\"\$|\1sha256 \"${SHA256}\"|" "$FORMULA"
-          # Assert the postcondition. `git diff --cached --quiet` below cannot tell "already
-          # correct" from "matched nothing", so without this a missed regex is a green job
-          # that ships the previous release's archive under the new tag. Compare whole
-          # lines, indentation stripped: a substring match would also accept a line the
-          # unanchored seds above had left trailing arguments on.
-          for expected in "url \"${URL}\"" "sha256 \"${SHA256}\""; do
-            sed -E 's|^ +||' "$FORMULA" | grep -qxF -- "$expected" \
-              || { echo "::error::${FORMULA} has no line \`${expected}\` after the rewrite"; exit 1; }
-          done
+          CASK="Casks/lumi.rb"
+
+          # Rewrite the one `<field> "<value>"` line in a package definition, and prove
+          # afterwards that the line now reads exactly what it should.
+          #
+          # Anchored at both ends, and at *exactly two spaces* of indent. Every part of
+          # that matters:
+          #
+          #   - Without the trailing `$` these match the *prefix* of a line such as
+          #     `url "...", branch: "main"` and rewrite it while leaving its trailing
+          #     arguments attached — and every check below still reports success.
+          #   - `[^"]*` keeps them off such a line for the same reason.
+          #   - `^  ` rather than `^ *` is what makes "top-level" mean it. A formula that
+          #     lost its own `url` but still has one inside a `resource do` block is
+          #     indented four, so `^ *` would count 1, rewrite the resource, satisfy the
+          #     postcondition, and pass `ruby -c` — publishing a formula with no
+          #     installable source. At two spaces that file fails the count guard instead.
+          #
+          # The count guard runs first because sed rewrites in place and cannot insert, so
+          # a file that lost the line entirely must fail rather than silently ship the
+          # previous release's asset under the new tag.
+          #
+          # The seds use `|` as their delimiter unescaped, so a value containing `|`,
+          # `&`, or a backslash would corrupt the substitution. Every value passed here
+          # is a dotted version, a hex digest, or a GitHub release URL; none can.
+          #
+          # `expect_line` is separate because the cask's `url` is asserted but never
+          # rewritten. `git diff --cached --quiet` below cannot tell "already correct"
+          # from "matched nothing", which is why the assertion exists at all, and it is a
+          # whole-line match because a substring one accepts `...zip-old` and text in a
+          # comment.
+          expect_line() {
+            grep -qxF -- "  $2" "$1" \
+              || { echo "::error::$1 has no line \`  $2\`"; exit 1; }
+          }
+          rewrite() {
+            local file="$1" field="$2" value="$3" count
+            count="$(grep -cE "^  ${field} \"[^\"]*\"$" "$file" || true)"
+            [ "${count}" = "1" ] || { echo "::error::${file} has ${count} top-level \`${field} \"...\"\` lines, expected exactly 1"; exit 1; }
+            sed -i -E "s|^  ${field} \"[^\"]*\"$|  ${field} \"${value}\"|" "$file"
+            expect_line "$file" "${field} \"${value}\""
+          }
+
+          # The formula names the tag in its url. The cask names it through
+          # `v#{version}`, so its url line is never rewritten and must never match the
+          # `url` guard above — which it would, harmlessly, if this ever called
+          # `rewrite "$CASK" url ...`. It does not.
+          rewrite "$FORMULA" url "https://github.com/${{ github.repository }}/releases/download/${TAG}/lumi-darwin-arm64.tar.gz"
+          rewrite "$FORMULA" sha256 "${{ steps.sha256.outputs.archive }}"
           cat "$FORMULA"
+
+          if [ ! -f "$CASK" ]; then
+            # The first cask is written by hand, after the first release that carries
+            # lumi-macos-arm64.zip — a cask committed ahead of its asset points the tap at
+            # a 404. docs/release.md holds the file to commit and the procedure.
+            echo "::notice::${CASK} does not exist yet; skipping the cask update"
+            exit 0
+          fi
+          rewrite "$CASK" version "${VERSION}"
+          rewrite "$CASK" sha256 "${{ steps.sha256.outputs.app }}"
+          # The url is left alone, so assert it still resolves to this tag through the
+          # version that was just written. Rewriting `version` is what moves the cask's
+          # download; if that interpolation is ever flattened to a literal, this job goes
+          # on reporting success while the cask serves the previous release forever.
+          expect_line "$CASK" 'url "https://github.com/${{ github.repository }}/releases/download/v#{version}/lumi-macos-arm64.zip"'
+          [ "v${VERSION}" = "${TAG}" ] || { echo "::error::v${VERSION} is not the release tag ${TAG}"; exit 1; }
+          # Ruby parses both files, which is the check that catches a value with a quote
+          # or a backslash in it. `brew audit --cask --strict` is the fuller check and is
+          # a macOS-only, maintainer-run step — casks cannot be audited on Linux, and
+          # `--signing`/`--new` must not be used while the bundle is un-notarized.
+          ruby -c "$FORMULA" >/dev/null
+          ruby -c "$CASK" >/dev/null
+          cat "$CASK"
 
       - name: Commit and push
         run: |
@@ -270,8 +472,11 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add HomebrewFormula/lumi.rb
+          # One commit for both, so the tap never has a formula and a cask from
+          # different releases in its history.
+          if [ -f Casks/lumi.rb ]; then git add Casks/lumi.rb; fi
           git diff --cached --quiet && echo "No changes to commit" && exit 0
-          git commit -m "chore: update Homebrew formula to ${VERSION}"
+          git commit -m "chore: update Homebrew packages to ${VERSION}"
           # main can move underneath us between the checkout and here; rebase rather than
           # fail the release on a non-fast-forward push.
           git pull --rebase origin main

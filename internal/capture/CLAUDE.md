@@ -216,3 +216,21 @@ chunks over eight minutes, and the ratio scales with how much the user switches 
   system track still attributes. These chunks are the one thing the derived queue cannot drain, which is
   what `store.ChunksFailedTranscription` exists to count — `lumi transcript` and `get_transcript` name them
   apart from real gaps so neither recommends a backfill that would reach the same dead end.
+- **`Recorder.Levels` is nil by default, and nil means the measurement is never taken.** Nothing in the
+  pipeline needs it — only a supervising app drawing a meter (`levels.go`, `lumi record start
+  --emit-levels`). It is measured *live*: sound is summed inside the ScreenCaptureKit callback as it
+  arrives, and drained on a ticker every `LevelInterval`, because a meter whose job is to tell a user
+  whether their microphone works cannot wait for a chunk to close. The formula and the silence floor stay
+  in `internal/wav` — the native side accumulates mean squares of normalised samples and nothing else, and
+  `wav.DBFSFromMeanSquare` is the only conversion. The sink runs on the level goroutine, never the capture
+  path, and must not block.
+- **The level goroutine may never slow capture, and the accumulator may never reject a buffer it does not
+  understand *silently enough to matter*.** ScreenCaptureKit does not deliver one format: measured on macOS
+  26.5 the system track is non-interleaved 32-bit float at 16kHz and the microphone is interleaved 24-bit
+  packed signed integer, stereo, at 48kHz. An accumulator written for float alone measured the system track
+  and dropped every microphone buffer — a meter that never moved for the one source a user is most likely
+  to be testing, with nothing in any log to say so. Widths are handled explicitly in `LumiLevelMeterAdd`;
+  add a case rather than assuming the next one matches.
+- **An empty drain is not silence.** No completed window means the poll outran the window length; silence
+  completes windows too, at `wav.SilenceFloorDBFS`. Collapsing the two draws a dead microphone as a quiet
+  room, which is the exact question the meter exists to answer.

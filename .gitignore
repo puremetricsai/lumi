@@ -47,3 +47,6 @@ docs/superpowers/
 
 # Swift speech bridge (generated)
 internal/macosnative/liblumispeech.a
+
+# Built app bundle
+/build/

@@ -260,6 +260,17 @@ func (s *nativeAudioStream) Next(ctx context.Context) (AudioChunk, error) {
 	}
 }
 
+// SampleLevels satisfies LevelSampler, which is what gives the live meters their
+// sound. The energy is drained from the capture callback, never read back off
+// the written file.
+func (s *nativeAudioStream) SampleLevels() (system, microphone []float64, err error) {
+	levels, err := s.session.Levels()
+	if err != nil {
+		return nil, nil, fmt.Errorf("read ScreenCaptureKit audio levels: %w", err)
+	}
+	return levels.System, levels.Microphone, nil
+}
+
 func (s *nativeAudioStream) Close() error {
 	s.session.Close()
 	return nil

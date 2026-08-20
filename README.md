@@ -8,7 +8,7 @@ Lumi is a minimal, open source AI memory of everything you do. It sees your scre
 
 Everything runs on your Mac. Nothing is uploaded, and it's completely free.
 
-Lumi deliberately targets a small surface: capture → process → store → query, with no GUI, server, or plugins.
+Lumi deliberately targets a small surface: capture → process → store → query. The `lumi` CLI remains the core interface; a native menu-bar `Lumi.app` wraps it, and Homebrew installs either one.
 
 ## Requirements
 
@@ -26,16 +26,61 @@ ScreenCaptureKit captures system output and the default microphone directly; no 
 
 ## Installation
 
+One tap ships two packages: a cask holding the menu-bar app *and* the CLI it embeds, and a formula holding the CLI alone.
+
 ```sh
 brew tap puremetricsai/lumi https://github.com/puremetricsai/lumi
+```
+
+App and CLI — installs `/Applications/Lumi.app` and puts its embedded `lumi` on your `PATH`:
+
+```sh
+brew trust --cask puremetricsai/lumi/lumi
+brew install --cask puremetricsai/lumi/lumi
+```
+
+CLI only:
+
+```sh
 brew trust --formula puremetricsai/lumi/lumi
-brew install lumi
+brew install --formula puremetricsai/lumi/lumi
+```
+
+Install one of them, not both: they share the token `lumi` and both provide a `lumi` command. That is also why every command here names `--cask` or `--formula` and the full `puremetricsai/lumi/lumi` — a bare `brew install lumi` is ambiguous while both exist. Upgrade with the matching form, which for the cask moves the app and the CLI together:
+
+```sh
+brew upgrade --cask puremetricsai/lumi/lumi
+brew upgrade --formula puremetricsai/lumi/lumi
+```
+
+To move an existing formula install to the app:
+
+```sh
+brew uninstall --formula puremetricsai/lumi/lumi
+brew install --cask puremetricsai/lumi/lumi
+```
+
+Then, whichever you installed:
+
+```sh
 lumi permissions --request
 lumi doctor
 lumi record start
 ```
 
-Homebrew downloads the prebuilt `darwin/arm64` binary from the [latest release](https://github.com/puremetricsai/lumi/releases), so no Go or Swift toolchain is involved. Upgrade with `brew upgrade lumi`.
+Homebrew downloads a prebuilt `darwin/arm64` build from the [latest release](https://github.com/puremetricsai/lumi/releases), so no Go or Swift toolchain is involved. Uninstalling either package leaves `~/Library/Application Support/Lumi` — your database and captured media — untouched.
+
+### The app is not notarized yet
+
+Lumi has no Apple Developer ID certificate, so the released app carries the project's own signing certificate instead. macOS quarantines the cask install and refuses the first launch. Open Lumi once from Finder, then open **System Settings → Privacy & Security**, find the message naming Lumi, and choose **Open Anyway**.
+
+Quarantine is written to every file inside the bundle, and the `lumi` command is a link into it, so the CLI can be refused too — and it is refused *silently*, with `Killed: 9` and no dialog. If that happens after you have approved the app, clear the flag once:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/Lumi.app
+```
+
+This is once per machine, not once per release: the signing certificate is stable, so Homebrew keeps the approval across upgrades and your granted permissions survive them. `brew install --formula` is not affected at all — quarantine applies to cask installs. All of it goes away with notarization.
 
 To build and install from source instead:
 
@@ -46,6 +91,30 @@ task install # compiles the Swift SpeechAnalyzer bridge (task speech), then go i
 `task install` places the `lumi` binary in your Go bin directory — `go env GOBIN` if set, otherwise `$(go env GOPATH)/bin` — and prints the path it used. Add that directory to your `PATH` if it isn't there already. Remove the binary with `task uninstall`.
 
 macOS grants capture permissions to a specific binary, so re-run `lumi permissions --request` after installing if you had previously granted them to a `./lumi` built in the repository.
+
+### Native menu-bar app
+
+`brew install --cask puremetricsai/lumi/lumi` installs it. From a checkout instead:
+
+```sh
+task app          # build build/Lumi.app
+task app:install  # install ~/Applications/Lumi.app
+task app:run      # install and launch it
+```
+
+The app embeds the same `lumi` binary and offers to symlink it into a writable directory on your shell's `PATH`; it never replaces an existing `lumi` command. It supervises that CLI rather than capturing anything itself: the menu bar item shows capture state, and Settings holds recording, storage, permissions, MCP, and data-deletion controls. A recorder the app owns is visible to `lumi record status` in a terminal, and vice versa — either interface refuses to start a second one.
+
+The `lumi` CLI reaches the app in the other direction:
+
+```sh
+lumi app             # open it, or bring it to the front (alias: lumi open)
+lumi app --settings  # open its Settings window
+lumi app --quit      # quit it, stopping the recorder it owns
+```
+
+A bundle built by `task app` is ad-hoc signed, so every rebuild changes its TCC identity and requires Screen Recording, Accessibility, Microphone, and Speech Recognition to be granted again. `./scripts/restart-lumi-app.sh` is the development loop that does the rebuild, the TCC reset, and the relaunch in one step. That applies to development builds only — the released cask carries one stable certificate, so its grants survive an upgrade.
+
+Homebrew is the update mechanism. Lumi has no self-updater and is not getting one.
 
 ## Build and run (Development)
 

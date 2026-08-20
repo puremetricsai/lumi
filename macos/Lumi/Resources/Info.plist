@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Not "Lumi": the bundle also ships the CLI at Contents/MacOS/lumi, and
+       macOS filesystems are case-insensitive by default, so "Lumi" and "lumi"
+       are the same file. Naming them alike silently overwrites one with the
+       other at build time. -->
+  <key>CFBundleExecutable</key><string>LumiApp</string>
+  <key>CFBundleIdentifier</key><string>com.puremetricsai.lumi</string>
+  <key>CFBundleName</key><string>Lumi</string>
+  <key>CFBundleDisplayName</key><string>Lumi</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
+  <!-- The version is not written here by hand. `task app` stamps it from
+       `lumi version`, whose single source is the `version` var in
+       internal/cli, set at release time by -ldflags. -->
+  <key>CFBundleShortVersionString</key><string>0.0.0</string>
+  <key>CFBundleVersion</key><string>0</string>
+  <key>LSMinimumSystemVersion</key><string>26.0</string>
+
+  <!-- Menu bar only: no Dock icon, windows open on demand. -->
+  <key>LSUIElement</key><true/>
+
+  <!-- The deep links `lumi app` sends. A URL reaches an app that is already
+       running, which is the normal state for an always-on menu bar app;
+       `open -a … --args` cannot, because LaunchServices drops the arguments. -->
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key><string>com.puremetricsai.lumi.url</string>
+      <key>CFBundleURLSchemes</key><array><string>lumi</string></array>
+    </dict>
+  </array>
+
+  <!-- Required regardless of signing. Each states the local-only guarantee,
+       because this string is the only explanation many people will ever read. -->
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Lumi transcribes your microphone on this Mac so you can search what was said. Audio and transcripts stay on this machine and are never uploaded.</string>
+  <key>NSSpeechRecognitionUsageDescription</key>
+  <string>Lumi uses Apple's on-device speech recognizer to turn captured audio into searchable text. Nothing is sent to Apple or to anyone else.</string>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>Lumi reads text from your screen locally so you can search what you were working on. Screenshots stay on this Mac.</string>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>Lumi does not control other applications. This entry exists only so macOS can explain any prompt it raises.</string>
+</dict>
+</plist>

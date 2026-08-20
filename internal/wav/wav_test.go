@@ -304,3 +304,45 @@ func TestEnvelopeHandlesDegenerateInput(t *testing.T) {
 		t.Errorf("zero window returned %v", got)
 	}
 }
+
+// The live meter reaches this package holding a mean square rather than samples,
+// and must land on the same decibels as the samples themselves would. Nothing
+// but this test connects the two, because the live caller's samples never enter
+// Go at all.
+func TestDBFSFromMeanSquareMatchesRMSDBFS(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		samples []int16
+	}{
+		{"digital silence", []int16{0, 0, 0, 0}},
+		{"full scale", []int16{32767, -32768, 32767, -32768}},
+		{"a quiet room", []int16{12, -9, 7, -14, 3}},
+		{"ordinary speech", []int16{900, -1200, 1500, -800, 1100}},
+		{"one loud sample among quiet ones", []int16{4, -3, 21000, -5, 2}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var sum float64
+			for _, sample := range c.samples {
+				value := float64(sample) / 32768.0
+				sum += value * value
+			}
+			want := RMSDBFS(c.samples)
+			got := DBFSFromMeanSquare(sum / float64(len(c.samples)))
+			if math.Abs(got-want) > 1e-9 {
+				t.Errorf("DBFSFromMeanSquare = %v, RMSDBFS = %v; the live and stored paths disagree", got, want)
+			}
+		})
+	}
+}
+
+// Energy that cannot be a level must reach the floor rather than a number, for
+// the reason SilenceFloorDBFS exists: negative infinity and NaN both propagate
+// through the comparisons and averages downstream.
+func TestDBFSFromMeanSquareClampsUnusableEnergy(t *testing.T) {
+	for _, meanSquare := range []float64{0, -1, math.NaN()} {
+		if got := DBFSFromMeanSquare(meanSquare); got != SilenceFloorDBFS {
+			t.Errorf("DBFSFromMeanSquare(%v) = %v, want the silence floor %v",
+				meanSquare, got, SilenceFloorDBFS)
+		}
+	}
+}

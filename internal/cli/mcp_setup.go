@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -68,6 +69,42 @@ type mcpSetupFlags struct {
 	name   string
 	dryRun bool
 	force  bool
+	asJSON bool
+}
+
+// mcpSetupReport is `lumi mcp setup --json`.
+//
+// It carries the resolved binary and argv as well as the per-client results,
+// because a reader showing "this is what gets registered" would otherwise have
+// to rebuild them — and `lumiBinaryPath` plus the absolute --data-dir are
+// exactly the parts it cannot rebuild correctly.
+//
+// `--json` is orthogonal to `--dry-run`: paired with it this is the read-only
+// status query the package otherwise has no path for, and on its own it is the
+// machine-readable outcome of a real run.
+type mcpSetupReport struct {
+	Name        string               `json:"name"`
+	Command     string               `json:"command"`
+	Args        []string             `json:"args"`
+	CommandLine string               `json:"command_line"`
+	DryRun      bool                 `json:"dry_run"`
+	Results     []mcpSetupResultJSON `json:"results"`
+}
+
+// mcpSetupResultJSON is one client's result plus the error that client
+// produced, if any.
+//
+// The error has to travel *with* the result, because the status alone is not
+// enough to tell a machine reader what happened. A target sets StatusAdded
+// before it attempts the write and returns that same result when the write
+// fails, so a reader that trusts the status renders "registered" for a run that
+// registered nothing. A human never sees that: the error is on stderr and the
+// exit code is non-zero. A reader decoding stdout would, which is why this
+// exists.
+type mcpSetupResultJSON struct {
+	mcpsetup.Result
+	// Error is the failure this client reported, empty when it succeeded.
+	Error string `json:"error,omitempty"`
 }
 
 // mcpSetupCommand registers `lumi mcp` with the MCP clients on this machine.
@@ -99,6 +136,7 @@ func (a *app) mcpSetupCommand() *cobra.Command {
 	cmd.Flags().StringVar(&f.name, "name", "lumi", "name to register the server under")
 	cmd.Flags().BoolVar(&f.dryRun, "dry-run", false, "report what would change without writing anything")
 	cmd.Flags().BoolVar(&f.force, "force", false, "replace an existing entry that differs")
+	cmd.Flags().BoolVar(&f.asJSON, "json", false, "emit JSON")
 	return cmd
 }
 
@@ -143,15 +181,35 @@ func (a *app) runMCPSetup(cmd *cobra.Command, f mcpSetupFlags) error {
 
 	targets := newSetupTargets(selection)
 	results := make([]mcpsetup.Result, 0, len(targets))
+	// Never nil: a JSON null here would make every reader special-case "no
+	// clients" separately from "no results".
+	rows := make([]mcpSetupResultJSON, 0, len(targets))
 	var errs []error
 	for _, target := range targets {
 		// One client's failure must never stop the others from being
 		// configured; the errors are joined and returned once at the end.
 		result, err := target.Apply(cmd.Context(), spec, opts)
 		results = append(results, result)
+		row := mcpSetupResultJSON{Result: result}
 		if err != nil {
 			errs = append(errs, err)
+			// Carried with the result rather than only joined, so --json can
+			// say which client failed.
+			row.Error = err.Error()
 		}
+		rows = append(rows, row)
+	}
+
+	if f.asJSON {
+		// The payload is written before the joined error is returned, so a run
+		// that ends in a conflict still prints a complete document and then
+		// exits non-zero — the same shape `permissions --json` has, and what
+		// lets a reader decode the payload first and consult the status only
+		// when there was nothing to read.
+		if err := writeSetupJSON(cmd.OutOrStdout(), spec, rows, f.dryRun); err != nil {
+			return err
+		}
+		return errors.Join(errs...)
 	}
 
 	printSetupResults(cmd.OutOrStdout(), results, f.dryRun)
@@ -234,6 +292,25 @@ func verifyBinary(ctx context.Context, exe string) error {
 		return fmt.Errorf("%s is not runnable (%w)%s", exe, err, msg)
 	}
 	return nil
+}
+
+// writeSetupJSON writes the machine-readable report.
+//
+// Nothing advisory is emitted alongside it: every reason a human run prints to
+// stderr — a skip's manual snippet, a conflict's current entry, whether Claude
+// Desktop actually changed — is a field of the payload, and a second rendering
+// of it on stderr would be a copy that can drift.
+func writeSetupJSON(w io.Writer, spec mcpsetup.Spec, rows []mcpSetupResultJSON, dryRun bool) error {
+	encoder := json.NewEncoder(w)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(mcpSetupReport{
+		Name:        spec.Name,
+		Command:     spec.Command,
+		Args:        spec.Args,
+		CommandLine: spec.CommandLine(),
+		DryRun:      dryRun,
+		Results:     rows,
+	})
 }
 
 // printSetupResults writes one aligned line per client to stdout. These are the

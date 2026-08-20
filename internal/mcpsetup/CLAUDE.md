@@ -47,6 +47,13 @@ path is an injectable field, so tests need no client present.
   only way to know what a dry run would do. That command exits 1 both for an unknown name and an unparseable
   config, so a failure is followed by `codex mcp list --json` as a health probe. A read it cannot trust is
   `StatusFailed`, deliberately not `StatusConflict` — nothing is in the way, and offering `--force` would be
-  advice that cannot work. `Changed` stays false in every dry run.
+  advice that cannot work. `Changed` stays false in every dry run. A dry run is also the only read-only
+  status query this package offers — there is no "what is registered?" call, and `lumi mcp setup --dry-run
+  --json` is how the macOS app asks.
+- **`Result.Manual` and `ManualHint` are filled in on every result, before anything can go wrong.** They
+  used to be set only where Lumi declined to write, which made "copy this client's config" a button that
+  worked on a skip and did nothing once setup succeeded. The format follows the client, so it is built here
+  and never by a caller; a caller rendering its own snippet would tell a Codex user to paste TOML into a
+  JSON object.
 
 Why the argv it is handed is absolute — binary path and `--data-dir` alike — is `internal/cli/CLAUDE.md`.

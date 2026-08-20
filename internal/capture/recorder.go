@@ -52,7 +52,11 @@ type Recorder struct {
 	CaptureScreen   bool
 	CaptureAudio    bool
 	Logger          *slog.Logger
-
+	// Levels is optional. When set, and when the audio stream can report its own
+	// sound (LevelSampler), each track's level is drained live and reported here
+	// so a supervising app can draw a meter that moves with the room. Nil means
+	// no measurement is taken at all — nothing in the capture pipeline needs it.
+	Levels LevelSink
 	// attribution is owned by the screen goroutine alone; captureScreen is the
 	// only reader and writer, so it needs no lock.
 	attribution attributionHealth
@@ -506,6 +510,14 @@ func (r *Recorder) consumeAudio(ctx context.Context, stream AudioStream) {
 			r.Logger.Error("close audio capture stream", "error", err)
 		}
 	}()
+	// The meters live exactly as long as this stream does, so a stream reopened
+	// after a capture failure gets a fresh sampler and a stream that closed
+	// stops reporting sound nobody is capturing.
+	if sampler, ok := stream.(LevelSampler); ok && r.Levels != nil {
+		levelCtx, stopLevels := context.WithCancel(ctx)
+		defer stopLevels()
+		go r.sampleLevels(levelCtx, sampler)
+	}
 	for {
 		chunk, err := stream.Next(ctx)
 		if err != nil {
