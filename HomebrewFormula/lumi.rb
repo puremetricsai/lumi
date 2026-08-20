@@ -6,8 +6,8 @@ class Lumi < Formula
   # and stay well-formed: that job seds them in place, it does not insert them, and it
   # first asserts there is exactly one top-level line of each. A `head do`, `stable do`,
   # or `resource` block would introduce a second `url`/`sha256` and fail that assertion.
-  url "https://github.com/puremetricsai/lumi/releases/download/v0.6.0/lumi-darwin-arm64.tar.gz"
-  sha256 "3bf0b88bf8292ab7235d82a0bfba65ebbfd6112c4f2407eff70697306ed47f8b"
+  url "https://github.com/puremetricsai/lumi/releases/download/v0.6.1/lumi-darwin-arm64.tar.gz"
+  sha256 "ab361a848ed4240613a9286a1dac13b71ec437f18bcb1c337a5024adcd6db133"
   license "MIT"
 
   # Nothing is built here. This is the release archive the build-binaries job produced on a
