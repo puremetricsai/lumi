@@ -108,11 +108,16 @@ licence — there is no bundle in it, and a cask may not build from source.
    `lumi-macos-arm64.zip`, and `SHA256SUMS.txt`, and that `verify-macos-app` passed.
 3. Take the ZIP's hash from `SHA256SUMS.txt` and write `Casks/lumi.rb` from the template below,
    with that release's numeric version and that hash.
-4. Check it before committing, on macOS. `--strict` alone does not run either of these:
+4. Check it before committing, on macOS. `--strict` alone does not run either of these. Homebrew 6
+   refuses a cask outside a tap and has disabled `brew audit` on a path, so copy the candidate into
+   the tap clone and check it there by name:
 
    ```sh
-   brew style --cask Casks/lumi.rb      # desc, stanza order, deprecated depends_on forms
-   brew audit --cask --strict Casks/lumi.rb
+   TAP="$(brew --repository puremetricsai/lumi)"
+   mkdir -p "${TAP}/Casks" && cp Casks/lumi.rb "${TAP}/Casks/lumi.rb"
+   brew style --cask "${TAP}/Casks/lumi.rb"      # desc, stanza order, deprecated depends_on forms
+   brew audit --cask --strict puremetricsai/lumi/lumi
+   rm "${TAP}/Casks/lumi.rb"                     # let the push, not the copy, serve it
    ```
 
    Do **not** pass `--signing` or `--new`. Those are the flags that turn on `audit_signing`, which
