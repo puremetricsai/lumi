@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.6.0](https://github.com/puremetricsai/lumi/compare/v0.5.0...v0.6.0) (2026-08-20)
+
+
+### Features
+
+* **capture:** drain the live meters on a ticker instead of measuring a file ([91d1fb5](https://github.com/puremetricsai/lumi/commit/91d1fb5974bb6edee8c726e7215c5009cf9ef796))
+* **cli:** add --json to mcp setup so the app can read registration status ([c562364](https://github.com/puremetricsai/lumi/commit/c562364b157a105c26c39dc0d6f0b41e472a74b1))
+* **cli:** add the lumi app launcher and app-owned recorder registration ([a9ec45d](https://github.com/puremetricsai/lumi/commit/a9ec45d542ee7e29bb89a01092e31152e6a60677))
+* **macos:** add compress to the Danger tab and measure it up front ([20e95c7](https://github.com/puremetricsai/lumi/commit/20e95c7da2cbbfb64b44f0434c0cd28cca9498cd))
+* **macos:** add Lumi.app, a menu-bar supervisor for the lumi CLI ([1a17a26](https://github.com/puremetricsai/lumi/commit/1a17a268a8e4b797e0537be186e5f0345a2ed713))
+* **macos:** add the five remaining Settings tabs ([f96de95](https://github.com/puremetricsai/lumi/commit/f96de95f7fc771d8030f59ed96391e9ed752bcc5))
+* **macos:** add the Lumi.app menu bar shell ([a842b8b](https://github.com/puremetricsai/lumi/commit/a842b8b13a6938850b164bde4c359131aaa5e418))
+* **macos:** draw a track with no signal as having none ([2dac48f](https://github.com/puremetricsai/lumi/commit/2dac48f9883e94c22e7b6a6d133f7cc2e4c680fb))
+* **macos:** finish menu bar app development workflow ([d410051](https://github.com/puremetricsai/lumi/commit/d410051a4c315137a7ce043fb0399e4e082d1b0a))
+* **macos:** move Quit from the window footer to the menu bar menu ([c3acfbf](https://github.com/puremetricsai/lumi/commit/c3acfbfde1efe3f065928384f6ae2fb25846f04e))
+* **macosnative:** sum audio energy inside the capture callback ([a17cfb3](https://github.com/puremetricsai/lumi/commit/a17cfb37214f667faca489eea7dba06ad9f9ce97))
+* name Homebrew as the way to install and update the app ([12dd200](https://github.com/puremetricsai/lumi/commit/12dd20075c805ba79211b687175d42c0bb0fb410))
+* **wav:** report a level from energy a caller already summed ([ddfcdf5](https://github.com/puremetricsai/lumi/commit/ddfcdf5da4d90df8a2c361b00dd441f0617a28d7))
+
+
+### Bug Fixes
+
+* **compress:** skip audio too short for the FLAC encoder ([e21f85f](https://github.com/puremetricsai/lumi/commit/e21f85ff8c0081d8ca355802fd46630432150422))
+* **compress:** skip audio too short for the FLAC encoder ([6fffeab](https://github.com/puremetricsai/lumi/commit/6fffeabdb47f8c5c72a3a80966274a3091aaeadb))
+* **macos:** close the dead band under the window footer, and unrule the chrome ([9bfdecd](https://github.com/puremetricsai/lumi/commit/9bfdecdf6652b27e06e56dc9b0dad8bb1201d67b))
+* **macos:** give every ungranted permission its own route to System Settings ([9a2d91d](https://github.com/puremetricsai/lumi/commit/9a2d91db22f6e81a4dc44a0a5ee263cdac7a7791))
+
 ## [0.5.0](https://github.com/puremetricsai/lumi/compare/v0.4.0...v0.5.0) (2026-08-14)
 
 
