@@ -115,7 +115,10 @@ struct LumiWindow: View {
                         healthy: true)
                 }
                 if Preferences.shared.captureAudio {
-                    AudioStatusRow(title: "Microphone", level: recorder.level(for: "microphone"))
+                    AudioStatusRow(
+                        title: "Microphone",
+                        level: recorder.level(for: "microphone"),
+                        silenceIsFailure: true)
                     AudioStatusRow(title: "System audio", level: recorder.level(for: "system"))
                 }
             }
@@ -325,16 +328,28 @@ struct LumiWindow: View {
 ///
 /// Levels are live, so this clears within a second of capture starting. A row
 /// still reading "No signal yet" after that is a real answer about that track.
+///
+/// The recorder's own `silent` means opposite things on the two tracks, which is
+/// `silenceIsFailure`. Nothing playing is what a system track sounds like most
+/// of the time; a live microphone in a silent room still carries its own noise,
+/// so a microphone reporting silence is one nothing is reaching — a denied or
+/// stale Microphone grant delivers empty buffers rather than an error, and this
+/// row is the only place that shows. Judged one interval at a time, because a
+/// live microphone does not produce one.
 private struct AudioStatusRow: View {
     var title: String
     var level: AudioLevel?
+    var silenceIsFailure = false
+
+    private var isDigitallySilent: Bool { silenceIsFailure && level?.silent == true }
 
     var body: some View {
         StatusRow(
             title: title,
-            detail: level == nil ? "No signal yet" : nil,
+            detail: level == nil ? "No signal yet"
+                : isDigitallySilent ? "Silent — check Microphone access" : nil,
             level: level,
-            healthy: level != nil)
+            healthy: level != nil && !isDigitallySilent)
     }
 }
 

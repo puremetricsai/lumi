@@ -41,6 +41,17 @@ type AudioLevel struct {
 	// DurationMS is how much sound the figures summarise, which is how a reader
 	// knows how stale the measurement is allowed to get before the meter decays.
 	DurationMS int64 `json:"duration_ms"`
+	// Silent says the interval reached wav.SilenceFloorDBFS, which is the floor
+	// a signal is clamped to rather than a level anything reaches: below it is
+	// less sound than a live input's own noise. It is answered here so no reader
+	// has to compare against the floor itself — that comparison is the rule, and
+	// a second copy of it in another language drifts invisibly.
+	//
+	// It is a fact about the sound, not a verdict about the source. Nothing
+	// playing is what a system track sounds like most of the time; a microphone
+	// that reports this is not being listened to. That reading belongs to
+	// whoever is drawing the meter.
+	Silent bool `json:"silent"`
 }
 
 // LevelSink receives one measurement per track per interval. It is called from
@@ -141,6 +152,7 @@ func levelFrom(source string, energy []float64, measuredAt time.Time) (AudioLeve
 		MedianDBFS: median,
 		WindowMS:   transcript.EnvelopeWindowMS,
 		DurationMS: span,
+		Silent:     peak <= wav.SilenceFloorDBFS,
 	}, true
 }
 

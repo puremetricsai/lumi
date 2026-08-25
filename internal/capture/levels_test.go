@@ -71,6 +71,29 @@ func TestSummarizeEnvelopeRefusesToInventALevel(t *testing.T) {
 	}
 }
 
+// An interval of digital silence must say so, because the alternative is every
+// reader comparing against the floor itself. A track that is not being listened
+// to reads exactly like a quiet room otherwise.
+func TestLevelFromReportsSilence(t *testing.T) {
+	measuredAt := time.Now().UTC()
+	silent, ok := levelFrom("microphone", []float64{0, 0, 0}, measuredAt)
+	if !ok {
+		t.Fatal("silence produced no level; silence is a measurement")
+	}
+	if !silent.Silent {
+		t.Errorf("peak %v was not reported silent; want silent at %v",
+			silent.PeakDBFS, wav.SilenceFloorDBFS)
+	}
+	quiet, ok := levelFrom("microphone", []float64{1e-9, 1e-9}, measuredAt)
+	if !ok {
+		t.Fatal("energy produced no level")
+	}
+	if quiet.Silent {
+		t.Errorf("a room at %v dBFS was reported silent; only the floor is",
+			quiet.PeakDBFS)
+	}
+}
+
 // A drained interval must reach the sink as decibels this repository already
 // defines. Nothing else connects the live meter to internal/wav, so this is what
 // stops the two drifting.

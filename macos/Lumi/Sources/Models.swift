@@ -146,6 +146,10 @@ struct AudioLevel: Decodable {
     var medianDbfs: Double
     var windowMs: Int
     var durationMs: Int
+    /// Whether the interval was digital silence, as `internal/capture` decides
+    /// it. Read rather than computed: the floor this compares against belongs to
+    /// `internal/wav`, and a second copy of the comparison here would drift.
+    var silent: Bool
 
     /// When this app read the measurement, which is what staleness is counted
     /// from. The default is evaluated during decoding, so it is receipt time and
@@ -160,7 +164,7 @@ struct AudioLevel: Decodable {
     /// synthesised. Everything the recorder sends that is absent here — most of
     /// all `captured_at` — is ignored on purpose.
     private enum CodingKeys: String, CodingKey {
-        case event, source, peakDbfs, medianDbfs, windowMs, durationMs
+        case event, source, peakDbfs, medianDbfs, windowMs, durationMs, silent
     }
 
     /// Digital silence, as `internal/wav.SilenceFloorDBFS` defines it. A level
