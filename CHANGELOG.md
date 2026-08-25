@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.7.0](https://github.com/puremetricsai/lumi/compare/v0.6.1...v0.7.0) (2026-08-25)
+
+
+### Features
+
+* **app:** flag a silent microphone in the Lumi window ([ab25e46](https://github.com/puremetricsai/lumi/commit/ab25e46a0be221a8935fa42f18fc5fc5e05b71ca))
+* **capture:** report digital silence on each audio level ([34c87c3](https://github.com/puremetricsai/lumi/commit/34c87c37a964c9a01a890fb1c3feea45fd901eb3))
+* flag a silent microphone track in Lumi.app ([6a8fd12](https://github.com/puremetricsai/lumi/commit/6a8fd12d3e269fbb9042c49135c8da728d7a08a2))
+
 ## [0.6.1](https://github.com/puremetricsai/lumi/compare/v0.6.0...v0.6.1) (2026-08-20)
 
 
