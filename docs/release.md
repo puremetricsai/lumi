@@ -2,19 +2,21 @@
 
 `.github/workflows/release-please.yml` is the whole release. A push to `main` with a releasable
 commit opens a release PR; merging it cuts the tag, and the rest of the workflow builds, signs,
-publishes, verifies, and then updates the two Homebrew package definitions in this repository.
+publishes, verifies, and then updates the Homebrew cask in this repository.
 
-One tap serves two packages from the same tag:
+The tap serves exactly one package, `Casks/lumi.rb`. It installs `/Applications/Lumi.app` **and**
+the `lumi` CLI the bundle embeds, from `lumi-macos-arm64.zip`, and macOS quarantines it until the
+app is notarized. There was a `HomebrewFormula/lumi.rb` carrying the CLI alone through `v0.7.0`;
+it was removed because both packages provided a `lumi` command at the same path and Homebrew
+refuses to link the second one, so the two could never be installed together. `README.md` carries
+the migration for anyone still on it.
 
-| | `HomebrewFormula/lumi.rb` | `Casks/lumi.rb` |
-| --- | --- | --- |
-| Installs | the `lumi` CLI | `/Applications/Lumi.app` **and** its embedded `lumi` |
-| Asset | `lumi-darwin-arm64.tar.gz` | `lumi-macos-arm64.zip` |
-| Quarantined on install | no | yes, until the app is notarized |
+The release still publishes `lumi-darwin-arm64.tar.gz` — the bare CLI plus the licence — for people
+who want the binary without the app. Nothing in the tap consumes it; it is a manual download.
 
-Both are rewritten by the same job, in one commit, and only after the release's assets exist and
-have been verified. A failed release leaves both pointing at the last working one — that is the
-intent, not an accident. See the comment block on `update-homebrew-packages` for the recovery,
+The cask is rewritten only after the release's assets exist and have been verified, so a failed
+release leaves it pointing at the last working one — that is the intent, not an accident. See the
+comment block on `update-homebrew-packages` for the recovery,
 which is *not* a fresh run: use GitHub's **Re-run failed jobs** on the same run, because
 release-please will not re-cut a version whose release already exists.
 
@@ -89,10 +91,12 @@ moving to Developer ID will. Keep the `.p12` somewhere you will still have it in
 
 `Casks/lumi.rb` is committed **after** the first release that carries `lumi-macos-arm64.zip`, and
 by hand. The cask's `url` resolves through `v#{version}`, so a cask committed before its asset
-exists points the tap at a 404 for every user until the next release — the same failure the formula
-had, and the reason `update-homebrew-packages` runs after the assets are published rather than
-before. `update-homebrew-packages` maintains the file from the *following* release onward; it logs
-a notice and skips while the file is absent, and never authors the first one.
+exists points the tap at a 404 for every user until the next release, and the reason
+`update-homebrew-packages` runs after the assets are published rather than before.
+`update-homebrew-packages` maintains the file from the *following* release onward and never authors
+the first one. It no longer skips when the file is absent: the cask is the only package the tap
+ships, so a missing `Casks/lumi.rb` now fails that job rather than letting a release report success
+while pointing users at nothing.
 
 No published release can serve it retroactively. Every release through `v0.5.0` carries only
 `lumi-darwin-arm64.tar.gz` and `SHA256SUMS.txt`, and that tarball is the bare CLI binary plus the
@@ -199,15 +203,15 @@ keeps the designated requirement stable, so the TCC grants and the Gatekeeper ap
 
 ## Recovery
 
-- **The build, signing, upload, or either verification job failed.** Both package definitions still
-  point at the previous release, and users are unaffected. Fix forward, or use **Re-run failed
+- **The build, signing, upload, or either verification job failed.** The cask still points at the
+  previous release, and users are unaffected. Fix forward, or use **Re-run failed
   jobs** on the same run for a transient failure. Do not push a fresh run expecting it to republish:
   release-please sets `release_created` to false for a version whose release exists, and every job
   downstream of it is skipped.
 - **The release published but `update-homebrew-packages` failed.** The assets are good; only the tap
   is stale. Re-run that job.
-- **The formula and cask disagree about the version.** They are written in one commit, so this means
-  a hand edit landed between releases. The next release rewrites both.
+- **`Casks/lumi.rb`'s `version` and `sha256` disagree with the latest tag.** A hand edit landed
+  between releases. The next release rewrites both.
 - **`Casks/lumi.rb` points at a tag with no `lumi-macos-arm64.zip`.** Every `brew install --cask`
-  404s. Revert the cask to the previous release's version and sha256 by hand; the formula is
-  independent and unaffected.
+  404s, and that is every install Lumi has. Revert the cask to the previous release's version and
+  sha256 by hand.
