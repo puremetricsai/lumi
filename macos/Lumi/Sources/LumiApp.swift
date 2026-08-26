@@ -228,11 +228,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// directly would discard media that was written but not yet indexed.
     private func buildMenu() -> NSMenu {
         let menu = NSMenu()
+        // Explicit enablement: AppKit's auto-enabling ignores `isEnabled` for any
+        // item whose target responds to its action, which would re-enable the
+        // toggle in the states where it does nothing.
+        menu.autoenablesItems = false
 
         let status = NSMenuItem(title: statusLine, action: nil, keyEquivalent: "")
         status.isEnabled = false
         status.image = Self.dotImage(for: recorder.isStopping ? .idle : recorder.state)
         menu.addItem(status)
+
+        // Titled and dispatched on `isSupervisingRecorder`, never on `state`. A
+        // permission revoked mid-capture moves the UI to `.needsPermissions`
+        // while the child keeps running and writing, and reading `state` there
+        // would offer "Start Recording" beside a live recorder.
+        //
+        // Two selectors rather than one that decides when it runs, because the
+        // title and the action must not be able to disagree. Reassigning
+        // `item.menu` cannot reach a menu that is already open, so a child that
+        // exits while the dropdown is held leaves "Stop Recording" on screen —
+        // and a single action re-reading the recorder at click time would start
+        // one instead. Deciding here makes a stale click land in the guard at
+        // the top of `start()`/`stop()` and do nothing, which is the only
+        // honest outcome for a button whose label is out of date.
+        let recording = recorder.isSupervisingRecorder
+        let toggle = NSMenuItem(
+            title: recording ? "Stop Recording" : "Start Recording",
+            action: recording ? #selector(stopRecording) : #selector(startRecording),
+            keyEquivalent: "")
+        toggle.target = self
+        toggle.isEnabled = !recorder.isStopping
+            && !(recorder.state == .needsPermissions && !recorder.isSupervisingRecorder)
+        menu.addItem(toggle)
+
         menu.addItem(.separator())
 
         let open = NSMenuItem(title: "Open Lumi", action: #selector(openWindow), keyEquivalent: "")
@@ -286,6 +314,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Actions and deep links
 
     @objc private func openWindow() { showWindow() }
+
+    /// startRecording and stopRecording run the same supervisor methods the Lumi
+    /// window's buttons do, so the graceful SIGTERM-then-wait stop is shared
+    /// rather than restated. Each rebuilds the status item afterwards because a
+    /// `start()` that fails to launch changes only `lastError`, firing no status
+    /// hook of its own.
+    @objc private func startRecording() {
+        Task {
+            await recorder.start()
+            updateStatusItem()
+        }
+    }
+
+    @objc private func stopRecording() {
+        Task {
+            await recorder.stop()
+            updateStatusItem()
+        }
+    }
 
     @objc private func quitApp() { Task { await quit() } }
 

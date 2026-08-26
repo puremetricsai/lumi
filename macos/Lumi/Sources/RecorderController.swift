@@ -166,6 +166,12 @@ final class RecorderController {
         if status != 0 && status != 143 && !isStopping {
             lastError = "The recorder exited unexpectedly (status \(status))."
         }
+        // Fired unconditionally: the child being gone is a visible status
+        // change on its own, and the assignment above does not always make one.
+        // A permission revoked mid-capture leaves `state` at
+        // `.needsPermissions` through the exit, so a menu titled on whether a
+        // child is held would keep offering to stop one that had already died.
+        statusDidChange?()
         Task { await refreshPermissions() }
     }
 

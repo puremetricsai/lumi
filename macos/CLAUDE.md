@@ -45,9 +45,13 @@ The app is a supervisor and nothing else — root `CLAUDE.md` states that rule; 
   written and indexed. This is also the app-quit path: `AppDelegate` returns `.terminateLater` while a
   child is held, so ⌘Q asks first and then shuts down gracefully.
 - **Never restart the recorder when displays change.** The Go recorder rediscovers displays every interval.
-- **A settings change restarts on `isSupervisingRecorder`, never on `state == .recording`.** A permission
-  revoked mid-capture moves the UI to `.needsPermissions` while the child keeps running and keeps writing;
-  gating on the UI state saves the setting and leaves the live recorder on the old flags.
+- **Anything that acts on the recorder reads `isSupervisingRecorder`, never `state == .recording`.** A
+  permission revoked mid-capture moves the UI to `.needsPermissions` while the child keeps running and keeps
+  writing. A settings change gated on the UI state saves the setting and leaves the live recorder on the old
+  flags; the menu bar's Start/Stop item titled on it offers "Start Recording" beside a running child. That
+  menu sets `autoenablesItems = false` — AppKit re-enables any item whose target answers its action — and
+  `RecorderController` fires `statusDidChange` unconditionally when the child exits, because the exit is a
+  visible change even when `state` does not move.
 - **Children get `FileHandle.nullDevice` for stdin, so no CLI prompt can ever be answered.** Anything
   interactive must be pre-answered — `prune --all --yes`, gated by the app's own typed confirmation sheet.
 - **Every *development* rebuild destroys the app's TCC grants.** A local bundle is ad-hoc signed
