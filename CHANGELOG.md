@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.0](https://github.com/puremetricsai/lumi/compare/v0.1.0...v0.2.0) (2026-08-26)
+
+
+### Features
+
+* **app:** add a Start/Stop Recording item to the menu bar ([4800d1b](https://github.com/puremetricsai/lumi/commit/4800d1b13d94961dc133f3d9cd91c9c9d499e551))
+* **app:** add a Start/Stop Recording item to the menu bar ([60980bd](https://github.com/puremetricsai/lumi/commit/60980bdc534983abbce715ff397e0e08b2a542aa))
+
 ## 0.1.0 (2026-08-26)
 
 
