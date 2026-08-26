@@ -34,6 +34,8 @@ struct MCPSettings: View {
     @State private var needsDesktopRelaunch = false
     /// The client whose snippet was just copied, so the button can confirm it.
     @State private var copiedTarget: String?
+    /// The conflicting client awaiting a replace confirmation, if any.
+    @State private var replacing: MCPSetupResult?
 
     var body: some View {
         Form {
@@ -90,6 +92,28 @@ struct MCPSettings: View {
         .formStyle(.grouped)
         .frame(minHeight: 420)
         .task { await refresh() }
+        // `presenting:` rather than reading `replacing` inside the action, which
+        // the Replace button clears before its work starts.
+        .confirmationDialog(
+            "Replace the registered entry?",
+            isPresented: Binding(
+                get: { replacing != nil },
+                set: { if !$0 { replacing = nil } }),
+            titleVisibility: .visible,
+            presenting: replacing
+        ) { result in
+            Button("Replace", role: .destructive) {
+                replacing = nil
+                Task { await runSetup(replacing: result.target) }
+            }
+            Button("Cancel", role: .cancel) { replacing = nil }
+        } message: { result in
+            // Scoped to the one client by name. A blanket --force would also
+            // overwrite another client's entry that somebody tuned by hand,
+            // which is the thing this confirmation exists to protect.
+            Text("Lumi will overwrite \(result.displayName)'s existing entry with its own. "
+                + "No other client is changed.")
+        }
     }
 
     // MARK: - Clients
@@ -141,11 +165,15 @@ struct MCPSettings: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     code(result.current)
-                    // Named as a command, not offered as a button. Overwriting
-                    // an entry someone tuned by hand is a decision that belongs
-                    // to them, in a terminal, and not to a click in this app.
-                    SettingsCaption("Lumi will not overwrite it. "
-                        + "Run `\(Self.forceCommand)` in a terminal to replace it.")
+                    // A button, which it deliberately was not while a `lumi`
+                    // command existed to run in a terminal. Nothing about
+                    // overwriting a hand-tuned entry got safer — there is just
+                    // nowhere else to do it now, which is what the confirmation
+                    // and the entry shown above it are for.
+                    SettingsCaption("Lumi will not overwrite it unless you ask.")
+                    Button("Replace…") { replacing = result }
+                        .disabled(isRunningSetup || isLoading)
+                        .accessibilityLabel("Replace the \(result.displayName) entry")
                 }
             }
 
@@ -229,17 +257,27 @@ struct MCPSettings: View {
 
     /// runSetup registers Lumi with every installed client, then re-reads the
     /// status so the badges describe the machine and not the run.
-    private func runSetup() async {
+    ///
+    /// `replacing` names the one client whose existing entry is to be
+    /// overwritten, and is passed to `--client` verbatim — `internal/cli` accepts
+    /// a target's own name there so this holds no second copy of that
+    /// vocabulary. Scoping it is what keeps a confirmed replace from also
+    /// forcing a client the user never saw.
+    private func runSetup(replacing target: String? = nil) async {
         isRunningSetup = true
         setupError = nil
         setupOutcome = []
         needsDesktopRelaunch = false
         defer { isRunningSetup = false }
         do {
+            var arguments = ["mcp", "setup", "--json"]
+            if let target {
+                arguments += ["--force", "--client", target]
+            }
             // Decoded even on a non-zero exit: a conflict prints a complete
             // document and *then* fails, and that document is the answer.
             // LumiCLI.json already reads the payload before the exit status.
-            let report = try await LumiCLI.json(MCPSetupReport.self, ["mcp", "setup", "--json"])
+            let report = try await LumiCLI.json(MCPSetupReport.self, arguments)
             setupOutcome = report.results.map(Self.outcome)
             // `changed` and not `status`: a target reports `added` even when
             // the write it then attempted failed, and only `changed` is set
@@ -315,21 +353,6 @@ struct MCPSettings: View {
     ///
     /// Deliberately not `status.label`: the badge describes the state of the
     /// machine ("Not registered"), while this describes what the run just did.
-    /// The command that replaces a conflicting entry, spelled for a terminal.
-    ///
-    /// `--data-dir` is included whenever the app holds a directory of its own.
-    /// The app passes it on every invocation, but a shell knows nothing about
-    /// the app's UserDefaults: the plain command would resolve the CLI's own
-    /// default root and register an entry pointing somewhere else. That entry
-    /// would then read as a conflict again on the next refresh, with no visible
-    /// reason why.
-    private static var forceCommand: String {
-        guard Preferences.shared.hasCustomDataDirectory else {
-            return "lumi mcp setup --force"
-        }
-        return "lumi mcp setup --force --data-dir '\(Preferences.shared.dataDirectory)'"
-    }
-
     private static func outcome(_ result: MCPSetupResult) -> String {
         // A status that claims success is checked against the error first,
         // because the status cannot carry this on its own: a target sets

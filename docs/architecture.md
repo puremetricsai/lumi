@@ -5,7 +5,7 @@ ScreenCaptureKit displays ─→ Vision OCR (full screen) ─┐
                          └─→ Accessibility (attribution) ├─→ events + FTS5 ─→ search / mcp
 ScreenCaptureKit system + microphone ─→ WAV ─→ SpeechAnalyzer (in-process) ─┘
 
-(`lumi compress` later re-encodes the stored JPEGs as HEIC and the WAVs as lossless FLAC in place.)
+(the compress pass later re-encodes the stored JPEGs as HEIC and the WAVs as lossless FLAC in place.)
 ```
 
 - `internal/macosnative`: cgo bridge to ScreenCaptureKit, Accessibility, Vision, and permission APIs
@@ -21,4 +21,4 @@ ScreenCaptureKit system + microphone ─→ WAV ─→ SpeechAnalyzer (in-proces
 
 Frames use a hash fast path plus a sampled color-histogram comparison with independent state per display; recent user input makes the threshold more sensitive. Two safety intervals keep capture from going silent: a frame whose bytes changed but scored as a near-duplicate — a video, an advancing slide — is retained at least every ten seconds, while a byte-identical frame is retained every five minutes, so a frozen screen leaves a bounded presence marker instead of re-indexing the same JPEG. Full-display Vision OCR is the primary screen-text source, so the index reflects the whole screen rather than just the focused window; the Accessibility snapshot supplies focused-app attribution and its window text is kept in event metadata when substantive. If Accessibility, Vision, comparison, or transcription fails after media was captured, Lumi preserves and indexes the event with processor diagnostics instead of silently losing the original data.
 
-`lumi permissions --request` invokes Apple's native Screen Recording, Accessibility, Microphone, and Speech Recognition request flows. `lumi doctor` reports their current state with the matching System Settings location. Input Monitoring is informational and is only requested when `--input-monitoring` is explicitly passed; capture does not require an event tap.
+The app's Permissions tab invokes Apple's native Screen Recording, Accessibility, Microphone, and Speech Recognition request flows through `permissions --request`, and reports their current state with the matching System Settings location. Input Monitoring is informational and is only requested when `--input-monitoring` is explicitly passed; capture does not require an event tap.

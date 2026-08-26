@@ -4,15 +4,18 @@
 commit opens a release PR; merging it cuts the tag, and the rest of the workflow builds, signs,
 publishes, verifies, and then updates the Homebrew cask in this repository.
 
-The tap serves exactly one package, `Casks/lumi.rb`. It installs `/Applications/Lumi.app` **and**
-the `lumi` CLI the bundle embeds, from `lumi-macos-arm64.zip`, and macOS quarantines it until the
-app is notarized. There was a `HomebrewFormula/lumi.rb` carrying the CLI alone through `v0.7.0`;
-it was removed because both packages provided a `lumi` command at the same path and Homebrew
-refuses to link the second one, so the two could never be installed together. `README.md` carries
-the migration for anyone still on it.
+The tap serves exactly one package, `Casks/lumi.rb`, and it installs exactly one thing:
+`/Applications/Lumi.app`, from `lumi-macos-arm64.zip`. macOS quarantines it until the app is
+notarized.
 
-The release still publishes `lumi-darwin-arm64.tar.gz` — the bare CLI plus the licence — for people
-who want the binary without the app. Nothing in the tap consumes it; it is a manual download.
+**The release publishes one archive, and the embedded binary is not one of them.** `Lumi.app` is the
+whole product; the binary inside it is an implementation detail of the bundle. Two earlier packagings
+put it in front of users and both are gone — a `HomebrewFormula/lumi.rb` carrying it alone through
+`v0.7.0`, removed because both packages provided a `lumi` command at the same path and Homebrew
+refuses to link the second, and a `binary` stanza in the cask that symlinked it onto `PATH`, removed
+with the standalone `lumi-darwin-arm64.tar.gz` when the app became the only surface. `README.md`
+carries the migration for anyone arriving from either. Nothing should reintroduce a second published
+artifact without deciding again that Lumi has two front doors.
 
 The cask is rewritten only after the release's assets exist and have been verified, so a failed
 release leaves it pointing at the last working one — that is the intent, not an accident. See the
@@ -99,7 +102,7 @@ ships, so a missing `Casks/lumi.rb` now fails that job rather than letting a rel
 while pointing users at nothing.
 
 No published release can serve it retroactively. Every release through `v0.5.0` carries only
-`lumi-darwin-arm64.tar.gz` and `SHA256SUMS.txt`, and that tarball is the bare CLI binary plus the
+`lumi-darwin-arm64.tar.gz` and `SHA256SUMS.txt`, and that tarball is the bare binary plus the
 licence — there is no bundle in it, and a cask may not build from source.
 
 0. Know that `README.md` already documents `brew install --cask puremetricsai/lumi/lumi`. It ships
@@ -108,8 +111,8 @@ licence — there is no bundle in it, and a cask may not build from source.
    gap to one release.
 1. Set the three secrets above. `build-binaries` refuses to run un-signed once `Casks/lumi.rb`
    exists, so this is a precondition of step 5 and not only of step 2.
-2. Merge the release PR. Confirm the release carries `lumi-darwin-arm64.tar.gz`,
-   `lumi-macos-arm64.zip`, and `SHA256SUMS.txt`, and that `verify-macos-app` passed.
+2. Merge the release PR. Confirm the release carries `lumi-macos-arm64.zip` and `SHA256SUMS.txt`,
+   and that `verify-macos-app` passed.
 3. Take the ZIP's hash from `SHA256SUMS.txt` and write `Casks/lumi.rb` from the template below,
    with that release's numeric version and that hash.
 4. Check it before committing, on macOS. `--strict` alone does not run either of these. Homebrew 6
@@ -144,23 +147,22 @@ cask "lumi" do
   depends_on macos: :tahoe
 
   app "Lumi.app"
-  binary "#{appdir}/Lumi.app/Contents/MacOS/lumi"
 
   caveats <<~EOS
     Lumi is not notarized yet, so macOS quarantines it. Open Lumi once from
     Finder, then allow it in System Settings > Privacy & Security > Open Anyway.
-    If the `lumi` command reports "Killed: 9", the same approval has not reached
-    the embedded binary; clear it with:
+    If it still will not launch, the approval has not reached everything inside
+    the bundle; clear the flag with:
 
       xattr -dr com.apple.quarantine #{appdir}/Lumi.app
 
-    Then grant capture permissions to the installed binary:
+    Then open Lumi > Settings > Permissions and grant Screen & System Audio
+    Recording, Accessibility, Microphone, and Speech Recognition.
 
-      lumi permissions --request
-      lumi doctor
-
-    Approve Screen & System Audio Recording, Accessibility, Microphone, and
-    Speech Recognition in System Settings > Privacy & Security.
+    Upgrading from 0.2.0 or earlier: that version also put a `lumi` command on
+    your PATH, and AI agents were registered against it. It is gone. Re-register
+    them from Lumi > Settings > MCP, which offers Replace for an entry still
+    naming the old path.
   EOS
 end
 ```
@@ -173,10 +175,12 @@ Two of its lines look like free choices and are not, because `brew audit` passes
 - **`desc` may not name the platform.** `Cask/Desc` rejects `Mac`, `macOS`, and `OS X` anywhere in
   the string, so "…for your Mac" fails style while passing audit.
 
-And one absence is deliberate: no `zap`, no `uninstall`, no `postflight`, no `auto_updates`.
-Uninstall unlinks the binary on its own and leaves `~/Library/Application Support/Lumi` alone, which
-is the point — uninstalling software must never delete captured media or the database. Homebrew owns
-upgrades; the app has no updater and is not getting one.
+Two absences are deliberate. There is **no `binary` stanza**: it used to symlink the embedded binary
+onto `PATH`, and it went when `Lumi.app` became the only product surface — re-adding it would put a
+second front door back without anyone deciding to. And there is **no `zap`, `uninstall`, `postflight`,
+or `auto_updates`**: uninstall removes the app and leaves `~/Library/Application Support/Lumi` alone,
+which is the point — uninstalling software must never delete captured media or the database. Homebrew
+owns upgrades; the app has no updater and is not getting one.
 
 ### Measure the bootstrap release
 
@@ -186,17 +190,18 @@ half of it applies before the second release. On a clean Apple Silicon macOS 26 
 ```sh
 brew tap puremetricsai/lumi https://github.com/puremetricsai/lumi
 brew install --cask puremetricsai/lumi/lumi
-lumi version            # count what happens: output, a prompt, or "Killed: 9"
+open -a Lumi            # count what happens: it launches, or it is killed silently
 # then Open Anyway in System Settings, and:
-lumi version            # count again
+open -a Lumi            # count again
 ```
 
 A quarantined, never-executed, non-notarized Mach-O is **killed with SIGKILL and no prompt at all**
 — measured on macOS 26.5.2, exit 137, no output, `syspolicyd: Terminating process due to Gatekeeper
-rejection`. That is the app's first launch, and it is also `lumi` run from a terminal, because
-quarantine is written to every file inside the bundle and the cask's `lumi` command is a symlink
-into it. What is *not* yet measured is whether approving the app in System Settings also clears the
-nested binary. Record the answer here and fix the caveat to match.
+rejection`. That is the app's first launch. Quarantine is written to every file inside the bundle, so
+the same applies to the binary the app spawns, and it is the app's own child rather than anything a
+user runs. What is *not* yet measured is whether approving the app in System Settings also clears
+that nested binary — if it does not, the app starts and its recorder dies immediately. Record the
+answer here and fix the caveat to match.
 
 Then, on the release after it, check the thing only a second release can show: that a cask upgrade
 keeps the designated requirement stable, so the TCC grants and the Gatekeeper approval both survive.

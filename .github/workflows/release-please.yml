@@ -72,17 +72,13 @@ jobs:
           # tag rather than the 0.1.0-dev default.
           ACTUAL="$(./lumi version)"
           [ "${ACTUAL}" = "${TAG}" ] || { echo "::error::lumi version printed '${ACTUAL}', expected '${TAG}'"; exit 1; }
-      - name: Archive binary
-        run: tar -czf lumi-darwin-arm64.tar.gz lumi LICENSE
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: lumi-darwin-arm64.tar.gz
-          path: lumi-darwin-arm64.tar.gz
-          retention-days: 1
-
+      # The binary is not published on its own. Lumi.app is the whole product, and
+      # this build is its engine: it is embedded in the bundle below rather than
+      # shipped beside it.
+      #
       # Lumi.app is built around the binary the steps above produced and verified,
-      # never around a second one: the app and the CLI it embeds are one version by
-      # construction, not by two builds agreeing.
+      # never around a second one: the app and the binary it embeds are one version
+      # by construction, not by two builds agreeing.
       - name: Import the release signing identity
         env:
           P12_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_P12_BASE64 }}
@@ -207,14 +203,13 @@ jobs:
           set -euo pipefail
           TAG="${{ needs.release-please.outputs.tag_name }}"
           cd artifacts
-          # Named, not globbed. A release is incomplete unless it carries both, and a
-          # glob cannot tell "the app job produced nothing" from "there is nothing to
-          # produce" -- it would publish a CLI-only release and call it a success.
-          # These same two names are what verify-release checks for and what
-          # SHA256SUMS.txt lists; update-homebrew-packages looks the zip up in it. The
-          # tarball feeds no package -- the cask ships the CLI inside Lumi.app -- and is
-          # published as the manual download for people who want the binary alone.
-          ARCHIVES=(lumi-darwin-arm64.tar.gz lumi-macos-arm64.zip)
+          # Named, not globbed. A glob cannot tell "the app job produced nothing" from
+          # "there is nothing to produce" -- it would publish an assetless release and
+          # call it a success. This name is what verify-release checks for and what
+          # SHA256SUMS.txt lists; update-homebrew-packages looks the zip up in it.
+          # The list is one entry because Lumi.app is the whole product: the binary it
+          # embeds is not published separately.
+          ARCHIVES=(lumi-macos-arm64.zip)
           for file in "${ARCHIVES[@]}"; do
             [ -f "$file" ] || { echo "::error::build-binaries produced no ${file}"; ls -R; exit 1; }
           done
@@ -245,7 +240,7 @@ jobs:
           set -euo pipefail
           TAG="${{ needs.release-please.outputs.tag_name }}"
           ASSETS=$(gh release view "$TAG" --json assets --jq '.assets[].name' --repo ${{ github.repository }})
-          for asset in lumi-darwin-arm64.tar.gz lumi-macos-arm64.zip SHA256SUMS.txt; do
+          for asset in lumi-macos-arm64.zip SHA256SUMS.txt; do
             echo "$ASSETS" | grep -q "^${asset}$" && echo "✓ $asset" || { echo "✗ Missing: $asset"; exit 1; }
           done
 

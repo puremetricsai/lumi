@@ -78,8 +78,17 @@ developer's own Claude config.
 - **`lumi mcp setup` bakes an absolute binary path and absolute `--data-dir` into the argv** — always, even
   at the default root. Same bare-environment reason as `lumi mcp`, plus it makes the desired entry a pure
   function of (binary, root), which is what lets the "already configured?" check be an exact comparison. It
-  deliberately does not `EvalSymlinks`: a packaged install is reached through a stable symlink whose target
-  moves every version bump.
+  deliberately does not `EvalSymlinks`: resolving can only turn a stable name into an unstable one. A
+  packaged install is `/Applications/Lumi.app/Contents/MacOS/lumi`, which a cask upgrade replaces in place,
+  and a symlinked one keeps the link's own name while its target moves every version bump.
+  Because the comparison is exact, retiring the cask's `binary` stanza was a migration: entries written
+  against the old `/opt/homebrew/bin/lumi` no longer equal the desired argv, so every client holding one
+  reports `conflict`. `--force`, scoped by `--client`, is the way through.
+- **`--client` accepts a `Target`'s own name as well as the short one.** A caller reading the JSON has only
+  the target name, so accepting it is what lets `Lumi.app` replace one conflicting entry by handing back the
+  `target` it was given rather than keeping a second copy of this vocabulary in Swift.
+  `TestEveryTargetNameIsAClientValue` derives the check from `defaultSetupTargets`, so a fourth client fails
+  it until `parseClientSelection` learns both of its names.
 - **`mcp setup --dry-run --json` is the read-only status query `internal/mcpsetup` does not otherwise
   have.** `Target.Apply` is the only entry point and it writes unless `DryRun` is set, so the macOS app's
   MCP tab asks what a run *would* do rather than asking what is registered. `--json` is orthogonal to
@@ -118,4 +127,4 @@ developer's own Claude config.
   `--args` because LaunchServices drops arguments to an already-running app, which is the normal state for
   a menu bar app. `openURL` and `appIsRunning` are test seams for the same reason `resolveLumiBinary` is
   one: without them a test run would launch or quit the developer's own copy.
-- **The CLI refuses to run on anything but `darwin/arm64`** (`platform.Validate` in `PersistentPreRunE`).
+- **The binary refuses to run on anything but `darwin/arm64`** (`platform.Validate` in `PersistentPreRunE`).

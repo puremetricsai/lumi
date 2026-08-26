@@ -376,6 +376,7 @@ func TestParseClientSelection(t *testing.T) {
 		"case insensive": {value: "Codex", want: clientSelection{codex: true, explicit: true}},
 		"padded":         {value: " all ", want: clientSelection{code: true, desktop: true, codex: true}},
 		"unknown":        {value: "cursor", wantErr: true},
+		"target name":    {value: "claude-desktop", want: clientSelection{desktop: true, explicit: true}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -391,6 +392,42 @@ func TestParseClientSelection(t *testing.T) {
 			}
 			if got != tc.want {
 				t.Errorf("parseClientSelection(%q) = %+v, want %+v", tc.value, got, tc.want)
+			}
+		})
+	}
+}
+
+// Every `Target` name is a --client value selecting exactly that client. The
+// names are the only client vocabulary a caller reading the JSON has: Lumi.app's
+// MCP tab replaces one conflicting entry by handing the `target` it was given
+// straight back to --client, so a target whose own name this flag rejects would
+// make that button fail for that client alone. Derived from
+// defaultSetupTargets rather than listed, so a fourth client is covered here the
+// moment it is added — and fails this test until parseClientSelection knows its
+// name.
+func TestEveryTargetNameIsAClientValue(t *testing.T) {
+	t.Parallel()
+	all, err := parseClientSelection("all")
+	if err != nil {
+		t.Fatalf("parseClientSelection: %v", err)
+	}
+	for _, target := range defaultSetupTargets(all) {
+		name := target.Name()
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			sel, err := parseClientSelection(name)
+			if err != nil {
+				t.Fatalf("parseClientSelection(%q): %v", name, err)
+			}
+			if !sel.explicit {
+				t.Errorf("--client %q did not name a specific client: %+v", name, sel)
+			}
+			var selected []string
+			for _, got := range defaultSetupTargets(sel) {
+				selected = append(selected, got.Name())
+			}
+			if !slices.Equal(selected, []string{name}) {
+				t.Errorf("--client %q selected %v, want only %q", name, selected, name)
 			}
 		})
 	}

@@ -1,8 +1,9 @@
 # macos
 
-`Lumi.app`: a SwiftUI menu-bar shell around the `lumi` CLI. `Lumi/Sources/` holds the app delegate and
-menu bar item (`LumiApp.swift`), the CLI runner (`LumiCLI.swift`), the recorder supervisor
-(`RecorderController.swift`), the decoded CLI JSON (`Models.swift`), the Lumi window (`LumiWindow.swift`),
+`Lumi.app`: the product. A SwiftUI menu-bar shell around the embedded `lumi` binary, which is the whole
+of the implementation and is never installed or documented as a command of its own. `Lumi/Sources/` holds the app delegate and
+menu bar item (`LumiApp.swift`), the binary runner (`LumiCLI.swift`), the recorder supervisor
+(`RecorderController.swift`), the decoded JSON (`Models.swift`), the Lumi window (`LumiWindow.swift`),
 and one file per Settings tab — the six run Recording (in `SettingsWindow.swift`), `StorageSettings`,
 `MCPSettings`, `DangerSettings`, `PermissionsSettings`, `AboutSettings`, an order that is deliberate and
 explained where it is written. `build-app.sh` builds the bundle; `task app` runs it, `task app:install`
@@ -10,13 +11,13 @@ places it at `~/Applications/Lumi.app`, and `../scripts/restart-lumi-app.sh` is 
 
 The app is a supervisor and nothing else — root `CLAUDE.md` states that rule; this file is how it is kept.
 
-- **Every capability comes from running `lumi` with `--json` and decoding it.** Swift never opens the
-  database, reads media, calls a capture framework, or writes a file the CLI owns. A rule that has a Go
-  home is read from there, never restated here: `record status --json` rather than parsing `record.json`
-  (`internal/cli/CLAUDE.md` owns that format), `mcp setup --dry-run --json` rather than inspecting a
-  client's config, `Result.manual_hint` rather than rendering a client's JSON or TOML
-  (`internal/mcpsetup/CLAUDE.md`). Every invocation passes the app's `--data-dir`, because a child inherits
-  no shell environment.
+- **Every capability comes from running the embedded binary with `--json` and decoding it.** Swift never
+  opens the database, reads media, calls a capture framework, or writes a file the binary owns. A rule that
+  has a Go home is read from there, never restated here: `record status --json` rather than parsing
+  `record.json` (`internal/cli/CLAUDE.md` owns that format), `mcp setup --dry-run --json` rather than
+  inspecting a client's config, `Result.manual_hint` rather than rendering a client's JSON or TOML
+  (`internal/mcpsetup/CLAUDE.md`), a result's own `target` handed back to `--client` rather than a name
+  table. Every invocation passes the app's `--data-dir`, because a child inherits no shell environment.
 - **`LumiCLI.decoder` maps keys with `.convertFromSnakeCase`, so `Models.swift` carries no key tables.**
   A model that needs a `CodingKeys` enum anyway must spell its cases in the *converted* names — a case
   written `= "manual_hint"` matches nothing once the strategy has already produced `manualHint`, and the
@@ -52,7 +53,7 @@ The app is a supervisor and nothing else — root `CLAUDE.md` states that rule; 
   menu sets `autoenablesItems = false` — AppKit re-enables any item whose target answers its action — and
   `RecorderController` fires `statusDidChange` unconditionally when the child exits, because the exit is a
   visible change even when `state` does not move.
-- **Children get `FileHandle.nullDevice` for stdin, so no CLI prompt can ever be answered.** Anything
+- **Children get `FileHandle.nullDevice` for stdin, so no prompt can ever be answered.** Anything
   interactive must be pre-answered — `prune --all --yes`, gated by the app's own typed confirmation sheet.
 - **Every *development* rebuild destroys the app's TCC grants.** A local bundle is ad-hoc signed
   (`codesign -s -`), so its code identity changes each build and Screen Recording and Accessibility land on
@@ -65,13 +66,20 @@ The app is a supervisor and nothing else — root `CLAUDE.md` states that rule; 
   denies any service `macos/Lumi/Resources/Lumi.entitlements` does not name — so a permission can
   work in development and be dead in a release. Read that file before any Go or Swift when one is.
 - **The executable is `Contents/MacOS/LumiApp`, beside the embedded `Contents/MacOS/lumi`.** macOS
-  filesystems are case-insensitive, so naming it `Lumi` makes it the same file as `lumi` and the CLI
+  filesystems are case-insensitive, so naming it `Lumi` makes it the same file as `lumi` and the binary
   silently overwrites the app. `build-app.sh` compares inodes and fails loudly if that returns.
 - **`lumi app` hands off over the `lumi://` URL scheme, delivered to a resolved bundle path.**
   LaunchServices drops `--args` to an already-running app, which is a menu bar app's normal state, and
   AppleScript would cost an Automation prompt. The Go side of this is `internal/cli/CLAUDE.md`.
-- **The first-launch CLI symlink never replaces an existing `lumi`.** It asks the login shell for its
-  `PATH` (a Finder-launched app inherits none) and offers the first writable directory on it.
+- **Nothing in the app may tell the user to run a command.** There is no `lumi` on anyone's `PATH` to run:
+  the app is the whole product, and an instruction to open a terminal is an instruction to do something
+  impossible. `MCPSettings` is where this was bought — a conflicting MCP entry used to name
+  `lumi mcp setup --force` as a command and now offers **Replace…** behind a `.confirmationDialog`.
+  The reason it was *not* a button before still stands and is why the confirmation exists: overwriting an
+  entry somebody tuned by hand must be asked for, and the entry it would replace is shown above the button.
+  **That replace is scoped to one client** by passing the result's own `target` to `--client`; a blanket
+  `--force` would also overwrite entries for clients the user never looked at. `internal/cli` accepts a
+  target's name there precisely so Swift holds no second copy of that vocabulary.
 - **The build stays on the default Swift language mode.** `-swift-version 6` fails today:
   `Preferences.shared` is a `static let` on a non-Sendable `@Observable` class, and `LumiCLI` captures
   non-Sendable values across its pipe reads.

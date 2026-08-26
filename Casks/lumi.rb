@@ -11,22 +11,21 @@ cask "lumi" do
   depends_on macos: :tahoe
 
   app "Lumi.app"
-  binary "#{appdir}/Lumi.app/Contents/MacOS/lumi"
 
   caveats <<~EOS
     Lumi is not notarized yet, so macOS quarantines it. Open Lumi once from
     Finder, then allow it in System Settings > Privacy & Security > Open Anyway.
-    If the `lumi` command reports "Killed: 9", the same approval has not reached
-    the embedded binary; clear it with:
+    If it still will not launch, the approval has not reached everything inside
+    the bundle; clear the flag with:
 
       xattr -dr com.apple.quarantine #{appdir}/Lumi.app
 
-    Then grant capture permissions to the installed binary:
+    Then open Lumi > Settings > Permissions and grant Screen & System Audio
+    Recording, Accessibility, Microphone, and Speech Recognition.
 
-      lumi permissions --request
-      lumi doctor
-
-    Approve Screen & System Audio Recording, Accessibility, Microphone, and
-    Speech Recognition in System Settings > Privacy & Security.
+    Upgrading from 0.2.0 or earlier: this cask no longer puts a `lumi` command
+    on your PATH, so AI agents registered against that path stop resolving.
+    Re-register them from Lumi > Settings > MCP, which offers Replace for an
+    entry still naming the old one.
   EOS
 end

@@ -55,10 +55,12 @@ func TestReplacedBinaryReportsAChange(t *testing.T) {
 	}
 }
 
-// The Homebrew case, and the reason Stamp records the resolved target rather
-// than the path it was reached through. `lumi mcp setup` bakes the stable
-// symlink into every client config, and an upgrade repoints it at a new Cellar
-// directory — so watching the link's own identity would report nothing at all.
+// The symlinked case, and the reason Stamp records the resolved target rather
+// than the path it was reached through. A packaged install is now the binary
+// inside Lumi.app, which an upgrade replaces in place, but `lumi mcp setup`
+// bakes whatever path it was reached through into every client config — and
+// reached through a symlink an upgrade repoints, watching the link's own
+// identity would report nothing at all.
 func TestRepointedSymlinkReportsAChange(t *testing.T) {
 	dir := t.TempDir()
 	oldTarget := filepath.Join(dir, "lumi-1.0")

@@ -91,11 +91,9 @@ Lumi uses:
 # 1. Build
 task build && task app
 
-# 2. Sign standalone CLI and bundle with runtime + timestamp + explicit identifier
+# 2. Sign the bundle with runtime + timestamp. build-app.sh signs the embedded
+#    binary before the bundle around it; nothing is signed or shipped separately.
 IDENTITY="Developer ID Application: Puremetrics AI Inc. (ABC123XYZ0)"
-codesign --force --sign "$IDENTITY" --options runtime --timestamp \
-  --entitlements macos/Lumi/Resources/Lumi.entitlements \
-  -i com.puremetricsai.lumi.cli lumi
 CODESIGN_IDENTITY="$IDENTITY" ./macos/build-app.sh
 
 # 3. Create submission archive
@@ -127,16 +125,15 @@ ditto -c -k --keepParent build/Lumi.app lumi-macos-arm64.zip
 In `.github/workflows/release-please.yml`:
 
 1. **Import Keychain & API Key**: Decode `.p12` into temporary keychain and `.p8` with mode 0600.
-2. **Sign & Notarize CLI**: Sign `lumi` (`-i com.puremetricsai.lumi.cli`, `--entitlements macos/Lumi/Resources/Lumi.entitlements`), zip, submit to `notarytool`, then tarball as `lumi-darwin-arm64.tar.gz`.
-3. **Build & Sign App**: Run `CODESIGN_IDENTITY="$IDENTITY" ./macos/build-app.sh`.
-4. **Notarize & Staple App**:
+2. **Build & Sign App**: Run `CODESIGN_IDENTITY="$IDENTITY" ./macos/build-app.sh`. It signs the embedded binary and then the bundle. `Lumi.app` is the only artifact — there is nothing to sign or notarize beside it.
+3. **Notarize & Staple App**:
    - `ditto -c -k --keepParent build/Lumi.app lumi-submission.zip`
    - `xcrun notarytool submit lumi-submission.zip ... --wait --output-format json`
    - On error: fetch submission log via `xcrun notarytool log <submission-id> ...`
    - `xcrun stapler staple build/Lumi.app && xcrun stapler validate build/Lumi.app`
    - Re-archive final `lumi-macos-arm64.zip`.
-5. **Verify**: Run `codesign --verify --deep --strict`, `spctl --assess --type execute` on both `Lumi.app` and `Contents/MacOS/lumi`.
-6. **Cleanup**: Delete temporary keychain and private key files in `if: always()`.
+4. **Verify**: Run `codesign --verify --deep --strict`, `spctl --assess --type execute` on both `Lumi.app` and `Contents/MacOS/lumi`.
+5. **Cleanup**: Delete temporary keychain and private key files in `if: always()`.
 
 ---
 

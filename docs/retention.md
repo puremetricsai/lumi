@@ -1,7 +1,10 @@
 # Retention
 
-Captured screenshots and audio remain on disk until explicitly pruned. Preview an age policy before
-applying it:
+Captured screenshots and audio remain on disk until explicitly pruned. **Settings → Danger** in
+`Lumi.app` is where you preview and apply an age policy; this document is the policy reference behind
+that tab, and the commands in it are the embedded binary as invoked during development.
+
+Preview an age policy before applying it:
 
 ```sh
 ./lumi prune --older-than 720h --dry-run
