@@ -30,8 +30,8 @@ CODESIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
 #
 # CFBundleShortVersionString is the one a person reads, and it is the tag with
 # its leading `v` stripped: `v0.6.0` is a git tag, `0.6.0` is a version. The
-# cask's `version` field, the formula's, and this must agree, and only one of
-# the three can carry a `v`.
+# cask's `version` field and this must agree, and only one of the two can carry
+# a `v`.
 #
 # CFBundleVersion must be one to three period-separated integers. A development
 # build reports "0.1.0-dev", which is not, and LaunchServices treats an invalid
