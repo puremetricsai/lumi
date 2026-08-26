@@ -69,11 +69,19 @@ Add to GitHub repository **Settings $\rightarrow$ Secrets and variables $\righta
 Lumi uses:
 - **Hardened Runtime (`--options runtime`)**: Required for notarization. Go + Cgo + static Swift `liblumispeech.a` runs without JIT, unsigned executable memory, or library validation disablement exceptions.
 - **No App Sandbox**: Omitted because system-wide Accessibility attribution (`AXIsProcessTrustedWithOptions`) and background capture across apps cannot run in App Sandbox.
+- **Entitlements (`macos/Lumi/Resources/Lumi.entitlements`)**: one key,
+  `com.apple.security.device.audio-input`. Without it the Hardened Runtime denies the microphone
+  *silently* — the prompt still appears, the user still allows it, and `AVCaptureDevice` keeps
+  answering `not_determined`. Nothing errors, and Lumi never appears in System Settings > Privacy &
+  Security > Microphone. Nothing else Lumi does needs a key here: screen and system-audio capture
+  are governed by the Screen Recording TCC service, and Accessibility, Vision, SpeechAnalyzer and
+  Speech Recognition have no Hardened Runtime entitlement at all. `build-app.sh` passes the file to
+  every signature and then asserts the built bundle carries the key.
 - **Info.plist Purpose Strings**:
   - `NSMicrophoneUsageDescription`
   - `NSSpeechRecognitionUsageDescription`
   - `NSScreenCaptureUsageDescription`
-  - `NSAudioCaptureUsageDescription` (macOS 14.2+ system audio)
+  - `NSAppleEventsUsageDescription`
 
 ---
 
@@ -85,7 +93,9 @@ task build && task app
 
 # 2. Sign standalone CLI and bundle with runtime + timestamp + explicit identifier
 IDENTITY="Developer ID Application: Puremetrics AI Inc. (ABC123XYZ0)"
-codesign --force --sign "$IDENTITY" --options runtime --timestamp -i com.puremetricsai.lumi.cli lumi
+codesign --force --sign "$IDENTITY" --options runtime --timestamp \
+  --entitlements macos/Lumi/Resources/Lumi.entitlements \
+  -i com.puremetricsai.lumi.cli lumi
 CODESIGN_IDENTITY="$IDENTITY" ./macos/build-app.sh
 
 # 3. Create submission archive
@@ -117,7 +127,7 @@ ditto -c -k --keepParent build/Lumi.app lumi-macos-arm64.zip
 In `.github/workflows/release-please.yml`:
 
 1. **Import Keychain & API Key**: Decode `.p12` into temporary keychain and `.p8` with mode 0600.
-2. **Sign & Notarize CLI**: Sign `lumi` (`-i com.puremetricsai.lumi.cli`), zip, submit to `notarytool`, then tarball as `lumi-darwin-arm64.tar.gz`.
+2. **Sign & Notarize CLI**: Sign `lumi` (`-i com.puremetricsai.lumi.cli`, `--entitlements macos/Lumi/Resources/Lumi.entitlements`), zip, submit to `notarytool`, then tarball as `lumi-darwin-arm64.tar.gz`.
 3. **Build & Sign App**: Run `CODESIGN_IDENTITY="$IDENTITY" ./macos/build-app.sh`.
 4. **Notarize & Staple App**:
    - `ditto -c -k --keepParent build/Lumi.app lumi-submission.zip`
