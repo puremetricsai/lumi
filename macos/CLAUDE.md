@@ -57,7 +57,9 @@ The app is a supervisor and nothing else — root `CLAUDE.md` states that rule; 
   row reads enabled while the app reads denied. Not a bug to fix in code, and not what a released bundle
   does: `build-app.sh` signs with `CODESIGN_IDENTITY`, ad-hoc only by default, and a release passes a real
   identity whose designated requirement is the certificate rather than the hash — so those grants survive
-  an upgrade. `docs/release.md` owns that half.
+  an upgrade. `docs/release.md` owns that half. A release also gets the Hardened Runtime, which
+  denies any service `macos/Lumi/Resources/Lumi.entitlements` does not name — so a permission can
+  work in development and be dead in a release. Read that file before any Go or Swift when one is.
 - **The executable is `Contents/MacOS/LumiApp`, beside the embedded `Contents/MacOS/lumi`.** macOS
   filesystems are case-insensitive, so naming it `Lumi` makes it the same file as `lumi` and the CLI
   silently overwrites the app. `build-app.sh` compares inodes and fails loudly if that returns.
