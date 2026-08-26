@@ -8,7 +8,7 @@ Lumi is a minimal, open source AI memory of everything you do. It sees your scre
 
 Everything runs on your Mac. Nothing is uploaded, and it's completely free.
 
-Lumi deliberately targets a small surface: capture → process → store → query. The `lumi` CLI remains the core interface; a native menu-bar `Lumi.app` wraps it, and Homebrew installs either one.
+Lumi deliberately targets a small surface: capture → process → store → query. The `lumi` CLI remains the core interface; a native menu-bar `Lumi.app` wraps it, and Homebrew installs both together as one cask.
 
 ## Requirements
 
@@ -26,41 +26,21 @@ ScreenCaptureKit captures system output and the default microphone directly; no 
 
 ## Installation
 
-One tap ships two packages: a cask holding the menu-bar app *and* the CLI it embeds, and a formula holding the CLI alone.
+The tap ships one package: a cask holding the menu-bar app *and* the `lumi` CLI it embeds. Installing it puts `/Applications/Lumi.app` in place and the app's own `lumi` on your `PATH`, so the two can never disagree about a version.
 
 ```sh
 brew tap puremetricsai/lumi https://github.com/puremetricsai/lumi
-```
-
-App and CLI — installs `/Applications/Lumi.app` and puts its embedded `lumi` on your `PATH`:
-
-```sh
 brew trust --cask puremetricsai/lumi/lumi
 brew install --cask puremetricsai/lumi/lumi
 ```
 
-CLI only:
-
-```sh
-brew trust --formula puremetricsai/lumi/lumi
-brew install --formula puremetricsai/lumi/lumi
-```
-
-Install one of them, not both: they share the token `lumi` and both provide a `lumi` command. That is also why every command here names `--cask` or `--formula` and the full `puremetricsai/lumi/lumi` — a bare `brew install lumi` is ambiguous while both exist. Upgrade with the matching form, which for the cask moves the app and the CLI together:
+Upgrading moves the app and the CLI together:
 
 ```sh
 brew upgrade --cask puremetricsai/lumi/lumi
-brew upgrade --formula puremetricsai/lumi/lumi
 ```
 
-To move an existing formula install to the app:
-
-```sh
-brew uninstall --formula puremetricsai/lumi/lumi
-brew install --cask puremetricsai/lumi/lumi
-```
-
-Then, whichever you installed:
+Then:
 
 ```sh
 lumi permissions --request
@@ -68,7 +48,27 @@ lumi doctor
 lumi record start
 ```
 
-Homebrew downloads a prebuilt `darwin/arm64` build from the [latest release](https://github.com/puremetricsai/lumi/releases), so no Go or Swift toolchain is involved. Uninstalling either package leaves `~/Library/Application Support/Lumi` — your database and captured media — untouched.
+Homebrew downloads a prebuilt `darwin/arm64` build from the [latest release](https://github.com/puremetricsai/lumi/releases), so no Go or Swift toolchain is involved. Uninstalling leaves `~/Library/Application Support/Lumi` — your database and captured media — untouched.
+
+### Moving from the old CLI-only formula
+
+Releases up to 0.7.0 also shipped a `lumi` *formula* carrying the CLI alone. It is gone: both packages provided a `lumi` command at the same path, so the two could not be installed side by side. The tap points the old formula name at the cask, but the two cannot replace each other in place — do it by hand:
+
+```sh
+brew uninstall --formula lumi
+brew install --cask puremetricsai/lumi/lumi
+```
+
+Your database and captured media survive the move, but two things do not. macOS grants capture permissions to a specific binary, and the cask's `lumi` is a different one, so re-approve them with `lumi permissions --request`. MCP clients are registered with an absolute command path, so re-register with `lumi mcp install`.
+
+Prefer the CLI without the app? Fetch `lumi-darwin-arm64.tar.gz` from the [latest release](https://github.com/puremetricsai/lumi/releases) and put `lumi` on your `PATH` yourself. Download it with `curl`, not the browser — a browser download quarantines the binary, and a quarantined `lumi` is killed silently (`Killed: 9`, no dialog):
+
+```sh
+curl -fsSLO https://github.com/puremetricsai/lumi/releases/latest/download/lumi-darwin-arm64.tar.gz
+tar -xzf lumi-darwin-arm64.tar.gz
+```
+
+If you did download it in a browser, clear the flag first: `xattr -dr com.apple.quarantine lumi`.
 
 ### The app is not notarized yet
 
@@ -80,7 +80,7 @@ Quarantine is written to every file inside the bundle, and the `lumi` command is
 xattr -dr com.apple.quarantine /Applications/Lumi.app
 ```
 
-This is once per machine, not once per release: the signing certificate is stable, so Homebrew keeps the approval across upgrades and your granted permissions survive them. `brew install --formula` is not affected at all — quarantine applies to cask installs. All of it goes away with notarization.
+This is once per machine, not once per release: the signing certificate is stable, so Homebrew keeps the approval across upgrades and your granted permissions survive them. All of it goes away with notarization.
 
 To build and install from source instead:
 

@@ -210,8 +210,10 @@ jobs:
           # Named, not globbed. A release is incomplete unless it carries both, and a
           # glob cannot tell "the app job produced nothing" from "there is nothing to
           # produce" -- it would publish a CLI-only release and call it a success.
-          # These same two names are what verify-release checks for, what
-          # SHA256SUMS.txt lists, and what update-homebrew-packages looks up in it.
+          # These same two names are what verify-release checks for and what
+          # SHA256SUMS.txt lists; update-homebrew-packages looks the zip up in it. The
+          # tarball feeds no package -- the cask ships the CLI inside Lumi.app -- and is
+          # published as the manual download for people who want the binary alone.
           ARCHIVES=(lumi-darwin-arm64.tar.gz lumi-macos-arm64.zip)
           for file in "${ARCHIVES[@]}"; do
             [ -f "$file" ] || { echo "::error::build-binaries produced no ${file}"; ls -R; exit 1; }
@@ -299,11 +301,9 @@ jobs:
           codesign -dvvv "${APP}" 2>&1 | grep -E 'Identifier=|Signature=|Authority=' || true
 
   update-homebrew-packages:
-    # The formula and the cask both name a release asset now, so neither may be
-    # rewritten before that asset exists: a tap pointing at a 404 breaks every
-    # `brew install`, while a tap still pointing at the previous release keeps
-    # working. That inverts the ordering this job used to have, back when the formula
-    # built from source and consumed nothing the other jobs produced.
+    # The cask names a release asset, so it may not be rewritten before that asset
+    # exists: a tap pointing at a 404 breaks every `brew install --cask`, while a tap
+    # still pointing at the previous release keeps working.
     #
     # A failed release must therefore leave the tap alone rather than advance it — that
     # is the intent, not a side effect to engineer around. Fixing the release, or
@@ -318,10 +318,9 @@ jobs:
     # so release_created stays true and tag_name persists, and the cascade re-runs from
     # the failed job forward.
     #
-    # Both verification jobs are barriers, not just upload-release-assets. The sha256
-    # step below hashes the bytes itself, so upload alone would be sufficient for the
-    # formula's own safety — but a bundle that fails `codesign --verify` after download
-    # is a release users must not be pointed at, and only verify-macos-app can see that.
+    # Both verification jobs are barriers, not just upload-release-assets. A bundle that
+    # fails `codesign --verify` after download is a release users must not be pointed at,
+    # and only verify-macos-app can see that.
     needs: [release-please, upload-release-assets, verify-release, verify-macos-app]
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
     runs-on: ubuntu-latest
@@ -351,7 +350,6 @@ jobs:
           # into a directory this step then deletes out from under itself.
           gh release download "$TAG" --repo "${{ github.repository }}" --clobber \
             --dir "$WORK" \
-            --pattern lumi-darwin-arm64.tar.gz \
             --pattern lumi-macos-arm64.zip \
             --pattern SHA256SUMS.txt
           # Sets SHA. Hash the bytes brew will download rather than trusting the published
@@ -376,25 +374,26 @@ jobs:
             published="$(awk -v f="$asset" '$2 == f {print $1}' "${WORK}/SHA256SUMS.txt")"
             [ "$published" = "$SHA" ] || { echo "::error::SHA256SUMS.txt records '${published}' for ${asset}, but the asset hashes to '${SHA}'"; exit 1; }
           }
-          # Prove each file is really the container it claims to be before hashing it.
-          gzip -t "${WORK}/lumi-darwin-arm64.tar.gz"
+          # Prove the file is really the container it claims to be before hashing it.
           unzip -qt "${WORK}/lumi-macos-arm64.zip"
-          hash_asset lumi-darwin-arm64.tar.gz
-          echo "archive=${SHA}" >> "$GITHUB_OUTPUT"
           hash_asset lumi-macos-arm64.zip
           echo "app=${SHA}" >> "$GITHUB_OUTPUT"
           rm -rf "$WORK"
 
-      - name: Update the formula and the cask
+      - name: Update the cask
         run: |
           set -euo pipefail
           TAG="${{ needs.release-please.outputs.tag_name }}"
           VERSION="${TAG#v}"
-          FORMULA="HomebrewFormula/lumi.rb"
           CASK="Casks/lumi.rb"
 
-          # Rewrite the one `<field> "<value>"` line in a package definition, and prove
-          # afterwards that the line now reads exactly what it should.
+          # The cask is the only Homebrew package Lumi ships. It carries the menu-bar app
+          # and the `lumi` CLI the app embeds, so a missing cask is a broken release, not
+          # a step to skip.
+          [ -f "$CASK" ] || { echo "::error::${CASK} does not exist; there is no package to point at ${TAG}"; exit 1; }
+
+          # Rewrite the one `<field> "<value>"` line in the cask, and prove afterwards
+          # that the line now reads exactly what it should.
           #
           # Anchored at both ends, and at *exactly two spaces* of indent. Every part of
           # that matters:
@@ -403,11 +402,11 @@ jobs:
           #     `url "...", branch: "main"` and rewrite it while leaving its trailing
           #     arguments attached — and every check below still reports success.
           #   - `[^"]*` keeps them off such a line for the same reason.
-          #   - `^  ` rather than `^ *` is what makes "top-level" mean it. A formula that
-          #     lost its own `url` but still has one inside a `resource do` block is
-          #     indented four, so `^ *` would count 1, rewrite the resource, satisfy the
-          #     postcondition, and pass `ruby -c` — publishing a formula with no
-          #     installable source. At two spaces that file fails the count guard instead.
+          #   - `^  ` rather than `^ *` is what makes "top-level" mean it. A field nested
+          #     inside an `on_arm do` block is indented four, so `^ *` would count 1,
+          #     rewrite the nested one, satisfy the postcondition, and pass `ruby -c` —
+          #     publishing a cask whose top-level field still names the previous release.
+          #     At two spaces that file fails the count guard instead.
           #
           # The count guard runs first because sed rewrites in place and cannot insert, so
           # a file that lost the line entirely must fail rather than silently ship the
@@ -415,7 +414,7 @@ jobs:
           #
           # The seds use `|` as their delimiter unescaped, so a value containing `|`,
           # `&`, or a backslash would corrupt the substitution. Every value passed here
-          # is a dotted version, a hex digest, or a GitHub release URL; none can.
+          # is a dotted version or a hex digest; neither can.
           #
           # `expect_line` is separate because the cask's `url` is asserted but never
           # rewritten. `git diff --cached --quiet` below cannot tell "already correct"
@@ -434,34 +433,21 @@ jobs:
             expect_line "$file" "${field} \"${value}\""
           }
 
-          # The formula names the tag in its url. The cask names it through
-          # `v#{version}`, so its url line is never rewritten and must never match the
-          # `url` guard above — which it would, harmlessly, if this ever called
-          # `rewrite "$CASK" url ...`. It does not.
-          rewrite "$FORMULA" url "https://github.com/${{ github.repository }}/releases/download/${TAG}/lumi-darwin-arm64.tar.gz"
-          rewrite "$FORMULA" sha256 "${{ steps.sha256.outputs.archive }}"
-          cat "$FORMULA"
-
-          if [ ! -f "$CASK" ]; then
-            # The first cask is written by hand, after the first release that carries
-            # lumi-macos-arm64.zip — a cask committed ahead of its asset points the tap at
-            # a 404. docs/release.md holds the file to commit and the procedure.
-            echo "::notice::${CASK} does not exist yet; skipping the cask update"
-            exit 0
-          fi
           rewrite "$CASK" version "${VERSION}"
           rewrite "$CASK" sha256 "${{ steps.sha256.outputs.app }}"
-          # The url is left alone, so assert it still resolves to this tag through the
-          # version that was just written. Rewriting `version` is what moves the cask's
-          # download; if that interpolation is ever flattened to a literal, this job goes
-          # on reporting success while the cask serves the previous release forever.
+          # The cask names the tag through `v#{version}`, so its url line is never
+          # rewritten and must never match the `url` guard above — which it would,
+          # harmlessly, if this ever called `rewrite "$CASK" url ...`. It does not.
+          # Assert instead that the url still resolves to this tag through the version
+          # that was just written. Rewriting `version` is what moves the cask's download;
+          # if that interpolation is ever flattened to a literal, this job goes on
+          # reporting success while the cask serves the previous release forever.
           expect_line "$CASK" 'url "https://github.com/${{ github.repository }}/releases/download/v#{version}/lumi-macos-arm64.zip"'
           [ "v${VERSION}" = "${TAG}" ] || { echo "::error::v${VERSION} is not the release tag ${TAG}"; exit 1; }
-          # Ruby parses both files, which is the check that catches a value with a quote
-          # or a backslash in it. `brew audit --cask --strict` is the fuller check and is
-          # a macOS-only, maintainer-run step — casks cannot be audited on Linux, and
+          # Ruby parses the file, which is the check that catches a value with a quote or
+          # a backslash in it. `brew audit --cask --strict` is the fuller check and is a
+          # macOS-only, maintainer-run step — casks cannot be audited on Linux, and
           # `--signing`/`--new` must not be used while the bundle is un-notarized.
-          ruby -c "$FORMULA" >/dev/null
           ruby -c "$CASK" >/dev/null
           cat "$CASK"
 
@@ -471,12 +457,9 @@ jobs:
           VERSION="${TAG#v}"
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add HomebrewFormula/lumi.rb
-          # One commit for both, so the tap never has a formula and a cask from
-          # different releases in its history.
-          if [ -f Casks/lumi.rb ]; then git add Casks/lumi.rb; fi
+          git add Casks/lumi.rb
           git diff --cached --quiet && echo "No changes to commit" && exit 0
-          git commit -m "chore: update Homebrew packages to ${VERSION}"
+          git commit -m "chore: update Homebrew cask to ${VERSION}"
           # main can move underneath us between the checkout and here; rebase rather than
           # fail the release on a non-fast-forward push.
           git pull --rebase origin main
