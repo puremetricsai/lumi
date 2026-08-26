@@ -14,8 +14,8 @@
 # gives the bundle a stable requirement and adds the Hardened Runtime and a
 # secure timestamp that notarization needs — see docs/release.md.
 #
-# `build-app.sh --self-test` asserts the two decisions this script makes from
-# that one variable, without building anything.
+# `build-app.sh --self-test` asserts the decisions this script makes from that
+# one variable, without building anything.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -25,6 +25,9 @@ APP="$BUILD/Lumi.app"
 CONTENTS="$APP/Contents"
 
 CODESIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
+
+# Why the Hardened Runtime needs this: docs/signing-and-notarization.md, §2.
+ENTITLEMENTS="$HERE/Lumi/Resources/Lumi.entitlements"
 
 # The two version fields both come out of the one string the binary reports.
 #
@@ -49,11 +52,14 @@ normalize_version() {
 # Sets SIGN to the codesign arguments for an identity. Ad-hoc cannot carry a
 # secure timestamp and gains nothing from the Hardened Runtime; a real identity
 # needs both, because notarization rejects a bundle without them.
+# The entitlements go on both, so the signature a developer tests is the shape
+# the release ships. They are inert without the Hardened Runtime, and the
+# ad-hoc identity moves on every rebuild regardless.
 sign_args() {
   if [ "$1" = "-" ]; then
-    SIGN=(--force --sign - --timestamp=none)
+    SIGN=(--force --sign - --timestamp=none --entitlements "$ENTITLEMENTS")
   else
-    SIGN=(--force --sign "$1" --options runtime --timestamp)
+    SIGN=(--force --sign "$1" --options runtime --timestamp --entitlements "$ENTITLEMENTS")
   fi
 }
 
@@ -69,10 +75,11 @@ if [ "${1:-}" = "--self-test" ]; then
   expect "normalize_version v1.2"       "$(normalize_version v1.2)"       "1.2 1.2"
   expect "normalize_version dev"        "$(normalize_version dev)"        "dev 0.0.0"
   sign_args -
-  expect "sign_args -" "${SIGN[*]}" "--force --sign - --timestamp=none"
+  expect "sign_args -" "${SIGN[*]}" \
+    "--force --sign - --timestamp=none --entitlements $ENTITLEMENTS"
   sign_args "Developer ID Application: Example (ABCDE12345)"
   expect "sign_args <identity>" "${SIGN[*]}" \
-    "--force --sign Developer ID Application: Example (ABCDE12345) --options runtime --timestamp"
+    "--force --sign Developer ID Application: Example (ABCDE12345) --options runtime --timestamp --entitlements $ENTITLEMENTS"
   [ "$fail" -eq 0 ] && echo "--- build-app.sh self-test ok"
   exit "$fail"
 fi
@@ -146,6 +153,12 @@ codesign "${SIGN[@]}" "$CONTENTS/MacOS/LumiApp"
 codesign "${SIGN[@]}" "$APP"
 
 codesign --verify --deep --strict "$APP"
+
+# What the bundle carries, not what the arguments asked for: without the key the
+# Hardened Runtime denies the microphone silently, forever reading `not_determined`.
+codesign -d --entitlements - --xml "$APP" 2>/dev/null |
+  plutil -extract 'com\.apple\.security\.device\.audio-input' raw - 2>/dev/null |
+  grep -qx true || { echo "error: $APP lacks com.apple.security.device.audio-input" >&2; exit 1; }
 
 # Both executables must remain native arm64 binaries. This also catches the
 # case-insensitive-name collision above on a case-sensitive build volume.

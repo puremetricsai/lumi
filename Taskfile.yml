@@ -66,6 +66,7 @@ tasks:
     sources:
       - macos/Lumi/Sources/*.swift
       - macos/Lumi/Resources/Info.plist
+      - macos/Lumi/Resources/Lumi.entitlements
       - macos/build-app.sh
       - '{{.BINARY}}'
     generates:
