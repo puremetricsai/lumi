@@ -1,6 +1,6 @@
 cask "lumi" do
-  version "0.1.0"
-  sha256 "4cfcfe67dde32a6917c81d590a531893b7c4ee070aa48c33da8b3919b025b242"
+  version "0.2.0"
+  sha256 "7e8f312509bd712fcc1576ce49c0108c92d2cd56783e2d266d091ce7ee8b0057"
 
   url "https://github.com/puremetricsai/lumi/releases/download/v#{version}/lumi-macos-arm64.zip"
   name "Lumi"
