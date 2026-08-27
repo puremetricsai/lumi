@@ -39,9 +39,23 @@ release.
 | `MACOS_DEVELOPER_ID_P12_PASSWORD` | the password that `.p12` was exported with |
 | `MACOS_DEVELOPER_IDENTITY` | the identity's common name, passed to `codesign --sign` |
 
-The names say *Developer ID* while the certificate is self-signed on purpose. Getting a real
-Developer ID later is then a change of secret *values* and no change to the workflow at all —
-`.claude/commands/lumi-developer-id-signing.md` is the rest of that move.
+The names were chosen to survive the move off the interim self-signed certificate: getting a real
+Developer ID is a change of secret *values* and no change to the workflow at all.
+
+**That move has happened.** As of 2026-08-27 the three secrets hold a real
+`Developer ID Application` certificate, not the self-signed one the section below describes. Two
+consequences follow, and the first arrives on its own:
+
+- **The next release cut ships Developer-ID-signed**, which moves the designated requirement once
+  and costs every existing user their five TCC grants. This happens because the secrets changed —
+  not because notarization landed — so it needs a release note whether or not anything else is
+  ready. `.claude/commands/lumi-developer-id-signing.md` carries the detail.
+- **The release is still not notarized.** The workflow has no `notarytool` step yet; the
+  certificate is the precondition for adding one, not the thing that adds it. Until it exists,
+  `README.md`'s "not notarized yet" section stays accurate and stays put.
+
+The self-signed procedure below is kept as the record of what shipped before, and as the fallback
+if the Developer ID certificate is ever lost.
 
 Never commit the `.p12`, the password, or the exported certificate. The workflow prints neither.
 

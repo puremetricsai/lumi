@@ -61,8 +61,26 @@ Signing and notarization require a paid Apple Developer Program account ($99/yr)
 
 ---
 
-### Step 2: Create App Store Connect Team API Key
-> **Note**: `notarytool` requires an **App Store Connect Team Key** (Individual keys fail with 401).
+### Step 2: Create notarization credentials
+
+`notarytool` authenticates three ways, and the choice is not cosmetic — an App Store Connect API key
+needs App Store Connect access, which Developer Program enrollment does not by itself grant. If
+App Store Connect answers *"Your Apple Account isn't enabled for App Store Connect"*, use Step 2b;
+it needs nothing from App Store Connect at all.
+
+| Method | Flags | Needs App Store Connect |
+| :--- | :--- | :--- |
+| API key (**preferred**) | `--key` `--key-id` `--issuer` | yes |
+| Apple ID (**interim**) | `--apple-id` `--password` `--team-id` | no |
+| Keychain profile | `--keychain-profile` | wraps either of the above |
+
+Prefer the API key: it is not tied to one person's Apple ID, and
+`.claude/commands/lumi-developer-id-signing.md` names it as the target state. Step 2b is the
+workaround for a blocked account, not the destination.
+
+#### Step 2a: App Store Connect API key
+> **Note**: `--issuer` is **required for Team keys and must be omitted for Individual keys**. Passing
+> it with an Individual key is a 401. Prefer a Team key; the workflow passes `--issuer`.
 
 1. Sign in to [App Store Connect: Users and Access $\rightarrow$ Integrations $\rightarrow$ App Store Connect API](https://appstoreconnect.apple.com/access/integrations/api).
 2. Click **(+)** to generate a new key:
@@ -77,6 +95,25 @@ Signing and notarization require a paid Apple Developer Program account ($99/yr)
    base64 -i AuthKey_<KEY_ID>.p8 | pbcopy
    ```
 
+#### Step 2b: Apple ID and app-specific password
+
+Use this only when Step 2a is blocked. An app-specific password is created on the Apple ID account
+page, which every Developer Program member can reach:
+
+1. Sign in to [account.apple.com](https://account.apple.com) $\rightarrow$ **Sign-In and Security**
+   $\rightarrow$ **App-Specific Passwords**.
+2. Generate one named `Lumi Notarization`. It is shown once.
+3. The **Team ID** is the parenthesised code in the certificate name —
+   `Developer ID Application: <Team Name> (<TEAM_ID>)`.
+
+```sh
+xcrun notarytool submit lumi-submission.zip \
+  --apple-id <apple-id-email> --team-id <TEAM_ID> --password <app-specific-password> --wait
+```
+
+Revoking the password, or the person leaving the team, breaks the release. That is the reason to
+move to Step 2a once App Store Connect is reachable.
+
 ---
 
 ### Step 3: Configure GitHub Repository Secrets
@@ -90,6 +127,15 @@ Add to GitHub repository **Settings $\rightarrow$ Secrets and variables $\righta
 | `APPLE_API_KEY_P8_BASE64` | Base64-encoded `AuthKey_<KEY_ID>.p8` |
 | `APPLE_API_KEY_ID` | 10-character Key ID |
 | `APPLE_API_ISSUER_ID` | Issuer UUID |
+
+The last three are Step 2a. Having used Step 2b instead, set these three in their place, and the
+workflow's notarization step must pass the Apple ID flags rather than the API-key ones:
+
+| Secret | Value |
+| :--- | :--- |
+| `APPLE_ID` | Apple ID email the app-specific password belongs to |
+| `APPLE_APP_SPECIFIC_PASSWORD` | the app-specific password from Step 2b |
+| `APPLE_TEAM_ID` | `<TEAM_ID>`, the code in the certificate name |
 
 ---
 
