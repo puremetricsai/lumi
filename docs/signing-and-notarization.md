@@ -21,14 +21,43 @@ Signing and notarization require a paid Apple Developer Program account ($99/yr)
 2. Sign in to [Apple Developer: Certificates](https://developer.apple.com/account/resources/certificates/list).
 3. Click **(+)** $\rightarrow$ Select **Developer ID Application** (under Software) $\rightarrow$ **Continue**.
 4. Upload `.certSigningRequest` $\rightarrow$ **Generate** $\rightarrow$ Download `developerID_application.cer`.
-5. Double-click `developerID_application.cer` to install into Keychain Access.
-6. Under **My Certificates**, find:
+5. Install the certificate **into the login keychain**, the one holding the private key the CSR in
+   step 1 created. Double-clicking the `.cer` can drop it into the System keychain instead, and an
+   identity only exists when certificate and key share a keychain — so the certificate lands under
+   **Certificates** rather than **My Certificates**, *Export as .p12* is grayed out, and
+   `security find-identity -p codesigning` finds nothing to export. Import explicitly:
+   ```sh
+   security import developerID_application.cer -k ~/Library/Keychains/login.keychain-db
+   ```
+6. Install Apple's **Developer ID Certification Authority (G2)** intermediate. It is not present by
+   default, and without it the certificate reads as untrusted — Keychain Access says so, and
+   `security find-identity -p codesigning` reports the identity as `CSSMERR_TP_NOT_TRUSTED` while
+   `find-identity -v` reports `0 valid identities found`:
+   ```sh
+   curl -fsSLO https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
+   security import DeveloperIDG2CA.cer -k ~/Library/Keychains/login.keychain-db
+   ```
+7. Confirm both steps took, before going further:
+   ```sh
+   security find-identity -v -p codesigning   # lists the identity exactly once
+   ```
+   Two entries mean a stale copy in another keychain; delete that one, naming its keychain file:
+   `sudo security delete-certificate -Z <SHA-1> /Library/Keychains/System.keychain`.
+8. Under **My Certificates**, find:
    `Developer ID Application: <Team Name> (<TEAM_ID>)`
-7. Right-click certificate $\rightarrow$ **Export "Developer ID Application: ..."** as `.p12` with a password.
-8. Base64 encode for CI:
+9. Right-click certificate $\rightarrow$ **Export "Developer ID Application: ..."** as `.p12` with a password,
+   or export from the command line:
+   ```sh
+   security export -k ~/Library/Keychains/login.keychain-db -t identities -f pkcs12 -o DeveloperID.p12
+   ```
+10. Base64 encode for CI:
    ```sh
    base64 -i DeveloperID.p12 | pbcopy
    ```
+11. The first `codesign` run prompts for keychain access. Answer **Always Allow** — plain *Allow*
+   re-prompts on every signature, and `build-app.sh` makes two per build, so it stalls mid-build
+   waiting on a dialog. The non-interactive equivalent is
+   `security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k <login-password> ~/Library/Keychains/login.keychain-db`.
 
 ---
 
@@ -125,6 +154,9 @@ ditto -c -k --keepParent build/Lumi.app lumi-macos-arm64.zip
 In `.github/workflows/release-please.yml`:
 
 1. **Import Keychain & API Key**: Decode `.p12` into temporary keychain and `.p8` with mode 0600.
+   The runner's temporary keychain has the same G2 gap as a fresh Mac: unless the `.p12` carries the
+   chain, import `DeveloperIDG2CA.cer` into it after the `.p12`, or `codesign` cannot build a chain
+   to the Apple root.
 2. **Build & Sign App**: Run `CODESIGN_IDENTITY="$IDENTITY" ./macos/build-app.sh`. It signs the embedded binary and then the bundle. `Lumi.app` is the only artifact — there is nothing to sign or notarize beside it.
 3. **Notarize & Staple App**:
    - `ditto -c -k --keepParent build/Lumi.app lumi-submission.zip`
