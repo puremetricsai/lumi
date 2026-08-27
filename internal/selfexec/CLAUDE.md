@@ -21,10 +21,10 @@ the client owns it.
   `execve` leaves the current image running and intact — so the caller's correct response is to log it and
   keep serving as the build it already is.
 - **The stamp is of the *resolved* target, but the path to exec stays unresolved.** A packaged install is
-  now `/Applications/Lumi.app/Contents/MacOS/lumi`, which a cask upgrade replaces in place: no symlink is
+  now `/Applications/Lumi.app/Contents/MacOS/lumi`, which install.sh replaces wholesale: no symlink is
   involved, the stamp of the resolved target simply differs afterwards, and the two halves of this rule
-  agree trivially. The rule exists for the case where they do not. Reached through a symlink — the
-  retired `/opt/homebrew/bin/lumi`, or a developer's own — the link keeps its identity across an upgrade
+  agree trivially. The rule exists for the case where they do not. Reached through a symlink — a
+  developer's own — the link keeps its identity across an upgrade
   while the file behind it changes, so stamping the resolved target is what makes the upgrade visible at
   all, and exec'ing the unresolved path is what makes the *next* one visible too
   (`internal/mcpsetup/CLAUDE.md`). Either way it is the path `lumi mcp setup` baked into the client's

@@ -60,9 +60,9 @@ func (a *app) mcpCommand() *cobra.Command {
 				DatabasePath: paths.Database,
 				Logger:       logger,
 			}
-			// An agent holds this process for the whole session, so a `brew
-			// upgrade lumi` would otherwise keep serving the old build until the
-			// user restarted the session. Watching the binary lets the process
+			// An agent holds this process for the whole session, so an upgrade
+			// would otherwise keep serving the old build until the user restarted
+			// the session. Watching the binary lets the process
 			// replace itself in place instead. A watcher that cannot be built is
 			// not fatal: it costs the upgrade path, not the server.
 			if watcher, err := selfexec.NewWatcher(); err != nil {

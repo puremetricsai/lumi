@@ -79,11 +79,12 @@ developer's own Claude config.
   at the default root. Same bare-environment reason as `lumi mcp`, plus it makes the desired entry a pure
   function of (binary, root), which is what lets the "already configured?" check be an exact comparison. It
   deliberately does not `EvalSymlinks`: resolving can only turn a stable name into an unstable one. A
-  packaged install is `/Applications/Lumi.app/Contents/MacOS/lumi`, which a cask upgrade replaces in place,
-  and a symlinked one keeps the link's own name while its target moves every version bump.
-  Because the comparison is exact, retiring the cask's `binary` stanza was a migration: entries written
-  against the old `/opt/homebrew/bin/lumi` no longer equal the desired argv, so every client holding one
-  reports `conflict`. `--force`, scoped by `--client`, is the way through.
+  packaged install is `/Applications/Lumi.app/Contents/MacOS/lumi`, which `install.sh` replaces along with
+  the bundle around it — same path, new file — and a symlinked one keeps the link's own name while its
+  target moves every version bump.
+  Because the comparison is exact, an entry written against any other binary path no longer equals the
+  desired argv, so every client holding one reports `conflict`. `--force`, scoped by `--client`, is the
+  way through.
 - **`--client` accepts a `Target`'s own name as well as the short one.** A caller reading the JSON has only
   the target name, so accepting it is what lets `Lumi.app` replace one conflicting entry by handing back the
   `target` it was given rather than keeping a second copy of this vocabulary in Swift.

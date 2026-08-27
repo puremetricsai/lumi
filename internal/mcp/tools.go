@@ -60,8 +60,8 @@ type handlers struct {
 //
 // It exists because both kinds of skew are otherwise *silent*, which is the
 // failure mode this repository treats as the worst one. An agent holds a
-// long-lived `lumi mcp` subprocess for the whole session, so a `brew upgrade
-// lumi` leaves the old image mapped and serving old code — and every migration
+// long-lived `lumi mcp` subprocess for the whole session, so an upgrade that
+// replaces the bundle leaves the old image mapped and serving old code — and every migration
 // is additive, so an older build reading a newer file finds every column its
 // fixed SELECT names, succeeds, and returns rows missing only what the new build
 // added. Nothing errors on either path. Without this the user upgrades to get a

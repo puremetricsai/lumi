@@ -2,8 +2,8 @@
 // from, and replaces the process with the new one when that file changes.
 //
 // It exists for `lumi mcp`. An agent launches that server as a subprocess and
-// keeps it for the lifetime of the session, so a `brew upgrade lumi` that
-// replaces the file on disk changes nothing about the already-running process:
+// keeps it for the lifetime of the session, so an upgrade that replaces the
+// file on disk changes nothing about the already-running process:
 // on Unix the old image stays mapped until it exits. The user upgrades, the
 // agent keeps talking to the old build, and nothing anywhere reports it. No MCP
 // transport or protocol revision addresses this — it is process lifecycle, and
@@ -30,13 +30,13 @@ import (
 // every way a binary is installed writes a new file rather than editing one in
 // place.
 type Stamp struct {
-	// Path is the *resolved* target, which is the field that carries a
-	// Homebrew-style upgrade. A packaged install is reached through a stable
-	// symlink whose target moves every version bump
-	// (internal/mcpsetup/CLAUDE.md), so /opt/homebrew/bin/lumi keeps its own
-	// identity across an upgrade while the Cellar path it points at changes.
-	// Stamping the resolved target is what makes that upgrade visible; stamping
-	// the symlink would report no change at all.
+	// Path is the *resolved* target, which is the field that carries an
+	// upgrade reached through a symlink. The packaged install is replaced at
+	// the same path, so there the two agree; a symlinked install — a developer's own —
+	// keeps the link's identity across an upgrade while the file behind it
+	// changes (internal/mcpsetup/CLAUDE.md). Stamping the resolved target is
+	// what makes that upgrade visible; stamping the symlink would report no
+	// change at all.
 	Path    string
 	Size    int64
 	ModTime time.Time
@@ -56,11 +56,10 @@ type Watcher struct {
 // NewWatcher stamps the binary the current process was started from.
 //
 // The watched path is os.Args[0] when that is absolute, and os.Executable()
-// otherwise. The distinction matters for exactly the Homebrew case above:
+// otherwise. The distinction matters for exactly the symlinked case above:
 // `lumi mcp setup` bakes an absolute argv[0] into every client config
 // (internal/cli/CLAUDE.md), and that path is the symlink, while os.Executable()
-// reports the resolved Cellar target that an upgrade abandons rather than
-// rewrites.
+// reports the resolved target that an upgrade abandons rather than rewrites.
 func NewWatcher() (*Watcher, error) {
 	path, err := watchPath()
 	if err != nil {

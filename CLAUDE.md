@@ -13,7 +13,7 @@ or plugins.
 **`Lumi.app` (`macos/`) is the whole of the product; the Go binary is the whole of the implementation.**
 The app is a SwiftUI menu-bar shell that supervises the binary as a child process and adds nothing of its
 own. The binary is embedded at `Contents/MacOS/lumi` and is not shipped, installed, or documented
-separately — it is not a user-facing command, and nothing in `Casks/` or the release puts it on a `PATH`.
+separately — it is not a user-facing command, and neither `install.sh` nor the release puts it on a `PATH`.
 It stays a cobra command tree because that is the app's interface to it and how the pipeline is driven
 during development. The one exception a user's machine ever invokes directly is `lumi mcp`, which an MCP
 client spawns by absolute in-bundle path; that is IPC, not a command line anybody types.
@@ -104,7 +104,7 @@ changing anything there** — the rationale lives with the code it constrains, n
 - **A process serving stale code or reading a stranger's schema must say so, because neither is detectable
   from the data.** Migrations are additive, so an older build reading a newer file succeeds and returns rows
   short of whatever the new build added — no error, anywhere. The long-lived `lumi mcp` process is where this
-  actually bites: the agent holds it across the user's `brew upgrade`. `internal/mcp` reports both skews in
+  actually bites: the agent holds it across the user's upgrade. `internal/mcp` reports both skews in
   every tool's `notice` and replaces its own image to fix the first.
   → `internal/mcp/CLAUDE.md`, `internal/selfexec/CLAUDE.md`
 - **`Lumi.app` is a supervisor, never a second implementation.** It spawns the embedded `lumi` binary and
