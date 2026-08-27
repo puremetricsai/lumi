@@ -21,11 +21,14 @@ the client owns it.
   `execve` leaves the current image running and intact — so the caller's correct response is to log it and
   keep serving as the build it already is.
 - **The stamp is of the *resolved* target, but the path to exec stays unresolved.** A packaged install is
-  reached through a stable symlink whose target moves every version bump
-  (`internal/mcpsetup/CLAUDE.md`), so `/opt/homebrew/bin/lumi` keeps its own identity across an upgrade
-  while the Cellar path behind it changes. Stamping the resolved target is what makes the upgrade visible
-  at all; exec'ing the symlink is what makes the *next* upgrade visible too, and it is the path
-  `lumi mcp setup` baked into the client's config.
+  now `/Applications/Lumi.app/Contents/MacOS/lumi`, which install.sh replaces wholesale: no symlink is
+  involved, the stamp of the resolved target simply differs afterwards, and the two halves of this rule
+  agree trivially. The rule exists for the case where they do not. Reached through a symlink — a
+  developer's own — the link keeps its identity across an upgrade
+  while the file behind it changes, so stamping the resolved target is what makes the upgrade visible at
+  all, and exec'ing the unresolved path is what makes the *next* one visible too
+  (`internal/mcpsetup/CLAUDE.md`). Either way it is the path `lumi mcp setup` baked into the client's
+  config.
 - **A binary that cannot be stat'd is not a change.** The file is briefly absent mid-install, and calling
   that an upgrade would exec a path that does not exist yet — killing a working server to chase a build
   that is not there. `Changed()` returns false on any stat error; the next check picks the real upgrade up.
@@ -35,5 +38,5 @@ the client owns it.
   A relative argv[0] names nothing stable — the server's working directory is wherever the client launched
   it — so that case falls back to `os.Executable()`.
 - **The non-Unix `Exec` is a build-time stub, not a fallback.** There is no portable way to replace a
-  process image, and the alternatives do not preserve the client's pipes. The CLI refuses to run off
+  process image, and the alternatives do not preserve the client's pipes. The binary refuses to run off
   `darwin/arm64` anyway (`internal/platform`); the stub only keeps cross-compilation and vet working.

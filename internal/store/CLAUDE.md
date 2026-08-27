@@ -88,7 +88,7 @@ and `transcript.Segment` — shadow each other the way `internal/mcp`'s `Attribu
   empty expression means "run no FTS query at all" — an empty MATCH is a syntax error, not a zero-result
   search.
 - **`store.MatchAny`, `SearchOptions.RequireText`, and the `bm25(events_fts, 1.0, 0.4, 0.4)` weights are
-  reached only through `lumi mcp`** (its `match: "any"` and `require_text` parameters). No CLI command sets
+  reached only through `lumi mcp`** (its `match: "any"` and `require_text` parameters). No command sets
   them. The weights matter: without them a one-word `app` or `window` hit outranks a page of screen text.
 - **A rule about the store lives in the store.** When a caller needs to know what `Search` will do, export
   the answer and read it rather than restating it. `HasSearchableTerms` exists because `internal/mcp` had

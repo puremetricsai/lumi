@@ -1,8 +1,9 @@
 # Compression
 
-`lumi compress` re-encodes the media already on disk into smaller files, leaving every event exactly where
+Compression re-encodes the media already on disk into smaller files, leaving every event exactly where
 it is. Screenshots become HEIC, audio becomes lossless FLAC, and the database is rebuilt to return the free
-pages a prune left behind.
+pages a prune left behind. **Settings → Danger** in `Lumi.app` is where you run it; this document is the
+reference behind that tab, and the commands in it are the embedded binary as invoked during development.
 
 Compress and prune are complementary: prune decides what history to keep, compress decides how densely to
 keep it. Nothing compress does deletes an event.

@@ -30,7 +30,7 @@ func TestAlreadyRecordingErrorNamesTheOwningApp(t *testing.T) {
 	// not be told to quit an app that is not involved.
 	terminal := alreadyRecordingError(recordState{
 		PID:        99,
-		Executable: "/opt/homebrew/bin/lumi",
+		Executable: "/usr/local/bin/lumi",
 	}).Error()
 	want := "recording is already in progress (pid 99); run `lumi record stop` first"
 	if terminal != want {

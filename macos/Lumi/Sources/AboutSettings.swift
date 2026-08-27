@@ -62,16 +62,16 @@ struct AboutSettings: View {
 
             Section("Updates") {
                 // The mockup showed an "Automatic updates" toggle. The app has
-                // no updater and is not getting one: Homebrew is the update
-                // mechanism, so a second one would race it and leave the cask's
-                // record of what is installed wrong. The row keeps its shape,
-                // but it promises only what it does — it opens the releases
-                // page.
+                // no updater and is not getting one: re-running install.sh is
+                // the update mechanism, and a second one would race it while
+                // replacing the bundle this app is running from. The row keeps
+                // its shape, but it promises only what it does — it opens the
+                // releases page.
                 LabeledContent("Check for new releases") {
                     Button("Check now") { open(Self.releases) }
                         .accessibilityLabel("Open the Lumi releases page on GitHub")
                 }
-                SettingsCaption("Lumi does not update itself. Check now opens the GitHub releases page, which lists what each release changed. An install from Homebrew upgrades with brew upgrade --cask puremetricsai/lumi/lumi.")
+                SettingsCaption("Lumi does not update itself. Check now opens the GitHub releases page, which lists what each release changed. Re-run the install command from the README to upgrade.")
             }
 
             Section("Links") {

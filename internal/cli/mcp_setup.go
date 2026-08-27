@@ -218,13 +218,18 @@ func (a *app) runMCPSetup(cmd *cobra.Command, f mcpSetupFlags) error {
 }
 
 // parseClientSelection maps --client onto the target set.
+//
+// A `Target`'s own name is accepted alongside the short one, because it is the
+// only client name a caller reading the JSON has: Lumi.app hands the `target` it
+// was given straight back rather than keeping a second copy of this vocabulary in
+// Swift. A fourth client needs both of its names here.
 func parseClientSelection(value string) (clientSelection, error) {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "all":
 		return clientSelection{code: true, desktop: true, codex: true}, nil
-	case "code":
+	case "code", "claude-code":
 		return clientSelection{code: true, explicit: true}, nil
-	case "desktop":
+	case "desktop", "claude-desktop":
 		return clientSelection{desktop: true, explicit: true}, nil
 	case "codex":
 		return clientSelection{codex: true, explicit: true}, nil
@@ -236,10 +241,13 @@ func parseClientSelection(value string) (clientSelection, error) {
 
 // lumiBinaryPath resolves the binary to configure.
 //
-// Deliberately no filepath.EvalSymlinks. A packaged install is reached through
-// a stable symlink — /opt/homebrew/bin/lumi — whose target moves on every
-// version bump, so resolving it would write an entry that breaks at the next
-// upgrade. The symlink is the durable name.
+// Deliberately no filepath.EvalSymlinks: the durable name is whatever path this
+// process was reached through, and resolving one can only make it less stable. A
+// packaged install is /Applications/Lumi.app/Contents/MacOS/lumi, a real file
+// that install.sh replaces along with the bundle around it — same path, new
+// file — so there is nothing to resolve today. Reached through a symlink
+// instead — a developer's own, whose target moves every version bump — the
+// link is the name that survives.
 func lumiBinaryPath() (string, error) {
 	exe, err := resolveLumiBinary()
 	if err != nil {

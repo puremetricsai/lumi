@@ -5,7 +5,9 @@
       "changelog-path": "CHANGELOG.md",
       "initial-version": "0.1.0",
       "bump-minor-pre-major": true,
-      "bump-patch-for-minor-pre-major": false
+      "bump-patch-for-minor-pre-major": false,
+      "draft": true,
+      "force-tag-creation": true
     }
   },
   "last-release-sha": "7b03b29d40ea062b4b62d9ea3bbcb921ea08ad99",

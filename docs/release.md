@@ -1,29 +1,37 @@
 # Releasing Lumi
 
 `.github/workflows/release-please.yml` is the whole release. A push to `main` with a releasable
-commit opens a release PR; merging it cuts the tag, and the rest of the workflow builds, signs,
-publishes, verifies, and then updates the Homebrew cask in this repository.
+commit opens a release PR; merging it cuts a **draft** release, and the rest of the workflow builds,
+signs, uploads, verifies, and only then publishes it.
 
-The tap serves exactly one package, `Casks/lumi.rb`. It installs `/Applications/Lumi.app` **and**
-the `lumi` CLI the bundle embeds, from `lumi-macos-arm64.zip`, and macOS quarantines it until the
-app is notarized. There was a `HomebrewFormula/lumi.rb` carrying the CLI alone through `v0.7.0`;
-it was removed because both packages provided a `lumi` command at the same path and Homebrew
-refuses to link the second one, so the two could never be installed together. `README.md` carries
-the migration for anyone still on it.
+The release carries one asset that users install, `lumi-macos-arm64.zip`, and `install.sh` at the
+repository root is what installs it: it resolves `releases/latest/download/`, so nothing has to be
+rewritten per release.
 
-The release still publishes `lumi-darwin-arm64.tar.gz` — the bare CLI plus the licence — for people
-who want the binary without the app. Nothing in the tap consumes it; it is a manual download.
+**The draft is what keeps a failed release away from users, and it is the only thing that does.**
+GitHub's `latest` skips drafts, so it stays on the previous release for the whole build and forever
+if the build fails. Published at cut instead — release-please's default — `latest` would move to an
+assetless release seconds after the merge and every install would 404 until the assets landed.
+`draft: true` in `release-please-config.json` and the `publish-release` job are what enforce it.
 
-The cask is rewritten only after the release's assets exist and have been verified, so a failed
-release leaves it pointing at the last working one — that is the intent, not an accident. See the
-comment block on `update-homebrew-packages` for the recovery,
-which is *not* a fresh run: use GitHub's **Re-run failed jobs** on the same run, because
-release-please will not re-cut a version whose release already exists.
+`force-tag-creation: true` sits beside it and is not optional company. GitHub does not create a git
+tag for a draft until it is published, and release-please finds the previous release by its tag — so
+a release that failed before `publish-release` would leave a draft the next run cannot see, and that
+run would regenerate the changelog from the release before it. The option tags at cut instead. A
+bare tag does not move `latest`, so it costs the draft gate nothing.
+
+**The release publishes one archive, and the embedded binary is not one of them.** `Lumi.app` is the
+whole product; the binary inside it is an implementation detail of the bundle. Nothing should
+reintroduce a second published artifact, or a second install channel, without deciding again that
+Lumi has two front doors.
 
 ## Repository secrets
 
-All three are optional. With none of them set the release still ships and `Lumi.app` is ad-hoc
-signed; the workflow logs a warning saying so. Set them together or not at all.
+All three are required, and the release fails without them. An ad-hoc signature has a fresh
+designated requirement every build, so shipping one would cost every existing user their TCC
+grants — which is the opposite of what `README.md` promises them. `build-binaries` refuses rather
+than letting that through, which leaves the draft unpublished and everyone on the previous
+release.
 
 | Secret | What it holds |
 | --- | --- |
@@ -40,8 +48,10 @@ Never commit the `.p12`, the password, or the exported certificate. The workflow
 ## Why the release is signed at all, before notarization is possible
 
 Signing and notarization need a paid Apple Developer account. Until one exists the app cannot be
-notarized, and there is no way to opt out of quarantine: `--no-quarantine` no longer exists,
-no cask stanza replaced it, and `Cask::Download#quarantine` runs unconditionally.
+notarized. `install.sh` sidesteps the consequence rather than fixing it — `curl` never writes
+`com.apple.quarantine`, so Gatekeeper does not gate the first launch — but that only covers the
+supported install path. A browser download of the same ZIP is quarantined and dies as measured
+below.
 
 What one stable certificate still buys, against ad-hoc signing:
 
@@ -49,12 +59,15 @@ What one stable certificate still buys, against ad-hoc signing:
 | --- | --- | --- |
 | Designated requirement | the cdhash, new on every build | `certificate leaf = H"…"`, stable |
 | TCC grants across an upgrade | all five lost, every release | survive |
-| Gatekeeper "Open Anyway" | every upgrade | first install only |
+| `install.sh` signature check | passes either way | passes either way |
 
-So configure the secrets **before cutting the first cask release**, not after. A bootstrap release
-that ships ad-hoc and a second one that ships self-signed differ in designated requirement, which is
-`:signer_changed` to Homebrew and a new identity to TCC: every early user loses their permissions and
-re-approves, once, for nothing.
+The last row is the reason the workflow gates on the secret rather than leaving it to
+`install.sh`: the script runs `codesign --verify --strict`, which an ad-hoc bundle passes. What it
+cannot see is that the identity changed since the release before it.
+
+So configure the secrets **before the first release anyone installs**, not after. A release that
+ships ad-hoc and a later one that ships self-signed differ in designated requirement, which is a new
+identity to TCC: every early user loses their permissions and re-approves, once, for nothing.
 
 ## Creating the interim self-signed certificate
 
@@ -87,131 +100,49 @@ certificate `codesign` then signs with perfectly well, because "valid" there mea
 Rotating the certificate costs every user their TCC grants and one more Open Anyway, exactly as
 moving to Developer ID will. Keep the `.p12` somewhere you will still have it in a year.
 
-## Bootstrapping the cask
+## Installing what was released
 
-`Casks/lumi.rb` is committed **after** the first release that carries `lumi-macos-arm64.zip`, and
-by hand. The cask's `url` resolves through `v#{version}`, so a cask committed before its asset
-exists points the tap at a 404 for every user until the next release, and the reason
-`update-homebrew-packages` runs after the assets are published rather than before.
-`update-homebrew-packages` maintains the file from the *following* release onward and never authors
-the first one. It no longer skips when the file is absent: the cask is the only package the tap
-ships, so a missing `Casks/lumi.rb` now fails that job rather than letting a release report success
-while pointing users at nothing.
+`install.sh` at the repository root is the only install channel. It gates on `arm64` and macOS 26,
+downloads `releases/latest/download/lumi-macos-arm64.zip`, extracts it with `ditto` (not `unzip`,
+which drops the extended attributes the signature is sealed over), verifies the signature, and moves
+`Lumi.app` into `/Applications`.
 
-No published release can serve it retroactively. Every release through `v0.5.0` carries only
-`lumi-darwin-arm64.tar.gz` and `SHA256SUMS.txt`, and that tarball is the bare CLI binary plus the
-licence — there is no bundle in it, and a cask may not build from source.
+`/Applications` is not a free choice. MCP registration writes the absolute in-bundle path into every
+client's config, and TCC keys its grants on path and signature together, so an install elsewhere
+costs users both.
 
-0. Know that `README.md` already documents `brew install --cask puremetricsai/lumi/lumi`. It ships
-   with the workflow that produces the asset, one release ahead of the cask that serves it, so
-   between that merge and step 5 below the command fails with "Cask 'lumi' is unavailable". Keep the
-   gap to one release.
-1. Set the three secrets above. `build-binaries` refuses to run un-signed once `Casks/lumi.rb`
-   exists, so this is a precondition of step 5 and not only of step 2.
-2. Merge the release PR. Confirm the release carries `lumi-darwin-arm64.tar.gz`,
-   `lumi-macos-arm64.zip`, and `SHA256SUMS.txt`, and that `verify-macos-app` passed.
-3. Take the ZIP's hash from `SHA256SUMS.txt` and write `Casks/lumi.rb` from the template below,
-   with that release's numeric version and that hash.
-4. Check it before committing, on macOS. `--strict` alone does not run either of these. Homebrew 6
-   refuses a cask outside a tap and has disabled `brew audit` on a path, so copy the candidate into
-   the tap clone and check it there by name:
+It carries no version and no digest, so no release step rewrites it. What a release *does* move is
+the `latest` pointer the script resolves, which is why `publish-release` runs last. The digest is the
+one deliberate omission: the script is fetched over TLS from the same
+origin that serves the asset, so a pinned hash would add no trust the transport does not already
+carry, and `ditto` fails on a truncated archive anyway.
 
-   ```sh
-   TAP="$(brew --repository puremetricsai/lumi)"
-   mkdir -p "${TAP}/Casks" && cp Casks/lumi.rb "${TAP}/Casks/lumi.rb"
-   brew style --cask "${TAP}/Casks/lumi.rb"      # desc, stanza order, deprecated depends_on forms
-   brew audit --cask --strict puremetricsai/lumi/lumi
-   rm "${TAP}/Casks/lumi.rb"                     # let the push, not the copy, serve it
-   ```
+### What quarantine still costs
 
-   Do **not** pass `--signing` or `--new`. Those are the flags that turn on `audit_signing`, which
-   fails by design on an un-notarized bundle.
-5. Commit it, then run the measurement below.
+Measured on macOS 26.5.2, and the reason the install command is a `curl` pipe rather than a link to
+the ZIP: a quarantined, never-executed, non-notarized Mach-O is **killed with SIGKILL and no prompt
+at all** — exit 137, no output, `syspolicyd: Terminating process due to Gatekeeper rejection`.
+Quarantine is written to every file inside the bundle, so it reaches the binary the app spawns as
+well as the app itself.
 
-### The file to commit
-
-```ruby
-cask "lumi" do
-  version "0.6.0"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
-
-  url "https://github.com/puremetricsai/lumi/releases/download/v#{version}/lumi-macos-arm64.zip"
-  name "Lumi"
-  desc "Local-first searchable memory of your screen and meetings"
-  homepage "https://github.com/puremetricsai/lumi"
-
-  depends_on arch: :arm64
-  depends_on macos: :tahoe
-
-  app "Lumi.app"
-  binary "#{appdir}/Lumi.app/Contents/MacOS/lumi"
-
-  caveats <<~EOS
-    Lumi is not notarized yet, so macOS quarantines it. Open Lumi once from
-    Finder, then allow it in System Settings > Privacy & Security > Open Anyway.
-    If the `lumi` command reports "Killed: 9", the same approval has not reached
-    the embedded binary; clear it with:
-
-      xattr -dr com.apple.quarantine #{appdir}/Lumi.app
-
-    Then grant capture permissions to the installed binary:
-
-      lumi permissions --request
-      lumi doctor
-
-    Approve Screen & System Audio Recording, Accessibility, Microphone, and
-    Speech Recognition in System Settings > Privacy & Security.
-  EOS
-end
-```
-
-Two of its lines look like free choices and are not, because `brew audit` passes either way and only
-`brew style` objects:
-
-- **`depends_on macos: :tahoe`**, not `">= :tahoe"`. The symbol form already means `>=`. The string
-  form parses but calls `odeprecated`, which *raises* under `HOMEBREW_DEVELOPER=1`.
-- **`desc` may not name the platform.** `Cask/Desc` rejects `Mac`, `macOS`, and `OS X` anywhere in
-  the string, so "…for your Mac" fails style while passing audit.
-
-And one absence is deliberate: no `zap`, no `uninstall`, no `postflight`, no `auto_updates`.
-Uninstall unlinks the binary on its own and leaves `~/Library/Application Support/Lumi` alone, which
-is the point — uninstalling software must never delete captured media or the database. Homebrew owns
-upgrades; the app has no updater and is not getting one.
-
-### Measure the bootstrap release
-
-Quarantine has a measured consequence that no amount of caveat wording removes, so find out which
-half of it applies before the second release. On a clean Apple Silicon macOS 26 machine:
-
-```sh
-brew tap puremetricsai/lumi https://github.com/puremetricsai/lumi
-brew install --cask puremetricsai/lumi/lumi
-lumi version            # count what happens: output, a prompt, or "Killed: 9"
-# then Open Anyway in System Settings, and:
-lumi version            # count again
-```
-
-A quarantined, never-executed, non-notarized Mach-O is **killed with SIGKILL and no prompt at all**
-— measured on macOS 26.5.2, exit 137, no output, `syspolicyd: Terminating process due to Gatekeeper
-rejection`. That is the app's first launch, and it is also `lumi` run from a terminal, because
-quarantine is written to every file inside the bundle and the cask's `lumi` command is a symlink
-into it. What is *not* yet measured is whether approving the app in System Settings also clears the
-nested binary. Record the answer here and fix the caveat to match.
-
-Then, on the release after it, check the thing only a second release can show: that a cask upgrade
-keeps the designated requirement stable, so the TCC grants and the Gatekeeper approval both survive.
+`curl` writes only `com.apple.provenance`, never `com.apple.quarantine`, so none of that happens on
+the supported path. A browser download of the same asset gets all of it, which is what `README.md`
+documents the recovery for.
 
 ## Recovery
 
-- **The build, signing, upload, or either verification job failed.** The cask still points at the
-  previous release, and users are unaffected. Fix forward, or use **Re-run failed
-  jobs** on the same run for a transient failure. Do not push a fresh run expecting it to republish:
-  release-please sets `release_created` to false for a version whose release exists, and every job
-  downstream of it is skipped.
-- **The release published but `update-homebrew-packages` failed.** The assets are good; only the tap
-  is stale. Re-run that job.
-- **`Casks/lumi.rb`'s `version` and `sha256` disagree with the latest tag.** A hand edit landed
-  between releases. The next release rewrites both.
-- **`Casks/lumi.rb` points at a tag with no `lumi-macos-arm64.zip`.** Every `brew install --cask`
-  404s, and that is every install Lumi has. Revert the cask to the previous release's version and
-  sha256 by hand.
+- **The build, signing, upload, or either verification job failed.** The release is still a draft,
+  `latest` still names the previous one, and users are unaffected — there is nothing to roll back.
+  Fix forward, or use **Re-run failed jobs** on the same run for a transient failure. Do not push a
+  fresh run expecting it to republish: release-please sets `release_created` to false for a version
+  whose release exists, and every job downstream of it is skipped.
+- **Everything passed but `publish-release` failed.** The assets are good and verified; only the
+  draft is unpublished. Re-run that job, or publish by hand:
+  `gh release edit "$TAG" --draft=false --latest`.
+- **A published release is missing `lumi-macos-arm64.zip`.** `upload-release-assets` fails rather
+  than letting one through, so this needs a hand-deleted asset to reach. Re-upload it to the same
+  tag; until then every `install.sh` run 404s.
+- **The signing secrets are missing.** `build-binaries` fails at *Import the release signing
+  identity* before anything is built. Set all three and re-run the job; nothing shipped, so there is
+  nothing to undo. Rotating the certificate to a *different* one later is what costs every user
+  their TCC grants once, and that is a decision to make deliberately.

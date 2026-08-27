@@ -1,5 +1,4 @@
 import AppKit
-import Darwin
 import SwiftUI
 
 @main
@@ -52,7 +51,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 await recorder.start()
             }
             updateStatusItem()
-            await offerCommandLineInstallIfNeeded()
         }
 
         // Re-check on activation so a grant made in System Settings clears
@@ -65,107 +63,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.updateStatusItem()
             }
         }
-    }
-
-    // MARK: - Command-line install
-
-    /// On first launch, offer the bundled CLI at the first writable directory
-    /// on the user's login-shell PATH. An existing `lumi` already satisfies the
-    /// command-line install, and is never replaced.
-    private func offerCommandLineInstallIfNeeded() async {
-        let defaults = UserDefaults.standard
-        let key = "lumi.commandLineInstallOffered"
-        guard !defaults.bool(forKey: key) else { return }
-
-        let (destination, commandExists) = await Self.commandLineDestination()
-        if commandExists {
-            defaults.set(true, forKey: key)
-            return
-        }
-        guard let destination else { return }
-
-        let alert = NSAlert()
-        alert.messageText = "Install the lumi command?"
-        alert.informativeText = "Lumi can create this symlink so you can use the bundled CLI from Terminal:\n\n\(destination.path) → \(LumiCLI.executableURL.path)"
-        alert.addButton(withTitle: "Install")
-        alert.addButton(withTitle: "Don’t Install")
-        NSApp.activate(ignoringOtherApps: true)
-
-        guard alert.runModal() == .alertFirstButtonReturn else {
-            defaults.set(true, forKey: key)
-            return
-        }
-
-        do {
-            try FileManager.default.createSymbolicLink(
-                at: destination, withDestinationURL: LumiCLI.executableURL)
-            defaults.set(true, forKey: key)
-        } catch {
-            let failure = NSAlert(error: error)
-            failure.messageText = "Could not install the lumi command"
-            failure.informativeText = error.localizedDescription
-            failure.runModal()
-        }
-    }
-
-    /// A Finder-launched app does not inherit the shell's PATH, so ask the
-    /// user's login shell rather than guessing /usr/local/bin or Homebrew's
-    /// prefix. The first writable entry wins; an existing executable wins over
-    /// all of them because replacing a standalone CLI would be destructive.
-    private nonisolated static func commandLineDestination() async -> (URL?, Bool) {
-        await Task.detached(priority: .utility) {
-            let shell = ProcessInfo.processInfo.environment["SHELL"]
-                ?? getpwuid(getuid()).map { String(cString: $0.pointee.pw_shell) }
-                ?? "/bin/zsh"
-            let marker = "__LUMI_PATH__"
-            let process = Process()
-            let output = Pipe()
-            process.executableURL = URL(fileURLWithPath: shell)
-            let shellName = URL(fileURLWithPath: shell).lastPathComponent
-            let isCsh = ["csh", "tcsh"].contains(shellName)
-            let printPath: String
-            if shellName == "fish" {
-                printPath = "printf '\\n\(marker)%s\\n' (string join : $PATH)"
-            } else if isCsh {
-                printPath = "if ( -r ~/.login ) source ~/.login; printf '\\n\(marker)%s\\n' \"$PATH\""
-            } else {
-                printPath = "printf '\\n\(marker)%s\\n' \"$PATH\""
-            }
-            process.arguments = [isCsh ? "-ic" : "-lic", printPath]
-            process.standardOutput = output
-            process.standardError = FileHandle.nullDevice
-            process.standardInput = FileHandle.nullDevice
-            do {
-                try process.run()
-            } catch {
-                return (nil, false)
-            }
-
-            let data = output.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
-            let text = String(decoding: data, as: UTF8.self)
-            guard let mark = text.range(of: marker, options: .backwards) else { return (nil, false) }
-            let path = text[mark.upperBound...].split(whereSeparator: \Character.isNewline).first ?? ""
-            let directories = path.split(separator: ":").map(String.init)
-            let files = FileManager.default
-
-            if directories.contains(where: {
-                files.isExecutableFile(atPath: URL(fileURLWithPath: $0).appendingPathComponent("lumi").path)
-            }) {
-                return (nil, true)
-            }
-
-            for directory in directories {
-                var isDirectory: ObjCBool = false
-                let destination = URL(fileURLWithPath: directory).appendingPathComponent("lumi")
-                guard files.fileExists(atPath: directory, isDirectory: &isDirectory),
-                      isDirectory.boolValue,
-                      files.isWritableFile(atPath: directory),
-                      (try? files.attributesOfItem(atPath: destination.path)) == nil else { continue }
-                return (destination, false)
-            }
-            return (nil, false)
-        }.value
     }
 
     /// Closing the last window must not quit: capture continues with everything

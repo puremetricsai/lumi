@@ -376,6 +376,7 @@ func TestParseClientSelection(t *testing.T) {
 		"case insensive": {value: "Codex", want: clientSelection{codex: true, explicit: true}},
 		"padded":         {value: " all ", want: clientSelection{code: true, desktop: true, codex: true}},
 		"unknown":        {value: "cursor", wantErr: true},
+		"target name":    {value: "claude-desktop", want: clientSelection{desktop: true, explicit: true}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -391,6 +392,42 @@ func TestParseClientSelection(t *testing.T) {
 			}
 			if got != tc.want {
 				t.Errorf("parseClientSelection(%q) = %+v, want %+v", tc.value, got, tc.want)
+			}
+		})
+	}
+}
+
+// Every `Target` name is a --client value selecting exactly that client. The
+// names are the only client vocabulary a caller reading the JSON has: Lumi.app's
+// MCP tab replaces one conflicting entry by handing the `target` it was given
+// straight back to --client, so a target whose own name this flag rejects would
+// make that button fail for that client alone. Derived from
+// defaultSetupTargets rather than listed, so a fourth client is covered here the
+// moment it is added — and fails this test until parseClientSelection knows its
+// name.
+func TestEveryTargetNameIsAClientValue(t *testing.T) {
+	t.Parallel()
+	all, err := parseClientSelection("all")
+	if err != nil {
+		t.Fatalf("parseClientSelection: %v", err)
+	}
+	for _, target := range defaultSetupTargets(all) {
+		name := target.Name()
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			sel, err := parseClientSelection(name)
+			if err != nil {
+				t.Fatalf("parseClientSelection(%q): %v", name, err)
+			}
+			if !sel.explicit {
+				t.Errorf("--client %q did not name a specific client: %+v", name, sel)
+			}
+			var selected []string
+			for _, got := range defaultSetupTargets(sel) {
+				selected = append(selected, got.Name())
+			}
+			if !slices.Equal(selected, []string{name}) {
+				t.Errorf("--client %q selected %v, want only %q", name, selected, name)
 			}
 		})
 	}
@@ -463,7 +500,6 @@ func TestIsTemporaryBinary(t *testing.T) {
 		"go run build cache": {filepath.Join(os.TempDir(), "go-build42", "b001", "exe", "lumi"), true},
 		"go-build anywhere":  {"/var/somewhere/go-build999/lumi", true},
 		"installed":          {"/usr/local/bin/lumi", false},
-		"homebrew":           {"/opt/homebrew/bin/lumi", false},
 		"repo checkout":      {"/Users/someone/Projects/lumi/lumi", false},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -552,7 +588,7 @@ func TestMCPSetupJSONPrintsThePayloadEvenWhenItFails(t *testing.T) {
 		result: mcpsetup.Result{
 			Status:  mcpsetup.StatusConflict,
 			Detail:  "an entry with different settings already exists",
-			Current: "/opt/homebrew/bin/lumi mcp",
+			Current: "/usr/local/bin/lumi mcp",
 		},
 		err: errors.New("refusing to overwrite"),
 	}
@@ -569,7 +605,7 @@ func TestMCPSetupJSONPrintsThePayloadEvenWhenItFails(t *testing.T) {
 	if len(report.Results) != 1 || report.Results[0].Status != mcpsetup.StatusConflict {
 		t.Fatalf("report does not describe the conflict: %+v", report)
 	}
-	if report.Results[0].Current != "/opt/homebrew/bin/lumi mcp" {
+	if report.Results[0].Current != "/usr/local/bin/lumi mcp" {
 		t.Errorf("current = %q, want the existing entry", report.Results[0].Current)
 	}
 	if report.DryRun {

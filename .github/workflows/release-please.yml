@@ -45,9 +45,8 @@ jobs:
           SDK_VERSION="$(xcrun --sdk macosx --show-sdk-version)"
           echo "macOS SDK ${SDK_VERSION}"
           # Compare the major numerically rather than enumerating majors: an allowlist
-          # rejects a future SDK that satisfies the rule this message states, and
-          # build-binaries is the only job gated on release_created, so failing here
-          # leaves a tag and a GitHub release with no assets attached.
+          # rejects a future SDK that satisfies the rule this message states. Failing
+          # here is safe — the release is still a draft, so `latest` never moves.
           SDK_MAJOR="${SDK_VERSION%%.*}"
           case "${SDK_MAJOR}" in
             ''|*[!0-9]*) echo "::error::could not parse a major version out of the macOS SDK version '${SDK_VERSION}'"; exit 1 ;;
@@ -72,17 +71,13 @@ jobs:
           # tag rather than the 0.1.0-dev default.
           ACTUAL="$(./lumi version)"
           [ "${ACTUAL}" = "${TAG}" ] || { echo "::error::lumi version printed '${ACTUAL}', expected '${TAG}'"; exit 1; }
-      - name: Archive binary
-        run: tar -czf lumi-darwin-arm64.tar.gz lumi LICENSE
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: lumi-darwin-arm64.tar.gz
-          path: lumi-darwin-arm64.tar.gz
-          retention-days: 1
-
+      # The binary is not published on its own. Lumi.app is the whole product, and
+      # this build is its engine: it is embedded in the bundle below rather than
+      # shipped beside it.
+      #
       # Lumi.app is built around the binary the steps above produced and verified,
-      # never around a second one: the app and the CLI it embeds are one version by
-      # construction, not by two builds agreeing.
+      # never around a second one: the app and the binary it embeds are one version
+      # by construction, not by two builds agreeing.
       - name: Import the release signing identity
         env:
           P12_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_P12_BASE64 }}
@@ -90,24 +85,19 @@ jobs:
           IDENTITY: ${{ secrets.MACOS_DEVELOPER_IDENTITY }}
         run: |
           set -euo pipefail
-          # A secret cannot be read in a job- or step-level `if:`, so the branch lives
-          # in the script. With no certificate configured the release still ships and
-          # the bundle is ad-hoc signed; docs/release.md is what that costs the people
-          # installing it, and why it should be configured before the first cask
-          # release rather than after.
+          # A secret cannot be read in a job- or step-level `if:`, so the check lives
+          # in the script. The certificate is required, not optional: install.sh serves
+          # the release to users, and README.md tells them their TCC grants survive an
+          # upgrade — which is true of a stable certificate and false of an ad-hoc
+          # signature, whose designated requirement is a fresh hash every build. So the
+          # promise is enforced where it is made rather than left to a maintainer
+          # remembering docs/release.md. install.sh also verifies the signature it
+          # downloads, which an ad-hoc bundle would still pass; what it cannot see is
+          # that the identity changed since the last release. Failing here leaves the
+          # draft unpublished and every user on the previous release.
           if [ -z "${P12_BASE64}" ]; then
-            # Before the cask exists, an ad-hoc bundle reaches nobody and the release
-            # ships. Once it exists it does reach people, and README.md tells them their
-            # Gatekeeper approval and TCC grants survive upgrades — which is true of a
-            # stable certificate and false of an ad-hoc signature, whose designated
-            # requirement is a fresh hash every build. So the promise is enforced where
-            # it is made rather than left to a maintainer remembering docs/release.md.
-            if [ -f Casks/lumi.rb ]; then
-              echo "::error::Casks/lumi.rb ships Lumi.app to users, but no signing certificate is configured. Set MACOS_DEVELOPER_ID_P12_BASE64, MACOS_DEVELOPER_ID_P12_PASSWORD and MACOS_DEVELOPER_IDENTITY (docs/release.md), or an ad-hoc release will cost every user their permissions."
-              exit 1
-            fi
-            echo "::warning::no signing certificate configured; Lumi.app will be ad-hoc signed"
-            exit 0
+            echo "::error::install.sh ships Lumi.app to users, but no signing certificate is configured. Set MACOS_DEVELOPER_ID_P12_BASE64, MACOS_DEVELOPER_ID_P12_PASSWORD and MACOS_DEVELOPER_IDENTITY (docs/release.md), or an ad-hoc release will cost every user their permissions."
+            exit 1
           fi
           [ -n "${IDENTITY}" ] || { echo "::error::MACOS_DEVELOPER_ID_P12_BASE64 is set but MACOS_DEVELOPER_IDENTITY is not"; exit 1; }
           KEYCHAIN="${RUNNER_TEMP}/lumi-signing.keychain-db"
@@ -136,8 +126,9 @@ jobs:
 
       - name: Build Lumi.app
         env:
-          # Empty when no identity is configured, which build-app.sh resolves to
-          # ad-hoc — the same path `task app` takes locally.
+          # Never empty here: the step above fails the job when it is. build-app.sh
+          # still resolves an empty value to ad-hoc, which is the path `task app`
+          # takes locally.
           CODESIGN_IDENTITY: ${{ secrets.MACOS_DEVELOPER_IDENTITY }}
         run: ./macos/build-app.sh
 
@@ -150,7 +141,7 @@ jobs:
           # The bundle states the version twice and both must agree with the tag, in
           # the two spellings that are correct for them: the CLI prints the tag it was
           # linked with, and CFBundleShortVersionString is that tag without its `v`,
-          # which is also what the cask's `version` field carries.
+          # which is also what verify-macos-app re-checks after publication.
           ACTUAL="$("${APP}/Contents/MacOS/lumi" version)"
           [ "${ACTUAL}" = "${TAG}" ] || { echo "::error::the embedded lumi reports '${ACTUAL}', expected '${TAG}'"; exit 1; }
           SHORT="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "${APP}/Contents/Info.plist")"
@@ -167,7 +158,7 @@ jobs:
 
       # ditto, not zip: it preserves the extended attributes, symlinks, and resource
       # forks a signed bundle is sealed over, and --keepParent keeps Lumi.app itself
-      # as the archive's top-level entry, which is what the cask's `app` stanza names.
+      # as the archive's top-level entry, which is what install.sh moves into place.
       - name: Archive Lumi.app
         run: /usr/bin/ditto -c -k --keepParent build/Lumi.app lumi-macos-arm64.zip
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
@@ -207,22 +198,19 @@ jobs:
           set -euo pipefail
           TAG="${{ needs.release-please.outputs.tag_name }}"
           cd artifacts
-          # Named, not globbed. A release is incomplete unless it carries both, and a
-          # glob cannot tell "the app job produced nothing" from "there is nothing to
-          # produce" -- it would publish a CLI-only release and call it a success.
-          # These same two names are what verify-release checks for and what
-          # SHA256SUMS.txt lists; update-homebrew-packages looks the zip up in it. The
-          # tarball feeds no package -- the cask ships the CLI inside Lumi.app -- and is
-          # published as the manual download for people who want the binary alone.
-          ARCHIVES=(lumi-darwin-arm64.tar.gz lumi-macos-arm64.zip)
+          # Named, not globbed. A glob cannot tell "the app job produced nothing" from
+          # "there is nothing to produce" -- it would publish an assetless release and
+          # call it a success. This name is what verify-release checks for and what
+          # SHA256SUMS.txt lists.
+          # The list is one entry because Lumi.app is the whole product: the binary it
+          # embeds is not published separately.
+          ARCHIVES=(lumi-macos-arm64.zip)
           for file in "${ARCHIVES[@]}"; do
             [ -f "$file" ] || { echo "::error::build-binaries produced no ${file}"; ls -R; exit 1; }
           done
           # Hashing the bare names rather than a `find` path keeps the names in
           # SHA256SUMS.txt relative and unprefixed, which is what `sha256sum -c` in
-          # verify-release needs: it resolves every name against its own cwd, and what
-          # update-homebrew-packages' `awk '$2 == f'` lookup needs, which matches a bare
-          # filename and silently yields nothing for a prefixed one.
+          # verify-release needs: it resolves every name against its own cwd.
           sha256sum "${ARCHIVES[@]}" > SHA256SUMS.txt
           cat SHA256SUMS.txt
           if grep -qvE '^[0-9a-f]{64}  [^/]+$' SHA256SUMS.txt; then
@@ -245,7 +233,7 @@ jobs:
           set -euo pipefail
           TAG="${{ needs.release-please.outputs.tag_name }}"
           ASSETS=$(gh release view "$TAG" --json assets --jq '.assets[].name' --repo ${{ github.repository }})
-          for asset in lumi-darwin-arm64.tar.gz lumi-macos-arm64.zip SHA256SUMS.txt; do
+          for asset in lumi-macos-arm64.zip SHA256SUMS.txt; do
             echo "$ASSETS" | grep -q "^${asset}$" && echo "✓ $asset" || { echo "✗ Missing: $asset"; exit 1; }
           done
 
@@ -265,7 +253,7 @@ jobs:
           sha256sum -c SHA256SUMS.txt
 
   # Linux can prove the published bytes are the bytes that were built. Only macOS
-  # can prove they are a bundle it will run, and a cask installs a bundle. So this
+  # can prove they are a bundle it will run, and install.sh installs a bundle. So this
   # repeats the build-time assertions against what a user actually downloads.
   verify-macos-app:
     needs: [release-please, upload-release-assets]
@@ -300,167 +288,37 @@ jobs:
           # certificate.
           codesign -dvvv "${APP}" 2>&1 | grep -E 'Identifier=|Signature=|Authority=' || true
 
-  update-homebrew-packages:
-    # The cask names a release asset, so it may not be rewritten before that asset
-    # exists: a tap pointing at a 404 breaks every `brew install --cask`, while a tap
-    # still pointing at the previous release keeps working.
-    #
-    # A failed release must therefore leave the tap alone rather than advance it — that
-    # is the intent, not a side effect to engineer around. Fixing the release, or
-    # re-running it for a transient failure, is the developer's job; nothing here should
-    # try to publish a package definition around a build that did not produce a binary.
-    #
-    # The recovery is worth writing down because it is not obvious. Job 1 cuts the tag
-    # before build-binaries runs, and release-please will not re-cut a version whose
-    # release already exists, so a *fresh* run (a new push to main, or workflow_dispatch)
-    # sets release_created to false and skips this job. Use GitHub's "Re-run failed jobs"
-    # on the *same* run instead — that reuses the completed release-please job's outputs,
-    # so release_created stays true and tag_name persists, and the cascade re-runs from
-    # the failed job forward.
-    #
-    # Both verification jobs are barriers, not just upload-release-assets. A bundle that
-    # fails `codesign --verify` after download is a release users must not be pointed at,
-    # and only verify-macos-app can see that.
+  # release-please cuts the release as a *draft* (release-please-config.json), and this
+  # is what publishes it. The ordering is the invariant: `install.sh` resolves
+  # `releases/latest/download/`, and GitHub's `latest` skips drafts entirely, so until
+  # this job runs every install keeps getting the previous release.
+  #
+  # Without it, `latest` would move to the new tag the moment release-please created it —
+  # seconds after the merge, ten minutes before any asset exists — and every install
+  # would 404 for the length of the build, and forever if the build failed.
+  #
+  # The git tag already exists by the time this runs, because the release config sets
+  # `force-tag-creation`. GitHub does not tag a draft until it is published, and
+  # release-please finds the previous release by its tag — so without that option a
+  # release that failed before this job would leave a tagless draft that the next run
+  # cannot see, and it would regenerate the changelog from the release before it. A
+  # bare tag does not move `latest`, so creating it early costs the draft gate nothing.
+  #
+  # Recovery for a failed release is therefore to do nothing: users are still on the last
+  # published release. Use GitHub's "Re-run failed jobs" on the same run, because
+  # release-please will not re-cut a version whose release already exists.
+  publish-release:
     needs: [release-please, upload-release-assets, verify-release, verify-macos-app]
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout lumi repository
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
-        with:
-          token: ${{ github.token }}
-          # The push step below rebases onto whatever main has become. A shallow
-          # clone has no merge base to rebase against once main moves, so the
-          # rebase fails exactly in the race it exists to survive.
-          fetch-depth: 0
-
-      - name: Compute release asset SHA256s
-        id: sha256
+      - name: Publish the verified release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           TAG="${{ needs.release-please.outputs.tag_name }}"
-          # Download outside the checkout. The commit-and-push step below runs in this same
-          # working tree, and a stray archive there is one `git add -A` away from being
-          # committed.
-          WORK="${RUNNER_TEMP}/release-assets"
-          rm -rf "$WORK"
-          # Stay in the checkout and address the downloads absolutely, rather than cd-ing
-          # into a directory this step then deletes out from under itself.
-          gh release download "$TAG" --repo "${{ github.repository }}" --clobber \
-            --dir "$WORK" \
-            --pattern lumi-macos-arm64.zip \
-            --pattern SHA256SUMS.txt
-          # Sets SHA. Hash the bytes brew will download rather than trusting the published
-          # list, then cross-check against what the release publishes for the same file.
-          # The hashed value is not in doubt — those are the bytes brew will download. What
-          # a disagreement means is that the release contradicts itself, and a release whose
-          # own manifest does not describe its own asset is not one to point users at.
-          #
-          # `$2` is the bare filename because upload-release-assets already asserts the
-          # manifest is two-space, text-mode and unprefixed (`^[0-9a-f]{64}  [^/]+$`), which
-          # rejects binary-mode `*name` and any path. That guard and this awk are a pair, and
-          # so is the named-asset list there: a filename absent from the manifest yields an
-          # empty PUBLISHED — awk still exits 0, so `set -e` does not fire and this
-          # comparison is what catches it.
-          #
-          # Not a command substitution: `exit 1` inside `$( )` leaves the subshell, and the
-          # assignment around it succeeds, so a mismatch would be reported and then ignored.
-          hash_asset() {
-            local asset="$1" published
-            SHA="$(sha256sum "${WORK}/${asset}" | awk '{print $1}')"
-            [ "${#SHA}" -eq 64 ] || { echo "::error::bad ${asset} sha256: '${SHA}'"; exit 1; }
-            published="$(awk -v f="$asset" '$2 == f {print $1}' "${WORK}/SHA256SUMS.txt")"
-            [ "$published" = "$SHA" ] || { echo "::error::SHA256SUMS.txt records '${published}' for ${asset}, but the asset hashes to '${SHA}'"; exit 1; }
-          }
-          # Prove the file is really the container it claims to be before hashing it.
-          unzip -qt "${WORK}/lumi-macos-arm64.zip"
-          hash_asset lumi-macos-arm64.zip
-          echo "app=${SHA}" >> "$GITHUB_OUTPUT"
-          rm -rf "$WORK"
-
-      - name: Update the cask
-        run: |
-          set -euo pipefail
-          TAG="${{ needs.release-please.outputs.tag_name }}"
-          VERSION="${TAG#v}"
-          CASK="Casks/lumi.rb"
-
-          # The cask is the only Homebrew package Lumi ships. It carries the menu-bar app
-          # and the `lumi` CLI the app embeds, so a missing cask is a broken release, not
-          # a step to skip.
-          [ -f "$CASK" ] || { echo "::error::${CASK} does not exist; there is no package to point at ${TAG}"; exit 1; }
-
-          # Rewrite the one `<field> "<value>"` line in the cask, and prove afterwards
-          # that the line now reads exactly what it should.
-          #
-          # Anchored at both ends, and at *exactly two spaces* of indent. Every part of
-          # that matters:
-          #
-          #   - Without the trailing `$` these match the *prefix* of a line such as
-          #     `url "...", branch: "main"` and rewrite it while leaving its trailing
-          #     arguments attached — and every check below still reports success.
-          #   - `[^"]*` keeps them off such a line for the same reason.
-          #   - `^  ` rather than `^ *` is what makes "top-level" mean it. A field nested
-          #     inside an `on_arm do` block is indented four, so `^ *` would count 1,
-          #     rewrite the nested one, satisfy the postcondition, and pass `ruby -c` —
-          #     publishing a cask whose top-level field still names the previous release.
-          #     At two spaces that file fails the count guard instead.
-          #
-          # The count guard runs first because sed rewrites in place and cannot insert, so
-          # a file that lost the line entirely must fail rather than silently ship the
-          # previous release's asset under the new tag.
-          #
-          # The seds use `|` as their delimiter unescaped, so a value containing `|`,
-          # `&`, or a backslash would corrupt the substitution. Every value passed here
-          # is a dotted version or a hex digest; neither can.
-          #
-          # `expect_line` is separate because the cask's `url` is asserted but never
-          # rewritten. `git diff --cached --quiet` below cannot tell "already correct"
-          # from "matched nothing", which is why the assertion exists at all, and it is a
-          # whole-line match because a substring one accepts `...zip-old` and text in a
-          # comment.
-          expect_line() {
-            grep -qxF -- "  $2" "$1" \
-              || { echo "::error::$1 has no line \`  $2\`"; exit 1; }
-          }
-          rewrite() {
-            local file="$1" field="$2" value="$3" count
-            count="$(grep -cE "^  ${field} \"[^\"]*\"$" "$file" || true)"
-            [ "${count}" = "1" ] || { echo "::error::${file} has ${count} top-level \`${field} \"...\"\` lines, expected exactly 1"; exit 1; }
-            sed -i -E "s|^  ${field} \"[^\"]*\"$|  ${field} \"${value}\"|" "$file"
-            expect_line "$file" "${field} \"${value}\""
-          }
-
-          rewrite "$CASK" version "${VERSION}"
-          rewrite "$CASK" sha256 "${{ steps.sha256.outputs.app }}"
-          # The cask names the tag through `v#{version}`, so its url line is never
-          # rewritten and must never match the `url` guard above — which it would,
-          # harmlessly, if this ever called `rewrite "$CASK" url ...`. It does not.
-          # Assert instead that the url still resolves to this tag through the version
-          # that was just written. Rewriting `version` is what moves the cask's download;
-          # if that interpolation is ever flattened to a literal, this job goes on
-          # reporting success while the cask serves the previous release forever.
-          expect_line "$CASK" 'url "https://github.com/${{ github.repository }}/releases/download/v#{version}/lumi-macos-arm64.zip"'
-          [ "v${VERSION}" = "${TAG}" ] || { echo "::error::v${VERSION} is not the release tag ${TAG}"; exit 1; }
-          # Ruby parses the file, which is the check that catches a value with a quote or
-          # a backslash in it. `brew audit --cask --strict` is the fuller check and is a
-          # macOS-only, maintainer-run step — casks cannot be audited on Linux, and
-          # `--signing`/`--new` must not be used while the bundle is un-notarized.
-          ruby -c "$CASK" >/dev/null
-          cat "$CASK"
-
-      - name: Commit and push
-        run: |
-          TAG="${{ needs.release-please.outputs.tag_name }}"
-          VERSION="${TAG#v}"
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Casks/lumi.rb
-          git diff --cached --quiet && echo "No changes to commit" && exit 0
-          git commit -m "chore: update Homebrew cask to ${VERSION}"
-          # main can move underneath us between the checkout and here; rebase rather than
-          # fail the release on a non-fast-forward push.
-          git pull --rebase origin main
-          git push
+          gh release edit "$TAG" --draft=false --latest --repo ${{ github.repository }}
+          # Prove `latest` is now this release rather than trusting the edit reported it.
+          LATEST="$(gh release view --json tagName --jq .tagName --repo ${{ github.repository }})"
+          [ "${LATEST}" = "${TAG}" ] || { echo "::error::latest is ${LATEST}, expected ${TAG}"; exit 1; }

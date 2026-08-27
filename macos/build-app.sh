@@ -32,9 +32,7 @@ ENTITLEMENTS="$HERE/Lumi/Resources/Lumi.entitlements"
 # The two version fields both come out of the one string the binary reports.
 #
 # CFBundleShortVersionString is the one a person reads, and it is the tag with
-# its leading `v` stripped: `v0.6.0` is a git tag, `0.6.0` is a version. The
-# cask's `version` field and this must agree, and only one of the two can carry
-# a `v`.
+# its leading `v` stripped: `v0.6.0` is a git tag, `0.6.0` is a version.
 #
 # CFBundleVersion must be one to three period-separated integers. A development
 # build reports "0.1.0-dev", which is not, and LaunchServices treats an invalid

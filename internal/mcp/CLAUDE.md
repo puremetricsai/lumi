@@ -26,7 +26,7 @@ reports is the one enforced.
 
 - **A server process that no longer matches what is installed says so, in every tool's `notice`.** Both
   ways this drifts are silent by construction, which is why the reporting exists at all. An agent launches
-  `lumi mcp` once and keeps it for the session, so a `brew upgrade lumi` leaves the old image mapped and
+  `lumi mcp` once and keeps it for the session, so an upgrade leaves the old image mapped and
   answering — the client owns the process lifecycle and will not relaunch it mid-session. And every
   migration is additive (`internal/store/migrations.go`), so an older build reading a newer file finds every
   column its fixed `eventSelect` names, succeeds, and returns rows missing only what the new build added.

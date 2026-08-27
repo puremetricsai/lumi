@@ -31,7 +31,7 @@ type Options struct {
 	//
 	// Supplying both enables in-place upgrades: `lumi mcp` replaces itself
 	// between requests, carrying the client's pipes and handshake across, so a
-	// `brew upgrade lumi` reaches a live agent session. Leaving either nil
+	// a re-run of install.sh reaches a live agent session. Leaving either nil
 	// disables that and leaves the process serving the build it started as.
 	BinaryChanged func() bool
 	BinaryExec    func() error
