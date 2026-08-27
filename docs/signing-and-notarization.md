@@ -21,19 +21,66 @@ Signing and notarization require a paid Apple Developer Program account ($99/yr)
 2. Sign in to [Apple Developer: Certificates](https://developer.apple.com/account/resources/certificates/list).
 3. Click **(+)** $\rightarrow$ Select **Developer ID Application** (under Software) $\rightarrow$ **Continue**.
 4. Upload `.certSigningRequest` $\rightarrow$ **Generate** $\rightarrow$ Download `developerID_application.cer`.
-5. Double-click `developerID_application.cer` to install into Keychain Access.
-6. Under **My Certificates**, find:
+5. Install the certificate **into the login keychain**, the one holding the private key the CSR in
+   step 1 created. Double-clicking the `.cer` can drop it into the System keychain instead, and an
+   identity only exists when certificate and key share a keychain — so the certificate lands under
+   **Certificates** rather than **My Certificates**, *Export as .p12* is grayed out, and
+   `security find-identity -p codesigning` finds nothing to export. Import explicitly:
+   ```sh
+   security import developerID_application.cer -k ~/Library/Keychains/login.keychain-db
+   ```
+6. Install Apple's **Developer ID Certification Authority (G2)** intermediate. It is not present by
+   default, and without it the certificate reads as untrusted — Keychain Access says so, and
+   `security find-identity -p codesigning` reports the identity as `CSSMERR_TP_NOT_TRUSTED` while
+   `find-identity -v` reports `0 valid identities found`:
+   ```sh
+   curl -fsSLO https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
+   security import DeveloperIDG2CA.cer -k ~/Library/Keychains/login.keychain-db
+   ```
+7. Confirm both steps took, before going further:
+   ```sh
+   security find-identity -v -p codesigning   # lists the identity exactly once
+   ```
+   Two entries mean a stale copy in another keychain; delete that one, naming its keychain file:
+   `sudo security delete-certificate -Z <SHA-1> /Library/Keychains/System.keychain`.
+8. Under **My Certificates**, find:
    `Developer ID Application: <Team Name> (<TEAM_ID>)`
-7. Right-click certificate $\rightarrow$ **Export "Developer ID Application: ..."** as `.p12` with a password.
-8. Base64 encode for CI:
+9. Right-click certificate $\rightarrow$ **Export "Developer ID Application: ..."** as `.p12` with a password,
+   or export from the command line:
+   ```sh
+   security export -k ~/Library/Keychains/login.keychain-db -t identities -f pkcs12 -o DeveloperID.p12
+   ```
+10. Base64 encode for CI:
    ```sh
    base64 -i DeveloperID.p12 | pbcopy
    ```
+11. The first `codesign` run prompts for keychain access. Answer **Always Allow** — plain *Allow*
+   re-prompts on every signature, and `build-app.sh` makes two per build, so it stalls mid-build
+   waiting on a dialog. The non-interactive equivalent is
+   `security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k <login-password> ~/Library/Keychains/login.keychain-db`.
 
 ---
 
-### Step 2: Create App Store Connect Team API Key
-> **Note**: `notarytool` requires an **App Store Connect Team Key** (Individual keys fail with 401).
+### Step 2: Create notarization credentials
+
+`notarytool` authenticates three ways, and the choice is not cosmetic — an App Store Connect API key
+needs App Store Connect access, which Developer Program enrollment does not by itself grant. If
+App Store Connect answers *"Your Apple Account isn't enabled for App Store Connect"*, use Step 2b;
+it needs nothing from App Store Connect at all.
+
+| Method | Flags | Needs App Store Connect |
+| :--- | :--- | :--- |
+| API key (**preferred**) | `--key` `--key-id` `--issuer` | yes |
+| Apple ID (**interim**) | `--apple-id` `--password` `--team-id` | no |
+| Keychain profile | `--keychain-profile` | wraps either of the above |
+
+Prefer the API key: it is not tied to one person's Apple ID, and
+`.claude/commands/lumi-developer-id-signing.md` names it as the target state. Step 2b is the
+workaround for a blocked account, not the destination.
+
+#### Step 2a: App Store Connect API key
+> **Note**: `--issuer` is **required for Team keys and must be omitted for Individual keys**. Passing
+> it with an Individual key is a 401. Prefer a Team key; the workflow passes `--issuer`.
 
 1. Sign in to [App Store Connect: Users and Access $\rightarrow$ Integrations $\rightarrow$ App Store Connect API](https://appstoreconnect.apple.com/access/integrations/api).
 2. Click **(+)** to generate a new key:
@@ -48,6 +95,25 @@ Signing and notarization require a paid Apple Developer Program account ($99/yr)
    base64 -i AuthKey_<KEY_ID>.p8 | pbcopy
    ```
 
+#### Step 2b: Apple ID and app-specific password
+
+Use this only when Step 2a is blocked. An app-specific password is created on the Apple ID account
+page, which every Developer Program member can reach:
+
+1. Sign in to [account.apple.com](https://account.apple.com) $\rightarrow$ **Sign-In and Security**
+   $\rightarrow$ **App-Specific Passwords**.
+2. Generate one named `Lumi Notarization`. It is shown once.
+3. The **Team ID** is the parenthesised code in the certificate name —
+   `Developer ID Application: <Team Name> (<TEAM_ID>)`.
+
+```sh
+xcrun notarytool submit lumi-submission.zip \
+  --apple-id <apple-id-email> --team-id <TEAM_ID> --password <app-specific-password> --wait
+```
+
+Revoking the password, or the person leaving the team, breaks the release. That is the reason to
+move to Step 2a once App Store Connect is reachable.
+
 ---
 
 ### Step 3: Configure GitHub Repository Secrets
@@ -61,6 +127,15 @@ Add to GitHub repository **Settings $\rightarrow$ Secrets and variables $\righta
 | `APPLE_API_KEY_P8_BASE64` | Base64-encoded `AuthKey_<KEY_ID>.p8` |
 | `APPLE_API_KEY_ID` | 10-character Key ID |
 | `APPLE_API_ISSUER_ID` | Issuer UUID |
+
+The last three are Step 2a. Having used Step 2b instead, set these three in their place, and the
+workflow's notarization step must pass the Apple ID flags rather than the API-key ones:
+
+| Secret | Value |
+| :--- | :--- |
+| `APPLE_ID` | Apple ID email the app-specific password belongs to |
+| `APPLE_APP_SPECIFIC_PASSWORD` | the app-specific password from Step 2b |
+| `APPLE_TEAM_ID` | `<TEAM_ID>`, the code in the certificate name |
 
 ---
 
@@ -125,6 +200,9 @@ ditto -c -k --keepParent build/Lumi.app lumi-macos-arm64.zip
 In `.github/workflows/release-please.yml`:
 
 1. **Import Keychain & API Key**: Decode `.p12` into temporary keychain and `.p8` with mode 0600.
+   The runner's temporary keychain has the same G2 gap as a fresh Mac: unless the `.p12` carries the
+   chain, import `DeveloperIDG2CA.cer` into it after the `.p12`, or `codesign` cannot build a chain
+   to the Apple root.
 2. **Build & Sign App**: Run `CODESIGN_IDENTITY="$IDENTITY" ./macos/build-app.sh`. It signs the embedded binary and then the bundle. `Lumi.app` is the only artifact — there is nothing to sign or notarize beside it.
 3. **Notarize & Staple App**:
    - `ditto -c -k --keepParent build/Lumi.app lumi-submission.zip`
