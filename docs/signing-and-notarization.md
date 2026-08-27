@@ -139,9 +139,9 @@ In `.github/workflows/release-please.yml`:
 
 ## 5. Downstream Updates
 
-1. **`Casks/lumi.rb`**:
-   - Remove "Open Anyway" / `xattr -dr com.apple.quarantine` workarounds.
-   - Retain permissions guidance (`lumi permissions --request`).
+1. **`README.md`**:
+   - Remove the "The app is not notarized yet" section: the browser-download recovery it documents
+     stops applying once the bundle is stapled.
 2. **TCC Grants**:
    - Upgrading from interim self-signed to Developer ID resets TCC permissions once.
    - Subsequent updates retain permissions stably under `Developer ID Application` Designated Requirement.

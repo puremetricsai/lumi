@@ -15,7 +15,7 @@ Lumi deliberately targets a small surface: capture → process → store → que
 - Apple Silicon Mac running macOS 26 or newer (`darwin/arm64`)
 - Screen Recording, Accessibility, Microphone, and Speech Recognition permissions, granted to Lumi
 
-To build from source (not needed for `brew install`, which ships a prebuilt app):
+To build from source (not needed to install Lumi, which ships as a prebuilt app):
 
 - Go 1.25 or newer
 - Xcode Command Line Tools and a Swift toolchain (`swiftc` compiles the SpeechAnalyzer bridge into a static archive that cgo links)
@@ -27,49 +27,28 @@ ScreenCaptureKit captures system output and the default microphone directly; no 
 ## Installation
 
 ```sh
-brew tap puremetricsai/lumi https://github.com/puremetricsai/lumi
-brew trust --cask puremetricsai/lumi/lumi
-brew install --cask puremetricsai/lumi/lumi
+curl -fsSL https://raw.githubusercontent.com/puremetricsai/lumi/main/install.sh | sh
 ```
 
-That puts `/Applications/Lumi.app` in place. Upgrade it with:
-
-```sh
-brew upgrade --cask puremetricsai/lumi/lumi
-```
+That downloads the latest release and puts `/Applications/Lumi.app` in place. Re-run the same command to upgrade — the script quits a running Lumi first so an in-flight recording shuts down cleanly. Nothing else is installed: no command on your `PATH`, no daemon, no background updater.
 
 Open Lumi, then grant capture permissions from **Settings → Permissions**. macOS grants them to Lumi itself, so the prompts come from the app and nothing else needs approving. Recording starts from the menu bar item or the Lumi window.
 
-Homebrew downloads a prebuilt `darwin/arm64` build from the [latest release](https://github.com/puremetricsai/lumi/releases), so no Go or Swift toolchain is involved. Uninstalling leaves `~/Library/Application Support/Lumi` — your database and captured media — untouched.
+The script downloads a prebuilt `darwin/arm64` bundle from the [latest release](https://github.com/puremetricsai/lumi/releases), so no Go or Swift toolchain is involved. Uninstall by dragging `Lumi.app` to the Trash; that leaves `~/Library/Application Support/Lumi` — your database and captured media — untouched.
 
-Homebrew is the update mechanism. Lumi has no self-updater and is not getting one.
-
-### Upgrading from 0.2.0 or earlier
-
-Those versions also put a `lumi` command on your `PATH` and let you drive Lumi from a terminal. Lumi is now the app alone, and Homebrew no longer installs that command. Your database and captured media are unaffected, but AI agents were registered against the old path and stop resolving once it goes, so re-register them from **Settings → MCP** — a client still naming it shows as a conflict with a **Replace** button.
-
-If you took Lumi up on its old offer to link the command into a directory of your own, Homebrew does not manage that link and will not remove it. It keeps working, because it points inside the bundle. Delete it yourself if you would rather it were gone.
-
-Releases up to 0.7.0 also shipped a `lumi` *formula*. If you are still on it, the tap points the old name at the cask, but the two cannot replace each other in place:
-
-```sh
-brew uninstall --formula lumi
-brew install --cask puremetricsai/lumi/lumi
-```
-
-macOS grants capture permissions to a specific application, so re-approve them in **Settings → Permissions** afterwards.
+Lumi has no self-updater and is not getting one. Re-running the install command is the update mechanism, and nothing will tell you a new release exists — [watch the releases page](https://github.com/puremetricsai/lumi/releases) if you want to know.
 
 ### The app is not notarized yet
 
-Lumi has no Apple Developer ID certificate, so the released app carries the project's own signing certificate instead. macOS quarantines the cask install and refuses the first launch. Open Lumi once from Finder, then open **System Settings → Privacy & Security**, find the message naming Lumi, and choose **Open Anyway**.
+Lumi has no Apple Developer ID certificate, so the released app carries the project's own signing certificate instead. That is invisible if you install with the command above: `curl` does not mark the download with `com.apple.quarantine`, so Gatekeeper never blocks the first launch.
 
-Quarantine is written to every file inside the bundle, so if Lumi still will not start after you have approved it, clear the flag once:
+Download the ZIP in a browser instead and it does get quarantined — an un-notarized, never-executed app is then killed on launch with no prompt at all. Recovering from that takes **System Settings → Privacy & Security → Open Anyway**, and if it still will not start, clearing the flag by hand:
 
 ```sh
 xattr -dr com.apple.quarantine /Applications/Lumi.app
 ```
 
-This is once per machine, not once per release: the signing certificate is stable, so Homebrew keeps the approval across upgrades and your granted permissions survive them. All of it goes away with notarization.
+Use the install command and none of that applies. All of it goes away with notarization.
 
 ## Using Lumi
 
@@ -163,7 +142,7 @@ task app:install  # install ~/Applications/Lumi.app
 task app:run      # install and launch it
 ```
 
-`./scripts/restart-lumi-app.sh` is the app development loop: quit, rebuild, reset TCC, relaunch. A bundle built locally is ad-hoc signed, so every rebuild changes its TCC identity and the four permissions have to be granted again — batch UI changes into single builds. The released cask carries one stable certificate, so its grants survive an upgrade.
+`./scripts/restart-lumi-app.sh` is the app development loop: quit, rebuild, reset TCC, relaunch. A bundle built locally is ad-hoc signed, so every rebuild changes its TCC identity and the four permissions have to be granted again — batch UI changes into single builds. The released app carries one stable certificate, so its grants survive an upgrade.
 
 The binary is also how the pipeline is driven directly while working on it:
 
