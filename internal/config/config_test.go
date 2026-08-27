@@ -19,6 +19,7 @@ func TestFromRootDerivesEveryPath(t *testing.T) {
 		{"Audio", paths.Audio, filepath.Join(root, "audio")},
 		{"RecordState", paths.RecordState, filepath.Join(root, "record.json")},
 		{"RecordLog", paths.RecordLog, filepath.Join(root, "record.log")},
+		{"UpdateLog", paths.UpdateLog, filepath.Join(root, "update.log")},
 	} {
 		if c.got != c.want {
 			t.Errorf("%s = %q, want %q", c.name, c.got, c.want)
