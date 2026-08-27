@@ -80,6 +80,28 @@ The app is a supervisor and nothing else — root `CLAUDE.md` states that rule; 
   **That replace is scoped to one client** by passing the result's own `target` to `--client`; a blanket
   `--force` would also overwrite entries for clients the user never looked at. `internal/cli` accepts a
   target's name there precisely so Swift holds no second copy of that vocabulary.
+- **The app holds no install URL, no version comparison, and no knowledge of how an upgrade is
+  performed.** It runs `lumi update --json` and `lumi update --apply`; `internal/cli` owns the
+  `latest` pointer, what "newer" means, the two refusals, and the fact that the installer is
+  `install.sh`. The one half that *is* the app's is whether to ask at all — `Preferences.checkForUpdates`,
+  app policy rather than a capture flag, so it stays out of `recorderArguments()`. A second checker
+  anywhere would be two requests free to disagree, which is why `UpdateChecker` is owned by
+  `AppDelegate` and injected into Settings the same way `RecorderController` is.
+- **Taking an update asks once, stops the recorder, and only then starts the installer.** That
+  ordering is load-bearing, not tidiness. `install.sh` quits a running Lumi by Apple event, and
+  `applicationShouldTerminate` answers that by stopping and then replying `true` whatever the stop
+  returned — so an installer started first can race a slow shutdown and carry the app out from over a
+  child that is still writing. Nothing can race a shutdown that already finished. **`stopFailed` is
+  checked before the installer is started**, where the only cost of stopping is the update itself:
+  `stop()` returns normally after its 20s timeout with the child still alive, and a refusal from the
+  binary at that point restarts the recorder rather than leaving capture silently off.
+  `confirmAndInstallUpdate` deliberately does not call `quit()`, which would stack its own "Stop
+  recording and quit Lumi?" on top of the question already answered, and the app quits itself rather
+  than letting `install.sh` send the event, which would cost a needless Automation prompt.
+- **A failed automatic check is silent; a failed Check Now is shown.** An offline laptop must not
+  leave an error in a tab nobody opened, and a button somebody pressed owes them an answer. The status
+  badge reads "Not checked yet" rather than "Up to date" before the first answer returns: claiming a
+  build is current before anything was asked is the one wrong answer here nobody would notice.
 - **The build stays on the default Swift language mode.** `-swift-version 6` fails today:
   `Preferences.shared` is a `static let` on a non-Sendable `@Observable` class, and `LumiCLI` captures
   non-Sendable values across its pipe reads.

@@ -131,6 +131,25 @@ one deliberate omission: the script is fetched over TLS from the same
 origin that serves the asset, so a pinned hash would add no trust the transport does not already
 carry, and `ditto` fails on a truncated archive anyway.
 
+### The in-app update check
+
+`Lumi.app` tells the user a release exists; it is not a second way to install one. `lumi update`
+resolves `releases/latest` with redirects disabled and reads the tag out of the `Location` header —
+the *same* pointer `install.sh` follows to download the asset, which is why the check and the install
+can never disagree about which release is newest. No GitHub API, so no token and no rate limit.
+
+`lumi update --apply` then runs `install.sh` itself, from `main`, over the same TLS to the same
+origin. It adds two refusals ahead of it, for different reasons. The running binary must be inside
+`/Applications/Lumi.app`, which `install.sh` never checks at all: it replaces that path whatever
+asked it to, so a copy running from `~/Applications` would upgrade a *different* Lumi and report
+success. And `/Applications` must be writable — `install.sh` does check that, first thing, but it
+dies with "re-run with sudo", and by then it is a detached shell writing into `update.log` where
+nobody is reading, naming a command the app cannot run and must never tell a user to.
+
+So a release still moves exactly one thing: the `latest` pointer, which is why `publish-release` runs
+last. Nothing about the check is versioned, stamped, or published, and there is still no second front
+door.
+
 ### What quarantine still costs
 
 Measured on macOS 26.5.2, and the reason the install command is a `curl` pipe rather than a link to

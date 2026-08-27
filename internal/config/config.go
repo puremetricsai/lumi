@@ -13,9 +13,12 @@ type Paths struct {
 	Audio       string
 	// RecordState is the JSON file that tracks a background recorder (pid,
 	// start time, what it captures). RecordLog collects the background
-	// recorder's stdout/stderr. Both live directly under Root.
+	// recorder's stdout/stderr. UpdateLog collects the detached installer's,
+	// which outlives the process that started it and is the only record of
+	// what an in-app update did. All three live directly under Root.
 	RecordState string
 	RecordLog   string
+	UpdateLog   string
 }
 
 func DefaultPaths() (Paths, error) {
@@ -46,6 +49,7 @@ func FromRoot(root string) (Paths, error) {
 		Audio:       filepath.Join(root, "audio"),
 		RecordState: filepath.Join(root, "record.json"),
 		RecordLog:   filepath.Join(root, "record.log"),
+		UpdateLog:   filepath.Join(root, "update.log"),
 	}, nil
 }
 

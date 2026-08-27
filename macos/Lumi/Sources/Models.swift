@@ -6,6 +6,23 @@ import Foundation
 /// parsing `record.json` directly. That file's format belongs to
 /// `internal/cli`, and a second parser here would drift the moment either side
 /// changed — invisibly, since neither test suite can see the other.
+/// UpdateStatus is `lumi update --json`.
+///
+/// `internal/cli` decides what "newer" means, resolving the same `latest`
+/// pointer install.sh downloads from so the check and the install can never
+/// disagree. `reason` is set whenever no update is offered, so nothing here has
+/// to guess whether false means "up to date", "cannot tell", or "not
+/// applicable" — a development build reports the last of those.
+struct UpdateStatus: Decodable {
+    var current: String
+    var latest: String?
+    /// Spelled camelCase with no CodingKeys: `LumiCLI.decoder` converts Go's
+    /// `update_available` already, and a key table here would have to spell the
+    /// converted name anyway.
+    var updateAvailable: Bool
+    var reason: String?
+}
+
 struct RecordStatus: Decodable {
     var recording: Bool
     var pid: Int?

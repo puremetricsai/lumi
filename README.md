@@ -30,13 +30,22 @@ ScreenCaptureKit captures system output and the default microphone directly; no 
 curl -fsSL https://raw.githubusercontent.com/puremetricsai/lumi/main/install.sh | sh
 ```
 
-That downloads the latest release and puts `/Applications/Lumi.app` in place. Re-run the same command to upgrade — the script quits a running Lumi first so an in-flight recording shuts down cleanly. Nothing else is installed: no command on your `PATH`, no daemon, no background updater.
+That downloads the latest release and puts `/Applications/Lumi.app` in place. Re-run the same command to upgrade — the script quits a running Lumi first so an in-flight recording shuts down cleanly. Nothing else is installed: no command on your `PATH` and no daemon.
 
 Open Lumi, then grant capture permissions from **Settings → Permissions**. macOS grants them to Lumi itself, so the prompts come from the app and nothing else needs approving. Recording starts from the menu bar item or the Lumi window.
 
 The script downloads a prebuilt `darwin/arm64` bundle from the [latest release](https://github.com/puremetricsai/lumi/releases), so no Go or Swift toolchain is involved. Uninstall by dragging `Lumi.app` to the Trash; that leaves `~/Library/Application Support/Lumi` — your database and captured media — untouched.
 
-Lumi has no self-updater and is not getting one. Re-running the install command is the update mechanism, and nothing will tell you a new release exists — [watch the releases page](https://github.com/puremetricsai/lumi/releases) if you want to know.
+Lumi tells you when a new release exists and can install it for you. Once a day it asks
+github.com for the newest release tag; the request carries nothing but itself — no account, no
+machine identifier, no usage. When there is an update, the menu bar offers it, and taking it runs the
+same `install.sh` above: one install channel, not two. Lumi stops recording, installs, and reopens.
+
+That daily check is the only time Lumi contacts the network on its own, and **Settings → About →
+Check for updates automatically** turns it off. With it off Lumi never reaches the network unless you
+ask it to — **Check Now** in the same tab still sends the one request, on the spot. Re-running the
+install command still upgrades you either way, and the [releases
+page](https://github.com/puremetricsai/lumi/releases) still lists what changed.
 
 ### The app is not notarized yet
 
