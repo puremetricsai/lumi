@@ -200,9 +200,12 @@ ditto -c -k --keepParent build/Lumi.app lumi-macos-arm64.zip
 In `.github/workflows/release-please.yml`:
 
 1. **Import Keychain & API Key**: Decode `.p12` into temporary keychain and `.p8` with mode 0600.
-   The runner's temporary keychain has the same G2 gap as a fresh Mac: unless the `.p12` carries the
-   chain, import `DeveloperIDG2CA.cer` into it after the `.p12`, or `codesign` cannot build a chain
-   to the Apple root.
+   Do not import `DeveloperIDG2CA.cer` in CI, with a real Developer ID identity or without one:
+   on `macos-26` `security import` exits 1 with "The specified item already exists in the keychain"
+   and fails the release (run 33126959558) — the intermediate is already reachable there. Should a
+   future runner image drop it, tolerate the duplicate rather than letting it fail the step:
+   `security import ... || grep -q "already exists" <<<"$out"`. A local machine missing the
+   intermediate is the case section 2 covers.
 2. **Build & Sign App**: Run `CODESIGN_IDENTITY="$IDENTITY" ./macos/build-app.sh`. It signs the embedded binary and then the bundle. `Lumi.app` is the only artifact — there is nothing to sign or notarize beside it.
 3. **Notarize & Staple App**:
    - `ditto -c -k --keepParent build/Lumi.app lumi-submission.zip`

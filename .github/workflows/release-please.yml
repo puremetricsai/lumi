@@ -111,16 +111,11 @@ jobs:
           security import "${RUNNER_TEMP}/certificate.p12" -k "${KEYCHAIN}" \
             -P "${P12_PASSWORD}" -T /usr/bin/codesign -f pkcs12
           rm -f "${RUNNER_TEMP}/certificate.p12"
-          # The temporary keychain holds whatever the .p12 carried, which for an
-          # identity exported with `security export` is the leaf alone. codesign
-          # cannot build a chain to the Apple root without the Developer ID G2
-          # intermediate, and no keychain on a fresh runner has it. Importing it
-          # is idempotent when the .p12 already carried it, and harmless to the
-          # interim self-signed path, which chains to nothing here either way.
-          curl -fsSL -o "${RUNNER_TEMP}/DeveloperIDG2CA.cer" \
-            https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
-          security import "${RUNNER_TEMP}/DeveloperIDG2CA.cer" -k "${KEYCHAIN}"
-          rm -f "${RUNNER_TEMP}/DeveloperIDG2CA.cer"
+          # No Developer ID intermediate is imported here, with a real identity
+          # or without one. On macos-26 `security import DeveloperIDG2CA.cer`
+          # exits 1 with "The specified item already exists in the keychain" and
+          # fails this step (run 33126959558); the rule and the conditions that
+          # would change it live in docs/signing-and-notarization.md.
           # Without a partition list codesign blocks on a GUI prompt no one can answer,
           # and the job hangs until it times out rather than failing.
           security set-key-partition-list -S apple-tool:,apple: -s -k "${KEYCHAIN_PASSWORD}" "${KEYCHAIN}" >/dev/null
