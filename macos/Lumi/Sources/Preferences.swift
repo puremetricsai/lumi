@@ -25,6 +25,7 @@ final class Preferences {
         static let audioChunkSeconds = "lumi.audioChunkSeconds"
         static let speechLocale = "lumi.speechLocale"
         static let dataDirectory = "lumi.dataDirectory"
+        static let checkForUpdates = "lumi.checkForUpdates"
     }
 
     private let defaults: UserDefaults
@@ -37,12 +38,23 @@ final class Preferences {
             Key.intervalSeconds: 2.0,
             Key.audioChunkSeconds: 30.0,
             Key.speechLocale: "en-US",
+            Key.checkForUpdates: true,
         ])
     }
 
     var captureScreen: Bool {
         get { defaults.bool(forKey: Key.captureScreen) }
         set { defaults.set(newValue, forKey: Key.captureScreen) }
+    }
+
+    /// Whether the app asks GitHub, once a day, whether a newer release exists.
+    ///
+    /// App policy rather than a capture flag, so it is deliberately absent from
+    /// `recorderArguments()`. What the request contains and what "newer" means
+    /// are both Go's; this only decides whether it is made at all.
+    var checkForUpdates: Bool {
+        get { defaults.bool(forKey: Key.checkForUpdates) }
+        set { defaults.set(newValue, forKey: Key.checkForUpdates) }
     }
 
     var captureAudio: Bool {

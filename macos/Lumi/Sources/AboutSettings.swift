@@ -5,9 +5,12 @@ import SwiftUI
 /// AboutSettings is the identity tab: what this build is, whether it starts
 /// with the Mac, and where the project lives.
 ///
-/// It makes no network call. The three link rows and "Check now" hand a URL to
-/// the user's browser, which is the user acting, not the app phoning home —
-/// that distinction is what keeps Lumi's local-first promise literally true.
+/// It is also the one place in Lumi that touches the network, and the only one
+/// that ever will: `lumi update` sends a bare GET to github.com carrying nothing
+/// but the request, to learn the newest release tag. The three link rows hand a
+/// URL to the user's browser instead, which is the user acting rather than the
+/// app phoning home. The update check is the app acting, so it is named plainly
+/// below and can be switched off.
 struct AboutSettings: View {
     /// The version reported by the bundled binary, or nil while it is being
     /// read. `internal/cli` owns this string and release sets it with
@@ -27,6 +30,16 @@ struct AboutSettings: View {
     /// there is no way for the user to tell which one is lying.
     @State private var loginStatus: SMAppService.Status?
     @State private var loginError: String?
+
+    /// Owned by `AppDelegate` and injected, like the recorder: the menu bar item
+    /// and this tab must read the same answer, and a second checker would make
+    /// two requests to disagree with each other.
+    @Environment(UpdateChecker.self) private var updates
+    @State private var preferences = Preferences.shared
+
+    /// The delegate owns the confirmation and the shutdown that follows it, so
+    /// the button here routes to it rather than restating either.
+    private var delegate: AppDelegate? { NSApp.delegate as? AppDelegate }
 
     private static let repository = URL(string: "https://github.com/puremetricsai/lumi")!
     private static let documentation = URL(string: "https://github.com/puremetricsai/lumi#readme")!
@@ -61,17 +74,47 @@ struct AboutSettings: View {
             }
 
             Section("Updates") {
-                // The mockup showed an "Automatic updates" toggle. The app has
-                // no updater and is not getting one: re-running install.sh is
-                // the update mechanism, and a second one would race it while
-                // replacing the bundle this app is running from. The row keeps
-                // its shape, but it promises only what it does — it opens the
-                // releases page.
-                LabeledContent("Check for new releases") {
-                    Button("Check now") { open(Self.releases) }
-                        .accessibilityLabel("Open the Lumi releases page on GitHub")
+                // This used to be a browser link, because the app had no
+                // updater. It has one now, and it is not a second install
+                // channel: `lumi update --apply` runs install.sh — the same
+                // script, the same URL, the same `latest` pointer the check
+                // itself resolved. Swift holds none of that. It asks the binary
+                // what is available and tells it to go.
+                LabeledContent("Status") {
+                    updateBadge
                 }
-                SettingsCaption("Lumi does not update itself. Check now opens the GitHub releases page, which lists what each release changed. Re-run the install command from the README to upgrade.")
+
+                LabeledContent("Check for new releases") {
+                    HStack(spacing: 8) {
+                        if updates.status?.updateAvailable == true {
+                            Button("Install Update…") {
+                                Task { await delegate?.confirmAndInstallUpdate() }
+                            }
+                            .accessibilityLabel("Stop recording, install the update, and reopen Lumi")
+                        }
+                        Button("Check Now") { Task { await updates.check(userInitiated: true) } }
+                            .disabled(updates.isChecking)
+                            .accessibilityLabel("Ask GitHub whether a newer Lumi has been released")
+                    }
+                }
+
+                Toggle("Check for updates automatically", isOn: Binding(
+                    get: { preferences.checkForUpdates },
+                    set: { preferences.checkForUpdates = $0 }))
+                SettingsCaption("Once a day, Lumi asks github.com for the newest release tag. The request carries nothing — no account, no machine identifier, no usage. Turn this off and Lumi never contacts the network on its own.")
+
+                link("Release notes", url: Self.releases,
+                     accessibility: "Open the Lumi releases page on GitHub")
+
+                if let reason = updates.status?.reason, updates.status?.latest == nil {
+                    SettingsCaption(reason)
+                }
+                if let lastError = updates.lastError {
+                    Text(lastError)
+                        .font(.caption)
+                        .foregroundStyle(Theme.attention)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
 
             Section("Links") {
@@ -90,6 +133,32 @@ struct AboutSettings: View {
             await loadVersion()
             await refreshLoginStatus()
         }
+    }
+
+    /// The status line. "Unknown" until the first check returns, rather than
+    /// "up to date" — claiming a version is current before anything was asked is
+    /// the one answer here that could be wrong without anybody noticing.
+    private var updateBadge: some View {
+        if updates.isChecking {
+            return Badge(text: "Checking…", tone: .neutral)
+        }
+        guard let status = updates.status else {
+            return Badge(text: updates.lastError == nil ? "Not checked yet" : "Check failed",
+                         tone: updates.lastError == nil ? .neutral : .warn)
+        }
+        if status.updateAvailable, let latest = status.latest {
+            return Badge(text: "\(latest) available", tone: .warn)
+        }
+        // `latest` is set exactly when a comparison happened, so its absence --
+        // not the wording of `reason` -- is what says nothing was compared. A
+        // development build lands here, and calling it "up to date" would claim
+        // a currency nobody established. Reading the reason string to decide
+        // this would put Go's vocabulary in Swift, which is the drift
+        // `macos/CLAUDE.md` forbids.
+        guard status.latest != nil else {
+            return Badge(text: "Not applicable", tone: .neutral)
+        }
+        return Badge(text: "Up to date", tone: .ok)
     }
 
     // MARK: - Header

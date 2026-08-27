@@ -21,6 +21,7 @@ struct LumiApp: App {
         Settings {
             SettingsWindow()
                 .environment(delegate.recorder)
+                .environment(delegate.updates)
         }
     }
 
@@ -30,6 +31,7 @@ struct LumiApp: App {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let recorder = RecorderController()
+    let updates = UpdateChecker()
     private var statusItem: NSStatusItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -38,7 +40,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // LaunchServices.
         NSApp.setActivationPolicy(.accessory)
         recorder.statusDidChange = { [weak self] in self?.updateStatusItem() }
+        // An available update is a menu bar item, so the same hook drives it.
+        updates.statusDidChange = { [weak self] in self?.updateStatusItem() }
         installStatusItem()
+
+        updates.startAutomaticChecks()
 
         Task {
             await recorder.refreshPermissions()
@@ -158,6 +164,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             && !(recorder.state == .needsPermissions && !recorder.isSupervisingRecorder)
         menu.addItem(toggle)
 
+        // Present only when there is an update, rather than greyed out when
+        // there is not: an item that never does anything on most days is
+        // clutter, and this menu is four lines long on purpose.
+        if updates.status?.updateAvailable == true, let latest = updates.status?.latest {
+            let update = NSMenuItem(
+                title: "Update to \(latest)…", action: #selector(installUpdate), keyEquivalent: "")
+            update.target = self
+            menu.addItem(update)
+        }
+
         menu.addItem(.separator())
 
         let open = NSMenuItem(title: "Open Lumi", action: #selector(openWindow), keyEquivalent: "")
@@ -233,6 +249,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func quitApp() { Task { await quit() } }
 
+    @objc private func installUpdate() { Task { await confirmAndInstallUpdate() } }
+
     @objc private func openSettingsWindow() {
         NSApp.activate(ignoringOtherApps: true)
         NSApp.perform(Selector(("showSettingsWindow:")), with: nil)
@@ -262,6 +280,85 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             default: showWindow()
             }
         }
+    }
+
+    /// confirmAndInstallUpdate asks once, then hands the upgrade to the binary
+    /// and quits.
+    ///
+    /// One alert, not two. It deliberately does not call `quit()`, which would
+    /// put its own "Stop recording and quit Lumi?" on top of the question the
+    /// user has already answered — it takes the same graceful stop directly.
+    /// `applicationShouldTerminate` then sees no child held and returns
+    /// `.terminateNow`, so nothing asks a third time.
+    ///
+    /// The app quits *itself* rather than letting install.sh do it by Apple
+    /// event: a self-directed event would cost a needless Automation prompt.
+    /// install.sh needs no change — by the time it looks, the recorder has
+    /// already stopped and the app is on its way out, so its quit block finds
+    /// nothing or waits out the last of the shutdown.
+    func confirmAndInstallUpdate() async {
+        guard let status = updates.status, status.updateAvailable else { return }
+        let version = status.latest ?? "the latest release"
+
+        let alert = NSAlert()
+        alert.messageText = "Install Lumi \(version)?"
+        alert.informativeText =
+            "Lumi will stop recording, install \(version), and reopen. Anything already "
+            + "captured is indexed first. The installer writes what it did to update.log in "
+            + "your Lumi data folder."
+        alert.addButton(withTitle: "Install and Restart")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        // Whether capture was actually running, read before it is stopped: the
+        // update can be taken with recording deliberately off, and `stop()`
+        // no-ops there, so an unconditional restart below would switch capture
+        // *on* for somebody who had switched it off.
+        let wasRecording = recorder.isSupervisingRecorder
+
+        // The recorder stops *before* the installer is started, not after.
+        // install.sh quits a running Lumi by Apple event, and
+        // `applicationShouldTerminate` answers that by stopping and then
+        // replying `true` whatever the stop returned — so an installer racing a
+        // slow shutdown can carry the app out from over a child that is still
+        // writing. Nothing can race a shutdown that has already finished.
+        await recorder.stop()
+        // A stop that timed out leaves the child alive and still writing, and
+        // media that was captured but not yet indexed is exactly what the
+        // graceful path exists to save. Nothing has been downloaded or replaced
+        // at this point, so stopping here costs the update and nothing else.
+        if recorder.stopFailed {
+            let failure = NSAlert()
+            failure.messageText = "Lumi is still finishing its recording."
+            failure.informativeText =
+                "Nothing has been changed. Try the update again once Lumi has finished "
+                + "indexing what it captured."
+            failure.addButton(withTitle: "OK")
+            failure.runModal()
+            return
+        }
+
+        do {
+            try await updates.apply()
+        } catch {
+            // The binary refuses before it downloads or replaces anything, so
+            // the only thing spent is the recording that was just stopped for
+            // an update that is not going to happen. Start it again rather than
+            // leaving capture silently off.
+            let failure = NSAlert()
+            failure.messageText = "Lumi could not install this update."
+            failure.informativeText = error.localizedDescription
+            failure.addButton(withTitle: "OK")
+            failure.runModal()
+            if wasRecording {
+                await recorder.start()
+                updateStatusItem()
+            }
+            return
+        }
+
+        NSApp.terminate(nil)
     }
 
     /// quit stops the recorder before terminating, and asks first when that
