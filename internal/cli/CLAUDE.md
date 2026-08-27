@@ -1,7 +1,7 @@
 # internal/cli
 
 Cobra commands (`record start`/`status`/`stop`, `search`, `mcp`, `prune`, `compress`, `doctor`,
-`permissions`, `native-smoke`, `transcribe`, `transcript`, `version`, `app`). This package wires concrete processors into a
+`permissions`, `native-smoke`, `transcribe`, `transcript`, `version`, `app`, `update`). This package wires concrete processors into a
 `capture.Recorder`; data flows one way from here and never back. `record start` detaches to the background
 by default (`--foreground` keeps it inline) as a re-exec tracked by a JSON state file and log under the data
 dir (`record_daemon.go`); `record stop` sends SIGTERM and waits for graceful shutdown. `search` offers exact
@@ -128,4 +128,33 @@ developer's own Claude config.
   `--args` because LaunchServices drops arguments to an already-running app, which is the normal state for
   a menu bar app. `openURL` and `appIsRunning` are test seams for the same reason `resolveLumiBinary` is
   one: without them a test run would launch or quit the developer's own copy.
+- **`lumi update` is the only outbound network call this binary makes**, besides Apple's on-device
+  speech-asset download, and it sends nothing but a bare `GET` — no query, no token, no identifier.
+  That is the single place Lumi's local-first promise is spent, so anything added here spends it
+  again. **It resolves the `latest` redirect rather than the GitHub API**: that is the same pointer
+  `install.sh` follows to download the asset, so the check and the install cannot disagree about which
+  release is newest, and there is no rate limit or token to hold. The redirect is deliberately not
+  followed — its target *is* the answer — and `latest`, `.`, and `/` are rejected as tags, because a
+  repository with no published release redirects to itself and comparing "latest" as a version would
+  be a silent wrong answer.
+- **Both version strings are normalized to a leading `v` before any `semver` call, and a development
+  build never checks at all.** `semver.IsValid("0.3.0")` is *false*, and both unprefixed forms are
+  real: the release stamps the tag verbatim (`v0.3.0`) while `root.go`'s default is `0.1.0-dev`.
+  Skipping the normalization fails silently rather than loudly — an invalid string sorts below every
+  valid one, so a released build would offer an update to its own version. The dev build returns
+  before the request is made, not after the answer is ignored: `install.sh` does not manage a
+  checkout, so no response could change the outcome, and every `task build` would otherwise both nag
+  and phone home.
+- **`update --apply` refuses before it downloads or quits anything, and the two refusals are there
+  for different reasons.** The running binary must be inside `/Applications/Lumi.app`
+  (`enclosingAppBundle`, the same helper `lumi app` uses) — a check `install.sh` does not make at
+  all, because it replaces that path whatever invoked it, so a copy running from `~/Applications`
+  would silently upgrade a *different* Lumi and report success. `/Applications` must be writable —
+  which `install.sh` does check, first thing, but its answer there is to re-run under `sudo`, and it
+  is by then a detached shell writing into a log nobody reads, naming a command the app cannot run. **Neither refusal may name a
+  command**: `Lumi.app` surfaces this text verbatim and there is no `lumi` on anyone's `PATH`
+  (`macos/CLAUDE.md`). It then hands off to `install.sh` through `startDetachedProcess` with
+  `Setsid`, logging to `paths.UpdateLog`, and returns — not `CommandContext`, whose cancellation on
+  return would kill the installer mid-download. Being orphaned to launchd is what lets it outlive both
+  the app quitting and this process's own bundle being replaced.
 - **The binary refuses to run on anything but `darwin/arm64`** (`platform.Validate` in `PersistentPreRunE`).

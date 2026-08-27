@@ -121,4 +121,5 @@ changing anything there** — the rationale lives with the code it constrains, n
 
 Xcode Command Line Tools plus a Swift toolchain, to build the native cgo bridge (`swiftc` compiles the
 SpeechAnalyzer bridge into `liblumispeech.a`). Capture and processing are fully native — no external
-binaries, and no network calls beyond Apple's on-device speech-asset download. Lumi performs no inference.
+binaries, and no network calls beyond Apple's on-device speech-asset download and `lumi update`'s bare
+`GET` for the newest release tag, which the user can switch off. Lumi performs no inference.
