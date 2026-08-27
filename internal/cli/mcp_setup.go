@@ -243,10 +243,11 @@ func parseClientSelection(value string) (clientSelection, error) {
 //
 // Deliberately no filepath.EvalSymlinks: the durable name is whatever path this
 // process was reached through, and resolving one can only make it less stable. A
-// packaged install is /Applications/Lumi.app/Contents/MacOS/lumi, which a cask
-// upgrade replaces in place, so there is nothing to resolve today. Reached
-// through a symlink instead — as it was through /opt/homebrew/bin/lumi, whose
-// target moved every version bump — the link is the name that survives.
+// packaged install is /Applications/Lumi.app/Contents/MacOS/lumi, a real file
+// that install.sh replaces along with the bundle around it — same path, new
+// file — so there is nothing to resolve today. Reached through a symlink
+// instead — a developer's own, whose target moves every version bump — the
+// link is the name that survives.
 func lumiBinaryPath() (string, error) {
 	exe, err := resolveLumiBinary()
 	if err != nil {

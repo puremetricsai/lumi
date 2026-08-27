@@ -500,7 +500,6 @@ func TestIsTemporaryBinary(t *testing.T) {
 		"go run build cache": {filepath.Join(os.TempDir(), "go-build42", "b001", "exe", "lumi"), true},
 		"go-build anywhere":  {"/var/somewhere/go-build999/lumi", true},
 		"installed":          {"/usr/local/bin/lumi", false},
-		"homebrew":           {"/opt/homebrew/bin/lumi", false},
 		"repo checkout":      {"/Users/someone/Projects/lumi/lumi", false},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -589,7 +588,7 @@ func TestMCPSetupJSONPrintsThePayloadEvenWhenItFails(t *testing.T) {
 		result: mcpsetup.Result{
 			Status:  mcpsetup.StatusConflict,
 			Detail:  "an entry with different settings already exists",
-			Current: "/opt/homebrew/bin/lumi mcp",
+			Current: "/usr/local/bin/lumi mcp",
 		},
 		err: errors.New("refusing to overwrite"),
 	}
@@ -606,7 +605,7 @@ func TestMCPSetupJSONPrintsThePayloadEvenWhenItFails(t *testing.T) {
 	if len(report.Results) != 1 || report.Results[0].Status != mcpsetup.StatusConflict {
 		t.Fatalf("report does not describe the conflict: %+v", report)
 	}
-	if report.Results[0].Current != "/opt/homebrew/bin/lumi mcp" {
+	if report.Results[0].Current != "/usr/local/bin/lumi mcp" {
 		t.Errorf("current = %q, want the existing entry", report.Results[0].Current)
 	}
 	if report.DryRun {

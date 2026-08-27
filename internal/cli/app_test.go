@@ -68,7 +68,7 @@ func TestEnclosingAppBundle(t *testing.T) {
 	for _, c := range []struct{ name, path, want string }{
 		{"binary inside a bundle", "/Applications/Lumi.app/Contents/MacOS/lumi", "/Applications/Lumi.app"},
 		{"the bundle directory itself is not inside itself", "/Applications/Lumi.app", ""},
-		{"outside any bundle", "/opt/homebrew/bin/lumi", ""},
+		{"outside any bundle", "/usr/local/bin/lumi", ""},
 		{"a bundle anywhere on disk", "/Users/x/build/Lumi.app/Contents/MacOS/lumi", "/Users/x/build/Lumi.app"},
 		{"nested bundles resolve to the innermost", "/Applications/Outer.app/Contents/Lumi.app/Contents/MacOS/lumi", "/Applications/Outer.app/Contents/Lumi.app"},
 		{"empty", "", ""},
@@ -120,7 +120,7 @@ func TestAppCommandReportsAMissingBundle(t *testing.T) {
 	// The message is the only thing a user gets here, and it is the one place
 	// the CLI names an install command. A README that has moved on from
 	// `task app` cannot fix a binary that still tells people to run it.
-	for _, want := range []string{"brew install --cask puremetricsai/lumi/lumi", "task app"} {
+	for _, want := range []string{"install.sh", "task app"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not mention %q", err, want)
 		}

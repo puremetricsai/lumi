@@ -35,11 +35,11 @@ const (
 // one command whose whole job is to reach the bundle, so this is a failure
 // rather than a notice, and the exit code says so.
 //
-// The cask is named first because it is how everyone who did not clone the
+// install.sh is named first because it is how everyone who did not clone the
 // repository gets the app, and it installs the bundle where this command looks
 // for it. `task app` stays as the developer's path and says so.
 var errNoAppBundle = fmt.Errorf(
-	"%s is not installed; install it with `brew install --cask puremetricsai/lumi/lumi`, or build it from a checkout with `task app`",
+	"%s is not installed; install it with `curl -fsSL https://raw.githubusercontent.com/puremetricsai/lumi/main/install.sh | sh`, or build it from a checkout with `task app`",
 	appBundleName)
 
 // openURL and appIsRunning are package vars purely as test seams, for the same
