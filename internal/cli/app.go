@@ -39,8 +39,8 @@ const (
 // repository gets the app, and it installs the bundle where this command looks
 // for it. `task app` stays as the developer's path and says so.
 var errNoAppBundle = fmt.Errorf(
-	"%s is not installed; install it with `curl -fsSL https://raw.githubusercontent.com/puremetricsai/lumi/main/install.sh | sh`, or build it from a checkout with `task app`",
-	appBundleName)
+	"%s is not installed; install it with `curl -fsSL %s | sh`, or build it from a checkout with `task app`",
+	appBundleName, installScriptURL)
 
 // openURL and appIsRunning are package vars purely as test seams, for the same
 // reason resolveLumiBinary is one: without them a test run would launch or quit
