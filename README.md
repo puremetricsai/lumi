@@ -2,13 +2,69 @@
   <img src="assets/img/lumi-logo.png" alt="Lumi" width="160" height="160">
 </p>
 
-# Lumi
+<h1 align="center">Lumi</h1>
 
-Lumi is a minimal, open source AI memory of everything you do. It sees your screen and hears your meetings, then turns all of it into a searchable record of your work — so you never have to take notes again. Connect it to Claude or any other AI agent and ask what happened.
+<p align="center">
+  <b>A local-first AI memory of everything you do on your Mac.</b><br>
+  It sees your screen and hears your meetings, then turns all of it into a searchable record of your
+  work — so you never have to take notes again. Connect Claude or any other AI agent and ask what happened.
+</p>
 
-Everything runs on your Mac. Nothing is uploaded, and it's completely free.
+<p align="center">
+  <a href="https://github.com/puremetricsai/lumi/releases"><img src="https://img.shields.io/github/v/release/puremetricsai/lumi?color=111111&label=release" alt="Latest release"></a>
+  <img src="https://img.shields.io/badge/macOS-26%2B%20%C2%B7%20Apple%20Silicon-111111" alt="macOS 26 or newer, Apple Silicon">
+  <img src="https://img.shields.io/badge/data-100%25%20on--device-111111" alt="All data stays on device">
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/puremetricsai/lumi?color=111111" alt="MIT licensed"></a>
+</p>
 
-Lumi deliberately targets a small surface: capture → process → store → query. `Lumi.app` is the whole of it — a menu-bar app that captures in the background and answers questions through any AI agent you connect.
+<p align="center">
+  <img src="assets/img/lumi-toolbar.png" alt="Lumi toolbar: recording state, screen, microphone, and system audio" width="370">
+</p>
+
+## Why Lumi
+
+You already forgot most of last week. The decision made on a call, the error message you skimmed, the
+name of the tool somebody shared — it happened on your screen, and now it is gone.
+
+Tools that fix this usually want your day on their servers, behind a subscription, feeding a model you
+do not control.
+
+Lumi keeps the whole loop on your Mac. Capture, OCR, transcription, and the index all run locally with
+Apple's own frameworks — nothing is uploaded, there is no account, and it is free. Lumi performs no
+inference at all; it hands your own searchable history to whichever AI agent you already trust.
+
+## Quickstart
+
+**1. Install.**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/puremetricsai/lumi/main/install.sh | sh
+```
+
+**2. Grant permissions.** Open Lumi, then **Settings → Permissions**. Press the buttons for Screen
+Recording, Accessibility, Microphone, and Speech Recognition.
+
+**3. Record, then connect an agent.** Start recording from the menu bar item, and press **Set up** in
+**Settings → MCP** to register Lumi with every MCP client on this Mac.
+
+Now ask your agent about your own day.
+
+## Ask it things
+
+Once Lumi is connected, these are plain questions to your agent — it reads your index through Lumi's
+four read-only tools and answers from what actually happened:
+
+- *"What did I work on yesterday? Break it down by app and tell me where the time went."*
+- *"Summarize the call I was on this morning and pull out anything I committed to."*
+- *"A few days ago I hit an error about a failed migration. Find it and show me the exact message."*
+- *"I read a pricing page last week and cannot remember the vendor. What was it?"*
+- *"Write my weekly update from what I actually did, not from what I remember doing."*
+- *"Which apps ate my afternoon, and what was I doing in them?"*
+- *"Somebody said a book title on a call last month. What was it?"*
+- *"Replay the last hour of that meeting as a transcript — I stepped away."*
+
+Nothing leaves your Mac to answer these except the question you type into your own agent. The tools
+return text and metadata only — never a screenshot or a recording.
 
 ## Requirements
 
@@ -24,15 +80,11 @@ Transcription runs entirely on-device through Apple SpeechAnalyzer — no extern
 
 ScreenCaptureKit captures system output and the default microphone directly; no loopback audio device is required. Lumi excludes its own process audio from system capture.
 
-## Installation
+## Installation details
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/puremetricsai/lumi/main/install.sh | sh
-```
+The command above downloads the latest release and puts `/Applications/Lumi.app` in place. Re-run the same command to upgrade — the script quits a running Lumi first so an in-flight recording shuts down cleanly. Nothing else is installed: no command on your `PATH` and no daemon.
 
-That downloads the latest release and puts `/Applications/Lumi.app` in place. Re-run the same command to upgrade — the script quits a running Lumi first so an in-flight recording shuts down cleanly. Nothing else is installed: no command on your `PATH` and no daemon.
-
-Open Lumi, then grant capture permissions from **Settings → Permissions**. macOS grants them to Lumi itself, so the prompts come from the app and nothing else needs approving. Recording starts from the menu bar item or the Lumi window.
+macOS grants capture permissions to Lumi itself, so the prompts come from the app and nothing else needs approving.
 
 The script downloads a prebuilt `darwin/arm64` bundle from the [latest release](https://github.com/puremetricsai/lumi/releases), so no Go or Swift toolchain is involved. Uninstall by dragging `Lumi.app` to the Trash; that leaves `~/Library/Application Support/Lumi` — your database and captured media — untouched.
 
@@ -49,13 +101,9 @@ page](https://github.com/puremetricsai/lumi/releases) still lists what changed.
 
 ### The app is not notarized yet
 
-Lumi has no Apple Developer ID certificate, so the released app carries the project's own signing certificate instead. That is invisible if you install with the command above: `curl` does not mark the download with `com.apple.quarantine`, so Gatekeeper never blocks the first launch.
+The released app is signed with a real Apple Developer ID certificate, but it is not notarized. That is invisible if you install with the command above: `curl` does not mark the download with `com.apple.quarantine`, so Gatekeeper never blocks the first launch.
 
-Download the ZIP in a browser instead and it does get quarantined — an un-notarized, never-executed app is then killed on launch with no prompt at all. Recovering from that takes **System Settings → Privacy & Security → Open Anyway**, and if it still will not start, clearing the flag by hand:
-
-```sh
-xattr -dr com.apple.quarantine /Applications/Lumi.app
-```
+Download the ZIP in a browser instead and it does get quarantined — Gatekeeper then refuses the first launch with "Apple could not verify Lumi is free of malware". Allow it once from **System Settings → Privacy & Security → Open Anyway**.
 
 Use the install command and none of that applies. All of it goes away with notarization.
 
@@ -137,41 +185,6 @@ How capture, processing, storage, and query fit together, what each package owns
 
 ## Development
 
-Lumi is a Swift menu-bar app wrapped around a Go binary that does all the work. The app supervises that binary as a child process; the binary is embedded in the bundle at `Contents/MacOS/lumi` and is not installed separately.
-
-```sh
-task build   # compiles the Swift SpeechAnalyzer bridge, then go build
-task test    # full suite (raw go build/go test will not link without the Swift archive)
-task check   # fmt → vet → test; the verification command
-```
-
-```sh
-task app          # build build/Lumi.app
-task app:install  # install ~/Applications/Lumi.app
-task app:run      # install and launch it
-```
-
-`./scripts/restart-lumi-app.sh` is the app development loop: quit, rebuild, reset TCC, relaunch. A bundle built locally is ad-hoc signed, so every rebuild changes its TCC identity and the four permissions have to be granted again — batch UI changes into single builds. The released app carries one stable certificate, so its grants survive an upgrade.
-
-The binary is also how the pipeline is driven directly while working on it:
-
-```sh
-./lumi permissions --request   # or: task permissions
-./lumi doctor                  # platform, permissions, speech assets, data directory
-./lumi record start --foreground --no-audio --duration 10s   # bounded smoke test
-./lumi search "quarterly roadmap"
-./lumi search "launch budget" --type audio --since 8h
-./lumi transcript --since 2h
-./lumi transcript backfill --since 7d
-```
-
-`search` returns audio as 30-second windows of one track, which reads poorly as conversation. `transcript` reads the same audio as an ordered conversation instead, labelling every turn by where the sound came from and showing the machine's words once rather than twice. A leading `~` marks a turn whose position was inferred; a trailing score marks uncertain attribution. Turns are derived from the two transcripts, so `transcript backfill` is what fills them in for audio captured before that existed — the default pass works from the index alone, while `--retranscribe` re-runs recognition to recover word timings and refuses to run beside a live recorder.
-
-Two more smoke tests, both permission-gated:
-
-```sh
-task test:native   # bounded native framework test
-task mcp           # hand-fed MCP JSON-RPC handshake
-```
+Lumi is a Swift menu-bar app wrapped around a Go binary that does all the work. Building it, the `task` targets, the app rebuild loop, and driving the pipeline from the binary directly: [docs/development.md](docs/development.md).
 
 Lumi is licensed under the MIT License.
