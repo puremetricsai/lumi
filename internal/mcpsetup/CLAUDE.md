@@ -29,8 +29,14 @@ path is an injectable field, so tests need no client present.
   (dropping a sibling's `args = []`, floating its timeout, sorting its `env`), which is the client's own
   behaviour and not something Lumi can narrow. Reads go through `codex mcp get <name> --json`, the
   structured comparison `claude mcp get` couldn't give. **The `--` separator is load-bearing here too**
-  (`TestCodexAddPassesArgsAfterASeparator`). Detection is the `codex` binary on PATH and nothing else —
-  `~/.codex/` is created by the ChatGPT desktop app too.
+  (`TestCodexAddPassesArgsAfterASeparator`). Detection is the `codex` **binary** — on PATH, else at a known
+  install location — and never the presence of `~/.codex/`, which the ChatGPT desktop app creates whether or
+  not a CLI exists. PATH alone was not enough: `Lumi.app` is launched by launchd with
+  `/usr/bin:/bin:/usr/sbin:/sbin`, so the app's own button reported Codex "not installed" on machines where
+  it plainly was. `/Applications/ChatGPT.app/Contents/Resources/codex` is in that list on purpose — the
+  desktop app and the CLI read and write the same `$CODEX_HOME/config.toml`, so registering through either
+  configures both. A user whose only `codex` is somewhere else entirely (an nvm version directory, say) and
+  who has no desktop app still gets the skip and the paste-able snippet.
 - **A disabled Codex entry is a difference, not a match.** An entry with Lumi's exact command and args but
   `enabled = false` is one codex will not launch; comparing only command and args reported `unchanged` while
   the agent silently never saw Lumi. It is a difference, so `--force` fixes it, and `Result.Current` appends

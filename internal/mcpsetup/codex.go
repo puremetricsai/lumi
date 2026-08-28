@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"time"
 )
@@ -40,6 +42,10 @@ type Codex struct {
 	CLIPath string
 	// LookPath finds a binary on PATH. nil uses exec.LookPath.
 	LookPath func(string) (string, error)
+	// Candidates are the absolute paths checked when PATH has no codex. nil
+	// uses codexCLICandidates; a test sets it so a codex the developer really
+	// has installed cannot answer for the machine under test.
+	Candidates []string
 	// Required makes an unconfigurable client an error rather than a skip. The
 	// caller sets it when the user named this client explicitly.
 	Required bool
@@ -47,12 +53,29 @@ type Codex struct {
 
 func (c *Codex) Name() string { return codexName }
 
-// resolveCLI finds the codex binary, or returns "" if there is none.
+// codexCLICandidates are the install locations checked when `codex` is not on
+// PATH, for the same reason claudeCLICandidates exists: Lumi.app is launched by
+// launchd, whose PATH is /usr/bin:/bin:/usr/sbin:/sbin and nothing else, so a
+// bare LookPath reports "not installed" on a machine where Codex plainly is.
 //
-// PATH only — deliberately no candidate install locations, and deliberately no
-// probe of ~/.codex. That directory is created and populated by the ChatGPT
-// desktop app too, so its presence is no evidence the CLI is installed, and its
-// absence is no evidence it is not. The binary is the only honest signal.
+// The ChatGPT app's bundled binary is last and is deliberately included: the
+// desktop app and the CLI share $CODEX_HOME/config.toml, so registering through
+// either one configures both. It reads and writes that file correctly with no
+// environment beyond launchd's.
+//
+// Still deliberately absent: any probe of ~/.codex itself. That directory is
+// created and populated by the desktop app too, so its presence is no evidence
+// a CLI is installed. The binary remains the only honest signal — this widens
+// where Lumi looks for it, not what counts as one.
+func codexCLICandidates(home string) []string {
+	candidates := []string{"/opt/homebrew/bin/codex", "/usr/local/bin/codex"}
+	if home != "" {
+		candidates = append(candidates, filepath.Join(home, ".local", "bin", "codex"))
+	}
+	return append(candidates, "/Applications/ChatGPT.app/Contents/Resources/codex")
+}
+
+// resolveCLI finds the codex binary, or returns "" if there is none.
 func (c *Codex) resolveCLI() string {
 	if c.CLIPath != "" {
 		return c.CLIPath
@@ -63,6 +86,17 @@ func (c *Codex) resolveCLI() string {
 	}
 	if path, err := lookPath("codex"); err == nil {
 		return path
+	}
+	candidates := c.Candidates
+	if candidates == nil {
+		// A failing UserHomeDir only costs the one home-relative candidate.
+		home, _ := os.UserHomeDir()
+		candidates = codexCLICandidates(home)
+	}
+	for _, candidate := range candidates {
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
 	}
 	return ""
 }
@@ -190,7 +224,7 @@ func (c *Codex) Apply(ctx context.Context, spec Spec, opts Options) (Result, err
 	cli := c.resolveCLI()
 	if cli == "" {
 		result.Status = StatusSkipped
-		result.Detail = "the codex CLI was not found on PATH"
+		result.Detail = "no codex CLI was found on PATH or in the usual install locations"
 		if c.Required {
 			return result, notInstalledErr(codexName, result.Detail)
 		}
