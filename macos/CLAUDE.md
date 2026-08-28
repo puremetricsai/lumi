@@ -78,6 +78,25 @@ The app is a supervisor and nothing else — root `CLAUDE.md` states that rule; 
   flexible thing it holds, and `Text` measures zero — "REC" and the display count vanished while every
   icon and dot beside them looked right, so the bug reads as "text does not render" rather than as a
   layout one. Any label added to the bar depends on this modifier staying.
+- **The global start/stop shortcut is Carbon `RegisterEventHotKey`, never a global `NSEvent` monitor.**
+  A global monitor needs Input Monitoring, which `Models.swift` models as *optional* and
+  `PermissionsSettings` draws as a neutral "Off" when denied — building the shortcut on it would silently
+  promote that row into a requirement, and the Hardened Runtime would deny it in a release unless
+  `Lumi.entitlements` named it. Carbon costs no grant and no entitlement. Two consequences that are
+  invisible until they bite: a registered hotkey is consumed before it is ever an `NSEvent`, so
+  `ShortcutRecorder` must `suspend()` before it listens or pressing the current combination re-records
+  nothing and toggles capture instead; and **`RegisterEventHotKey` is non-exclusive**, so a combination
+  another app already holds registers with `noErr` here and then fires in *both* apps — measured, a second
+  process was given `noErr` for a combination Lumi held. `registrationFailed` therefore means "could not
+  arm it", never "somebody else has it", and no wording anywhere may promise collision detection Carbon
+  cannot do. That is the reason the shortcut ships **unassigned**: a default nobody vetted would silently
+  double up on whatever already owns those keys. `GlobalShortcut.action` is parked by `AppDelegate` exactly like `LumiApp.hide`, for the same
+  `NSApp.delegate as? AppDelegate` reason. It is app policy, not a capture flag: absent from
+  `recorderArguments()`, and its setter must not `restart()`.
+- **`RecorderController.canToggleRecording` is the one gate on whether start/stop would do anything**, read
+  by the menu bar item's `isEnabled` and by the shortcut alike. `AppDelegate.toggleRecording` reads the
+  recorder at fire time, which the menu deliberately does not — that rule is about a stale *label* on an
+  open dropdown, and a shortcut has none.
 - **Never restart the recorder when displays change.** The Go recorder rediscovers displays every interval.
 - **Anything that acts on the recorder reads `isSupervisingRecorder`, never `state == .recording`.** A
   permission revoked mid-capture moves the UI to `.needsPermissions` while the child keeps running and keeps
