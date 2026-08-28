@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.4.0](https://github.com/puremetricsai/lumi/compare/v0.3.2...v0.4.0) (2026-08-28)
+
+
+### Features
+
+* **app:** add a global start and stop recording shortcut ([cb372b2](https://github.com/puremetricsai/lumi/commit/cb372b24cd5369d2f3249fb0677ccfdab5ac927c))
+* **app:** add a global start and stop recording shortcut ([532bdde](https://github.com/puremetricsai/lumi/commit/532bdde780df7b0718d949d22839024fecc64b33))
+* **app:** let Settings be opened on a named tab ([ec96b8c](https://github.com/puremetricsai/lumi/commit/ec96b8c42cae3217d1cdd5935d006ad6163d9023))
+* **app:** redraw the Lumi window as a floating toolbar ([6e1de89](https://github.com/puremetricsai/lumi/commit/6e1de89e0bf0bbb49616086c5b5183e3ebdddb34))
+* **app:** redraw the Lumi window as a floating toolbar ([ea4b8f8](https://github.com/puremetricsai/lumi/commit/ea4b8f8b10e8567be32c1d5e68484ac7b8d8969d))
+
 ## [0.3.2](https://github.com/puremetricsai/lumi/compare/v0.3.1...v0.3.2) (2026-08-28)
 
 
