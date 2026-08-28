@@ -29,6 +29,9 @@ struct LumiWindow: View {
         // The negative padding gives it back. It is the measured band rather
         // than a constant: the height changes between macOS releases.
         .padding(.bottom, -Theme.systemTitleBarHeight)
+        // The menu bar item and `lumi://settings` open Settings too, and the
+        // delegate that serves them cannot read this action itself.
+        .onAppear { LumiApp.openSettings = openSettings }
     }
 
     // MARK: - Chrome
