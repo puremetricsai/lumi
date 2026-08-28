@@ -14,8 +14,26 @@ import AppKit
 /// means the repository keeps one logo file rather than a hand-made second copy
 /// that could drift from it.
 enum MenuBarGlyph {
-    /// The menu bar's usable height leaves about 18pt for an icon.
+    /// The menu bar's usable height leaves about 18pt for an icon. The window's
+    /// mark draws the same image resizable, so this is a rendering size rather
+    /// than a limit.
     static let side = 18
+
+    /// The mark, derived once and shared by the menu bar item and the Lumi
+    /// window. Two callers deriving it separately would be the hand-made second
+    /// copy this file exists to avoid, only made of CPU instead of pixels.
+    ///
+    /// It falls back to a system symbol so a missing resource costs the icon
+    /// rather than the app.
+    static let template: NSImage? = {
+        if let url = Bundle.main.url(forResource: "menubar-glyph", withExtension: "png"),
+           let glyph = make(from: url) {
+            return glyph
+        }
+        let fallback = NSImage(systemSymbolName: "circle.fill", accessibilityDescription: "Lumi")
+        fallback?.isTemplate = true
+        return fallback
+    }()
 
     static func make(from url: URL) -> NSImage? {
         guard let source = NSImage(contentsOf: url),

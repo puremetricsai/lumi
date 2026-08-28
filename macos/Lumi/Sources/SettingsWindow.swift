@@ -12,23 +12,51 @@ import SwiftUI
 /// Permissions rather than last, so an irreversible action is never the tab a
 /// stray click lands on.
 struct SettingsWindow: View {
+    @State private var selection = SettingsSelection.shared
+
     var body: some View {
-        TabView {
+        @Bindable var selection = selection
+        TabView(selection: $selection.tab) {
             RecordingSettings()
                 .tabItem { Label("Recording", systemImage: "record.circle") }
+                .tag(SettingsSelection.Tab.recording)
             StorageSettings()
                 .tabItem { Label("Storage", systemImage: "internaldrive") }
+                .tag(SettingsSelection.Tab.storage)
             MCPSettings()
                 .tabItem { Label("MCP", systemImage: "point.3.connected.trianglepath.dotted") }
+                .tag(SettingsSelection.Tab.mcp)
             DangerSettings()
                 .tabItem { Label("Danger", systemImage: "exclamationmark.triangle") }
+                .tag(SettingsSelection.Tab.danger)
             PermissionsSettings()
                 .tabItem { Label("Permissions", systemImage: "lock.shield") }
+                .tag(SettingsSelection.Tab.permissions)
             AboutSettings()
                 .tabItem { Label("About", systemImage: "info.circle") }
+                .tag(SettingsSelection.Tab.about)
         }
         .frame(width: Theme.settingsWidth)
     }
+}
+
+/// SettingsSelection is which tab the Settings window is showing.
+///
+/// It exists because the window is opened from outside itself — the toolbar's
+/// permissions warning wants the Permissions tab, not whichever tab was last
+/// left open — and `OpenSettingsAction` takes no argument. Observable rather
+/// than a value read once: the Settings scene is built once and reshown, so a
+/// tab chosen at open time has to reach a `TabView` that already exists.
+///
+/// Stored nowhere. Which tab someone was last looking at is not a preference.
+@Observable
+@MainActor
+final class SettingsSelection {
+    enum Tab: String { case recording, storage, mcp, danger, permissions, about }
+
+    static let shared = SettingsSelection()
+
+    var tab: Tab = .recording
 }
 
 struct RecordingSettings: View {

@@ -1,410 +1,325 @@
 import AppKit
 import SwiftUI
 
-/// LumiWindow is the small floating window behind "Open Lumi".
+/// LumiWindow is the floating toolbar behind "Open Lumi".
 ///
-/// It has exactly three mutually exclusive states and no navigation. Recording
-/// is the normal one: Lumi is always-on, so there is no start/stop ceremony,
-/// no timer, no session name, and no "processing" state to wait through.
+/// One capsule, no window chrome, no navigation, and no prose. Recording is the
+/// normal state — Lumi is always-on, so there is no start/stop ceremony, no
+/// timer, and no session name — which is why the whole app fits on a strip:
+/// what a user comes here for is "is it capturing, and is it hearing anything".
+///
+/// The three states differ only in what sits between the mark and the gear.
+/// Nothing here scrolls, wraps, or resizes; the window is exactly this row.
 struct LumiWindow: View {
     @Environment(RecorderController.self) private var recorder
     @Environment(\.openSettings) private var openSettings
 
     var body: some View {
-        VStack(spacing: 0) {
-            titleBar
-            content
-                .frame(maxWidth: .infinity)
-            footer
+        HStack(spacing: Theme.barSpacing) {
+            mark
+            middle
+            if let error = recorder.lastError {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 13))
+                    .foregroundStyle(Theme.attention)
+                    .help(error)
+                    .accessibilityLabel(error)
+            }
+            settingsButton
+            hideButton
         }
-        .frame(width: Theme.windowWidth)
-        .background(.regularMaterial)
-        // The content extends under the title bar so the title row can sit in
-        // the same band as the window buttons. Without this the system reserves
-        // the title bar's height above the content, and the title lands well
-        // below the buttons it is supposed to line up with.
-        .ignoresSafeArea(.container, edges: .top)
-        // …and the window still sizes itself as if that band were above the
-        // content, which left the band's height as dead space under the footer.
-        // The negative padding gives it back. It is the measured band rather
-        // than a constant: the height changes between macOS releases.
-        .padding(.bottom, -Theme.systemTitleBarHeight)
+        .padding(.horizontal, 10)
+        .frame(height: Theme.barHeight)
+        // The row takes its ideal width, and the window is sized from that.
+        // Without this the window proposes a width the row must fit into, and
+        // an `HStack` shrinks the only flexible thing it holds — so "REC" and
+        // the display count measured zero and silently did not draw, while
+        // every icon and dot beside them looked correct.
+        .fixedSize(horizontal: true, vertical: false)
+        .background {
+            // Material for the blur, then a dark wash over it: the toolbar is
+            // dark whatever is behind it, so a white glyph is legible over a
+            // pale desktop as well as a dark one.
+            Capsule().fill(.regularMaterial)
+            Capsule().fill(Color.black.opacity(0.4))
+        }
+        // The capsule is the whole window, so it carries its own dark
+        // appearance rather than following the desktop's: the wash above is
+        // what the glyph colours are chosen against.
+        .preferredColorScheme(.dark)
+        .background(WindowChrome())
         // The menu bar item and `lumi://settings` open Settings too, and the
         // delegate that serves them cannot read this action itself.
         .onAppear { LumiApp.openSettings = openSettings }
     }
 
-    // MARK: - Chrome
+    // MARK: - Mark
 
-    private var titleBar: some View {
-        ZStack {
-            Text("lumi")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.secondary)
-            HStack {
-                Spacer()
-                Button {
-                    openSettings()
-                } label: {
-                    Image(systemName: "gearshape")
-                        .font(.system(size: 12, weight: .medium))
-                }
-                .buttonStyle(.accessoryBar)
-                .accessibilityLabel("Open Settings")
-                .help("Settings")
+    /// The mark is the window's drag handle and nothing else.
+    ///
+    /// Drawn exactly as the menu bar draws it: the same template image, at the
+    /// same secondary weight as every other glyph on the bar. It is not a
+    /// button, so it takes no hover treatment — but it is not a logo either,
+    /// and a solid white disc among translucent glyphs read as one.
+    ///
+    /// `isMovableByWindowBackground` is off, so this gesture is the only thing
+    /// that moves the window — dragging a button must press it, not slide the
+    /// toolbar out from under the pointer.
+    private var mark: some View {
+        Group {
+            if let glyph = MenuBarGlyph.template {
+                Image(nsImage: glyph)
+                    .resizable()
+                    .renderingMode(.template)
             }
         }
-        // No padding on either side. The gear used to sit 14pt in from an
-        // already generously padded .accessoryBar button, which left its glyph
-        // 32pt from the right edge while the close button sits 10pt from the
-        // left. Flush, the glyph lands ~13pt in — the same band the traffic
-        // lights occupy — and the title centres on the window rather than on a
-        // padded row. The explicit 24pt square around the glyph went with the
-        // padding: .accessoryBar draws its own hit area, and the square only
-        // pushed the gear further from the edge.
-        //
-        // Height rather than padding, so the row's centre — and with it the
-        // title and the gear — falls on the same line as the close, minimise,
-        // and zoom buttons the system draws over it.
-        .frame(height: Theme.titleBarHeight)
+        .foregroundStyle(.secondary)
+        // A touch larger than the 17pt glyphs beside it: the mark is a filled
+        // disc where they are line art, and at the same size it reads smaller
+        // than they do.
+        .frame(width: 20, height: 20)
+        .frame(width: Theme.barItemHeight, height: Theme.barItemHeight)
+        .contentShape(Rectangle())
+        .gesture(WindowDragGesture())
+        .accessibilityLabel("Lumi. Drag to move the window")
     }
 
+    // MARK: - States
+
+    /// One row per state, so the recording case's own spacing is stated where
+    /// its contents are rather than inherited from the bar it sits in.
     @ViewBuilder
-    private var content: some View {
+    private var middle: some View {
         switch recorder.state {
-        case .recording: recordingState
-        case .idle: idleState
-        case .needsPermissions: permissionsState
-        }
-    }
-
-    /// The footer carries the local-first guarantee and nothing else.
-    ///
-    /// Quit used to sit here. It lives in the menu bar menu now, which is where
-    /// a menu bar app is quit from, and it is the only place: two routes out of
-    /// the app would be two places to keep the graceful-stop confirmation
-    /// right.
-    private var footer: some View {
-        HStack {
-            Text("On-device · nothing leaves your Mac")
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-            Spacer()
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 9)
-    }
-
-    // MARK: - Recording
-
-    private var recordingState: some View {
-        VStack(spacing: 16) {
-            HStack(spacing: 7) {
-                StatusDot(color: Theme.recording, pulsing: true)
-                Text("Recording")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(Theme.recording)
-                    .textCase(.uppercase)
-                    .kerning(0.3)
-            }
-            .accessibilityElement(children: .ignore)
-            .accessibilityLabel("Recording")
-
-            VStack(spacing: 7) {
-                if Preferences.shared.captureScreen {
-                    StatusRow(
-                        title: "Screen capture",
-                        detail: recorder.displayCount == 1 ? "1 display" : "\(recorder.displayCount) displays",
-                        healthy: true)
-                }
+        case .recording:
+            HStack(spacing: Theme.barSpacing) {
+                recordingPill
+                if Preferences.shared.captureScreen { displayPill }
                 if Preferences.shared.captureAudio {
-                    AudioStatusRow(
-                        title: "Microphone",
-                        level: recorder.level(for: "microphone"),
-                        silenceIsFailure: true)
-                    AudioStatusRow(title: "System audio", level: recorder.level(for: "system"))
+                    audioPill(symbol: "mic", title: "Microphone", source: "microphone",
+                              silenceIsFailure: true)
+                    audioPill(symbol: "speaker.wave.2", title: "System audio", source: "system")
                 }
+                stopButton
             }
-
-            if let error = recorder.lastError {
-                Text(error)
-                    .font(.system(size: 11))
-                    .foregroundStyle(Theme.attention)
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
-            Button(recorder.isStopping ? "Stopping…" : "Stop recording") {
-                Task { await recorder.stop() }
-            }
-            .buttonStyle(StopButtonStyle())
-            .disabled(recorder.isStopping)
-        }
-        .padding(.horizontal, 24)
-        .padding(.top, 20)
-        .padding(.bottom, 24)
-    }
-
-    // MARK: - Idle
-
-    private var idleState: some View {
-        VStack(spacing: 18) {
-            Button {
-                Task { await recorder.start() }
-            } label: {
-                ZStack {
-                    Circle()
-                        .fill(Color.primary.opacity(0.08))
-                        .frame(width: 104, height: 104)
-                    Circle()
-                        .fill(LinearGradient(
-                            colors: [Color(nsColor: .systemRed).opacity(0.92), Theme.recording],
-                            startPoint: .top, endPoint: .bottom))
-                        .frame(width: 66, height: 66)
-                }
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Start recording")
-
-            VStack(spacing: 3) {
-                Text("Ready to record")
-                    .font(.system(size: 17, weight: .semibold))
-                Text("Continuously capture screen & audio into your searchable memory.")
-                    .font(.system(size: 13))
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .frame(maxWidth: 220)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
-            if let error = recorder.lastError {
-                Text(error)
-                    .font(.system(size: 11))
-                    .foregroundStyle(Theme.attention)
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-        .padding(.horizontal, 24)
-        .padding(.top, 22)
-        .padding(.bottom, 26)
-    }
-
-    // MARK: - Permissions
-
-    private var permissionsState: some View {
-        VStack(spacing: 14) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .font(.system(size: 26))
-                .foregroundStyle(Theme.accent)
-
-            VStack(spacing: 3) {
-                Text("Permissions needed")
-                    .font(.system(size: 17, weight: .semibold))
-                Text("Lumi needs system access before it can capture.")
-                    .font(.system(size: 13))
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
-            // Every required service, granted or not — the list is what the
-            // rule in `requireRecordingPermissions` says is required for the
-            // current capture mode, never a fixed count.
-            VStack(spacing: 7) {
-                ForEach(requiredRows) { row in
-                    permissionRow(row)
-                }
-            }
-
-            // Said plainly, because the alternative is the user waiting for a
-            // dialog that is never coming. Screen Recording and Accessibility
-            // do not re-prompt once macOS holds a decision for this build, and
-            // an unsigned rebuild is a new build every time. The measurement is
-            // docs/research/2026-08-17-tcc-spike.md, Result 6.
-            if hasSettingsOnlyService {
-                Text("Screen Recording and Accessibility never ask twice. "
-                     + "Switch them on in System Settings, then come back.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
-            // Explained before requested, never the other way round: the app
-            // must not raise a system prompt the user has had no chance to
-            // understand.
-            //
-            // This runs the request flows, which is what Microphone and Speech
-            // Recognition need — they answer with a dialog. It no longer opens
-            // a pane afterwards. It used to open the *first* missing service's
-            // pane, which meant that with both Screen Recording and
-            // Accessibility missing, the second one had no route at all: the
-            // user granted the first, came back, and the same button sent them
-            // to the same place. Each row carries its own route now.
-            Button("Request access") {
-                Task { await recorder.requestPermissions() }
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(Theme.accent)
-            .help("Ask macOS for the permissions that answer with a dialog")
-        }
-        .padding(.horizontal, 24)
-        .padding(.top, 20)
-        .padding(.bottom, 24)
-    }
-
-    /// permissionRow is one service. An ungranted one is a button that opens
-    /// its own pane in System Settings.
-    ///
-    /// Per service, not one button for the set. Two of these services can only
-    /// ever be fixed in System Settings, and they live in two different panes;
-    /// a single destination leaves whichever one is not first unreachable.
-    @ViewBuilder
-    private func permissionRow(_ row: PermissionRow) -> some View {
-        let body = HStack {
-            Text(row.service.title)
-                .font(.system(size: 13))
-            Spacer()
-            Badge(text: row.state.label, tone: row.state.tone)
-            if !row.state.isGranted, row.service.settingsURL != nil {
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 9)
-        .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.05)))
-
-        if !row.state.isGranted, let url = row.service.settingsURL {
-            Button {
-                NSWorkspace.shared.open(url)
-            } label: {
-                body
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("\(row.service.title), \(row.state.label). Open it in System Settings")
-            .help("Open \(row.service.title) in System Settings")
-        } else {
-            body.accessibilityElement(children: .combine)
+        case .idle:
+            recordButton
+        case .needsPermissions:
+            permissionsButton
         }
     }
 
-    /// hasSettingsOnlyService reports whether anything missing is one macOS
-    /// will not re-prompt for. Screen Recording and Accessibility are the two;
-    /// both are reached only through System Settings once a decision exists.
-    private var hasSettingsOnlyService: Bool {
-        recorder.missingPermissions.contains {
-            $0.service == .screenRecording || $0.service == .accessibility
+    private var recordingPill: some View {
+        HStack(spacing: 6) {
+            StatusDot(color: Theme.recording, pulsing: true, diameter: 7)
+            Text("REC")
+                .font(.system(size: 11, weight: .bold))
+                .kerning(0.5)
+                .foregroundStyle(Theme.recording)
         }
-    }
-
-    // There is deliberately no "can this still prompt?" test. Screen Recording
-    // and Accessibility report `denied_or_not_determined`, and that conflation
-    // is on purpose: `lumi_permissions_json` says splitting the two needs Full
-    // Disk Access or a call that prompts as a side effect. So "never asked" and
-    // "already refused" are indistinguishable here, and disabling the button on
-    // that guess would suppress a prompt that would have worked. Running the
-    // flows again costs nothing when there is nothing to ask.
-
-    /// requiredRows is every service the current capture mode needs, with the
-    /// ungranted ones first so the thing to fix is at the top.
-    private var requiredRows: [PermissionRow] {
-        let missing = recorder.missingPermissions
-        let missingIDs = Set(missing.map(\.id))
-        let granted = recorder.permissions.rows.filter {
-            !$0.service.isOptional && !missingIDs.contains($0.id) && $0.state.isGranted
-        }
-        return missing + granted
-    }
-}
-
-/// AudioStatusRow is one audio track's line in the recording card.
-///
-/// A missing level is drawn as a missing level. `RecorderController` prunes a
-/// measurement the recorder has stopped refreshing, so nil here means one of
-/// two things — capture has only just started, or the track has stopped
-/// reporting because the microphone is denied, absent, or gone — and neither is
-/// "sound was heard". Bars at their floor beside a green dot said the opposite
-/// of both, and a dead microphone was indistinguishable from a quiet room.
-///
-/// Levels are live, so this clears within a second of capture starting. A row
-/// still reading "No signal yet" after that is a real answer about that track.
-///
-/// The recorder's own `silent` means opposite things on the two tracks, which is
-/// `silenceIsFailure`. Nothing playing is what a system track sounds like most
-/// of the time; a live microphone in a silent room still carries its own noise,
-/// so a microphone reporting silence is one nothing is reaching — a denied or
-/// stale Microphone grant delivers empty buffers rather than an error, and this
-/// row is the only place that shows. Judged one interval at a time, because a
-/// live microphone does not produce one.
-private struct AudioStatusRow: View {
-    var title: String
-    var level: AudioLevel?
-    var silenceIsFailure = false
-
-    private var isDigitallySilent: Bool { silenceIsFailure && level?.silent == true }
-
-    var body: some View {
-        StatusRow(
-            title: title,
-            detail: level == nil ? "No signal yet"
-                : isDigitallySilent ? "Silent — check Microphone access" : nil,
-            level: level,
-            healthy: level != nil && !isDigitallySilent)
-    }
-}
-
-/// StatusRow is one source's line in the recording card.
-private struct StatusRow: View {
-    var title: String
-    var detail: String? = nil
-    var level: AudioLevel? = nil
-    var healthy: Bool
-
-    var body: some View {
-        HStack(spacing: 10) {
-            Text(title)
-                .font(.system(size: 13))
-            Spacer()
-            if let detail {
-                Text(detail)
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-            } else {
-                LevelMeter(level: level)
-            }
-            StatusDot(color: healthy ? Theme.live : Theme.attention, diameter: 7)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 9)
-        .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.05)))
+        .padding(.horizontal, 10)
+        .frame(height: Theme.barItemHeight)
+        .background(Capsule().fill(Theme.recording.opacity(0.16)))
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(accessibilityLabel)
+        .accessibilityLabel("Recording")
     }
 
-    private var accessibilityLabel: String {
-        if let detail { return "\(title), \(detail)" }
-        guard let level else { return "\(title), no recent measurement" }
-        return "\(title), peak \(Int(level.peakDbfs)) decibels full scale"
+    /// The live sources are behind the same preference gates the recorder itself
+    /// is started with: a track that was never asked for has no pill.
+    private var displayPill: some View {
+        ToolbarPill {
+            Image(systemName: "display").font(.system(size: 12))
+            Text("\(recorder.displayCount)").font(.system(size: 12, weight: .medium))
+            StatusDot(color: Theme.live, diameter: 6)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(recorder.displayCount == 1
+            ? "Screen capture, 1 display" : "Screen capture, \(recorder.displayCount) displays")
+    }
+
+    /// audioPill is one audio track.
+    ///
+    /// A missing level is drawn as a missing level. `RecorderController` prunes a
+    /// measurement the recorder has stopped refreshing, so nil here means one of
+    /// two things — capture has only just started, or the track has stopped
+    /// reporting because the microphone is denied, absent, or gone — and neither
+    /// is "sound was heard". Bars at their floor beside a green dot said the
+    /// opposite of both, and a dead microphone was indistinguishable from a quiet
+    /// room. Levels are live, so this clears within a second of capture starting.
+    ///
+    /// The recorder's own `silent` means opposite things on the two tracks, which
+    /// is `silenceIsFailure`. Nothing playing is what a system track sounds like
+    /// most of the time; a live microphone in a silent room still carries its own
+    /// noise, so a microphone reporting silence is one nothing is reaching — a
+    /// denied or stale Microphone grant delivers empty buffers rather than an
+    /// error, and this pill is the only place that shows.
+    private func audioPill(
+        symbol: String, title: String, source: String, silenceIsFailure: Bool = false
+    ) -> some View {
+        let level = recorder.level(for: source)
+        let digitallySilent = silenceIsFailure && level?.silent == true
+        let healthy = level != nil && !digitallySilent
+        let detail = level == nil ? "No signal yet"
+            : digitallySilent ? "Silent — check Microphone access"
+            : "peak \(Int(level!.peakDbfs)) decibels full scale"
+        return ToolbarPill {
+            Image(systemName: symbol).font(.system(size: 12))
+            LevelMeter(level: level)
+            StatusDot(color: healthy ? Theme.live : Theme.attention, diameter: 6)
+        }
+        // The sentence the row used to print. There is no width for it here, so
+        // it is the tooltip and the accessibility label instead of being lost.
+        .help("\(title) — \(detail)")
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(title), \(detail)")
+    }
+
+    // MARK: - Buttons
+
+    private var recordButton: some View {
+        Button {
+            Task { await recorder.start() }
+        } label: {
+            Image(systemName: "circle.fill").font(.system(size: 15))
+        }
+        .buttonStyle(ToolbarButtonStyle(tint: .white, hoverTint: Theme.recording))
+        .accessibilityLabel("Start recording")
+        .help("Start recording")
+    }
+
+    private var stopButton: some View {
+        Button {
+            Task { await recorder.stop() }
+        } label: {
+            Image(systemName: "stop.fill").font(.system(size: 14))
+        }
+        .buttonStyle(ToolbarButtonStyle(tint: .white, hoverTint: Theme.recording))
+        .disabled(recorder.isStopping)
+        .opacity(recorder.isStopping ? 0.4 : 1)
+        .accessibilityLabel(recorder.isStopping ? "Stopping" : "Stop recording")
+        .help(recorder.isStopping ? "Stopping…" : "Stop recording")
+    }
+
+    /// The permissions state is one button.
+    ///
+    /// It runs the request flows first — Microphone and Speech Recognition
+    /// answer with a dialog, and this is their only caller — and then opens
+    /// Settings on the Permissions tab, which carries a System Settings route
+    /// per service. Both, because they fix disjoint halves: Screen Recording and
+    /// Accessibility never ask twice once macOS holds a decision for this build,
+    /// so no amount of requesting reaches them.
+    private var permissionsButton: some View {
+        Button {
+            Task {
+                await recorder.requestPermissions()
+                guard recorder.state == .needsPermissions else { return }
+                SettingsSelection.shared.tab = .permissions
+                openSettings()
+            }
+        } label: {
+            Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 13))
+        }
+        .buttonStyle(ToolbarButtonStyle(tint: Theme.attention, hoverTint: Theme.attention))
+        .accessibilityLabel("Permissions needed. Grant system access")
+        .help("Lumi needs system access before it can capture")
+    }
+
+    private var settingsButton: some View {
+        Button {
+            openSettings()
+        } label: {
+            Image(systemName: "gearshape").font(.system(size: 14))
+        }
+        .buttonStyle(ToolbarButtonStyle())
+        .accessibilityLabel("Open Settings")
+        .help("Settings")
+    }
+
+    /// The x puts the toolbar away; it does not quit Lumi.
+    ///
+    /// An x in the corner of a window is read as "quit" by anyone who has met a
+    /// menu bar app that hides in one, which is why the tooltip says what
+    /// happens to capture. Lumi is quit from the menu bar and nowhere else, so
+    /// this takes the plain tint rather than the red reserved for controls that
+    /// end something.
+    private var hideButton: some View {
+        Button {
+            LumiApp.hide?()
+        } label: {
+            Image(systemName: "xmark").font(.system(size: 13, weight: .medium))
+        }
+        .buttonStyle(ToolbarButtonStyle())
+        .accessibilityLabel("Hide Lumi")
+        .help("Hide the toolbar. Recording continues.")
     }
 }
 
-/// StopButtonStyle keeps stopping low-emphasis. Recording is the normal state
-/// and stopping is the exception, so this is text-sized and only turns red on
-/// hover — never a primary call to action.
-private struct StopButtonStyle: ButtonStyle {
-    @State private var hovering = false
+/// WindowChrome strips the window down to the capsule the toolbar draws.
+///
+/// `.windowStyle(.plain)` removes the title bar and the traffic lights but
+/// leaves an opaque background behind the capsule's rounded corners, and there
+/// is no SwiftUI API for a window's level or for turning background-dragging
+/// off. All four settings are AppKit-only, so this reaches the `NSWindow` once,
+/// when the view is installed in it.
+private struct WindowChrome: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView { Configurator() }
 
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(.system(size: 12))
-            .foregroundStyle(hovering ? Theme.recording : Color.secondary)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 4)
-            .contentShape(Rectangle())
-            .onHover { hovering = $0 }
-            .opacity(configuration.isPressed ? 0.6 : 1)
+    func updateNSView(_ nsView: NSView, context: Context) {}
+
+    private final class Configurator: NSView {
+        private var escapeMonitor: Any?
+
+        deinit {
+            if let escapeMonitor { NSEvent.removeMonitor(escapeMonitor) }
+        }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard let window else { return }
+            installEscapeMonitor(for: window)
+            window.hasShadow = true
+            // `.plain` leaves a borderless window, and a borderless window
+            // cannot become key — so no key press reaches it at all and the
+            // toolbar has no keyboard route out. `.titled` restores that
+            // without restoring any chrome: `.fullSizeContentView` keeps the
+            // content the whole window, and the title bar it would otherwise
+            // draw is made transparent and emptied of its buttons.
+            window.styleMask.insert([.titled, .fullSizeContentView])
+            window.titlebarAppearsTransparent = true
+            window.titleVisibility = .hidden
+            for button in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+                window.standardWindowButton(button)?.isHidden = true
+            }
+            window.isOpaque = false
+            window.backgroundColor = .clear
+            // Above every other app: the toolbar says whether capture is live,
+            // which is worth nothing behind the window being captured.
+            window.level = .floating
+            // The mark is the drag handle. Dragging the background would make
+            // every button a place the window slides from.
+            window.isMovableByWindowBackground = false
+            // "Open Lumi" must open it where the user is. A window left on the
+            // Space it was created in reports `isVisible` while being on
+            // nobody's screen, and with no traffic lights and no Dock icon
+            // there is nothing to find it with.
+            window.collectionBehavior.insert(.moveToActiveSpace)
+        }
+
+        /// Esc is handled here rather than with `onExitCommand`.
+        ///
+        /// SwiftUI delivers a cancel action through whatever holds focus, and
+        /// this window holds none: no text field, no list, nothing focusable
+        /// but buttons nobody has tabbed to. A local monitor sees the key down
+        /// on its way into the app instead, which needs no focus at all — only
+        /// a key window, which is the one condition no mechanism can escape.
+        /// It returns nil so AppKit does not beep at an unhandled Esc.
+        private func installEscapeMonitor(for window: NSWindow) {
+            guard escapeMonitor == nil else { return }
+            escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                guard event.keyCode == 53, event.window === window else { return event }
+                Task { @MainActor in LumiApp.hide?() }
+                return nil
+            }
+        }
     }
 }

@@ -13,7 +13,10 @@ struct LumiApp: App {
             LumiWindow()
                 .environment(delegate.recorder)
         }
-        .windowStyle(.hiddenTitleBar)
+        // .plain, not .hiddenTitleBar: hiding the title bar still draws the
+        // traffic lights and an opaque background, and the window here is the
+        // toolbar capsule itself. `WindowChrome` in LumiWindow clears the rest.
+        .windowStyle(.plain)
         .windowResizability(.contentSize)
         .defaultPosition(.center)
         .commandsRemoved()
@@ -44,6 +47,19 @@ struct LumiApp: App {
     /// `NSApp.delegate as? AppDelegate` is nil and fails silently — which is
     /// how the first attempt at this fix looked exactly like the bug.
     @MainActor static var openSettings: OpenSettingsAction?
+
+    /// Putting the toolbar away, routed to `AppDelegate.hideWindow()`.
+    ///
+    /// Parked like `openSettings` above and for the same reason — the cast
+    /// `NSApp.delegate as? AppDelegate` is nil under
+    /// `@NSApplicationDelegateAdaptor` — but set by `AppDelegate` itself, since
+    /// unlike an `OpenSettingsAction` it needs no SwiftUI environment to read.
+    ///
+    /// The x button, Esc, and the menu bar's toggle are three ways to hide one
+    /// window; this is what keeps them one implementation of hiding it. Not
+    /// `\.dismiss`, which closes the window without telling the menu bar item,
+    /// leaving it offering "Hide Lumi" for a window that is already gone.
+    @MainActor static var hide: (() -> Void)?
 }
 
 @MainActor
@@ -57,6 +73,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // this makes the same statement to AppKit for a launch that bypassed
         // LaunchServices.
         NSApp.setActivationPolicy(.accessory)
+        LumiApp.hide = { [weak self] in self?.hideWindow() }
         recorder.statusDidChange = { [weak self] in self?.updateStatusItem() }
         // An available update is a menu bar item, so the same hook drives it.
         updates.statusDidChange = { [weak self] in self?.updateStatusItem() }
@@ -109,25 +126,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func installStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item.button?.image = Self.menuBarGlyph()
+        item.button?.image = MenuBarGlyph.template
         item.button?.setAccessibilityLabel("Lumi")
         item.menu = buildMenu()
         statusItem = item
         updateStatusItem()
-    }
-
-    /// menuBarGlyph loads the "l" mark from the bundle, falling back to a
-    /// system symbol so a missing resource costs the icon rather than the app.
-    /// It ships as a template image, which is what makes it follow the menu
-    /// bar's own appearance in light and dark.
-    private static func menuBarGlyph() -> NSImage? {
-        if let url = Bundle.main.url(forResource: "menubar-glyph", withExtension: "png"),
-           let glyph = MenuBarGlyph.make(from: url) {
-            return glyph
-        }
-        let fallback = NSImage(systemSymbolName: "circle.fill", accessibilityDescription: "Lumi")
-        fallback?.isTemplate = true
-        return fallback
     }
 
     func updateStatusItem() {
@@ -194,7 +197,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
-        let open = NSMenuItem(title: "Open Lumi", action: #selector(openWindow), keyEquivalent: "")
+        // The window has no traffic lights. Its own x button and Esc are the
+        // other two routes to the same `hideWindow()`.
+        let open = NSMenuItem(
+            title: lumiWindow?.isVisible == true ? "Hide Lumi" : "Open Lumi",
+            action: #selector(openWindow), keyEquivalent: "")
         open.target = self
         menu.addItem(open)
 
@@ -244,7 +251,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Actions and deep links
 
-    @objc private func openWindow() { showWindow() }
+    @objc private func openWindow() { toggleWindow() }
 
     /// startRecording and stopRecording run the same supervisor methods the Lumi
     /// window's buttons do, so the graceful SIGTERM-then-wait stop is shared
@@ -274,16 +281,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         LumiApp.openSettings?()
     }
 
+    /// The window that already exists. `lumi app` promises never to start a
+    /// second copy of Lumi, and the same promise holds for the window: nothing
+    /// here ever asks for another one.
+    private var lumiWindow: NSWindow? {
+        NSApp.windows.first { $0.identifier?.rawValue.contains(LumiApp.windowID) == true }
+    }
+
     func showWindow() {
         NSApp.activate(ignoringOtherApps: true)
-        // Raise the window that already exists rather than asking for another:
-        // `lumi app` promises never to start a second copy, and the same
-        // promise holds for the window.
-        if let existing = NSApp.windows.first(where: { $0.identifier?.rawValue.contains(LumiApp.windowID) == true }) {
-            existing.makeKeyAndOrderFront(nil)
+        (lumiWindow ?? NSApp.windows.first)?.makeKeyAndOrderFront(nil)
+    }
+
+    /// hideWindow is the one implementation of putting the toolbar away: the
+    /// window's x button, Esc, and the menu bar's toggle all end here.
+    ///
+    /// The `updateStatusItem()` is why this exists rather than SwiftUI's
+    /// `\.dismiss`. The menu item is titled on `lumiWindow?.isVisible`, so a
+    /// close nobody told the menu bar about leaves it offering "Hide Lumi" for
+    /// a window that is not on screen.
+    func hideWindow() {
+        lumiWindow?.close()
+        updateStatusItem()
+    }
+
+    /// toggleWindow is what the menu bar item runs. Visible, not visible *and*
+    /// key: the toolbar floats above other apps, so it is routinely on screen
+    /// without being key — testing for key would leave the item raising a window
+    /// the user is already looking at, with no way to dismiss it from the menu.
+    func toggleWindow() {
+        if lumiWindow?.isVisible == true {
+            hideWindow()
             return
         }
-        NSApp.windows.first?.makeKeyAndOrderFront(nil)
+        showWindow()
+        updateStatusItem()
     }
 
     /// application(_:open:) handles the `lumi://` URLs that `lumi app` sends.

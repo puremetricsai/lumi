@@ -37,11 +37,11 @@ The app is a supervisor and nothing else — root `CLAUDE.md` states that rule; 
   `RecorderController.dropStaleLevels` prunes on the existing poll, which makes presence in `levels` *be*
   freshness, so no reader asks twice. Levels arrive continuously now, silence included, so a track going
   stale means capture stopped rather than the room going quiet.
-- **A missing level is drawn as missing — "No signal yet" and an amber dot, never floor bars and a green
-  one.** A track that wrote no file is never an event (`internal/macosnative`), so a denied or absent
+- **A missing level is drawn as missing — an amber dot and "No signal yet" in the tooltip, never floor
+  bars and a green one.** A track that wrote no file is never an event (`internal/macosnative`), so a denied or absent
   microphone produces no level at all, and bars at their floor beside a hardcoded `healthy: true` rendered
   that identically to a quiet room. Levels are live, so this clears within a second of capture starting: a
-  row still reading "No signal yet" after that is a real answer about that track.
+  pill still reading "No signal yet" after that is a real answer about that track.
 - **Opening Settings goes through `LumiApp.openSettings`, and only a SwiftUI view can fill it.** There is
   no AppKit route to a SwiftUI `Settings` scene. The private `showSettingsWindow:` selector that used to
   serve one is gone in macOS 26 — AppKit raises NSInvalidArgumentException — so the menu bar item and
@@ -52,6 +52,32 @@ The app is a supervisor and nothing else — root `CLAUDE.md` states that rule; 
 - **Stopping is SIGTERM then wait (`stopTimeout`, 20s), never SIGKILL** — in-flight media is still being
   written and indexed. This is also the app-quit path: `AppDelegate` returns `.terminateLater` while a
   child is held, so ⌘Q asks first and then shuts down gracefully.
+- **The menu bar is the only place Lumi is quit from, and the toolbar's x only hides.** An x in a window
+  is read as "quit" by anyone who has met a menu bar app, so the button says otherwise in its tooltip;
+  capture keeps running with every window closed, which is the point of the app. Nothing outside
+  `AppDelegate.quit()` may end the process — it owns the "Stop recording and quit Lumi?" confirmation and
+  the graceful stop above, and `NSApp.terminate` skips the question and shortens the wait.
+- **The window is the toolbar capsule and has no chrome at all.** `.windowStyle(.plain)`, then
+  `WindowChrome` in `LumiWindow` clears the background, floats the window above other apps, and turns
+  `isMovableByWindowBackground` *off* — the Lumi mark's `WindowDragGesture` is the only thing that moves
+  it, so dragging from a button presses the button. The toolbar has no room for prose: a source's
+  sentence is its `.help` and its accessibility label, never a caption.
+- **Hiding the window is `AppDelegate.hideWindow()`, reached from three places and implemented once.**
+  The x button and Esc go through `LumiApp.hide`, parked exactly like `openSettings` but set by
+  `AppDelegate` in `applicationDidFinishLaunching`, since unlike an `OpenSettingsAction` it needs no
+  SwiftUI environment to read; the menu bar item calls it directly. Not `\.dismiss`: the menu item is
+  titled on `lumiWindow?.isVisible` — `isVisible` alone, because a floating window is routinely visible
+  without being key — so a close nobody told the status item about leaves it offering "Hide Lumi" for a
+  window that is gone. **Esc is a local `NSEvent` monitor in `WindowChrome`, not `onExitCommand`**, which
+  never fired: SwiftUI routes a cancel action through whatever holds focus and this window holds none.
+  Both need the window to be *key*, and `.plain` alone leaves a borderless window that cannot become one
+  — which is what `WindowChrome`'s `.titled` insert is for. Esc while another app is frontmost is not a
+  bug and needs a global event tap nobody wants.
+- **The toolbar row is `.fixedSize(horizontal: true, vertical: false)`, and the window is sized from
+  that.** Without it the window proposes a width the row must fit into, an `HStack` shrinks the only
+  flexible thing it holds, and `Text` measures zero — "REC" and the display count vanished while every
+  icon and dot beside them looked right, so the bug reads as "text does not render" rather than as a
+  layout one. Any label added to the bar depends on this modifier staying.
 - **Never restart the recorder when displays change.** The Go recorder rediscovers displays every interval.
 - **Anything that acts on the recorder reads `isSupervisingRecorder`, never `state == .recording`.** A
   permission revoked mid-capture moves the UI to `.needsPermissions` while the child keeps running and keeps
