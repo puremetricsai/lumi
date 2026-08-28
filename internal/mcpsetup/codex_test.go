@@ -3,7 +3,9 @@ package mcpsetup
 import (
 	"context"
 	"errors"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -352,8 +354,12 @@ func TestCodexDryRunReadsButNeverWrites(t *testing.T) {
 func TestCodexSkipsWhenTheCLIIsMissing(t *testing.T) {
 	t.Parallel()
 	missing := func(string) (string, error) { return "", exec.ErrNotFound }
+	// Candidates is emptied rather than left to the default: the real list
+	// holds absolute paths like /opt/homebrew/bin/codex, so on a developer's
+	// own Mac the default would find a codex and this test never see a skip.
+	none := []string{}
 
-	target := &Codex{LookPath: missing}
+	target := &Codex{LookPath: missing, Candidates: none}
 	result, err := target.Apply(context.Background(), testSpec(), Options{})
 	if err != nil {
 		t.Fatalf("an implicitly reached client failed instead of skipping: %v", err)
@@ -369,7 +375,7 @@ func TestCodexSkipsWhenTheCLIIsMissing(t *testing.T) {
 	}
 
 	// Named explicitly, the same condition is an error.
-	required := &Codex{LookPath: missing, Required: true}
+	required := &Codex{LookPath: missing, Candidates: none, Required: true}
 	if _, err := required.Apply(context.Background(), testSpec(), Options{}); err == nil {
 		t.Error("--client codex succeeded with no codex installed")
 	}
@@ -498,5 +504,56 @@ func TestCodexWillNotSilentlyReEnableAnEntryItRestores(t *testing.T) {
 	// One add attempted, and no second one dressed up as a restore.
 	if len(runner.writeCalls()) != 2 {
 		t.Errorf("invocations = %v, want a remove and one add", runner.writeCalls())
+	}
+}
+
+// Lumi.app is launched by launchd, whose PATH is /usr/bin:/bin:/usr/sbin:/sbin
+// and nothing more, so a PATH-only lookup reported "not installed" for every
+// user whose codex lives anywhere else — the app's Set up MCP button silently
+// skipped Codex. A candidate that exists is used exactly as a PATH hit is.
+func TestCodexFallsBackToACandidateWhenPATHHasNone(t *testing.T) {
+	t.Parallel()
+	installed := filepath.Join(t.TempDir(), "codex")
+	if err := os.WriteFile(installed, nil, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := notConfigured()
+	target := &Codex{
+		Runner:     runner,
+		LookPath:   func(string) (string, error) { return "", exec.ErrNotFound },
+		Candidates: []string{filepath.Join(t.TempDir(), "absent"), installed},
+	}
+
+	result, err := target.Apply(context.Background(), testSpec(), Options{})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if result.Status != StatusAdded {
+		t.Fatalf("status = %q, want added", result.Status)
+	}
+	writes := runner.writeCalls()
+	if len(writes) != 1 || writes[0][0] != installed {
+		t.Fatalf("wrote through %v, want the candidate %q", writes, installed)
+	}
+}
+
+// The ChatGPT desktop app and the codex CLI share $CODEX_HOME/config.toml, so
+// the app's bundled binary registers both and belongs in the list. Nothing in
+// the list probes ~/.codex, which the desktop app creates whether or not a CLI
+// is installed.
+func TestCodexCandidatesIncludeTheDesktopAppsBinary(t *testing.T) {
+	t.Parallel()
+	got := codexCLICandidates("/home/u")
+	if !slices.Contains(got, "/Applications/ChatGPT.app/Contents/Resources/codex") {
+		t.Errorf("candidates omit the desktop app's binary: %v", got)
+	}
+	if !slices.Contains(got, "/home/u/.local/bin/codex") {
+		t.Errorf("candidates omit the home-relative install: %v", got)
+	}
+	for _, candidate := range got {
+		if strings.Contains(candidate, "/.codex/") {
+			t.Errorf("candidate %q probes ~/.codex, which is no evidence of a CLI", candidate)
+		}
 	}
 }
