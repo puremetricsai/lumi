@@ -154,11 +154,13 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "${APP}"
           lipo "${APP}/Contents/MacOS/LumiApp" -verify_arch arm64
           lipo "${APP}/Contents/MacOS/lumi" -verify_arch arm64
-          # Notarization, stapling, `stapler validate`, `spctl --assess`, and the
-          # assertion that the authority is a Developer ID all wait on a certificate
-          # that does not exist yet. Each of them fails by design on an un-notarized
-          # bundle, so running them here would fail every release rather than report
-          # anything. .claude/commands/lumi-developer-id-signing.md restores them.
+          # Notarization, stapling, `stapler validate`, and `spctl --assess` are
+          # absent because the release is not notarized: each fails by design on an
+          # un-notarized bundle, so running them here would fail every release rather
+          # than report anything. The certificate itself is no longer the blocker --
+          # the bundle is signed with a real Developer ID, so asserting that authority
+          # would pass today. .claude/commands/lumi-developer-id-signing.md adds the
+          # notarization steps.
           codesign -dvvv "${APP}" 2>&1 | grep -E 'Identifier=|Signature=|Authority=' || true
 
       # ditto, not zip: it preserves the extended attributes, symlinks, and resource
@@ -288,9 +290,9 @@ jobs:
           lipo "${APP}/Contents/MacOS/lumi" -verify_arch arm64
           # `xcrun stapler validate` and `spctl --assess --type execute` belong here and
           # are absent for one reason: there is no notarization ticket to staple yet, so
-          # both fail by design rather than reporting anything.
-          # .claude/commands/lumi-developer-id-signing.md restores them with the
-          # certificate.
+          # both fail by design rather than reporting anything. The Developer ID
+          # certificate exists and is what signed this bundle; only notarization is
+          # missing. .claude/commands/lumi-developer-id-signing.md adds it.
           codesign -dvvv "${APP}" 2>&1 | grep -E 'Identifier=|Signature=|Authority=' || true
 
   # release-please cuts the release as a *draft* (release-please-config.json), and this
