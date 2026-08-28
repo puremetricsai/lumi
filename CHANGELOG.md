@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.4.1](https://github.com/puremetricsai/lumi/compare/v0.4.0...v0.4.1) (2026-08-28)
+
+
+### Bug Fixes
+
+* **app:** make the About tab's Install Update button work ([7b416c5](https://github.com/puremetricsai/lumi/commit/7b416c5b3ed7081b526e9b4e9a701cc4d36391ba))
+* **app:** make the About tab's Install Update button work ([1ae7d7d](https://github.com/puremetricsai/lumi/commit/1ae7d7da2930bf6d109210bb2651b8873aa258b2))
+* **mcpsetup:** find codex outside PATH so Lumi.app can register it ([27605b8](https://github.com/puremetricsai/lumi/commit/27605b8add0cc70278754bd168548b7494ef5d12))
+* **mcpsetup:** find codex outside PATH so Lumi.app can register it ([d45f491](https://github.com/puremetricsai/lumi/commit/d45f491e736ed4fddc96c9c18b6dcd4a6710a899))
+
 ## [0.4.0](https://github.com/puremetricsai/lumi/compare/v0.3.2...v0.4.0) (2026-08-28)
 
 
