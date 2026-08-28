@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.2](https://github.com/puremetricsai/lumi/compare/v0.3.1...v0.3.2) (2026-08-28)
+
+
+### Bug Fixes
+
+* **app:** open Settings through the action that still exists in macOS 26 ([519cf06](https://github.com/puremetricsai/lumi/commit/519cf067e364d49d9af154f7f59defd28e80ea4f))
+
 ## [0.3.1](https://github.com/puremetricsai/lumi/compare/v0.3.0...v0.3.1) (2026-08-28)
 
 
