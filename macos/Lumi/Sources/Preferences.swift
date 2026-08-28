@@ -26,6 +26,9 @@ final class Preferences {
         static let speechLocale = "lumi.speechLocale"
         static let dataDirectory = "lumi.dataDirectory"
         static let checkForUpdates = "lumi.checkForUpdates"
+        static let shortcutKeyCode = "lumi.shortcutKeyCode"
+        static let shortcutModifiers = "lumi.shortcutModifiers"
+        static let shortcutLabel = "lumi.shortcutLabel"
     }
 
     private let defaults: UserDefaults
@@ -113,6 +116,47 @@ final class Preferences {
         }
         return FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/Lumi").path
+    }
+
+    /// The global start/stop key combination, or nil when none is assigned.
+    ///
+    /// No default is registered for these keys, the same way `dataDirectory`
+    /// registers none: unset is a real answer here. Shipping a combination
+    /// would claim one that another app may already hold, and Carbon would
+    /// simply refuse the registration with nothing on screen to say so.
+    ///
+    /// App policy rather than a capture flag, so it is deliberately absent from
+    /// `recorderArguments()` — the binary knows nothing about this, and the
+    /// Settings control must not call `RecordingSettings.restart()`. The
+    /// precedent is `checkForUpdates` above.
+    ///
+    /// `shortcutLabel` is the presence test: a key code of 0 is a real key (A),
+    /// so it cannot stand for "unset".
+    var recordingShortcut: RecordingShortcut? {
+        get {
+            guard let label = defaults.string(forKey: Key.shortcutLabel), !label.isEmpty else {
+                return nil
+            }
+            // `exactly:`, not a plain conversion: these are three independent
+            // values anybody can edit, and a negative or oversized one traps
+            // and takes the app down at launch. A shortcut that does not
+            // round-trip is no shortcut.
+            guard let keyCode = UInt16(exactly: defaults.integer(forKey: Key.shortcutKeyCode)),
+                  let modifiers = UInt(exactly: defaults.integer(forKey: Key.shortcutModifiers))
+            else { return nil }
+            return RecordingShortcut(keyCode: keyCode, modifiers: modifiers, label: label)
+        }
+        set {
+            guard let shortcut = newValue else {
+                defaults.removeObject(forKey: Key.shortcutKeyCode)
+                defaults.removeObject(forKey: Key.shortcutModifiers)
+                defaults.removeObject(forKey: Key.shortcutLabel)
+                return
+            }
+            defaults.set(Int(shortcut.keyCode), forKey: Key.shortcutKeyCode)
+            defaults.set(Int(shortcut.modifiers), forKey: Key.shortcutModifiers)
+            defaults.set(shortcut.label, forKey: Key.shortcutLabel)
+        }
     }
 
     /// recorderArguments translates these preferences into the argv for the

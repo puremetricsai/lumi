@@ -74,6 +74,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // LaunchServices.
         NSApp.setActivationPolicy(.accessory)
         LumiApp.hide = { [weak self] in self?.hideWindow() }
+        GlobalShortcut.shared.action = { [weak self] in self?.toggleRecording() }
+        GlobalShortcut.shared.reload()
         recorder.statusDidChange = { [weak self] in self?.updateStatusItem() }
         // An available update is a menu bar item, so the same hook drives it.
         updates.statusDidChange = { [weak self] in self?.updateStatusItem() }
@@ -181,8 +183,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             action: recording ? #selector(stopRecording) : #selector(startRecording),
             keyEquivalent: "")
         toggle.target = self
-        toggle.isEnabled = !recorder.isStopping
-            && !(recorder.state == .needsPermissions && !recorder.isSupervisingRecorder)
+        toggle.isEnabled = recorder.canToggleRecording
         menu.addItem(toggle)
 
         // Present only when there is an update, rather than greyed out when
@@ -268,6 +269,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func stopRecording() {
         Task {
             await recorder.stop()
+            updateStatusItem()
+        }
+    }
+
+    /// toggleRecording is what the global shortcut runs.
+    ///
+    /// It reads the recorder at fire time, which the menu above deliberately
+    /// does not. That comment is about a stale *label* on a dropdown that is
+    /// already open — a shortcut has no label to go stale, so the live state is
+    /// the only thing it could honestly act on. The gate is
+    /// `canToggleRecording`, the same one the menu item is enabled by, and
+    /// `isSupervisingRecorder` rather than `state`.
+    private func toggleRecording() {
+        guard recorder.canToggleRecording else { return }
+        Task {
+            if recorder.isSupervisingRecorder {
+                await recorder.stop()
+            } else {
+                await recorder.start()
+            }
             updateStatusItem()
         }
     }

@@ -71,6 +71,14 @@ struct RecordingSettings: View {
 
     var body: some View {
         Form {
+            // First, and its own section: it is the one control here that is
+            // not a capture flag. Everything below restarts the recorder when
+            // it changes; this one must not, and never reaches the binary at
+            // all.
+            Section("Shortcut") {
+                ShortcutRecorder()
+            }
+
             Section("Screen") {
                 Toggle("Capture screen", isOn: Binding(
                     get: { preferences.captureScreen },
