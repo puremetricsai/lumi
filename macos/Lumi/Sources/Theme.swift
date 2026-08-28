@@ -16,18 +16,53 @@ enum Theme {
     static let live = Color(nsColor: .systemGreen)
     static let attention = Color(nsColor: .systemOrange)
 
-    /// The window is a fixed 320pt: it holds three short states and never a
-    /// list, so resizing it would only ever add empty space.
-    static let windowWidth: CGFloat = 320
-    /// The band the system draws the window buttons in. The custom title row
-    /// matches it so the title sits on their line rather than below them.
-    static let titleBarHeight: CGFloat = 38
-    /// The height macOS reserves above a window's content for the title bar,
-    /// asked of AppKit rather than written down: it has changed between
-    /// releases, and the window's layout depends on it being right.
-    static let systemTitleBarHeight: CGFloat =
-        NSWindow.frameRect(forContentRect: .zero, styleMask: [.titled]).height
+    /// The toolbar capsule. The window is the capsule and nothing else — no
+    /// title bar, no fixed width — so it sizes itself to whichever controls the
+    /// current state draws.
+    static let barHeight: CGFloat = 44
+    static let barItemHeight: CGFloat = 30
+    static let barSpacing: CGFloat = 8
     static let settingsWidth: CGFloat = 660
+}
+
+/// ToolbarButtonStyle is every button in the toolbar capsule.
+///
+/// One style, not one per control: the hover tint is the only thing that
+/// differs. Red on hover is reserved for the controls that end something —
+/// record's own stop, and quit — so hovering a destructive control says so
+/// before it is clicked. The gear takes the default and merely brightens.
+struct ToolbarButtonStyle: ButtonStyle {
+    var tint: Color = .secondary
+    var hoverTint: Color = .primary
+    var size: CGFloat = Theme.barItemHeight
+
+    @State private var hovering = false
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundStyle(hovering ? hoverTint : tint)
+            .frame(width: size, height: size)
+            .background(Circle().fill(Color.primary.opacity(hovering ? 0.12 : 0)))
+            .contentShape(Circle())
+            .onHover { hovering = $0 }
+            .opacity(configuration.isPressed ? 0.6 : 1)
+            .animation(.easeOut(duration: 0.12), value: hovering)
+    }
+}
+
+/// ToolbarPill is one status group in the recording toolbar: an icon, a
+/// measurement, and a health dot in their own softer capsule.
+struct ToolbarPill<Content: View>: View {
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        HStack(spacing: 6) {
+            content
+        }
+        .padding(.horizontal, 10)
+        .frame(height: Theme.barItemHeight)
+        .background(Capsule().fill(Color.primary.opacity(0.07)))
+    }
 }
 
 /// StatusDot is the small filled circle used for every state indication, in the
