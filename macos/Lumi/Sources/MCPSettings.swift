@@ -39,6 +39,10 @@ struct MCPSettings: View {
 
     var body: some View {
         Form {
+            Section {
+                setup
+            }
+
             Section("Model Context Protocol server") {
                 LabeledContent("Transport") {
                     HStack(spacing: 8) {
@@ -66,10 +70,6 @@ struct MCPSettings: View {
                 }
             }
 
-            Section("Set up") {
-                setup
-            }
-
             if case let .loaded(report) = load {
                 Section("Launch command") {
                     // The mockup pairs Command with a "Choose…" button. There
@@ -83,11 +83,6 @@ struct MCPSettings: View {
                 }
             }
 
-            Section("Upgrades") {
-                SettingsCaption("A client holds one `lumi mcp` session open for a long time. "
-                    + "That session reports schema and version skew in every tool's notice, "
-                    + "and replaces its own image after an upgrade. This app does not manage it.")
-            }
         }
         .formStyle(.grouped)
         .frame(minHeight: 420)
@@ -211,8 +206,6 @@ struct MCPSettings: View {
             }
             Spacer()
         }
-        SettingsCaption("Writes the lumi entry into every MCP client installed here. "
-            + "Running it twice changes nothing.")
 
         if let setupError {
             Text(setupError)
