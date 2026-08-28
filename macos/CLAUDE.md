@@ -42,6 +42,13 @@ The app is a supervisor and nothing else — root `CLAUDE.md` states that rule; 
   microphone produces no level at all, and bars at their floor beside a hardcoded `healthy: true` rendered
   that identically to a quiet room. Levels are live, so this clears within a second of capture starting: a
   row still reading "No signal yet" after that is a real answer about that track.
+- **Opening Settings goes through `LumiApp.openSettings`, and only a SwiftUI view can fill it.** There is
+  no AppKit route to a SwiftUI `Settings` scene. The private `showSettingsWindow:` selector that used to
+  serve one is gone in macOS 26 — AppKit raises NSInvalidArgumentException — so the menu bar item and
+  `lumi://settings` crashed the app. `LumiWindow` hands its `\.openSettings` action over on appear and
+  `AppDelegate` calls it; the window appears at launch, which is what makes it there before the menu is.
+  Nothing may reach the delegate with `NSApp.delegate as? AppDelegate`: `@NSApplicationDelegateAdaptor`
+  leaves `NSApp.delegate` holding SwiftUI's own forwarding delegate, so that cast is nil and silent.
 - **Stopping is SIGTERM then wait (`stopTimeout`, 20s), never SIGKILL** — in-flight media is still being
   written and indexed. This is also the app-quit path: `AppDelegate` returns `.terminateLater` while a
   child is held, so ⌘Q asks first and then shuts down gracefully.

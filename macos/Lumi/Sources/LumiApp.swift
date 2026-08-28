@@ -26,6 +26,24 @@ struct LumiApp: App {
     }
 
     static let windowID = "lumi-main"
+
+    /// The supported way to open the `Settings` scene above, parked here by the
+    /// first `LumiWindow` to appear because only a SwiftUI view can read it out
+    /// of the environment and `AppDelegate` — which owns the menu bar item and
+    /// the `lumi://settings` handler — is not one.
+    ///
+    /// This replaces `NSApp.perform(Selector(("showSettingsWindow:")))`. That
+    /// private selector is gone in macOS 26: AppKit raises
+    /// NSInvalidArgumentException for it, so the menu item and the URL crashed
+    /// the app instead of opening anything. `OpenSettingsAction` is the only
+    /// route to a SwiftUI `Settings` scene, and there is no AppKit equivalent.
+    ///
+    /// Static rather than a property on `AppDelegate`, because there is no
+    /// reference to reach it through: `@NSApplicationDelegateAdaptor` leaves
+    /// `NSApp.delegate` holding SwiftUI's own forwarding delegate, so
+    /// `NSApp.delegate as? AppDelegate` is nil and fails silently — which is
+    /// how the first attempt at this fix looked exactly like the bug.
+    @MainActor static var openSettings: OpenSettingsAction?
 }
 
 @MainActor
@@ -125,7 +143,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ///
     /// Quit is the one destructive item here, so it is separated from the two
     /// that merely open a window — the separator is what stops it being hit by
-    /// a click aimed at Open Settings. It still goes through
+    /// a click aimed at Settings. It still goes through
     /// `AppDelegate.quit()`, which asks first while capture is live and always
     /// takes the graceful SIGTERM-then-wait path; a menu item that terminated
     /// directly would discard media that was written but not yet indexed.
@@ -180,7 +198,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         open.target = self
         menu.addItem(open)
 
-        let settings = NSMenuItem(title: "Open Settings", action: #selector(openSettingsWindow), keyEquivalent: ",")
+        let settings = NSMenuItem(title: "Settings…", action: #selector(openSettingsWindow), keyEquivalent: ",")
         settings.target = self
         menu.addItem(settings)
 
@@ -253,7 +271,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func openSettingsWindow() {
         NSApp.activate(ignoringOtherApps: true)
-        NSApp.perform(Selector(("showSettingsWindow:")), with: nil)
+        LumiApp.openSettings?()
     }
 
     func showWindow() {
