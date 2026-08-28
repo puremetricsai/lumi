@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.1](https://github.com/puremetricsai/lumi/compare/v0.3.0...v0.3.1) (2026-08-28)
+
+
+### Bug Fixes
+
+* **release:** stop importing the Developer ID G2 intermediate ([f245e64](https://github.com/puremetricsai/lumi/commit/f245e64d85b836de86232d1d3287999843c9ac40))
+* **release:** stop importing the Developer ID G2 intermediate ([164a1bf](https://github.com/puremetricsai/lumi/commit/164a1bf2da183303ef46cbe7228a4c78a6f08da5))
+
 ## [0.3.0](https://github.com/puremetricsai/lumi/compare/v0.2.0...v0.3.0) (2026-08-27)
 
 
