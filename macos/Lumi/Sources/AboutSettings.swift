@@ -37,10 +37,6 @@ struct AboutSettings: View {
     @Environment(UpdateChecker.self) private var updates
     @State private var preferences = Preferences.shared
 
-    /// The delegate owns the confirmation and the shutdown that follows it, so
-    /// the button here routes to it rather than restating either.
-    private var delegate: AppDelegate? { NSApp.delegate as? AppDelegate }
-
     private static let repository = URL(string: "https://github.com/puremetricsai/lumi")!
     private static let documentation = URL(string: "https://github.com/puremetricsai/lumi#readme")!
     private static let issues = URL(string: "https://github.com/puremetricsai/lumi/issues/new")!
@@ -88,7 +84,11 @@ struct AboutSettings: View {
                     HStack(spacing: 8) {
                         if updates.status?.updateAvailable == true {
                             Button("Install Update…") {
-                                Task { await delegate?.confirmAndInstallUpdate() }
+                                // The delegate owns the confirmation and the shutdown that
+                                // follows it, so the button here routes to it rather than
+                                // restating either — through `LumiApp`, because
+                                // `NSApp.delegate` is SwiftUI's forwarding delegate.
+                                Task { await LumiApp.installUpdate?() }
                             }
                             .accessibilityLabel("Stop recording, install the update, and reopen Lumi")
                         }

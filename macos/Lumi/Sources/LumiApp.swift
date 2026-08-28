@@ -60,6 +60,14 @@ struct LumiApp: App {
     /// `\.dismiss`, which closes the window without telling the menu bar item,
     /// leaving it offering "Hide Lumi" for a window that is already gone.
     @MainActor static var hide: (() -> Void)?
+
+    /// Taking the offered update, routed to `AppDelegate.confirmAndInstallUpdate()`.
+    ///
+    /// Parked like `hide` above and for the same reason: `AboutSettings` reached
+    /// the delegate with `NSApp.delegate as? AppDelegate`, which is nil here, so
+    /// its Install Update button called nothing while the menu bar item — which
+    /// is already inside the delegate — worked.
+    @MainActor static var installUpdate: (() async -> Void)?
 }
 
 @MainActor
@@ -74,6 +82,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // LaunchServices.
         NSApp.setActivationPolicy(.accessory)
         LumiApp.hide = { [weak self] in self?.hideWindow() }
+        LumiApp.installUpdate = { [weak self] in await self?.confirmAndInstallUpdate() }
         GlobalShortcut.shared.action = { [weak self] in self?.toggleRecording() }
         GlobalShortcut.shared.reload()
         recorder.statusDidChange = { [weak self] in self?.updateStatusItem() }
