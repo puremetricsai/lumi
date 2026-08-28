@@ -219,9 +219,27 @@ struct LumiWindow: View {
             // do not re-prompt once macOS holds a decision for this build, and
             // an unsigned rebuild is a new build every time. The measurement is
             // docs/research/2026-08-17-tcc-spike.md, Result 6.
+            //
+            // The second sentence is Result 5, and it is the one that gets
+            // people stuck: TCC stores its own requirement for the grant,
+            // pinning the *leaf certificate* that earned it, so a build signed
+            // with a different certificate fails that requirement while the
+            // switch stays visibly on. "Switch them on" is then advice the user
+            // has already followed. The addendum to Result 5 has the tccd trace.
+            //
+            // It says "try", and names no specific repair, deliberately. What
+            // is measured is that rewriting the row recovers it; which gesture
+            // rewrites it is not — Result 5's own recovery was a `tccutil
+            // reset` before re-enabling, and removing the row outright works
+            // too. Nothing here can detect the case either: telling a stale
+            // grant from a plain refusal needs Full Disk Access to read TCC.db,
+            // which is why this is a caption and not a branch.
             if hasSettingsOnlyService {
                 Text("Screen Recording and Accessibility never ask twice. "
-                     + "Switch them on in System Settings, then come back.")
+                     + "Switch them on in System Settings, then come back. "
+                     + "If a switch already looks on, try turning it off and on "
+                     + "again — an entry left by an earlier build can read as "
+                     + "enabled and still be denied.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
