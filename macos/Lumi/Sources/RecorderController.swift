@@ -320,6 +320,16 @@ final class RecorderController {
     /// graceful stop and orphan a live capture.
     var isSupervisingRecorder: Bool { process?.isRunning == true }
 
+    /// canToggleRecording reports whether starting or stopping would do
+    /// anything right now.
+    ///
+    /// One expression, read by both the menu bar's Start/Stop item and the
+    /// global shortcut. Two copies of this gate would be free to disagree, and
+    /// nothing in either would say which one was wrong.
+    var canToggleRecording: Bool {
+        !isStopping && !(state == .needsPermissions && !isSupervisingRecorder)
+    }
+
     /// stopFailed reports that the graceful stop timed out and the recorder is
     /// still running. Deliberately not escalated to a kill: the wait exists to
     /// protect media that is written but not yet indexed.
