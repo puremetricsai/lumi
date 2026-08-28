@@ -40,30 +40,17 @@ struct MCPSettings: View {
     var body: some View {
         Form {
             Section {
-                setup
-            }
-
-            Section("Model Context Protocol server") {
-                LabeledContent("Transport") {
-                    HStack(spacing: 8) {
-                        Text("stdio · launched as a child process")
-                            .foregroundStyle(.secondary)
-                        // The mockup shows a green "Running · pid" badge here.
-                        // Nothing is running: the server exists only for as
-                        // long as a client keeps it open.
-                        Badge(text: "On demand", tone: .neutral)
-                    }
-                }
-                SettingsCaption("A client starts `lumi mcp` itself when it needs it. "
-                    + "Lumi runs no server in the background, opens no port, and has nothing to restart.")
-            }
-
-            Section {
+                setupOutput
                 clients
             } header: {
                 HStack {
                     Text("Clients")
                     Spacer()
+                    Button("Set up MCP") { Task { await runSetup() } }
+                        .disabled(isRunningSetup || isLoading)
+                    if isRunningSetup {
+                        ProgressView().controlSize(.small)
+                    }
                     Button("Refresh") { Task { await refresh() } }
                         .accessibilityLabel("Refresh MCP client status")
                         .disabled(isLoading || isRunningSetup)
@@ -194,19 +181,10 @@ struct MCPSettings: View {
 
     // MARK: - Setup
 
+    /// The lines the last real setup run left behind. The button itself lives in
+    /// the section header next to Refresh.
     @ViewBuilder
-    private var setup: some View {
-        HStack {
-            Button("Set up MCP") { Task { await runSetup() } }
-                .buttonStyle(.borderedProminent)
-                .tint(Theme.accent)
-                .disabled(isRunningSetup || isLoading)
-            if isRunningSetup {
-                ProgressView().controlSize(.small)
-            }
-            Spacer()
-        }
-
+    private var setupOutput: some View {
         if let setupError {
             Text(setupError)
                 .foregroundStyle(Theme.attention)
