@@ -224,5 +224,8 @@ In `.github/workflows/release-please.yml`:
    - Remove the "The app is not notarized yet" section: the browser-download recovery it documents
      stops applying once the bundle is stapled.
 2. **TCC Grants**:
-   - Upgrading from interim self-signed to Developer ID resets TCC permissions once.
-   - Subsequent updates retain permissions stably under `Developer ID Application` Designated Requirement.
+   - Nothing further is owed here. The move off the interim self-signed certificate has already
+     happened — the published app is signed `Developer ID Application: Pure LLC (C34G34593Q)` — so
+     the one-time permission reset that move costs has already been paid.
+   - Notarizing does not move the designated requirement again, and updates keep retaining
+     permissions stably under the `Developer ID Application` Designated Requirement.
