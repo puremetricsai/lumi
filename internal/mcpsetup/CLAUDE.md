@@ -29,14 +29,42 @@ path is an injectable field, so tests need no client present.
   (dropping a sibling's `args = []`, floating its timeout, sorting its `env`), which is the client's own
   behaviour and not something Lumi can narrow. Reads go through `codex mcp get <name> --json`, the
   structured comparison `claude mcp get` couldn't give. **The `--` separator is load-bearing here too**
-  (`TestCodexAddPassesArgsAfterASeparator`). Detection is the `codex` **binary** — on PATH, else at a known
-  install location — and never the presence of `~/.codex/`, which the ChatGPT desktop app creates whether or
-  not a CLI exists. PATH alone was not enough: `Lumi.app` is launched by launchd with
-  `/usr/bin:/bin:/usr/sbin:/sbin`, so the app's own button reported Codex "not installed" on machines where
-  it plainly was. `/Applications/ChatGPT.app/Contents/Resources/codex` is in that list on purpose — the
-  desktop app and the CLI read and write the same `$CODEX_HOME/config.toml`, so registering through either
-  configures both. A user whose only `codex` is somewhere else entirely (an nvm version directory, say) and
-  who has no desktop app still gets the skip and the paste-able snippet.
+  (`TestCodexAddPassesArgsAfterASeparator`). Detection is the `codex` **binary**, never the presence of
+  `~/.codex/`, which the ChatGPT desktop app creates whether or not a CLI exists — and which names no
+  binary to run `codex mcp add` with, so it could not drive a registration even if it were evidence.
+  `/Applications/ChatGPT.app/Contents/Resources/codex` is in the candidate list on purpose: the desktop app
+  and the CLI read and write the same `$CODEX_HOME/config.toml`, so registering through either configures
+  both, and it is the one candidate that is a real binary rather than a `node` shim.
+- **Neither client's CLI is findable from `Lumi.app`'s PATH, and finding one is not the same as being able
+  to run it.** launchd gives the app `/usr/bin:/bin:/usr/sbin:/sbin`, so `exec.LookPath` misses every
+  `claude` and `codex` installed by npm, nvm, or any version manager, and the MCP settings tab reported
+  clients the user plainly had as "not installed". Enumerating install locations cannot fix it — a version
+  manager's directory contains the version, so there is no fixed path to list. `userPATH` asks the user's
+  own shell instead, once, memoized. The probe has **two** call sites and both are required. `lookCLI` is
+  the first, and alone it only moves the failure: an npm-installed `codex` is a `#!/usr/bin/env node`
+  script, so a resolved binary still exits 127 under launchd's PATH and the target reports "codex cannot
+  read its own configuration" — a lie about what went wrong. `execRunner` is the second, and it is what
+  makes the found binary runnable. Both targets reach the probe only through their injectable `LookPath`
+  field, so a test that stubs that field cannot be answered by whatever the developer has installed;
+  `TestMain` stubs `userPATH` besides, because a unit test must never spawn a shell.
+- **Everything the shell prints around the probe's answer is hostile, and three separate things guard
+  against it.** The invocation must be **interactive**, because nvm and its kin initialise from `~/.zshrc`,
+  which zsh sources only for an interactive shell — a login-only probe was measured returning a PATH
+  without the nvm bin directory it was run to find. That is what drags the user's whole startup chain into
+  a settings tab, and with it: a banner printed *before* the answer, a `~/.zlogout` printed *after* it with
+  no newline in between (measured appending `goodbye…` to the last PATH entry), and a shell that rejects
+  the flags outright — `csh` and `tcsh` answer `-l` with "Unknown option". So the answer is **marked**
+  (`pathMarker`) and the *last* marked line wins, which is what makes both the banner and the logout
+  message unmistakable; a rejected invocation is retried once without `-l`, which is lazier than a table of
+  shell names and self-heals for the next shell that dislikes a flag.
+- **`cmd.WaitDelay` is what bounds the probe, not the context.** `CommandContext` kills the shell and not
+  its descendants, so an rc file that backgrounds anything inheriting stdout leaves `Output()` waiting on a
+  pipe that never closes: measured at **60 seconds against a 5-second timeout**, hanging the settings tab.
+  The output is complete by then, so it is parsed *before* the error is consulted — discarding it on a
+  `WaitDelay` failure would reintroduce exactly the stall the delay exists to cap. Killing the process
+  group instead was considered and declined: the orphan is the user's own rc file's background job, it
+  exits on its own, and `WaitDelay` already fixes the part that hurt.
+
 - **A disabled Codex entry is a difference, not a match.** An entry with Lumi's exact command and args but
   `enabled = false` is one codex will not launch; comparing only command and args reported `unchanged` while
   the agent silently never saw Lumi. It is a difference, so `--force` fixes it, and `Result.Current` appends
