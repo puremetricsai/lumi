@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.5.0](https://github.com/puremetricsai/lumi/compare/v0.4.1...v0.5.0) (2026-08-31)
+
+
+### Features
+
+* **mcp:** centre a search excerpt on the matched term ([9aac4d6](https://github.com/puremetricsai/lumi/commit/9aac4d679699caa07047b2f29fcec51ee63e902f))
+* **mcp:** fold duplicate screen rows and name the page boundary ([2b09660](https://github.com/puremetricsai/lumi/commit/2b0966041ca1562316eef571a28f13a8cda5d8c3))
+* **mcp:** make the MCP tools leaner per call and fewer calls per answer ([80528ae](https://github.com/puremetricsai/lumi/commit/80528ae25916fd48e66e4bca0377e3e013f24cef))
+* **mcp:** ship server instructions that route between the tools ([babd32f](https://github.com/puremetricsai/lumi/commit/babd32f233aa5e88ff4ca67e1498e14f36665263))
+* **store:** export SearchTerms and make search ordering deterministic ([70bf22d](https://github.com/puremetricsai/lumi/commit/70bf22d9cd0e0814225e7819a956514b6266f03a))
+
+
+### Bug Fixes
+
+* **mcpsetup:** find client CLIs outside launchd's PATH ([49e3677](https://github.com/puremetricsai/lumi/commit/49e367778280858305d43c8e84fc822efc541689))
+* **mcpsetup:** find client CLIs outside launchd's PATH ([490e70e](https://github.com/puremetricsai/lumi/commit/490e70e2a3b0278433a73be270ea5bdad55317d3))
+
+
+### Performance Improvements
+
+* **mcp:** trim a transcript turn's envelope ([63253ef](https://github.com/puremetricsai/lumi/commit/63253ef6d0becef5e81474d35e480c00376f0158))
+
 ## [0.4.1](https://github.com/puremetricsai/lumi/compare/v0.4.0...v0.4.1) (2026-08-28)
 
 
