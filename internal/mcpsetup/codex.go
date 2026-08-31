@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"maps"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"time"
@@ -40,7 +39,8 @@ type Codex struct {
 	Runner Runner
 	// CLIPath is the codex binary. Empty resolves it via LookPath.
 	CLIPath string
-	// LookPath finds a binary on PATH. nil uses exec.LookPath.
+	// LookPath finds a binary on PATH. nil uses lookCLI, which also searches
+	// the user's shell's PATH.
 	LookPath func(string) (string, error)
 	// Candidates are the absolute paths checked when PATH has no codex. nil
 	// uses codexCLICandidates; a test sets it so a codex the developer really
@@ -53,20 +53,21 @@ type Codex struct {
 
 func (c *Codex) Name() string { return codexName }
 
-// codexCLICandidates are the install locations checked when `codex` is not on
-// PATH, for the same reason claudeCLICandidates exists: Lumi.app is launched by
-// launchd, whose PATH is /usr/bin:/bin:/usr/sbin:/sbin and nothing else, so a
-// bare LookPath reports "not installed" on a machine where Codex plainly is.
+// codexCLICandidates are the fixed install locations checked after both PATHs
+// have missed. They are the tail of the search, not its substance: lookCLI's
+// shell probe is what finds a version manager's codex, whose directory carries
+// the version and therefore cannot be listed here at all.
 //
 // The ChatGPT app's bundled binary is last and is deliberately included: the
 // desktop app and the CLI share $CODEX_HOME/config.toml, so registering through
-// either one configures both. It reads and writes that file correctly with no
-// environment beyond launchd's.
+// either one configures both. It is a real Mach-O rather than a `node` shim, so
+// it is also the one entry that runs with no environment beyond launchd's.
 //
 // Still deliberately absent: any probe of ~/.codex itself. That directory is
 // created and populated by the desktop app too, so its presence is no evidence
-// a CLI is installed. The binary remains the only honest signal — this widens
-// where Lumi looks for it, not what counts as one.
+// a CLI is installed, and it names no binary to run `codex mcp add` with. The
+// binary remains the only honest signal — the probe widens where Lumi looks for
+// one, not what counts as one.
 func codexCLICandidates(home string) []string {
 	candidates := []string{"/opt/homebrew/bin/codex", "/usr/local/bin/codex"}
 	if home != "" {
@@ -82,7 +83,7 @@ func (c *Codex) resolveCLI() string {
 	}
 	lookPath := c.LookPath
 	if lookPath == nil {
-		lookPath = exec.LookPath
+		lookPath = lookCLI
 	}
 	if path, err := lookPath("codex"); err == nil {
 		return path
@@ -224,7 +225,7 @@ func (c *Codex) Apply(ctx context.Context, spec Spec, opts Options) (Result, err
 	cli := c.resolveCLI()
 	if cli == "" {
 		result.Status = StatusSkipped
-		result.Detail = "no codex CLI was found on PATH or in the usual install locations"
+		result.Detail = "no codex CLI was found on PATH, in your shell's PATH, or in the usual install locations"
 		if c.Required {
 			return result, notInstalledErr(codexName, result.Detail)
 		}

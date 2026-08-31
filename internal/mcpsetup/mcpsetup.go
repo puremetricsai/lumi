@@ -29,10 +29,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
+	"time"
 )
 
 // Spec is the MCP server entry a client should end up holding. It is a pure
@@ -143,6 +147,11 @@ type execRunner struct{}
 
 func (execRunner) Run(ctx context.Context, name string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
+	// The user's own PATH, not launchd's. A client CLI installed by npm is a
+	// `#!/usr/bin/env node` script, so resolving it is not enough — without an
+	// interpreter on PATH it exits 127 and the target reports the client as
+	// unreadable rather than unrunnable. os/exec keeps the last duplicate key.
+	cmd.Env = append(os.Environ(), "PATH="+userPATH())
 	// A configuration helper must never block waiting for input.
 	cmd.Stdin = nil
 	out, err := cmd.CombinedOutput()
@@ -316,4 +325,117 @@ func conflictErr(target, name string) error {
 // out to be unconfigurable. Reached implicitly, the same condition is a skip.
 func notInstalledErr(target, reason string) error {
 	return fmt.Errorf("%s: %s", target, reason)
+}
+
+// --- Finding a client's CLI when there is no useful PATH ---------------------
+//
+// launchd gives Lumi.app PATH=/usr/bin:/bin:/usr/sbin:/sbin, which contains no
+// `claude` or `codex` installed by npm, nvm, or any version manager. Asking the
+// user's own shell is the only way to find one, and the reasoning for every
+// choice below — why interactive, why two call sites — is in this package's
+// CLAUDE.md.
+
+// userPATH is the PATH the user's own interactive login shell would have.
+//
+// A var rather than a func so tests can stub it: a unit test must never spawn a
+// real shell, and the developer's own installs must not answer for the machine
+// under test.
+var userPATH = sync.OnceValue(probeUserPATH)
+
+// pathProbeTimeout bounds one shell probe. An rc chain that hangs must not hang
+// a settings tab; falling back to the inherited PATH is always safe.
+const pathProbeTimeout = 5 * time.Second
+
+// pathMarker prefixes the probe's answer so it can be picked out of whatever
+// else the user's startup files decide to print. Without it the answer has to
+// be guessed at positionally, and a ~/.zlogout — which runs *after* the -c
+// command, with no newline between them — silently appends its message to the
+// last PATH entry.
+const pathMarker = "LUMIPATH:"
+
+// pathProbeFlags are the shell invocations tried in order.
+//
+// The first is what nvm and its equivalents need: they initialise from ~/.zshrc,
+// which zsh sources only for an *interactive* shell, and a login-only probe was
+// measured returning a PATH without the nvm bin directory it was run to find.
+// The second exists because csh and tcsh reject `-l` outright ("Unknown option")
+// and would otherwise get no probe at all; they read ~/.cshrc when interactive,
+// which is where a csh user's PATH is set. Retrying beats dispatching on the
+// shell's name — it needs no table, and it self-heals for any shell that
+// dislikes a flag. Only a failed attempt costs a second one.
+var pathProbeFlags = [][]string{{"-l", "-i", "-c"}, {"-i", "-c"}}
+
+// probeUserPATH asks the user's shell for its PATH, falling back to this
+// process's own on any trouble.
+func probeUserPATH() string {
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		shell = "/bin/zsh"
+	}
+	for _, flags := range pathProbeFlags {
+		if probed := runPATHProbe(shell, flags); probed != "" {
+			return probed
+		}
+	}
+	return os.Getenv("PATH")
+}
+
+// runPATHProbe runs one invocation and returns the PATH it reported, or "".
+func runPATHProbe(shell string, flags []string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), pathProbeTimeout)
+	defer cancel()
+
+	args := append(append([]string{}, flags...), `printf '\n`+pathMarker+`%s\n' "$PATH"`)
+	cmd := exec.CommandContext(ctx, shell, args...)
+	// TERM=dumb keeps an rc file from drawing a prompt or probing a terminal
+	// that is not there. Stdin and Stderr are left nil, which is /dev/null: no
+	// rc file waits for input, and nothing here reads its diagnostics.
+	cmd.Env = append(os.Environ(), "TERM=dumb")
+	// The context alone does not bound this. CommandContext kills the shell but
+	// not its descendants, so an rc file that backgrounds anything inheriting
+	// stdout leaves Output() waiting on a pipe that never closes — measured at
+	// 60s against a 5s timeout. WaitDelay is what actually caps it.
+	cmd.WaitDelay = time.Second
+
+	// Parsed before the error is consulted, deliberately: when WaitDelay fires
+	// the command reports failure while stdout already holds a complete answer,
+	// and throwing that away would reintroduce the bug it exists to bound.
+	out, _ := cmd.Output()
+	return parsePATHProbe(string(out))
+}
+
+// parsePATHProbe pulls the marked PATH out of the probe's stdout, or returns ""
+// if it is not there. Split out so it can be tested without a shell.
+//
+// The last marked line wins. A startup banner prints before the marker and a
+// logout message after it, so neither can be mistaken for the answer.
+func parsePATHProbe(out string) string {
+	probed := ""
+	for _, line := range strings.Split(out, "\n") {
+		if _, value, found := strings.Cut(line, pathMarker); found {
+			probed = strings.TrimSpace(value)
+		}
+	}
+	return probed
+}
+
+// lookCLI is the default LookPath both targets use: this process's PATH first,
+// then the user's shell's.
+//
+// It is reached only through each target's injectable LookPath field, so a test
+// that stubs that field is unaffected by whatever the developer has installed.
+func lookCLI(name string) (string, error) {
+	if path, err := exec.LookPath(name); err == nil {
+		return path, nil
+	}
+	for _, dir := range filepath.SplitList(userPATH()) {
+		// exec.LookPath on a path containing a separator checks that one file
+		// and nothing else: not a directory, and executable *by this user*,
+		// which a mode-bit test gets wrong for a file owned by somebody else.
+		// A candidate that fails is skipped rather than ending the search.
+		if path, err := exec.LookPath(filepath.Join(dir, name)); err == nil {
+			return path, nil
+		}
+	}
+	return "", exec.ErrNotFound
 }

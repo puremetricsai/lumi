@@ -1,6 +1,8 @@
 package mcpsetup
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -75,4 +77,108 @@ func TestManualHintMatchesTheFormat(t *testing.T) {
 	if tomlResult.ManualHint != tomlManualHint || !strings.HasPrefix(tomlResult.Manual, "[mcp_servers.") {
 		t.Errorf("manualTOML = %+v, want a TOML table", tomlResult)
 	}
+}
+
+// TestMain stubs the shell probe for every test in this package. A unit test
+// must never spawn a real interactive shell, and the developer's own installs
+// must not answer for the machine under test.
+func TestMain(m *testing.M) {
+	userPATH = func() string { return "" }
+	os.Exit(m.Run())
+}
+
+func TestParsePATHProbe(t *testing.T) {
+	const marked = "\n" + pathMarker + "/usr/bin:/bin\n"
+	tests := map[string]struct {
+		out  string
+		want string
+	}{
+		"clean": {marked, "/usr/bin:/bin"},
+		// A startup banner prints before the -c command runs.
+		"banner with newline":    {"welcome\n" + marked, "/usr/bin:/bin"},
+		"banner without newline": {"welcome" + marked, "/usr/bin:/bin"},
+		// ~/.zlogout runs *after* it, with nothing between the two. Measured:
+		// without the marker this appended itself to the last PATH entry.
+		"logout message glued on":   {"\n" + pathMarker + "/usr/bin:/bin\ngoodbye, saving to /tmp/x", "/usr/bin:/bin"},
+		"logout message no newline": {marked + "bye", "/usr/bin:/bin"},
+		// csh and tcsh reject -l; the retry, not the parser, answers for them.
+		"shell usage error": {"Unknown option: `-l'\nUsage: csh [ -bcdefilmnqstvVxX ]\n", ""},
+		"empty":             {"", ""},
+		"no marker":         {"\n/usr/bin:/bin\n", ""},
+		"empty path":        {"\n" + pathMarker + "\n", ""},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			if got := parsePATHProbe(tc.out); got != tc.want {
+				t.Errorf("parsePATHProbe(%q) = %q, want %q", tc.out, got, tc.want)
+			}
+		})
+	}
+}
+
+// The whole point of the probe: a binary that is not on this process's PATH but
+// is on the user's shell's is found.
+func TestLookCLIFindsABinaryOnlyTheUserShellKnows(t *testing.T) {
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "somemcpclient")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Not on this process's PATH: exec.LookPath must miss it.
+	t.Setenv("PATH", "/nonexistent")
+	if _, err := lookCLI("somemcpclient"); err == nil {
+		t.Fatal("lookCLI found the binary before the user PATH was in play")
+	}
+
+	stubUserPATH(t, dir)
+
+	got, err := lookCLI("somemcpclient")
+	if err != nil {
+		t.Fatalf("lookCLI: %v", err)
+	}
+	if got != binary {
+		t.Errorf("lookCLI = %q, want %q", got, binary)
+	}
+}
+
+// An unusable candidate in an earlier directory must not end the search. A
+// directory named `codex`, or one owned by somebody else that this user cannot
+// execute, would otherwise shadow the real CLI further along the user's PATH.
+func TestLookCLIScansPastAnUnusableCandidate(t *testing.T) {
+	shadow, real := t.TempDir(), t.TempDir()
+	if err := os.Mkdir(filepath.Join(shadow, "adirectory"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(shadow, "notexecutable"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", "/nonexistent")
+	stubUserPATH(t, shadow+string(filepath.ListSeparator)+real)
+
+	for _, name := range []string{"adirectory", "notexecutable"} {
+		// Nothing usable anywhere: not found, and no panic on the way.
+		if got, err := lookCLI(name); err == nil {
+			t.Errorf("lookCLI(%q) = %q, want not found", name, got)
+		}
+		// Now the same name exists, usable, in the later directory.
+		wanted := filepath.Join(real, name)
+		if err := os.WriteFile(wanted, []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		got, err := lookCLI(name)
+		if err != nil {
+			t.Fatalf("lookCLI(%q) after the shadow: %v", name, err)
+		}
+		if got != wanted {
+			t.Errorf("lookCLI(%q) = %q, want %q", name, got, wanted)
+		}
+	}
+}
+
+// stubUserPATH points the probe at a fixed PATH for one test.
+func stubUserPATH(t *testing.T, path string) {
+	t.Helper()
+	previous := userPATH
+	t.Cleanup(func() { userPATH = previous })
+	userPATH = func() string { return path }
 }
