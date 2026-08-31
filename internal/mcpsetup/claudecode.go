@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"maps"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -40,7 +39,8 @@ type ClaudeCode struct {
 	// CLIPath is the claude binary. Empty resolves it via LookPath and the
 	// known install locations.
 	CLIPath string
-	// LookPath finds a binary on PATH. nil uses exec.LookPath.
+	// LookPath finds a binary on PATH. nil uses lookCLI, which also searches
+	// the user's shell's PATH.
 	LookPath func(string) (string, error)
 	// StatePath is ~/.claude.json when empty. It is only ever read.
 	StatePath string
@@ -71,7 +71,7 @@ func (c *ClaudeCode) resolveCLI() string {
 	}
 	lookPath := c.LookPath
 	if lookPath == nil {
-		lookPath = exec.LookPath
+		lookPath = lookCLI
 	}
 	if path, err := lookPath("claude"); err == nil {
 		return path
@@ -150,7 +150,7 @@ func (c *ClaudeCode) Apply(ctx context.Context, spec Spec, opts Options) (Result
 	cli := c.resolveCLI()
 	if cli == "" {
 		result.Status = StatusSkipped
-		result.Detail = "the claude CLI was not found on PATH"
+		result.Detail = "no claude CLI was found on PATH, in your shell's PATH, or in the usual install locations"
 		if c.Required {
 			return result, notInstalledErr(claudeCodeName, result.Detail)
 		}
