@@ -110,7 +110,27 @@ reports is the one enforced.
   accurate about what it could see. `TestEveryToolResultCarriesItsWholePayloadAsText` pins it by asserting
   the text block parses and equals `structuredContent`, so a summary reintroduced on either side alone
   fails. Trim what a payload *contains* — see the media-path split and the metadata denylist below — never
-  which clients can read it.
+  which clients can read it. And there is no model-token saving to be had there in any case: measured by
+  calling the tool from a Claude Code session and reading what landed, only the content block enters the
+  agent's context, once. The duplication costs wire bytes and nothing else. It was re-examined under that
+  measurement and left exactly as it is.
+- **The server's `Instructions` route between tools and restate nothing a tool description already says.**
+  `newServer` passed `nil` for `*sdk.ServerOptions` and shipped no instructions at all — a channel wired and
+  empty, since the SDK returns `Instructions` in the initialize result and clients render it into the
+  agent's context once per session. The gap it closes is **cross-tool routing**, which no tool description
+  can close by construction: a description is per-tool, so none of the four can say which one to reach for
+  first. An agent opened audio questions with `search_events` and arrived at `get_transcript` a call later,
+  oriented with `list_apps` when it did not need to, and answered `truncated` one `get_event` at a time. So
+  the text says only which shape of question goes to which tool, that a truncated page is answered by
+  raising `max_text_chars` while `get_event` is for one specific event, and that each tool states its own
+  paging in its own `notice`. It stays routing-only, and that is a rule and not a budget: a second copy of a
+  provenance or paging rule is precisely the drift the rest of this file exists to prevent, and it would be
+  a copy with no test holding it to the Go. The arithmetic is favourable — roughly 200 tokens once per
+  session against calls measured at 4,844 (`search_events`) and 8,635 (`get_transcript`) tokens each, so two
+  avoided calls repay it many times over. **Not a Claude Code skill**: `mcpsetup` registers Claude Code,
+  Claude Desktop and Codex, and a skill reaches one of the three; it would also put Lumi's rules in a fourth
+  place, across a tool boundary, with nothing pinning them to the code. Instructions ship inside the binary
+  with what they describe.
 - **The media path is split, and the contract says how to rejoin it.** Every event of a kind comes from one
   directory, so repeating it per event was two thirds of each path and the largest constant cost on a page;
   `media_dir` states it once. Two rules keep the split honest. `media_file` is `filepath.Base` of the stored
@@ -120,21 +140,86 @@ reports is the one enforced.
   files sit in two directories — an index carried between data dirs — is left un-hoisted with whole paths,
   because a short name joined to the wrong directory is worse than a long one.
 - **Every timestamp a tool returns goes through `localStamp`** — the machine's local zone with its offset,
-  at nanosecond precision, matching what `lumi search` prints. The precision is what lets a value round-trip
-  when it is handed back as a `since` or `until` bound. The *zone* matters for a reason that only appears
-  between fields: an agent cannot know two timestamps in one response are the same kind of thing, so it
-  compares them as strings. `resume_from` was rendered UTC while `captured_at`, `started_at`, `ended_at` and
-  `last_seen` were local — both parse, both round-trip, and nothing failed, so the only symptom was an agent
-  reading a resume point as hours away from the turns it continues. The notice offering `resume_from` names
-  `covered_until` in the same sentence, which printed the two spellings side by side.
+  matching what `lumi search` prints. Precision is per value and follows what the value is *for*: anything a
+  caller hands back as a `since` or `until` bound keeps nanoseconds so it round-trips exactly, which today
+  means `resume_from` and nothing else, while a transcript turn's `started_at`/`ended_at` are rendered to
+  the millisecond because a turn is assembled from a ~30-second chunk and nanoseconds on it are precision
+  the measurement does not have. The *zone* is not scoped that way and never may be, for a reason that only
+  appears between fields: an agent cannot know two timestamps in one response are the same kind of thing, so
+  it compares them as strings. `resume_from` was rendered UTC while `captured_at`, `started_at`, `ended_at`
+  and `last_seen` were local — both parse, both round-trip, and nothing failed, so the only symptom was an
+  agent reading a resume point as hours away from the turns it continues. The notice offering `resume_from`
+  names `covered_until` in the same sentence, which printed the two spellings side by side.
   `lumi transcript` had the identical pair and was fixed with it. Note that `resume_from` legitimately sorts
   *at or before* the last turn's `ended_at` when a cap falls inside a chunk — the next page re-reads that
   chunk by design (`internal/store/transcript.go`), so ordering is not a property to assert here.
   `TestEveryTimestampIsRenderedInTheLocalZone` walks whole payloads rather than named fields, so a timestamp
-  added later is covered without anyone remembering. Storage and range comparison stay UTC.
-- **Truncation lives at the MCP boundary, never in the store.** `search_events` caps `text` in the handler
-  after `Search` returns, counting runes so multi-byte text is never split. Pushing `max_text_chars` into
-  the SQL `SELECT` would corrupt `lumi search --json`, a faithful export.
+  added later is covered without anyone remembering; it asserts the offset and that the value parses, never
+  how many digits it carries, which is why scoping precision per value left it untouched. Storage and range
+  comparison stay UTC.
+- **`confidence` is rounded to three decimals, not two, because `min_confidence` filters on the full
+  precision.** The filter is applied against the stored value (`internal/store/transcript.go`) while the
+  payload shows the rounded one, so any rounding opens a window in which a turn's displayed confidence
+  contradicts the filter that removed it: at two decimals a turn stored as `0.595` displays as `0.6` and
+  then vanishes under `min_confidence: 0.6`, which nothing in the response can explain. Three decimals
+  narrow that window to ±0.0005 and cost almost nothing — measured on a real 100-turn response, two decimals
+  saved 2.2% of the payload and three saved 1.9%. `"confidence": 0.8340000000000001` was the shape being
+  paid for.
+- **The rest of a transcript turn's envelope is not waste; what looks like waste is the doubt label.**
+  Measured on a real 100-turn response, `text` is 29.7% of the payload and the median turn is 35 characters,
+  so cutting fields is the obvious win: omitting `truncated: false` and `text_length` reaches −24%, dropping
+  `ended_at` −36%. Both were declined, because they cut the doubt label itself — a field that appears only
+  when it is interesting is a field an agent has to infer from an absence, which is the rule these fields
+  carry no `omitempty` for. Hoisting `order_confidence` to the envelope was declined for three separate
+  reasons, any one of them sufficient: `sdk.AddTool` infers the output schema from the Go struct, so
+  `omitempty` drops the field from the per-turn required list with no way to express "either every turn
+  carries it or the envelope does"; it falsifies the advertised description *"Every turn carries confidence
+  and order_confidence"*; and it breaks `TestTranscriptTurnAlwaysSerializesConfidence`, which exists to
+  guard this exact field against exactly this. Rounding and precision were where the payload could be made
+  smaller without changing anything it promises.
+- **Truncation lives at the MCP boundary, never in the store — and so does the choice of *which* window it
+  shows.** `search_events` caps `text` in the handler after `Search` returns, counting runes so multi-byte
+  text is never split. Pushing `max_text_chars` into the SQL `SELECT` would corrupt `lumi search --json`, a
+  faithful export, and centring the excerpt would corrupt it the same way, which is why `excerptAround` sits
+  beside `truncateText` here and not as a `snippet()` in the query. The cut used to be a blind prefix, and on
+  full-display OCR the first 600 runes are the menu bar and the tab strip: sampled on the live index, the
+  first occurrence of the query term sits past char 600 in 22% of rows for `claude`, 38% for `meeting`, and
+  **100%** for `invoice`. A real call for `claude` came back with 842 chars beginning
+  `"Comet\nFile\nEdit\nView\nAssistant…"` and the word nowhere in it, on 20 of 20 rows marked `truncated` —
+  and the description's own advice then turned that page into twenty `get_event` calls for one question.
+  The excerpt now centres on the earliest occurrence of any term `store.SearchTerms` returns, and the
+  description points at raising `max_text_chars` rather than at `get_event`. `text_length` stays the rune
+  count of the whole text and `truncated` stays true: the pair's contract is untouched, only the window is.
+- **Go-side centring cannot reproduce FTS5's matching, and every row where it fails falls back to the head
+  cut.** `events_fts` folds diacritics (`unicode61 remove_diacritics 2`, `internal/store/migrations.go`), a
+  whitespace-separated term becomes a quoted phrase that can span tokens (`internal/store/query.go`), and the
+  index covers `app` and `window` as well as `text` — so a row can legitimately match on its window title
+  with the term absent from `text` entirely. `excerptAround` finds nothing on those and returns the prefix
+  cut, which is exactly what shipped before it: **the floor is the old behaviour**, and the change is a
+  strict improvement on every row where a match is found, which the sampling says is most of them. Closing
+  the rest means FTS5-reported offsets, a new `Event` field and an opt-in plumbed through `Search`, spent on
+  a better window for the minority of rows that already sit at the floor. That is why it was declined and
+  not merely deferred.
+- **The collapse is screen-only, and no flag may ever let an audio row into it.** `collapse_similar` folds a
+  run of adjacent screen results sharing `app` + `window` + `display_id` whose text is near-identical into
+  one representative, because 76% of adjacent same-app screen pairs are more than 0.9 identical at a 2–10s
+  capture cadence. Audio is the same shape and the opposite case. All 967 audio pairs on the live index
+  share `app`, `window` and `display_id` — an audio row's `display_id` is always 0 — and their two
+  transcripts are **median 0.819 similar**, 87 of 140 above 0.7, precisely because the microphone re-records
+  what the speakers played. Keyed on those fields the collapse would merge a chunk's two tracks on the
+  majority of pairs, which is the defect the never-merge rule records as having deleted real transcripts,
+  arrived at from a timestamp a second time. `collapsed_ids` does not rescue it: it preserves *reachability*,
+  not content, so the microphone's account of the room leaves the visible result and the only way back is a
+  `get_event` the agent has no reason to make. `kind == "screen"` is therefore a precondition of the
+  collapse and not a filter layered over it, and a test asserts an audio pair survives
+  `collapse_similar: true` as two rows.
+- **The collapse runs after `LIMIT`, so the notice reports both counts.** The store returns `limit` rows and
+  the fold happens on the way out, so a page of 20 that collapses to 6 has still exhausted the limit: a
+  notice saying "capped at 20" beside six events contradicts its own payload, and one saying "capped at 6"
+  invents a cap nothing enforced. It states what was fetched and what survived. Refilling the page by
+  over-fetching was declined deliberately — a short page costs one clause of explanation, a refill loop
+  costs an unbounded number of store round-trips to hide it, and nothing has shown short pages cost more
+  calls than the tokens the fold saves.
 - **A rule about the store is read from the store, not reimplemented here.** `HasSearchableTerms` exists
   because this package had copied the unexported term-drop rule, and the drift was invisible to both test
   suites (`internal/store/CLAUDE.md`).
