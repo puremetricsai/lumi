@@ -93,7 +93,20 @@ and `transcript.Segment` — shadow each other the way `internal/mcp`'s `Attribu
 - **A rule about the store lives in the store.** When a caller needs to know what `Search` will do, export
   the answer and read it rather than restating it. `HasSearchableTerms` exists because `internal/mcp` had
   reimplemented the unexported drop rule — a copy is correct only until the original moves, and the drift
-  is invisible to both test suites.
+  is invisible to both test suites. `SearchTerms` is exported for exactly that reason and no other:
+  `lumi mcp` centres the excerpt it returns on the term that earned a row its place, so it has to know
+  which terms those were, and deriving them here rather than re-splitting with `strings.Fields` at the
+  boundary is what stops the drop rule being copied out of this file a second time. The terms come back
+  **as the user wrote them**, not as FTS5 tokenizes them — `unicode61` folds diacritics the caller's literal
+  comparison keeps, and a whitespace-separated term is a quoted phrase that may span several tokens — so a
+  caller that fails to find one in raw text must read that as "nothing to centre on", never as "this row
+  did not match".
+- **`Search` closes both its orderings with `e.id DESC`.** `captured_at` is not unique — a chunk's two
+  tracks share one by construction, and 21% of live rows share theirs — so without a tiebreaker the order
+  inside a tie group is unspecified, and two identical calls can return different subsets of a group the
+  `LIMIT` cuts through. `lumi mcp` pages browse results by handing the oldest `captured_at` on a page back
+  as `until`, which needs the same boundary every time. `DESC` so it agrees with `captured_at DESC` and
+  keeps the newest row of a tie group first.
 - **`Search`'s `app`/`window` filters are unqualified SQL predicates, so an app-shaped query spans both
   row kinds.** Callers that need to mean one of them say so: `ListAttribution` takes a `Kind`, and never
   sums the two into a single count — see `internal/mcp/CLAUDE.md` for what that conflation looked like.

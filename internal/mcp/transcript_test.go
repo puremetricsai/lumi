@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -504,5 +505,82 @@ func TestGetTranscriptResumePointDoesNotRepeatTheLastTurn(t *testing.T) {
 	if next.Turns[0].Text != "phrase 2" {
 		t.Errorf("resuming began at %q, want the first dropped turn %q",
 			next.Turns[0].Text, "phrase 2")
+	}
+}
+
+// TestGetTranscriptRoundsTurnConfidenceAndKeepsResumeExact pins the two halves
+// of the envelope trim and, more importantly, the line between them.
+//
+// A turn's started_at/ended_at are rendered to the millisecond because a turn is
+// assembled from a ~30-second chunk, so nine digits on it are precision the
+// measurement never had. resume_from is the one value a caller hands straight
+// back as a bound, so it keeps nanoseconds — a later "tidy this up too" that
+// truncated it would break paging silently.
+func TestGetTranscriptRoundsTurnConfidenceAndKeepsResumeExact(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	// Planted explicitly, never inherited from time.Now(), which can land
+	// millisecond-aligned and make the resume_from assertion pass by accident.
+	base := time.Now().UTC().Add(-10 * time.Hour).Truncate(time.Second).Add(123456789 * time.Nanosecond)
+	started := base.Add(500*time.Millisecond + 654321*time.Nanosecond)
+	ended := started.Add(2 * time.Second)
+
+	attributedChunk(t, ctx, s, base, store.Segment{
+		Origin: store.OriginExternal, SourceTrack: "microphone", Text: "happy friday",
+		Confidence: 0.8340000000000001, OrderConfidence: "sequence",
+		StartedAt: &started, EndedAt: &ended,
+	})
+	h := &handlers{store: s}
+
+	out := callTranscript(t, ctx, h, getTranscriptInput{Since: "11h"})
+	if len(out.Turns) != 1 {
+		t.Fatalf("got %d turns, want 1", len(out.Turns))
+	}
+	turn := out.Turns[0]
+
+	// The precision is the contract, not the value: assembly may legitimately
+	// pick a different constituent's score.
+	encoded, err := json.Marshal(turn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m := regexp.MustCompile(`"confidence":\s*[0-9]+\.([0-9]+)`).FindSubmatch(encoded); m != nil {
+		if len(m[1]) > 3 {
+			t.Fatalf("confidence carries %d fractional digits, want at most 3: %s", len(m[1]), encoded)
+		}
+	}
+
+	for _, field := range []struct{ name, value string }{
+		{"started_at", turn.StartedAt}, {"ended_at", turn.EndedAt},
+	} {
+		if field.value == "" {
+			t.Fatalf("%s is empty", field.name)
+		}
+		at, err := time.Parse(time.RFC3339Nano, field.value)
+		if err != nil {
+			t.Fatalf("%s = %q does not parse: %v", field.name, field.value, err)
+		}
+		if at.Nanosecond()%int(time.Millisecond) != 0 {
+			t.Fatalf("%s = %q carries sub-millisecond precision a ~30s chunk never had", field.name, field.value)
+		}
+	}
+
+	// An hour apart, the way TestGetTranscriptResumePointDoesNotRepeatTheLastTurn
+	// spaces its chunks: two close same-origin chunks risk assembling into one
+	// turn, leaving MaxTurns: 1 nothing to cap and resume_from empty.
+	attributedChunk(t, ctx, s, base.Add(time.Hour), store.Segment{
+		Origin: store.OriginExternal, SourceTrack: "microphone", Text: "second phrase",
+		Confidence: 0.9, OrderConfidence: "sequence",
+	})
+	paged := callTranscript(t, ctx, h, getTranscriptInput{Since: "11h", MaxTurns: 1})
+	if paged.ResumeFrom == "" {
+		t.Fatal("a capped transcript names no resume point")
+	}
+	resume, err := time.Parse(time.RFC3339Nano, paged.ResumeFrom)
+	if err != nil {
+		t.Fatalf("resume_from = %q does not parse: %v", paged.ResumeFrom, err)
+	}
+	if resume.Nanosecond()%int(time.Millisecond) == 0 {
+		t.Fatalf("resume_from = %q lost its nanoseconds; a bound handed back must round-trip exactly", paged.ResumeFrom)
 	}
 }

@@ -705,3 +705,100 @@ func TestVacuumBusyIsRecognisable(t *testing.T) {
 		}
 	}
 }
+
+// TestSearchBreaksCapturedAtTiesByDescendingID pins the tiebreaker that makes a
+// browse page walkable. captured_at is not unique — an audio chunk's two tracks
+// share one by construction, and 21% of live rows share theirs — so without
+// e.id the order inside a tie group is whatever the query plan produced, and two
+// identical calls can return different subsets of a group the LIMIT cuts
+// through. `lumi mcp` hands the oldest captured_at on a page back as `until`,
+// which needs the same boundary every time.
+func TestSearchBreaksCapturedAtTiesByDescendingID(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, ctx)
+	base := time.Now().UTC().Truncate(time.Second)
+	// Both inserted as slices: insertAll passes the slice's own array, so the IDs
+	// Insert writes back are visible here. A single Event passed by value is not.
+	older := []Event{{Kind: KindScreen, CapturedAt: base.Add(-time.Hour), Text: "older row"}}
+	tie := []Event{
+		{Kind: KindScreen, CapturedAt: base, Text: "tie one"},
+		{Kind: KindScreen, CapturedAt: base, Text: "tie two"},
+		{Kind: KindScreen, CapturedAt: base, Text: "tie three"},
+	}
+	insertAll(t, ctx, s, older...)
+	insertAll(t, ctx, s, tie...)
+
+	all, err := s.Search(ctx, SearchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 4 {
+		t.Fatalf("got %d events, want 4", len(all))
+	}
+	// The tie group comes back newest-id-first, and the older row lands last —
+	// proving the tiebreaker did not disturb the primary captured_at DESC key.
+	for i, want := range []int64{tie[2].ID, tie[1].ID, tie[0].ID, older[0].ID} {
+		if all[i].ID != want {
+			t.Fatalf("position %d = id %d, want %d (order: %v)", i, all[i].ID, want, ids(all))
+		}
+	}
+
+	// A cut THROUGH the tie group is exactly where an unspecified order shows.
+	first, err := s.Search(ctx, SearchOptions{Limit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.Search(ctx, SearchOptions{Limit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 2 || len(second) != 2 {
+		t.Fatalf("limited calls returned %d and %d rows, want 2 each", len(first), len(second))
+	}
+	for i := range first {
+		if first[i].ID != second[i].ID {
+			t.Fatalf("two identical calls returned different pages: %v then %v", ids(first), ids(second))
+		}
+	}
+	if first[0].ID != tie[2].ID || first[1].ID != tie[1].ID {
+		t.Fatalf("page = %v, want the tie group's two highest ids", ids(first))
+	}
+}
+
+// TestSearchBreaksRankedTiesByDescendingID: identical text at an identical
+// captured_at scores an identical bm25 rank, so e.id is the only key left.
+func TestSearchBreaksRankedTiesByDescendingID(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, ctx)
+	base := time.Now().UTC().Truncate(time.Second)
+	// Filler with distinct timestamps keeps FTS5's IDF term from going
+	// degenerate, the same reason TestSearchMatchAnyFindsPartialMatches carries it.
+	for i := range 5 {
+		insertAll(t, ctx, s, Event{Kind: KindScreen, CapturedAt: base.Add(-time.Duration(i+2) * time.Hour),
+			Text: fmt.Sprintf("unrelated filler text number %d", i)})
+	}
+	tie := []Event{
+		{Kind: KindScreen, CapturedAt: base, Text: "postgres index maintenance"},
+		{Kind: KindScreen, CapturedAt: base, Text: "postgres index maintenance"},
+	}
+	insertAll(t, ctx, s, tie...)
+
+	got, err := s.Search(ctx, SearchOptions{Query: "postgres"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d hits, want 2", len(got))
+	}
+	if got[0].ID != tie[1].ID || got[1].ID != tie[0].ID {
+		t.Fatalf("ranked tie order = %v, want descending id %v", ids(got), []int64{tie[1].ID, tie[0].ID})
+	}
+}
+
+func ids(events []Event) []int64 {
+	out := make([]int64, len(events))
+	for i, event := range events {
+		out[i] = event.ID
+	}
+	return out
+}

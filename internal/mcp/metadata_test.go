@@ -136,7 +136,7 @@ func TestPresenceIsAbsentWhenNothingWasObserved(t *testing.T) {
 	}
 	record := newEventRecord(store.Event{
 		Kind: store.KindAudio, AudioSource: "system", SourceApps: apps,
-	}, 0)
+	}, 0, nil)
 	if len(record.SourceApp) != 1 {
 		t.Fatalf("source_app = %#v", record.SourceApp)
 	}

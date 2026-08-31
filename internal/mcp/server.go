@@ -169,11 +169,48 @@ const audioProvenanceContract = "Audio results keep three different things apart
 
 // newServer builds the server and registers the tools. It is separate from
 // Serve so tests can drive it over an in-memory transport.
+// serverInstructions routes a caller to the right tool before it makes its
+// first call. The gap it closes is cross-tool, and a tool description is
+// per-tool by construction: none of the four can say "for a question of this
+// shape, start over there". That is why an agent opens an audio question with
+// search_events and reaches get_transcript a call later, orients with
+// list_apps it did not need, and answers a page of truncated rows one
+// get_event at a time. The channel was already wired and empty — the go-sdk
+// returns ServerOptions.Instructions in the initialize result, and clients
+// render it into the agent's context once per session.
+//
+// It states nothing the four tool descriptions already carry. A second copy of
+// a provenance or paging rule is the drift every CLAUDE.md in this repo exists
+// to prevent, and this copy would be the one an agent reads first. Paging in
+// particular differs per tool and each tool already reports its own; this only
+// says to read that notice.
+//
+// It is instructions rather than a Claude Code skill because mcpsetup
+// registers Claude Code, Claude Desktop and Codex: a skill reaches one client
+// of three, and would be a fourth place Lumi's rules live, in a file no Go
+// test holds to the Go. Instructions ship inside the binary with the code they
+// describe.
+const serverInstructions = "Lumi is this user's own captured history of their screen and audio. " +
+	"Route by the shape of the question. Anything about audio, a call, a meeting, or what was " +
+	"said: start with get_transcript, which reads each chunk whole and in order — search_events " +
+	"is the wrong first call for it and costs you an extra one. \"What was I working on\", " +
+	"anything read off the screen, or a search for a word or phrase: search_events. Filtering by " +
+	"app or window: call list_apps first, so the value you filter on is one that exists. One " +
+	"event whose id you already have: get_event. " +
+	"When search_events rows come back truncated, raise max_text_chars (0 removes the cap) and " +
+	"search again — one call widens the whole page. get_event is the escape hatch for one " +
+	"specific event, never the way to expand a page of them. " +
+	"Each tool paginates differently and each says how in its own notice: read the notice before " +
+	"you make a follow-up call."
+
 func newServer(s *store.Store, opts Options) *sdk.Server {
 	if opts.Name == "" {
 		opts.Name = "lumi"
 	}
-	server := sdk.NewServer(&sdk.Implementation{Name: opts.Name, Version: opts.Version}, nil)
+	server := sdk.NewServer(
+		&sdk.Implementation{Name: opts.Name, Version: opts.Version},
+		&sdk.ServerOptions{Instructions: serverInstructions},
+	)
 	h := &handlers{
 		store:        s,
 		databasePath: opts.DatabasePath,
@@ -196,7 +233,10 @@ func newServer(s *store.Store, opts Options) *sdk.Server {
 			"Every parameter is optional; with none it returns the most recent activity. " +
 			"Results are ranked by relevance when query is set, and newest-first otherwise — " +
 			"with a query, result[0] is the best match, not necessarily the most recent. " +
-			"Text is capped per event — when a result says truncated, call get_event for the full text. " +
+			"Text is capped per event — when results say truncated, raise max_text_chars (0 uncaps) and " +
+			"search again rather than calling get_event per row; get_event is for one specific event, " +
+			"not for a page. Set collapse_similar to fold runs of near-identical consecutive screen " +
+			"results into one representative naming the ids it stands for. " +
 			"Returns text and metadata only: screenshots and audio never leave the user's machine. " +
 			"Each event names its capture file in media_file; join that to media_dir's entry for the " +
 			"event's kind for a local path the user can open themselves. " +

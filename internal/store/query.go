@@ -49,19 +49,42 @@ func ftsExpression(input string, mode MatchMode) string {
 // quote doubled), which makes it a literal phrase rather than something the
 // FTS5 parser can interpret as an operator.
 //
-// Terms containing no letters or digits are dropped: FTS5 tokenizes them to
-// nothing, so a query built only from them would be a syntax error rather than
-// a zero-result search.
+// The terms themselves come from SearchTerms, so the drop rule is stated once.
 func joinTerms(input, operator string) string {
-	fields := strings.Fields(input)
-	quoted := make([]string, 0, len(fields))
+	terms := SearchTerms(input)
+	quoted := make([]string, 0, len(terms))
+	for _, term := range terms {
+		quoted = append(quoted, `"`+strings.ReplaceAll(term, `"`, `""`)+`"`)
+	}
+	return strings.Join(quoted, operator)
+}
+
+// SearchTerms splits query into the terms an FTS MATCH will actually be built
+// from: whitespace-separated fields, minus the ones FTS5 tokenizes to nothing.
+// Terms containing no letters or digits are dropped, because a query built only
+// from them would be an FTS5 syntax error rather than a zero-result search.
+//
+// It is exported for the same reason HasSearchableTerms is. `lumi mcp` centres
+// the excerpt it returns on the term that earned a row its place, and to do
+// that it has to know which terms those were. Deriving them here rather than
+// re-splitting at the boundary is what keeps the two from drifting — the drop
+// rule has been copied out of this file once already.
+//
+// The terms are returned as the user wrote them, not as FTS5 tokenizes them:
+// a caller matching them against raw text will miss what unicode61's diacritic
+// folding matched, and a term is a quoted phrase that may span several tokens.
+// Callers must treat a miss as "no excerpt to centre on", never as "this row
+// did not match".
+func SearchTerms(query string) []string {
+	fields := strings.Fields(query)
+	terms := make([]string, 0, len(fields))
 	for _, field := range fields {
 		if !hasAlphanumeric(field) {
 			continue
 		}
-		quoted = append(quoted, `"`+strings.ReplaceAll(field, `"`, `""`)+`"`)
+		terms = append(terms, field)
 	}
-	return strings.Join(quoted, operator)
+	return terms
 }
 
 // HasSearchableTerms reports whether query still yields a MATCH expression once

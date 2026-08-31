@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -140,14 +141,31 @@ func (h *handlers) getTranscript(ctx context.Context, _ *sdk.CallToolRequest, in
 		text, truncated, length := truncateText(turn.Text, maxChars)
 		record := TranscriptTurnRecord{
 			Origin: turn.Origin, Text: text, Truncated: truncated, TextLength: length,
-			Confidence: turn.Confidence, OrderConfidence: turn.OrderConfidence,
+			// Rounded for the same reason presenceOf rounds: more digits imply a
+			// resolution the measurement does not have, and "confidence":
+			// 0.8340000000000001 was the shape being paid for.
+			//
+			// Three places rather than two because min_confidence filters on the
+			// FULL stored value (internal/store/transcript.go) while this is only
+			// the displayed one. At two decimals a turn stored as 0.595 displays
+			// as 0.6 and then vanishes under min_confidence: 0.6 — a contradiction
+			// nothing in the response can explain. Three narrows that window to
+			// ±0.0005 and costs almost nothing: measured on a real 100-turn
+			// response, two decimals saved 2.2% of the payload and three saved 1.9%.
+			Confidence: math.Round(turn.Confidence*1000) / 1000, OrderConfidence: turn.OrderConfidence,
 			Overlaps: turn.Overlaps, EventIDs: turn.EventIDs,
 		}
+		// Nanoseconds exist so a value handed back as a since/until bound
+		// round-trips exactly. resume_from is the only such value and keeps them
+		// (out.ResumeFrom above). A turn is assembled from a ~30-second chunk, so
+		// nine digits on it are precision the measurement never had — and the
+		// pair was 29% of a measured 100-turn response. RFC3339Nano trims the
+		// trailing zeros, so no helper is needed.
 		if turn.StartedAt != nil {
-			record.StartedAt = localStamp(*turn.StartedAt)
+			record.StartedAt = localStamp(turn.StartedAt.Truncate(time.Millisecond))
 		}
 		if turn.EndedAt != nil {
-			record.EndedAt = localStamp(*turn.EndedAt)
+			record.EndedAt = localStamp(turn.EndedAt.Truncate(time.Millisecond))
 		}
 		out.Turns = append(out.Turns, record)
 	}

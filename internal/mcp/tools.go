@@ -150,6 +150,15 @@ type EventRecord struct {
 	// from a missing key the one thing this pair exists to state outright.
 	Truncated  bool `json:"truncated"`
 	TextLength int  `json:"text_length"`
+	// CollapsedIDs names the events this record stands for when collapse_similar
+	// folded a run of near-identical adjacent screen rows into it, so nothing is
+	// silently lost and get_event still reaches every dropped row.
+	// CollapsedCount is len(CollapsedIDs): redundant by construction, and present
+	// so an agent does not have to count a list to learn its page is short.
+	// Both are absent on an uncollapsed record, and always absent on an audio
+	// row — audio never enters the collapse.
+	CollapsedIDs   []int64 `json:"collapsed_ids,omitempty"`
+	CollapsedCount int     `json:"collapsed_count,omitempty"`
 	// App and Window are set on screen rows only. On an audio row the same two
 	// columns are reported as ForegroundApp/ForegroundWindow, because there they
 	// answer a question a reader of "app" does not expect them to: what the user
@@ -226,7 +235,11 @@ type SourceAppRecord struct {
 }
 
 // newEventRecord converts a stored event for the wire, capping Text at
-// maxTextChars runes (zero or less means no cap). It never fills Metadata:
+// maxTextChars runes (zero or less means no cap) and centring that window on
+// the earliest of terms to appear in it — the terms store.SearchTerms derived
+// from the query, so the drop rule is never restated here. Nil terms mean a
+// head cut, which is what browse mode and get_event both want. It never fills
+// Metadata:
 // get_event, the untruncated escape hatch, attaches that itself, so search
 // results stay compact.
 //
@@ -234,8 +247,8 @@ type SourceAppRecord struct {
 // what `lumi search` prints, at nanosecond precision so a timestamp handed back
 // as a `since` or `until` bound round-trips exactly. Storage and range
 // comparison stay UTC.
-func newEventRecord(event store.Event, maxTextChars int) EventRecord {
-	text, truncated, length := truncateText(event.Text, maxTextChars)
+func newEventRecord(event store.Event, maxTextChars int, terms []string) EventRecord {
+	text, truncated, length := excerptAround(event.Text, terms, maxTextChars)
 	record := EventRecord{
 		ID:          event.ID,
 		Kind:        string(event.Kind),
@@ -407,10 +420,11 @@ type searchEventsInput struct {
 	// The numbers in limit's description are store.DefaultSearchLimit and
 	// store.MaxSearchLimit; a struct tag cannot interpolate them, so
 	// TestSearchLimitDescriptionMatchesStoreBounds fails if they drift apart.
-	Limit        int    `json:"limit,omitempty" jsonschema:"maximum events to return; defaults to 20 and is capped at 500"`
-	Match        string `json:"match,omitempty" jsonschema:"\"all\" (default) requires every query term; \"any\" requires one and ranks by relevance"`
-	RequireText  bool   `json:"require_text,omitempty" jsonschema:"drop events whose text or transcript is empty or only whitespace"`
-	MaxTextChars *int   `json:"max_text_chars,omitempty" jsonschema:"per-event character cap on text; defaults to 600, and 0 means no cap"`
+	Limit           int    `json:"limit,omitempty" jsonschema:"maximum events to return; defaults to 20 and is capped at 500"`
+	Match           string `json:"match,omitempty" jsonschema:"\"all\" (default) requires every query term; \"any\" requires one and ranks by relevance"`
+	RequireText     bool   `json:"require_text,omitempty" jsonschema:"drop events whose text or transcript is empty or only whitespace"`
+	MaxTextChars    *int   `json:"max_text_chars,omitempty" jsonschema:"per-event character cap on text; defaults to 600, and 0 means no cap"`
+	CollapseSimilar bool   `json:"collapse_similar,omitempty" jsonschema:"fold a run of adjacent screen results showing the same app, window and display with near-identical text into one, carrying the folded ids as collapsed_ids; audio rows are never folded; off by default"`
 }
 
 type searchEventsOutput struct {
@@ -477,15 +491,37 @@ func (h *handlers) searchEvents(ctx context.Context, _ *sdk.CallToolRequest, in 
 	// against word timings and an energy envelope, and reaches an agent through
 	// get_transcript. Deciding it a second time from a timestamp alone deleted
 	// real transcripts.
+	// The terms are derived once per request, never per row, and never by
+	// re-splitting the query here: store.SearchTerms owns the drop rule and
+	// exports it precisely so this package cannot drift from it again. Browse
+	// mode gets an empty slice, which is excerptAround's fall-through.
+	terms := store.SearchTerms(in.Query)
 	out := searchEventsOutput{Events: make([]EventRecord, 0, len(events))}
 	for _, event := range events {
-		out.Events = append(out.Events, newEventRecord(event, maxTextChars))
+		out.Events = append(out.Events, newEventRecord(event, maxTextChars, terms))
 	}
+	// The page boundary is read BEFORE the collapse, off the last store row, so
+	// a representative that folded older rows cannot push the boundary back up
+	// the page.
+	fetched := len(events)
+	var oldest string
+	if fetched > 0 {
+		oldest = localStamp(events[fetched-1].CapturedAt)
+	}
+	if in.CollapseSimilar {
+		// ponytail: one store page in, collapsed page out — a collapsed page is
+		// short. Over-fetch in a loop only if short pages prove to cost more calls
+		// than they save tokens.
+		out.Events = collapseSimilarScreens(out.Events)
+	}
+	// Hoisted last, so media_dir describes the rows actually returned.
 	out.MediaDir = hoistMediaDir(out.Events)
 
 	// Two independent notices can apply at once, so compose the non-empty parts.
 	var parts []string
-	capped := len(out.Events) == limit
+	// Measured on what the STORE returned, never on what survived the collapse:
+	// a page of 20 that folds to 6 has still exhausted the limit.
+	capped := fetched == limit
 	switch {
 	case len(out.Events) == 0:
 		notice, err := h.noResultNotice(ctx,
@@ -498,9 +534,28 @@ func (h *handlers) searchEvents(ctx context.Context, _ *sdk.CallToolRequest, in 
 		// A full page is indistinguishable from "there happen to be exactly
 		// this many results" unless we say so: an agent that gets exactly the
 		// limit back cannot otherwise tell it saw a recency-truncated slice.
-		parts = append(parts, fmt.Sprintf(
-			"results were capped at %d events; there may be more — narrow since/until or raise limit to see them",
-			limit))
+		//
+		// How to continue is mode-dependent, and only browse mode has an answer.
+		// Its ORDER BY is captured_at DESC (closed by e.id DESC, so the boundary
+		// does not reshuffle), which makes the oldest stamp on the page a real
+		// cursor. Ranked mode keeps wording that implies no cursor exists,
+		// because none does.
+		continuation := "narrow since/until or raise limit to see them"
+		if in.Query == "" && oldest != "" {
+			continuation = fmt.Sprintf("pass until=%s to continue; the rows sharing that timestamp "+
+				"repeat, since the bound is inclusive and a chunk's two audio tracks share one stamp "+
+				"by design; a tie group larger than limit cannot advance, which needs limit: 1", oldest)
+		}
+		if collapsed := len(out.Events); collapsed < fetched {
+			// Reporting only one number would contradict the payload: "capped at
+			// 20" beside six events, or "capped at 6" inventing a cap nothing
+			// enforced.
+			parts = append(parts, fmt.Sprintf(
+				"%d fetched, collapsed to %d; there may be more — %s", fetched, collapsed, continuation))
+		} else {
+			parts = append(parts, fmt.Sprintf(
+				"results were capped at %d events; there may be more — %s", limit, continuation))
+		}
 	}
 	// An audio hit is a 30-second window of one track, which reads poorly as
 	// conversation: the machine's speech still appears in both tracks here, and
@@ -512,6 +567,95 @@ func (h *handlers) searchEvents(ctx context.Context, _ *sdk.CallToolRequest, in 
 	}
 	out.Notice = h.withStaleness(ctx, strings.Join(parts, "; "))
 	return nil, out, nil
+}
+
+// collapseSimilarScreens folds a run of adjacent screen records showing the
+// same app, window and display with near-identical text into one
+// representative, which is the FIRST row of the run — so ranked order and
+// browse order both survive the fold. Every dropped id lands on the
+// representative's CollapsedIDs, so get_event still reaches all of them.
+//
+// It exists because a page of screen results is largely the same screen
+// repeated: over the 200 most recent screen events, 76% of adjacent same-app
+// pairs are more than 0.9 identical, median similarity 0.974, at a 2-10s
+// capture cadence.
+//
+// AUDIO IS NEVER FOLDED, under any flag value, and that is a precondition
+// rather than a filter layered on top. All 967 audio pairs on the live index
+// share app, window and display_id — an audio row's display_id is always 0 —
+// and their two transcripts are median 0.819 similar, 87 of 140 above 0.7,
+// precisely because the microphone re-records what the speakers played. Keyed
+// on those fields the collapse would merge a chunk's two tracks on the majority
+// of pairs: the same defect the never-merge comment in searchEvents records as
+// having deleted real transcripts, arrived at from a timestamp a second time.
+// collapsed_ids does not rescue that — it preserves reachability, not content,
+// so the microphone's account of the room would leave the visible result.
+func collapseSimilarScreens(records []EventRecord) []EventRecord {
+	if len(records) < 2 {
+		return records
+	}
+	out := make([]EventRecord, 0, len(records))
+	for _, record := range records {
+		if len(out) > 0 {
+			if rep := &out[len(out)-1]; sameScreenRun(*rep, record) {
+				rep.CollapsedIDs = append(rep.CollapsedIDs, record.ID)
+				rep.CollapsedCount = len(rep.CollapsedIDs)
+				continue
+			}
+		}
+		out = append(out, record)
+	}
+	return out
+}
+
+// sameScreenRun is the collapse precondition and its key in one place: BOTH
+// rows must be screen rows before app, window or display_id is even looked at.
+//
+// The comparison is against the run's representative, never the immediately
+// preceding row, so a run cannot drift arbitrarily far from what it claims to
+// stand for.
+func sameScreenRun(rep, next EventRecord) bool {
+	if rep.Kind != string(store.KindScreen) || next.Kind != string(store.KindScreen) {
+		return false
+	}
+	if rep.App != next.App || rep.Window != next.Window || rep.DisplayID != next.DisplayID {
+		return false
+	}
+	return nearlyIdentical(rep.Text, next.Text)
+}
+
+// nearlyIdentical compares the already-truncated excerpts as word multisets,
+// as a ratio against the longer side.
+//
+// A bag rather than a common prefix because the menu-bar clock sits at the TOP
+// of a full-display OCR read: one changed character at rune 20 drops a prefix
+// score to near zero on two frames of the same screen, which is the exact pair
+// the collapse exists for.
+//
+// ponytail: prefix/shingle similarity, not real diffing; swap in a proper
+// measure if collapse quality matters more than the page it saves.
+func nearlyIdentical(a, b string) bool {
+	const threshold = 0.9
+	left, right := strings.Fields(a), strings.Fields(b)
+	if len(left) == 0 || len(right) == 0 {
+		return len(left) == len(right)
+	}
+	counts := make(map[string]int, len(left))
+	for _, word := range left {
+		counts[word]++
+	}
+	shared := 0
+	for _, word := range right {
+		if counts[word] > 0 {
+			counts[word]--
+			shared++
+		}
+	}
+	longer := len(left)
+	if len(right) > longer {
+		longer = len(right)
+	}
+	return float64(shared)/float64(longer) >= threshold
 }
 
 // hasAttributedAudio reports whether any returned audio event's chunk holds
@@ -607,7 +751,7 @@ func (h *handlers) getEvent(ctx context.Context, _ *sdk.CallToolRequest, in getE
 	if err != nil {
 		return nil, empty, fmt.Errorf("read event %d: %w", in.ID, err)
 	}
-	records := []EventRecord{newEventRecord(*event, 0)}
+	records := []EventRecord{newEventRecord(*event, 0, nil)}
 	// get_event is the only tool that returns the metadata blob.
 	records[0].Metadata = decodeMetadata(event.Metadata)
 	// hoistMediaDir rewrites the record in place, so it has to see the slice the

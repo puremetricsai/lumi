@@ -248,10 +248,20 @@ func (s *Store) Search(ctx context.Context, opts SearchOptions) ([]Event, error)
 	if len(where) > 0 {
 		query += " WHERE " + strings.Join(where, " AND ")
 	}
+	// e.id closes both orderings because captured_at is not unique: an audio
+	// chunk's two tracks share one by construction, and on the live index 1,936
+	// of 9,009 rows (21%) share theirs with another row. Without a tiebreaker the
+	// order inside a tie group is whatever the query plan happened to produce, so
+	// two identical calls can return different subsets of a group the LIMIT cuts
+	// through. `lumi mcp` now depends on that not happening: its browse-mode page
+	// boundary is the oldest captured_at on the page, handed back as `until`, and
+	// a boundary that reshuffles under the cap is one an agent cannot walk.
+	// DESC, so it agrees with captured_at DESC and keeps the newest row of a tie
+	// group first.
 	if match != "" {
-		query += " ORDER BY rank, e.captured_at DESC"
+		query += " ORDER BY rank, e.captured_at DESC, e.id DESC"
 	} else {
-		query += " ORDER BY e.captured_at DESC"
+		query += " ORDER BY e.captured_at DESC, e.id DESC"
 	}
 	query += " LIMIT ?"
 	args = append(args, opts.Limit)

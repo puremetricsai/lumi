@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -399,5 +400,41 @@ func TestHasSearchableTermsTracksTheExpressionBuilder(t *testing.T) {
 		if got := HasSearchableTerms(tc.query); got != tc.want {
 			t.Errorf("HasSearchableTerms(%q) = %v, want %v", tc.query, got, tc.want)
 		}
+	}
+}
+
+// TestSearchTermsAreTheTermsJoinTermsQuotes pins the written contract of the
+// exported splitter: terms come back AS THE USER WROTE THEM, minus the ones
+// FTS5 tokenizes to nothing.
+//
+// It is exported for the same reason HasSearchableTerms is — `lumi mcp` centres
+// its excerpt on the term that earned a row its place, and deriving the terms
+// here rather than re-splitting at the boundary is what keeps the two from
+// drifting; the drop rule has been copied out of this file once already. A
+// caller matching these against raw text may still miss what FTS5 matched, so a
+// miss is "no excerpt to centre on", never "this row did not match".
+func TestSearchTermsAreTheTermsJoinTermsQuotes(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		query string
+		want  []string
+	}{
+		{"plain terms", "postgres indexes", []string{"postgres", "indexes"}},
+		{"collapses whitespace", "  spaced \t out\n", []string{"spaced", "out"}},
+		{"keeps punctuation inside a term", "(alpha)", []string{"(alpha)"}},
+		{"quotes are escaped later, not here", `say "hi"`, []string{"say", `"hi"`}},
+		{"digits count as alphanumeric", "lumi2", []string{"lumi2"}},
+		{"non-ascii letters are kept", "café", []string{"café"}},
+		{"empty", "", nil},
+		{"only whitespace", "   ", nil},
+		{"only punctuation", "??? ...", nil},
+		{"only emoji", "🎉", nil},
+		{"drops the unsearchable term only", "??? alpha ...", []string{"alpha"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := SearchTerms(tc.query); !slices.Equal(got, tc.want) {
+				t.Fatalf("SearchTerms(%q) = %v, want %v", tc.query, got, tc.want)
+			}
+		})
 	}
 }
