@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/puremetricsai/lumi/internal/store"
 )
@@ -190,7 +191,7 @@ func TestSearchEventsTruncation(t *testing.T) {
 // while text_length stayed present — exactly the ambiguity the pair exists to
 // remove.
 func TestEventRecordAlwaysSerializesTruncated(t *testing.T) {
-	encoded, err := json.Marshal(newEventRecord(store.Event{Kind: store.KindScreen, Text: "short"}, 600))
+	encoded, err := json.Marshal(newEventRecord(store.Event{Kind: store.KindScreen, Text: "short"}, 600, nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -878,7 +879,7 @@ func TestAudioRecordsRenameAppToForeground(t *testing.T) {
 	audio := newEventRecord(store.Event{
 		ID: 1, Kind: store.KindAudio, CapturedAt: time.Now(), App: "Ghostty", Window: "lumi — zsh",
 		AudioSource: "system", AudioAttribution: string(store.AttributionEmittingProcess),
-	}, 0)
+	}, 0, nil)
 	if audio.App != "" || audio.Window != "" {
 		t.Fatalf("an audio record still carries app/window: %q/%q", audio.App, audio.Window)
 	}
@@ -888,7 +889,7 @@ func TestAudioRecordsRenameAppToForeground(t *testing.T) {
 
 	screen := newEventRecord(store.Event{
 		ID: 2, Kind: store.KindScreen, CapturedAt: time.Now(), App: "Zed", Window: "lumi — .env",
-	}, 0)
+	}, 0, nil)
 	if screen.App != "Zed" || screen.Window != "lumi — .env" {
 		t.Fatalf("screen record lost app/window: %q/%q", screen.App, screen.Window)
 	}
@@ -902,7 +903,7 @@ func TestMicrophoneRecordCarriesNoSourceApp(t *testing.T) {
 	record := newEventRecord(store.Event{
 		ID: 1, Kind: store.KindAudio, CapturedAt: time.Now(), App: "Ghostty",
 		AudioSource: "microphone", AudioAttribution: string(store.AttributionUnattributed),
-	}, 0)
+	}, 0, nil)
 	if record.Attribution != string(store.AttributionUnattributed) {
 		t.Fatalf("microphone attribution = %q", record.Attribution)
 	}
@@ -932,7 +933,7 @@ func TestSourceAppReachesTheWire(t *testing.T) {
 		ID: 1, Kind: store.KindAudio, CapturedAt: time.Now(), App: "Ghostty",
 		AudioSource: "system", AudioAttribution: string(store.AttributionEmittingProcess),
 		SourceApps: apps,
-	}, 0)
+	}, 0, nil)
 	if len(record.SourceApp) != 1 || record.SourceApp[0].Name != "Comet" {
 		t.Fatalf("source_app = %#v, want Comet", record.SourceApp)
 	}
@@ -1010,5 +1011,183 @@ func TestToolDescriptionsStateTheMicrophoneCaveat(t *testing.T) {
 		if !strings.Contains(description, "other people present") {
 			t.Errorf("%s description never says what microphone audio may have caught", name)
 		}
+	}
+}
+
+// TestSearchEventsCollapseNeverFoldsAnAudioPair is the regression this whole
+// feature was constrained to avoid, and the collapse_similar sibling of
+// TestSearchEventsKeepsBothTracksOfAChunk.
+//
+// The pair here is the worst case on purpose: same captured_at, same app, same
+// window, same display_id (audio's is always 0), and near-identical transcripts
+// — which is the MAJORITY case on the live index, where all 967 audio pairs
+// share those fields and their transcripts are median 0.819 similar because the
+// microphone re-records what the speakers played. Keyed on those fields alone a
+// collapse merges them, and collapsed_ids would preserve reachability but not
+// content: the microphone's account of the room leaves the visible result.
+func TestSearchEventsCollapseNeverFoldsAnAudioPair(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	base := time.Now().UTC().Truncate(time.Second)
+	const (
+		systemText = "the quarterly revenue review starts on the next slide please"
+		micText    = "the quarterly revenue review starts on the next slide okay"
+	)
+	pair := audioPair(t, ctx, s, base, systemText, micText)
+	h := &handlers{store: s}
+
+	out := callSearch(t, ctx, h, searchEventsInput{Kind: "audio", CollapseSimilar: true})
+	if len(out.Events) != 2 {
+		t.Fatalf("collapse_similar folded an audio pair into %d row(s); both tracks must survive", len(out.Events))
+	}
+	bySource := map[string]EventRecord{}
+	for _, rec := range out.Events {
+		if len(rec.CollapsedIDs) != 0 || rec.CollapsedCount != 0 {
+			t.Fatalf("an audio row carries collapse metadata: %#v", rec)
+		}
+		bySource[rec.AudioSource] = rec
+	}
+	for _, want := range []struct {
+		source, text string
+		id           int64
+	}{
+		{"system", systemText, pair[0].ID},
+		{"microphone", micText, pair[1].ID},
+	} {
+		rec, ok := bySource[want.source]
+		if !ok {
+			t.Fatalf("no %s row survived the collapse: %#v", want.source, out.Events)
+		}
+		if rec.ID != want.id || rec.Text != want.text {
+			t.Errorf("%s row = (%d, %q), want (%d, %q)", want.source, rec.ID, rec.Text, want.id, want.text)
+		}
+	}
+}
+
+// screenRun inserts count near-identical adjacent screen events for one app.
+func screenRun(t *testing.T, ctx context.Context, s *store.Store, base time.Time, app string, count int) []store.Event {
+	t.Helper()
+	events := make([]store.Event, 0, count)
+	for i := 0; i < count; i++ {
+		events = append(events, store.Event{
+			Kind: store.KindScreen, CapturedAt: base.Add(time.Duration(i) * time.Second),
+			App: app, Window: app + " — main", DisplayID: 1,
+			Text: fmt.Sprintf("File Edit View Window Help the deployment pipeline is green %d", i),
+		})
+	}
+	return insertEvents(t, ctx, s, events...)
+}
+
+// TestSearchEventsCollapseIsOffByDefault: nothing an existing agent expects may
+// disappear un-asked, so the fold only ever happens on request.
+func TestSearchEventsCollapseIsOffByDefault(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	screenRun(t, ctx, s, time.Now().UTC().Truncate(time.Second), "Ghostty", 3)
+	h := &handlers{store: s}
+
+	out := callSearch(t, ctx, h, searchEventsInput{})
+	if len(out.Events) != 3 {
+		t.Fatalf("default search returned %d events, want all 3 uncollapsed", len(out.Events))
+	}
+	for _, rec := range out.Events {
+		if len(rec.CollapsedIDs) != 0 || rec.CollapsedCount != 0 {
+			t.Fatalf("a record carries collapse metadata with the flag off: %#v", rec)
+		}
+	}
+}
+
+// TestSearchEventsCollapseCarriesEveryDroppedID: the fold is only safe because
+// nothing is silently lost — get_event must still reach every dropped row.
+func TestSearchEventsCollapseCarriesEveryDroppedID(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	base := time.Now().UTC().Truncate(time.Second)
+	run := screenRun(t, ctx, s, base, "Ghostty", 3)
+	other := insertEvents(t, ctx, s, store.Event{
+		Kind: store.KindScreen, CapturedAt: base.Add(10 * time.Second),
+		App: "Comet", Window: "Comet — main", DisplayID: 1,
+		Text: "a completely different page about invoices and billing",
+	})
+	h := &handlers{store: s}
+
+	out := callSearch(t, ctx, h, searchEventsInput{CollapseSimilar: true})
+	if len(out.Events) != 2 {
+		t.Fatalf("collapse returned %d records, want 2 (one per app)", len(out.Events))
+	}
+	byApp := map[string]EventRecord{}
+	for _, rec := range out.Events {
+		byApp[rec.App] = rec
+	}
+	rep, ok := byApp["Ghostty"]
+	if !ok {
+		t.Fatalf("no Ghostty representative: %#v", out.Events)
+	}
+	if rep.CollapsedCount != 2 || len(rep.CollapsedIDs) != 2 {
+		t.Fatalf("representative folded %d rows (%v), want 2", rep.CollapsedCount, rep.CollapsedIDs)
+	}
+	// Browse order is captured_at DESC, so the newest row represents the run and
+	// the two older ids are the ones folded into it.
+	reachable := map[int64]bool{rep.ID: true}
+	for _, id := range rep.CollapsedIDs {
+		reachable[id] = true
+	}
+	for _, event := range run {
+		if !reachable[event.ID] {
+			t.Errorf("event %d is unreachable: neither returned nor named in collapsed_ids", event.ID)
+		}
+	}
+	if solo, ok := byApp["Comet"]; !ok || solo.ID != other[0].ID || solo.CollapsedCount != 0 {
+		t.Fatalf("a row from a different app must survive as its own record: %#v", byApp)
+	}
+}
+
+// TestSearchEventsCollapsedNoticeReportsBothCounts: the collapse runs after
+// LIMIT, so a notice naming one number contradicts its own payload — "capped at
+// 20" beside six events, or "capped at 6" inventing a cap nothing enforced.
+func TestSearchEventsCollapsedNoticeReportsBothCounts(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	screenRun(t, ctx, s, time.Now().UTC().Truncate(time.Second), "Ghostty", 4)
+	h := &handlers{store: s}
+
+	out := callSearch(t, ctx, h, searchEventsInput{Limit: 4, CollapseSimilar: true})
+	if len(out.Events) != 1 {
+		t.Fatalf("collapse returned %d records, want 1", len(out.Events))
+	}
+	if !strings.Contains(out.Notice, "4 fetched, collapsed to 1") {
+		t.Fatalf("notice must report both counts honestly, got %q", out.Notice)
+	}
+	// Browse mode names the real cursor rather than telling the agent to guess.
+	if !strings.Contains(out.Notice, "until=") {
+		t.Fatalf("a browse-mode capped notice must name the page boundary, got %q", out.Notice)
+	}
+}
+
+// TestSearchEventsExcerptCentersOnTheMatch is change 1 end to end: the term the
+// row matched on must be in what the agent actually receives.
+func TestSearchEventsExcerptCentersOnTheMatch(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	text := strings.Repeat("File Edit View Assistant History Bookmarks ", 40) + "the invoice total is 4471 dollars"
+	insertEvents(t, ctx, s, store.Event{
+		Kind: store.KindScreen, CapturedAt: time.Now().UTC(), App: "Comet", Text: text,
+	})
+	h := &handlers{store: s}
+
+	cap := 200
+	out := callSearch(t, ctx, h, searchEventsInput{Query: "invoice", MaxTextChars: &cap})
+	if len(out.Events) != 1 {
+		t.Fatalf("expected one hit, got %d", len(out.Events))
+	}
+	rec := out.Events[0]
+	if !strings.Contains(strings.ToLower(rec.Text), "invoice") {
+		t.Fatalf("the excerpt does not contain the term the row matched on: %q", rec.Text)
+	}
+	if !rec.Truncated {
+		t.Fatal("truncated = false on a centred excerpt of a longer text")
+	}
+	if want := utf8.RuneCountInString(text); rec.TextLength != want {
+		t.Fatalf("text_length = %d, want the whole text's %d", rec.TextLength, want)
 	}
 }
