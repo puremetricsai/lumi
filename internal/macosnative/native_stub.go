@@ -11,11 +11,12 @@ import (
 var errUnsupported = errors.New("native capture requires Apple Silicon macOS with cgo enabled")
 
 type ScreenFrame struct {
-	Path         string `json:"path"`
-	DisplayID    uint32 `json:"display_id"`
-	Width        int    `json:"width"`
-	Height       int    `json:"height"`
-	CaptureError string `json:"capture_error,omitempty"`
+	Path              string `json:"path"`
+	DisplayID         uint32 `json:"display_id"`
+	Width             int    `json:"width"`
+	Height            int    `json:"height"`
+	SelectionFallback bool   `json:"selection_fallback,omitempty"`
+	CaptureError      string `json:"capture_error,omitempty"`
 }
 
 type AccessibilitySnapshot struct {
@@ -93,7 +94,7 @@ type Transcription struct {
 	Segments []SpeechSegment `json:"segments"`
 }
 
-func CaptureScreens(context.Context, string, string) ([]ScreenFrame, error) {
+func CaptureScreens(context.Context, string, string, []uint32, int) ([]ScreenFrame, error) {
 	return nil, errUnsupported
 }
 

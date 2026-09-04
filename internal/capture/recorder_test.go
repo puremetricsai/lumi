@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -2302,5 +2303,104 @@ func TestChunkKeyMatchesStoredCapturedAt(t *testing.T) {
 		t.Fatalf("%d of %d chunks are still queued for attribution with only %d failed "+
 			"transcriptions; the segment key does not match events.captured_at",
 			len(missing), len(times), failed)
+	}
+}
+
+// selectionFallbackScreen reports a selection that could not be honoured for
+// its first few ticks and then recovers, which is what a deselected display
+// being plugged back in looks like from the recorder's side.
+type selectionFallbackScreen struct {
+	calls           atomic.Int64
+	recoverAfter    int64
+	contents        []byte
+	displayIDsWhole []uint32
+}
+
+func (s *selectionFallbackScreen) Capture(_ context.Context, directory, prefix string) ([]ScreenFrame, error) {
+	fallback := s.calls.Add(1) <= s.recoverAfter
+	frames := make([]ScreenFrame, 0, len(s.displayIDsWhole))
+	for _, displayID := range s.displayIDsWhole {
+		path := filepath.Join(directory, fmt.Sprintf("%s-display-%d.jpg", prefix, displayID))
+		if err := os.WriteFile(path, s.contents, 0o600); err != nil {
+			return nil, err
+		}
+		frames = append(frames, ScreenFrame{
+			Path: path, DisplayID: displayID, Width: 64, Height: 36, SelectionFallback: fallback,
+		})
+	}
+	return frames, nil
+}
+
+// A display selection that cannot be honoured records the wrong screen, and
+// nothing in the captured data says so: every row looks exactly like a row from
+// a machine that was never given a selection. So it is said out loud — once per
+// transition, because at a two-second interval a standing condition logged every
+// tick buries the moment it began under thousands of identical lines.
+func TestRecorderReportsAnUnhonouredDisplaySelectionOnce(t *testing.T) {
+	ctx := context.Background()
+	paths, err := config.FromRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := paths.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(ctx, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	var logged strings.Builder
+	var ticks []ScreenCapture
+	var ticksMu sync.Mutex
+	recorder := Recorder{
+		Store: s, Paths: paths, CaptureScreen: true,
+		ScreenInterval: 8 * time.Millisecond,
+		Screen: &selectionFallbackScreen{
+			recoverAfter: 2, contents: []byte("frame"), displayIDsWhole: []uint32{1, 2},
+		},
+		Text: fakeVision{}, Context: fakeContext{},
+		Logger: slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelInfo})),
+		Screens: func(tick ScreenCapture) {
+			ticksMu.Lock()
+			defer ticksMu.Unlock()
+			ticks = append(ticks, tick)
+		},
+	}
+	recordCtx, cancel := context.WithTimeout(ctx, 60*time.Millisecond)
+	defer cancel()
+	if err := recorder.Run(recordCtx); err != nil {
+		t.Fatal(err)
+	}
+
+	warnings := strings.Count(logged.String(), "none of the selected displays are connected")
+	if warnings != 1 {
+		t.Errorf("logged the fallback %d times, want exactly one; log:\n%s", warnings, logged.String())
+	}
+	if !strings.Contains(logged.String(), "recording the selected displays again") {
+		t.Errorf("recovering from the fallback went unreported; log:\n%s", logged.String())
+	}
+
+	ticksMu.Lock()
+	defer ticksMu.Unlock()
+	if len(ticks) < 3 {
+		t.Fatalf("reported %d screen ticks, want at least 3", len(ticks))
+	}
+	// The report names the displays that were actually captured, which is what
+	// makes it a different number from the displays that are connected.
+	for _, tick := range ticks {
+		if len(tick.DisplayIDs) != 2 || tick.DisplayIDs[0] != 1 || tick.DisplayIDs[1] != 2 {
+			t.Errorf("tick reported displays %v, want [1 2]", tick.DisplayIDs)
+		}
+		if tick.IntervalMS != 8 {
+			t.Errorf("tick reported an interval of %dms, want 8", tick.IntervalMS)
+		}
+	}
+	if !ticks[0].SelectionFallback {
+		t.Error("the first tick should report the unhonoured selection")
+	}
+	if ticks[len(ticks)-1].SelectionFallback {
+		t.Error("the last tick should report the selection honoured again")
 	}
 }

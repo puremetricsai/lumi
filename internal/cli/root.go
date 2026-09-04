@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"os/signal"
 	"strconv"
@@ -55,7 +56,8 @@ func newRootCommand() *cobra.Command {
 	cmd.PersistentFlags().StringVar(&a.dataDir, "data-dir", "", "data directory (default: $LUMI_HOME or ~/Library/Application Support/Lumi)")
 	cmd.AddCommand(a.recordCommand(), a.searchCommand(), a.transcriptCommand(), a.pruneCommand(),
 		a.compressCommand(), a.doctorCommand(), a.permissionsCommand(), a.nativeSmokeCommand(),
-		a.mcpCommand(), a.transcribeCommand(), a.appCommand(), a.updateCommand())
+		a.mcpCommand(), a.transcribeCommand(), a.appCommand(), a.updateCommand(),
+		a.displaysCommand())
 	cmd.AddCommand(&cobra.Command{Use: "version", Short: "Print the Lumi version", Run: func(*cobra.Command, []string) {
 		fmt.Fprintln(os.Stdout, version)
 	}})
@@ -140,6 +142,9 @@ type recordFlags struct {
 	noScreen, noAudio              bool
 	speechLocale                   string
 	emitLevels                     bool
+	// displays is the CoreGraphics display IDs to record. Empty records every
+	// connected display, which is what every caller that never sets it gets.
+	displays []uint
 }
 
 func (f *recordFlags) bind(cmd *cobra.Command) {
@@ -154,7 +159,13 @@ func (f *recordFlags) bind(cmd *cobra.Command) {
 	// file read per captured track, and nothing in the capture pipeline needs
 	// it. Only a supervisor drawing a level meter does.
 	flags.BoolVar(&f.emitLevels, "emit-levels", false,
-		"report each captured track's energy as a JSON line on stderr")
+		"report capture telemetry — each track's energy, and each tick's displays — as JSON lines on stderr")
+	// Names IDs rather than positions: a position would have to be resolved
+	// against an enumeration made once, and the recorder re-enumerates every
+	// tick so that a display can be plugged in without restarting it. `lumi
+	// displays` is where the IDs come from.
+	flags.UintSliceVar(&f.displays, "displays", nil,
+		"CoreGraphics display IDs to record (default: every connected display)")
 }
 
 // runForeground runs the capture pipeline in the current process until the
@@ -202,10 +213,15 @@ func (a *app) runForeground(cmd *cobra.Command, f recordFlags, registerState boo
 		ctx, cancel = context.WithTimeout(ctx, f.duration)
 		defer cancel()
 	}
+	displayIDs, err := displayIDsFrom(f.displays)
+	if err != nil {
+		return err
+	}
+	telemetry := newTelemetryEmitter(emitLevels, cmd.ErrOrStderr())
 	recorder := capture.Recorder{
 		Store: s, Paths: paths, ScreenInterval: f.interval, AudioChunk: f.audioChunk,
 		CaptureScreen: !f.noScreen, CaptureAudio: !f.noAudio, Logger: logger,
-		Screen:  capture.NativeScreens{},
+		Screen:  capture.NativeScreens{DisplayIDs: displayIDs},
 		Text:    capture.VisionText{},
 		Context: capture.AccessibilityContext{},
 		Audio:   capture.NativeAudio{},
@@ -216,7 +232,8 @@ func (a *app) runForeground(cmd *cobra.Command, f recordFlags, registerState boo
 		AudioOutputs: capture.NativeAudioOutputs{},
 		AudioMarkers: capture.NativeAudioMarkers{},
 		Transcriber:  capture.NativeSpeech{Locale: f.speechLocale},
-		Levels:       levelEmitter(emitLevels, cmd.ErrOrStderr()),
+		Levels:       telemetry.audioLevel(),
+		Screens:      telemetry.screenCapture(),
 	}
 	// Registered last, so the file names a recorder that is actually about to
 	// run: everything above this can still fail, and a state file left behind
@@ -271,32 +288,71 @@ func registerForegroundRecorder(paths config.Paths, dataDir string, f recordFlag
 	return func() error { return removeOwnRecordState(paths) }, nil
 }
 
-// levelEmitter returns the recorder's level sink, or nil when levels were not
-// asked for — nil is what stops the measurement being taken at all.
+// displayIDsFrom narrows the flag's values to the display IDs the capture
+// layer takes. CoreGraphics display IDs are 32-bit; a wider value is a typo
+// that would otherwise be truncated into a real display's ID.
+func displayIDsFrom(values []uint) ([]uint32, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	ids := make([]uint32, 0, len(values))
+	for _, value := range values {
+		if value > math.MaxUint32 {
+			return nil, fmt.Errorf("--displays: %d is not a display ID", value)
+		}
+		ids = append(ids, uint32(value))
+	}
+	return ids, nil
+}
+
+// telemetryEmitter is the recorder's supervisor stream: one self-delimiting JSON
+// object per line on stderr, each naming its own `event`. Disabled, its sinks
+// are nil, and nil is what stops the underlying measurement being taken at all.
 //
-// It writes to stderr because stdout belongs to command results, and because
-// the one caller that wants this is a supervisor already reading the recorder's
-// stderr for its log. Each measurement is one self-delimiting JSON object on its
-// own line, so a reader interleaving it with the slog stream can simply ignore
-// every line that does not parse.
-func levelEmitter(enabled bool, out io.Writer) capture.LevelSink {
+// It writes to stderr because stdout belongs to command results, and because the
+// one caller that wants this is a supervisor already reading the recorder's
+// stderr for its log. A reader interleaving these with the slog stream can
+// simply ignore every line that does not parse.
+type telemetryEmitter struct {
+	encoder *json.Encoder
+	// Two recorder goroutines write here — the level loop and the screen tick —
+	// and a half-written JSON line is unparseable rather than merely out of
+	// order, so the writes are serialised rather than merely ordered.
+	mu sync.Mutex
+}
+
+func newTelemetryEmitter(enabled bool, out io.Writer) *telemetryEmitter {
 	if !enabled {
 		return nil
 	}
-	encoder := json.NewEncoder(out)
-	var mu sync.Mutex
+	return &telemetryEmitter{encoder: json.NewEncoder(out)}
+}
+
+func (t *telemetryEmitter) audioLevel() capture.LevelSink {
+	if t == nil {
+		return nil
+	}
 	return func(level capture.AudioLevel) {
-		// One level goroutine calls this today, in order. The lock stays
-		// because the sink is documented as callable from the recorder's own
-		// goroutines and a half-written JSON line is unparseable rather than
-		// merely out of order — this is several lines a second now, so a
-		// second caller would find the interleaving quickly and expensively.
-		mu.Lock()
-		defer mu.Unlock()
-		_ = encoder.Encode(struct {
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		_ = t.encoder.Encode(struct {
 			Event string `json:"event"`
 			capture.AudioLevel
 		}{Event: "audio_level", AudioLevel: level})
+	}
+}
+
+func (t *telemetryEmitter) screenCapture() capture.ScreenSink {
+	if t == nil {
+		return nil
+	}
+	return func(tick capture.ScreenCapture) {
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		_ = t.encoder.Encode(struct {
+			Event string `json:"event"`
+			capture.ScreenCapture
+		}{Event: "screen_capture", ScreenCapture: tick})
 	}
 }
 
@@ -634,7 +690,7 @@ func (a *app) nativeSmokeCommand() *cobra.Command {
 			}
 			defer os.RemoveAll(directory)
 
-			frames, err := macosnative.CaptureScreens(cmd.Context(), directory, "screen")
+			frames, err := macosnative.CaptureScreens(cmd.Context(), directory, "screen", nil, 0)
 			if err != nil {
 				return err
 			}
