@@ -13,10 +13,13 @@ struct StorageSettings: View {
     @Environment(RecorderController.self) private var recorder
 
     /// The path is held here rather than read from Preferences on every draw.
-    /// Preferences' values are computed over UserDefaults, so `@Observable`
-    /// reports no change when one is written and a view keyed on it would show
-    /// a stale path. This copy is the single driver: it feeds the label, the
-    /// measurement, and the reveal.
+    ///
+    /// It was once the workaround for Preferences reporting no change at all;
+    /// that is fixed at the source now (its properties are stored), so this copy
+    /// stays for its own reason: it is the single driver for three things that
+    /// must agree — the label, the measurement, and the reveal — and a
+    /// measurement is asynchronous, so re-reading the preference per draw would
+    /// let the label name one directory while the size describes another.
     @State private var dataDirectory = Preferences.shared.dataDirectory
     @State private var notice = StorageRelocationNotice.shared
 
@@ -386,8 +389,9 @@ struct StorageUsage: Sendable {
 /// It lasts as long as the process and no longer. The notice has to survive
 /// switching tabs and closing the Settings window — the user needs the old path
 /// long enough to act on it — but it is not a preference, so a relaunch clears
-/// it. A stored property is also what makes it observable at all: Preferences'
-/// values are computed over UserDefaults and report no changes.
+/// it. It is a class of its own rather than a preference for that reason alone;
+/// Preferences is observable now (its properties are stored), so this is not a
+/// workaround for that.
 /// It is main-actor isolated because its one instance is a shared mutable
 /// global: without that, `shared` is a strict-concurrency error under the Swift
 /// 6 language mode. Every reader is a SwiftUI view, which is already on the main
