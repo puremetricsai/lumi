@@ -59,8 +59,9 @@ changing anything there** — the rationale lives with the code it constrains, n
 | --- | --- |
 | `internal/macosnative` | cgo/Objective-C bridge: ScreenCaptureKit, Accessibility, Vision, AVFoundation WAV writing, CoreAudio process enumeration, permission preflight. Non-macOS stub. |
 | `internal/capture` | `Recorder`: independent screen and audio goroutines, native processors behind small interfaces, everything in-process. Owns what an event's `app` means, and what produced an audio row's sound. |
-| `internal/store` | Single-file SQLite (`modernc.org/sqlite`, no cgo), FTS5, versioned migrations, search, `audio_segments`, transcript assembly and coverage. |
+| `internal/store` | Single-file SQLite (`github.com/ncruces/go-sqlite3`, pure Go via wazero, no cgo), FTS5, versioned migrations, search, `audio_segments`, transcript assembly and coverage. Optional page-level encryption through the `adiantum` VFS. |
 | `internal/transcript` | Pure: decides where captured sound came from (`internal`/`external`) and assembles turns. No database, cgo, or filesystem. |
+| `internal/seal` | Pure: one file format (`LUMIENC1` ‖ nonce ‖ AES-256-GCM) and the six operations Lumi performs on it. Its zero-value key is a pass-through, so callers have no encrypted variant. |
 | `internal/wav` | Reads Lumi's mono 16-bit PCM WAVs and measures their energy. |
 | `internal/retention` | Age- and size-based pruning behind `lumi prune`. No background scheduler. |
 | `internal/compress` | Re-encodes indexed media in place behind `lumi compress` (HEIC, lossless FLAC), reconciles crash leftovers, then `VACUUM`s. Encoders injected as interfaces. No background scheduler. |
@@ -114,6 +115,23 @@ changing anything there** — the rationale lives with the code it constrains, n
   language boundary as well as a file one. Being the only product surface does not make the app the owner of
   a rule: where it needs an answer Go holds, Go exports it or accepts what it already emitted.
   → `macos/CLAUDE.md`, `internal/cli/CLAUDE.md`
+- **Encryption is one toggle with three rules that no package may restate.** `lumi encrypt` seals every
+  media file and converts the database; the key is a Keychain item ACL'd to Lumi's own binary.
+  - **The Keychain is the authority on whether encryption is on. A file header only says how far a
+    conversion got.** A fresh install with encryption enabled has no database at all, so reading intent
+    off a missing header creates a plaintext one and strands the next keyed writer. The two disagreeing
+    is a half-finished conversion, which `lumi doctor` reports and a re-run finishes.
+    → `internal/cli/CLAUDE.md`, `internal/store/CLAUDE.md`
+  - **Media is sealed *after* its row is committed, never before.** This is the never-lose-media rule's
+    newest instance: a file written and indexed but not yet encrypted is complete and recoverable, and
+    the missing magic header is the whole record of what is left to do. A seal failure is a warning.
+    → `internal/capture/CLAUDE.md`
+  - **While encryption is on, `lumi mcp` is the only sanctioned way captured content leaves the
+    machine, and `lumi reveal` the only way one file does.** `search`, `transcript` and `transcribe`
+    refuse, by a cobra annotation that **defaults to refusing** — so a new command that forgets to
+    declare itself fails on its author's machine rather than leaking on a user's. It is a speed bump
+    rather than a boundary, and `docs/encryption.md` is the honest statement of which.
+    → `internal/cli/CLAUDE.md`, `internal/mcp/CLAUDE.md`
 - **Real captured conversation never becomes a test fixture.** Harnesses that need real audio read a path
   from the environment and skip without it. The measured numbers belong in the repository; the words do not.
 

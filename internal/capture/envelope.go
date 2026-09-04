@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/puremetricsai/lumi/internal/macosnative"
+	"github.com/puremetricsai/lumi/internal/seal"
 	"github.com/puremetricsai/lumi/internal/wav"
 )
 
@@ -33,13 +34,31 @@ var nativeDecodePCM16 = macosnative.DecodeMonoPCM16
 // Getting this wrong is quiet rather than loud, which is why it is centralised:
 // both callers discard the error, so a chunk whose envelope could not be read
 // simply reaches its bleed verdict without one, with no diagnostic anywhere.
-func ReadAudioEnvelope(ctx context.Context, path string, windowMS int) ([]float64, wav.Info, error) {
+// It is also the one place that knows a stored audio file may be sealed. The
+// recorder measures a chunk it has just written, which is still plaintext; the
+// backfill measures chunks from disk, which are not. Both arrive here, so the
+// unseal happens once — and because seal.Key's zero value is a pass-through and
+// its readers accept plaintext either way, neither caller branches on it.
+func ReadAudioEnvelope(ctx context.Context, key seal.Key, path string, windowMS int) ([]float64, wav.Info, error) {
 	// Matched on ".wav" rather than on ".flac", so a container Lumi stores later
 	// takes the native path automatically instead of failing as a RIFF file.
+	// Sealing never changes an extension, so this dispatch is unaffected by it.
 	if strings.EqualFold(filepath.Ext(path), ".wav") {
-		return wav.ReadEnvelope(path, windowMS)
+		raw, err := key.ReadFile(path)
+		if err != nil {
+			return nil, wav.Info{}, err
+		}
+		return wav.EnvelopeFromBytes(raw, windowMS)
 	}
-	samples, sampleRate, err := nativeDecodePCM16(ctx, path)
+	// The native decoder takes a path, so a sealed file needs a plaintext copy
+	// for the length of the call. TempCopy hands back the original path when
+	// there is nothing to unseal, so this costs nothing when encryption is off.
+	decodable, cleanup, err := key.TempCopy(path)
+	if err != nil {
+		return nil, wav.Info{}, fmt.Errorf("decrypt %s for energy measurement: %w", filepath.Ext(path), err)
+	}
+	defer cleanup()
+	samples, sampleRate, err := nativeDecodePCM16(ctx, decodable)
 	if err != nil {
 		return nil, wav.Info{}, fmt.Errorf("decode %s for energy measurement: %w", filepath.Ext(path), err)
 	}

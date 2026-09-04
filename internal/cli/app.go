@@ -75,7 +75,7 @@ func defaultAppInstallRoots() []string {
 // TCC permissions to the terminal rather than to the bundle.
 func (a *app) appCommand() *cobra.Command {
 	var settings, quit bool
-	cmd := &cobra.Command{
+	cmd := emitsNoContent(&cobra.Command{
 		Use:     "app",
 		Aliases: []string{"open"},
 		Short:   "Open the Lumi menu bar app",
@@ -112,7 +112,7 @@ func (a *app) appCommand() *cobra.Command {
 			}
 			return openURL(cmd.Context(), bundle, appURLOpen)
 		},
-	}
+	})
 	cmd.Flags().BoolVar(&settings, "settings", false, "open the app's Settings window")
 	cmd.Flags().BoolVar(&quit, "quit", false, "quit the running app (stops the recorder it owns)")
 	return cmd

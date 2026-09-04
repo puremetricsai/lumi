@@ -326,6 +326,20 @@ func (c *writeTrackingConn) Write(ctx context.Context, msg jsonrpc.Message) erro
 	return err
 }
 
+// restartNeeded folds the two reasons this process should replace itself into
+// the one predicate the watcher polls: the binary was upgraded, or the database
+// it opened was replaced underneath it. Both are invisible from the rows, and
+// re-exec is the same fix for both — a fresh image re-opens whatever is at the
+// path with whatever key is now stored.
+func restartNeeded(opts Options) func() bool {
+	return func() bool {
+		if opts.BinaryChanged != nil && opts.BinaryChanged() {
+			return true
+		}
+		return opts.DatabaseReplaced != nil && opts.DatabaseReplaced()
+	}
+}
+
 // watch replaces the process once the binary has changed and the session has
 // gone quiet. It returns when ctx is done, or does not return at all.
 func (u *selfUpdater) watch(ctx context.Context, state func() *sdk.ServerSessionState, logger *slog.Logger) {
@@ -356,7 +370,7 @@ func (u *selfUpdater) watch(ctx context.Context, state func() *sdk.ServerSession
 			if err := stashSessionState(state()); err != nil {
 				return err
 			}
-			logger.Info("lumi binary changed on disk; replacing this process in place")
+			logger.Info("the lumi binary or its index changed on disk; replacing this process in place")
 			// On success this does not return: same pid, same fds 0/1/2, newer code.
 			return u.exec()
 		})

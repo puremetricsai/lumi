@@ -12,6 +12,7 @@ import (
 	"github.com/puremetricsai/lumi/internal/capture"
 	"github.com/puremetricsai/lumi/internal/config"
 	"github.com/puremetricsai/lumi/internal/macosnative"
+	"github.com/puremetricsai/lumi/internal/seal"
 	"github.com/puremetricsai/lumi/internal/store"
 	"github.com/puremetricsai/lumi/internal/transcript"
 )
@@ -45,7 +46,7 @@ func (a *app) transcriptBackfillCommand() *cobra.Command {
 		pace                   time.Duration
 		speechLocale           string
 	)
-	cmd := &cobra.Command{
+	cmd := emitsNoContent(&cobra.Command{
 		Use:   "backfill",
 		Short: "Attribute captured audio that has no origin labels yet",
 		Long: "Derive origin labels for audio chunks that have none, so `lumi transcript`\n" +
@@ -74,7 +75,7 @@ func (a *app) transcriptBackfillCommand() *cobra.Command {
 				}
 				untilTime = parsed
 			}
-			s, paths, err := a.openStore(cmd.Context())
+			s, paths, mediaKeys, err := a.openStoreWithKeys(cmd.Context())
 			if err != nil {
 				return err
 			}
@@ -88,10 +89,10 @@ func (a *app) transcriptBackfillCommand() *cobra.Command {
 			return runBackfill(cmd.Context(), cmd.OutOrStdout(), s, backfillOptions{
 				Since: sinceTime, Until: untilTime, Limit: limit, Force: force, DryRun: dryRun,
 				Explain: explain, Retranscribe: retranscribe, Pace: pace,
-				Locale: speechLocale,
+				Locale: speechLocale, Cipher: mediaKeys.media,
 			})
 		},
-	}
+	})
 	flags := cmd.Flags()
 	flags.StringVar(&since, "since", "", "only attribute chunks captured at or after this time")
 	flags.StringVar(&until, "until", "", "only attribute chunks captured at or before this time (RFC3339)")
@@ -141,6 +142,9 @@ type backfillOptions struct {
 	Retranscribe bool
 	Pace         time.Duration
 	Locale       string
+	// Cipher unseals stored audio. Its zero value is a pass-through, so the
+	// backfill reads plaintext and encrypted chunks through the same code.
+	Cipher seal.Key
 }
 
 func runBackfill(ctx context.Context, out io.Writer, s *store.Store, opts backfillOptions) error {
@@ -336,7 +340,7 @@ func attributeStoredChunk(ctx context.Context, s *store.Store, key string, opts 
 			method = "timed"
 		}
 	}
-	measureBackfillEnergy(ctx, &chunk, paths[transcript.TrackSystem])
+	measureBackfillEnergy(ctx, opts.Cipher, &chunk, paths[transcript.TrackSystem])
 
 	attributed := transcript.Attribute(chunk, transcript.Options{})
 	// Deferred rather than computed: --explain is off by default, and composing
@@ -384,7 +388,15 @@ func loadTimings(ctx context.Context, chunk *transcript.Chunk, paths map[string]
 		if _, err := os.Stat(path); err != nil {
 			return fmt.Errorf("%s audio is gone", source)
 		}
-		result, err := retranscribeChunk(ctx, path, opts.Locale)
+		// SpeechAnalyzer takes a path, so a sealed chunk needs a plaintext copy
+		// for the length of the call. With no key this is the original path and
+		// no copy is made.
+		audible, release, err := opts.Cipher.TempCopy(path)
+		if err != nil {
+			return fmt.Errorf("decrypt %s audio: %w", source, err)
+		}
+		result, err := retranscribeChunk(ctx, audible, opts.Locale)
+		release()
 		if err != nil {
 			return fmt.Errorf("re-transcribe %s: %w", source, err)
 		}
@@ -422,11 +434,11 @@ func loadTimings(ctx context.Context, chunk *transcript.Chunk, paths map[string]
 // Which reader opens the file is capture.ReadAudioEnvelope's, for that same
 // reason: a chunk `lumi compress` has stored as FLAC has to measure the same as
 // one still stored as a WAV.
-func measureBackfillEnergy(ctx context.Context, chunk *transcript.Chunk, systemPath string) {
+func measureBackfillEnergy(ctx context.Context, cipher seal.Key, chunk *transcript.Chunk, systemPath string) {
 	if systemPath == "" || !transcript.NeedsInternalEnergy(*chunk) {
 		return
 	}
-	envelope, _, err := capture.ReadAudioEnvelope(ctx, systemPath, transcript.EnvelopeWindowMS)
+	envelope, _, err := capture.ReadAudioEnvelope(ctx, cipher, systemPath, transcript.EnvelopeWindowMS)
 	if err != nil {
 		return
 	}

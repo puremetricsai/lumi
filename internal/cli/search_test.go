@@ -18,7 +18,7 @@ import (
 func seedAudioPair(t *testing.T, dataDir string, at time.Time, systemText, micText string) {
 	t.Helper()
 	ctx := context.Background()
-	s, err := store.Open(ctx, filepath.Join(dataDir, "lumi.db"))
+	s, err := store.Open(ctx, filepath.Join(dataDir, "lumi.db"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

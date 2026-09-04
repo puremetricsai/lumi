@@ -54,7 +54,7 @@ func newPruneStreamTest(t *testing.T) (string, func(stdin string, args ...string
 func seedEvent(t *testing.T, dataDir, name string) {
 	t.Helper()
 	ctx := context.Background()
-	s, err := store.Open(ctx, filepath.Join(dataDir, "lumi.db"))
+	s, err := store.Open(ctx, filepath.Join(dataDir, "lumi.db"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +72,7 @@ func seedEvent(t *testing.T, dataDir, name string) {
 func remainingEvents(t *testing.T, dataDir string) int {
 	t.Helper()
 	ctx := context.Background()
-	s, err := store.Open(ctx, filepath.Join(dataDir, "lumi.db"))
+	s, err := store.Open(ctx, filepath.Join(dataDir, "lumi.db"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

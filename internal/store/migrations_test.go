@@ -2,14 +2,17 @@ package store
 
 import (
 	"context"
-	"database/sql"
+	"github.com/ncruces/go-sqlite3"
+	"github.com/ncruces/go-sqlite3/driver"
+	"github.com/ncruces/go-sqlite3/ext/fts5"
+	"net/url"
 	"path/filepath"
 	"testing"
 )
 
 func TestMigrateSetsUserVersion(t *testing.T) {
 	ctx := context.Background()
-	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +46,7 @@ func TestCodeSchemaVersionMatchesTheMigrations(t *testing.T) {
 // written by a different build detectable at all.
 func TestSchemaVersionReportsTheAppliedVersion(t *testing.T) {
 	ctx := context.Background()
-	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +65,7 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "lumi.db")
 
-	first, err := Open(ctx, path)
+	first, err := Open(ctx, path, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +77,7 @@ func TestMigrateIsIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	second, err := Open(ctx, path)
+	second, err := Open(ctx, path, nil)
 	if err != nil {
 		t.Fatalf("reopening a migrated database must succeed: %v", err)
 	}
@@ -95,7 +98,9 @@ func TestMigrateUpgradesLegacyDatabase(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "lumi.db")
 
-	legacy, err := sql.Open("sqlite", path)
+	legacy, err := driver.Open((&url.URL{Scheme: "file", Path: path}).String(), func(conn *sqlite3.Conn) error {
+		return fts5.Register(conn)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +116,7 @@ func TestMigrateUpgradesLegacyDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s, err := Open(ctx, path)
+	s, err := Open(ctx, path, nil)
 	if err != nil {
 		t.Fatalf("opening a legacy database must succeed: %v", err)
 	}
@@ -128,7 +133,7 @@ func TestMigrateUpgradesLegacyDatabase(t *testing.T) {
 
 func TestCaptureProvenanceRoundTrip(t *testing.T) {
 	ctx := context.Background()
-	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +174,7 @@ func TestCaptureProvenanceRoundTrip(t *testing.T) {
 // zero, and an unrecorded source list is not an empty one.
 func TestAudioAttributionRoundTrip(t *testing.T) {
 	ctx := context.Background()
-	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -254,7 +259,7 @@ func TestAudioAttributionRoundTrip(t *testing.T) {
 // meaning by row kind, which is the defect it was added to undo.
 func TestScreenEventsCannotCarryAudioAttribution(t *testing.T) {
 	ctx := context.Background()
-	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

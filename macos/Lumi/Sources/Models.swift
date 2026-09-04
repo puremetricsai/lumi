@@ -373,3 +373,37 @@ struct CompressResult: Decodable {
     var alreadyDone: Int64 { screens.alreadyDone + audio.alreadyDone }
     var untouched: Int64 { screens.untouched + audio.untouched }
 }
+
+/// EncryptionStatus is `lumi encrypt status --json`.
+///
+/// Whether the captured history is encrypted is Go's answer and is read from
+/// there on every appearance, never cached in UserDefaults. A stored copy would
+/// be a second answer free to disagree with the disk — and it would be wrong in
+/// exactly the case that matters, when a conversion was interrupted.
+///
+/// The two flags are separate for the same reason `lumi encrypt status` reports
+/// them separately: they disagree only when a conversion did not finish, and one
+/// merged boolean could report that only as a guess. `LumiCLI.decoder` converts
+/// from snake case, so `database_encrypted` arrives as `databaseEncrypted`.
+struct EncryptionStatus: Decodable {
+    /// A key exists in the Keychain, which is what "encryption is on" means.
+    let enabled: Bool
+    /// The index file on disk is encrypted.
+    let databaseEncrypted: Bool
+    let database: String
+
+    /// The two halves disagree, so a conversion stopped partway.
+    var isIncomplete: Bool { enabled != databaseEncrypted }
+
+    /// The index is encrypted and its key is gone. Nothing can undo this, so the
+    /// toggle must not offer to try.
+    var isUnrecoverable: Bool { databaseEncrypted && !enabled }
+}
+
+/// EncryptResult is `lumi encrypt on|off --json`.
+struct EncryptResult: Decodable {
+    let enabled: Bool
+    let mediaConverted: Int
+    let mediaSkipped: Int
+    let mediaFailed: Int
+}

@@ -158,3 +158,40 @@ developer's own Claude config.
   return would kill the installer mid-download. Being orphaned to launchd is what lets it outlive both
   the app quitting and this process's own bundle being replaced.
 - **The binary refuses to run on anything but `darwin/arm64`** (`platform.Validate` in `PersistentPreRunE`).
+
+## Encryption
+
+- **The Keychain is the authority on whether encryption is on; the file headers only say how far a
+  conversion got.** Reading intent off a header breaks the case that matters most: turn encryption on
+  before anything is recorded and there is no `lumi.db` at all, so a header check reads "plaintext",
+  `openStore` creates a plaintext database, and the next keyed writer fails with "file is not a
+  database" on a store the user believes was encrypted from the first frame. `encryptionEnabled` asks
+  the Keychain, for attributes only, so refusing a command costs nobody a prompt. The two disagreeing
+  is a half-finished conversion — `lumi doctor` reports it and `lumi encrypt` resumes it.
+- **The content guard is a cobra annotation whose default is to refuse.** A command that declares
+  nothing does not run. A new content-emitting command therefore fails closed on its author's machine
+  rather than leaking on a user's, and `TestEveryCommandDeclaresItsContent` — walking the tree from
+  `newRootCommand` — is the enforcement, not code review.
+- **An unreadable Keychain refuses rather than guesses.** Treating "could not ask" as "encryption is
+  off" would print the whole index on exactly the machine where something is already wrong.
+- **It is a speed bump, not a boundary, and no wording here may say otherwise.** `lumi mcp` reads the
+  key without prompting, so anything that can spawn it can drive JSON-RPC by hand. What the guard buys
+  is that ambient access reaches ciphertext and that reading the history takes going through the MCP
+  surface the user granted on purpose. `docs/encryption.md` is the honest statement.
+- **`lumi encrypt`'s ordering is asymmetric on purpose.** On: store the key, seal the media, convert
+  the database. Off: convert the database, unseal the media, delete the key. The irreversible step
+  goes where a crash cannot strand anything — the key is written before the first file needs it and
+  deleted after the last file stops needing it. And the database goes last on the way in because
+  `encrypt status` reads its header, so converting it first would report a finished job while months
+  of media were still plaintext.
+- **There is no journal and no progress file; the headers are the resume state.** A run killed halfway
+  leaves a directory every reader handles correctly, and re-running finishes it. `ensureKey` reuses a
+  stored key rather than minting one, because a fresh key on the retry would make everything the first
+  run sealed permanently unreadable while reporting success.
+- **Clearing `-wal` and `-shm` before the rename is not tidiness.** The write-ahead log holds pages of
+  the old database in the old form, so a plaintext `-wal` beside an encrypted `lumi.db` is both a leak
+  and a corrupt pair, and neither is visible from the file that was replaced.
+- **`lumi reveal` is a second content exit, deliberately.** Media that can never be looked at cannot be
+  audited. Its plaintext copy is 0600 in `$TMPDIR` and lives only as long as the QuickLook panel —
+  `qlmanage -p` blocks for exactly that, which `open -W` does not, since Preview is usually already
+  running and it would return before the file was drawn.

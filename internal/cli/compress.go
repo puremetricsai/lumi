@@ -29,7 +29,7 @@ func (a *app) compressCommand() *cobra.Command {
 		whileRecording bool
 		dryRun, asJSON bool
 	)
-	cmd := &cobra.Command{
+	cmd := emitsNoContent(&cobra.Command{
 		Use:   "compress",
 		Short: "Re-encode indexed media in place and reclaim database space",
 		Long: "Re-encode the screenshots and audio already on disk into smaller files, leaving every\n" +
@@ -93,13 +93,14 @@ func (a *app) compressCommand() *cobra.Command {
 				defer release()
 			}
 
-			s, paths, err := a.openStore(cmd.Context())
+			s, paths, mediaKeys, err := a.openStoreWithKeys(cmd.Context())
 			if err != nil {
 				return err
 			}
 			defer s.Close()
 
 			result, err := runCompress(cmd.Context(), s, compress.Options{
+				Cipher:       mediaKeys.media,
 				Before:       before,
 				Screens:      screenCodec,
 				Audio:        audioCodec,
@@ -116,7 +117,7 @@ func (a *app) compressCommand() *cobra.Command {
 			})
 			return finishCompress(os.Stdout, result, dryRun, asJSON, err)
 		},
-	}
+	})
 	flags := cmd.Flags()
 	flags.StringVar(&olderThan, "older-than", "48h",
 		"only compress events older than this duration (e.g. 48h) or RFC3339 time")
