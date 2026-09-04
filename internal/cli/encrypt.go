@@ -36,10 +36,6 @@ import (
 // been done, so a run that is killed halfway leaves a directory that every
 // reader handles correctly and that a re-run finishes. That is the entire payoff
 // of putting a header on the format.
-type encryptFlags struct {
-	json bool
-}
-
 func (a *app) encryptCommand() *cobra.Command {
 	cmd := emitsNoContent(&cobra.Command{
 		Use:   "encrypt",
@@ -53,35 +49,26 @@ func (a *app) encryptCommand() *cobra.Command {
 			"If the Keychain item is lost, the captured history is unrecoverable. There is no\n" +
 			"password, no recovery code, and no second copy.",
 	})
-	cmd.AddCommand(a.encryptOnCommand(), a.encryptOffCommand(), a.encryptStatusCommand())
+	cmd.AddCommand(
+		a.encryptDirectionCommand("on", "Encrypt the data directory", true),
+		a.encryptDirectionCommand("off", "Decrypt the data directory and forget the key", false),
+		a.encryptStatusCommand())
 	return cmd
 }
 
-func (a *app) encryptOnCommand() *cobra.Command {
-	var flags encryptFlags
+// encryptDirectionCommand builds `on` and `off`, which differ only in which way
+// they convert.
+func (a *app) encryptDirectionCommand(use, short string, on bool) *cobra.Command {
+	var asJSON bool
 	cmd := emitsNoContent(&cobra.Command{
-		Use:   "on",
-		Short: "Encrypt the data directory",
+		Use:   use,
+		Short: short,
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return a.runEncrypt(cmd.Context(), cmd, flags, true)
+			return a.runEncrypt(cmd.Context(), cmd, asJSON, on)
 		},
 	})
-	cmd.Flags().BoolVar(&flags.json, "json", false, "emit the result as JSON")
-	return cmd
-}
-
-func (a *app) encryptOffCommand() *cobra.Command {
-	var flags encryptFlags
-	cmd := emitsNoContent(&cobra.Command{
-		Use:   "off",
-		Short: "Decrypt the data directory and forget the key",
-		Args:  cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			return a.runEncrypt(cmd.Context(), cmd, flags, false)
-		},
-	})
-	cmd.Flags().BoolVar(&flags.json, "json", false, "emit the result as JSON")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "emit the result as JSON")
 	return cmd
 }
 
@@ -127,7 +114,7 @@ type EncryptResult struct {
 	DatabasePath string `json:"database_path"`
 }
 
-func (a *app) runEncrypt(ctx context.Context, cmd *cobra.Command, flags encryptFlags, on bool) error {
+func (a *app) runEncrypt(ctx context.Context, cmd *cobra.Command, asJSON, on bool) error {
 	paths, err := a.paths()
 	if err != nil {
 		return err
@@ -151,9 +138,14 @@ func (a *app) runEncrypt(ctx context.Context, cmd *cobra.Command, flags encryptF
 	if err != nil {
 		return err
 	}
-	if on && state.Enabled && !state.Incomplete() {
-		return errors.New("Lumi's history is already encrypted")
-	}
+	// `on` never refuses for being already on. The headers are this command's
+	// only record of what is done, and they are per file — so a store whose key
+	// and database agree can still hold plaintext media: a seal that failed at
+	// capture time is logged and left readable on purpose (the never-lose-media
+	// rule), on the promise that the next run picks it up. Refusing here made
+	// that promise false, and the file stayed readable forever with nothing
+	// saying so. Re-running is idempotent by construction; let it run and report
+	// what it found.
 	if !on && !state.Enabled && !state.DatabaseEncrypted {
 		return errors.New("Lumi's history is not encrypted")
 	}
@@ -171,7 +163,7 @@ func (a *app) runEncrypt(ctx context.Context, cmd *cobra.Command, flags encryptF
 	if err != nil {
 		return err
 	}
-	if flags.json {
+	if asJSON {
 		return json.NewEncoder(cmd.OutOrStdout()).Encode(result)
 	}
 	return renderEncryptResult(cmd, result, on)
@@ -282,7 +274,7 @@ func convertDatabase(ctx context.Context, path string, from, to []byte) error {
 		os.Remove(scratch)
 		return fmt.Errorf("replace the database with its conversion: %w", err)
 	}
-	return syncDir(filepath.Dir(path))
+	return seal.SyncDir(filepath.Dir(path))
 }
 
 // clearWAL removes the sidecars belonging to the database being replaced.
@@ -297,15 +289,6 @@ func clearWAL(path string) error {
 		}
 	}
 	return nil
-}
-
-func syncDir(path string) error {
-	dir, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer dir.Close()
-	return dir.Sync()
 }
 
 // convertMedia seals or unseals every captured file.

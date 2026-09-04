@@ -74,7 +74,7 @@ func (a *app) guardContent(cmd *cobra.Command) error {
 		return fmt.Errorf("%s does not declare whether it emits captured content; "+
 			"annotate it with emitsContent or emitsNoContent", cmd.CommandPath())
 	}
-	enabled, err := encryptionEnabled()
+	enabled, err := keyring.has()
 	if err != nil {
 		// Refuse rather than guess. A Keychain that cannot be reached is not
 		// evidence that encryption is off, and treating it as such would print
@@ -85,5 +85,5 @@ func (a *app) guardContent(cmd *cobra.Command) error {
 	if !enabled {
 		return nil
 	}
-	return wrapEncryptedContent(cmd.CommandPath())
+	return fmt.Errorf("%s is unavailable: %w", cmd.CommandPath(), errEncryptedContent)
 }

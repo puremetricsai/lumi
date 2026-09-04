@@ -168,7 +168,7 @@ func TestEncryptRoundTrip(t *testing.T) {
 	if len(found) != 3 {
 		t.Errorf("found %d of 3 rows after decrypting", len(found))
 	}
-	if has, err := encryptionEnabled(); err != nil || has {
+	if has, err := keyring.has(); err != nil || has {
 		t.Errorf("the key survived `encrypt off`: %v, %v", has, err)
 	}
 }
@@ -304,5 +304,44 @@ func TestEncryptOffRefusesWhenTheKeyIsGone(t *testing.T) {
 	}
 	if !bytes.Contains([]byte(err.Error()), []byte("cannot be decrypted")) {
 		t.Errorf("the refusal does not explain that the data is unrecoverable: %v", err)
+	}
+}
+
+// TestEncryptOnSweepsMediaLeftUnsealed is the regression for a promise that was
+// false.
+//
+// internal/capture logs a warning and leaves a file readable when a seal fails,
+// deliberately — the never-lose-media rule — on the stated promise that the next
+// `lumi encrypt on` picks it up. But `on` used to refuse whenever the key and
+// the database agreed, and that check never looked at the media, so a file that
+// missed its seal at capture time stayed plaintext forever with nothing saying
+// so. Re-running is idempotent by construction; it must be allowed to run.
+func TestEncryptOnSweepsMediaLeftUnsealed(t *testing.T) {
+	fakeKeyring(t)
+	paths, _ := seedDataDir(t)
+	if out, err := runLumi(t, "--data-dir", paths.Root, "encrypt", "on"); err != nil {
+		t.Fatalf("encrypt on: %v\n%s", err, out)
+	}
+
+	// A capture whose seal failed: indexed, readable, no magic header.
+	missed := filepath.Join(paths.Screenshots, "20260903-130000-display-1.jpg")
+	if err := os.WriteFile(missed, []byte("a screenshot that missed its seal"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := runLumi(t, "--data-dir", paths.Root, "encrypt", "on")
+	if err != nil {
+		t.Fatalf("encrypt on refused to sweep unsealed media: %v\n%s", err, out)
+	}
+	sealed, err := seal.IsSealed(missed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sealed {
+		t.Error("a file left unsealed by a failed capture-time seal was never picked up")
+	}
+	// And the files already done were skipped rather than sealed twice.
+	if !bytes.Contains([]byte(out), []byte("already done")) {
+		t.Errorf("the resumed run did not report skipping the files already sealed:\n%s", out)
 	}
 }

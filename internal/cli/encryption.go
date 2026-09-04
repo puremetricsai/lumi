@@ -2,7 +2,6 @@ package cli
 
 import (
 	"errors"
-	"fmt"
 
 	"github.com/puremetricsai/lumi/internal/macosnative"
 	"github.com/puremetricsai/lumi/internal/seal"
@@ -55,11 +54,6 @@ type keys struct {
 // whether encryption is on.
 func (k keys) enabled() bool { return k.media.Enabled() }
 
-// encryptionEnabled reports whether a key is stored, without reading it.
-func encryptionEnabled() (bool, error) {
-	return keyring.has()
-}
-
 // resolveKeys reads the master key and derives from it, or returns the zero
 // value when encryption is off.
 //
@@ -111,7 +105,7 @@ func (s encryptionState) Unrecoverable() bool {
 }
 
 func readEncryptionState(databasePath string) (encryptionState, error) {
-	enabled, err := encryptionEnabled()
+	enabled, err := keyring.has()
 	if err != nil {
 		return encryptionState{}, err
 	}
@@ -132,7 +126,3 @@ var errEncryptedContent = errors.New(
 		"An AI assistant can still read it through Lumi's MCP server, which decrypts in memory and\n" +
 		"never writes plaintext to a terminal. To read one event's screenshot or audio yourself, use\n" +
 		"`lumi reveal <event-id>`. To turn encryption off, open Lumi → Settings → Storage")
-
-func wrapEncryptedContent(name string) error {
-	return fmt.Errorf("%s is unavailable: %w", name, errEncryptedContent)
-}

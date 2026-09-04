@@ -300,7 +300,7 @@ func replaceDurably(path string, content []byte) error {
 		os.Remove(scratch)
 		return fmt.Errorf("replace %s: %w", path, err)
 	}
-	return syncDir(filepath.Dir(path))
+	return SyncDir(filepath.Dir(path))
 }
 
 func writeNew(path string, content []byte) error {
@@ -325,7 +325,13 @@ func writeNew(path string, content []byte) error {
 	return nil
 }
 
-func syncDir(path string) error {
+// SyncDir flushes a directory entry.
+//
+// Exported because renaming a file into place is a two-part commit — the bytes
+// and the *name* — and the second half is easy to leave out. `lumi encrypt`
+// does the same rename over the database that this package does over a media
+// file, so it reads the primitive from here rather than keeping a second copy.
+func SyncDir(path string) error {
 	dir, err := os.Open(path)
 	if err != nil {
 		return err
