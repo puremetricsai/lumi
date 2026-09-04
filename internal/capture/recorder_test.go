@@ -320,7 +320,7 @@ func TestRecorderCaptureProcessStoreSearch(t *testing.T) {
 	if err := paths.Ensure(); err != nil {
 		t.Fatal(err)
 	}
-	s, err := store.Open(ctx, paths.Database)
+	s, err := store.Open(ctx, paths.Database, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -376,7 +376,7 @@ func TestRecorderUsesFullScreenVisionAndPreservesAccessibility(t *testing.T) {
 	if err := paths.Ensure(); err != nil {
 		t.Fatal(err)
 	}
-	s, err := store.Open(ctx, paths.Database)
+	s, err := store.Open(ctx, paths.Database, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -424,7 +424,7 @@ func TestRecorderIndexesAccessibilityTextWhenVisionFails(t *testing.T) {
 	if err := paths.Ensure(); err != nil {
 		t.Fatal(err)
 	}
-	s, err := store.Open(ctx, paths.Database)
+	s, err := store.Open(ctx, paths.Database, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -464,7 +464,7 @@ func TestRecorderFallsBackToVisionWhenAccessibilityIsTitleOnly(t *testing.T) {
 	if err := paths.Ensure(); err != nil {
 		t.Fatal(err)
 	}
-	s, err := store.Open(ctx, paths.Database)
+	s, err := store.Open(ctx, paths.Database, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -504,7 +504,7 @@ func TestRecorderDeletesPerceptualDuplicatesFromDiskAndIndex(t *testing.T) {
 	if err := paths.Ensure(); err != nil {
 		t.Fatal(err)
 	}
-	s, err := store.Open(ctx, paths.Database)
+	s, err := store.Open(ctx, paths.Database, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -546,7 +546,7 @@ func TestRecorderRecoversAfterTransientScreenFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := store.Open(ctx, paths.Database)
+	s, err := store.Open(ctx, paths.Database, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -584,7 +584,7 @@ func TestRecorderHandlesDisplayHotplugBetweenCaptures(t *testing.T) {
 	if err := paths.Ensure(); err != nil {
 		t.Fatal(err)
 	}
-	s, err := store.Open(ctx, paths.Database)
+	s, err := store.Open(ctx, paths.Database, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -626,7 +626,7 @@ func TestRecorderPreservesMediaAfterProcessorFailures(t *testing.T) {
 	if err := paths.Ensure(); err != nil {
 		t.Fatal(err)
 	}
-	s, err := store.Open(ctx, paths.Database)
+	s, err := store.Open(ctx, paths.Database, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -868,7 +868,7 @@ func newRecorderFixture(t *testing.T) (*store.Store, config.Paths, *slog.Logger)
 	if err := paths.Ensure(); err != nil {
 		t.Fatal(err)
 	}
-	s, err := store.Open(context.Background(), paths.Database)
+	s, err := store.Open(context.Background(), paths.Database, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -890,7 +890,7 @@ func TestRecorderIndexesSystemAndMicrophoneAudioSeparately(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := store.Open(ctx, paths.Database)
+	s, err := store.Open(ctx, paths.Database, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -952,7 +952,7 @@ func TestRecorderKeepsOneAudioStreamOpenAcrossChunks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := store.Open(ctx, paths.Database)
+	s, err := store.Open(ctx, paths.Database, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -990,7 +990,7 @@ func TestRecorderStampsAudioChunksFromTheirOwnStart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := store.Open(ctx, paths.Database)
+	s, err := store.Open(ctx, paths.Database, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1034,7 +1034,7 @@ func TestRecorderIndexesNativeAudioCompletedAfterCancellation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := store.Open(ctx, paths.Database)
+	s, err := store.Open(ctx, paths.Database, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1109,7 +1109,7 @@ func recorderPaths(t *testing.T) (config.Paths, *store.Store) {
 	if err := paths.Ensure(); err != nil {
 		t.Fatal(err)
 	}
-	s, err := store.Open(context.Background(), paths.Database)
+	s, err := store.Open(context.Background(), paths.Database, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

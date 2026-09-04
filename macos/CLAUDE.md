@@ -158,5 +158,24 @@ The app is a supervisor and nothing else — root `CLAUDE.md` states that rule; 
   `Preferences.shared` is a `static let` on a non-Sendable `@Observable` class, and `LumiCLI` captures
   non-Sendable values across its pipe reads.
 
+- **The encryption toggle's state comes from `lumi encrypt status --json` on every appearance, never
+  from `Preferences`.** It belongs beside the "never parse `record.json`" rule above, because it is the
+  same rule: a UserDefaults copy would be a second answer free to disagree with the disk, and it would
+  be wrong in exactly the case that matters — a conversion interrupted, where the key and the file
+  disagree. `EncryptionStatus` keeps the two halves separate for that reason; one merged boolean could
+  report the disagreement only as a guess.
+- **Stopping the recorder before a conversion is load-bearing.** The conversion rewrites every media
+  file and replaces the index by rename, so a live recorder would be writing new plaintext behind a
+  walk that has already passed it. `stopFailed` is checked *before* the conversion starts, exactly as
+  `confirmAndInstallUpdate` checks it before starting the installer and for the same reason: `stop()`
+  returns normally after its timeout with the child still alive. The recorder is restarted whether or
+  not the conversion succeeded — leaving capture off is not an outcome anybody asked for.
+- **Turning encryption off is confirmed; turning it on is not.** Off is the destructive direction: it
+  writes months of captured screen and audio back to disk in readable form and deletes the key. The
+  toggle is disabled outright when the key is gone, because there is nothing to offer — re-encrypting
+  would not bring the data back.
+- **The toggle owns no rule.** It does not decide what "encrypted" means, does not walk files, and
+  never touches the Keychain. Every one of those answers is read from the binary.
+
 There is no Swift test target. Changes are verified by driving the built app, which needs the grants
 re-established after the rebuild; the Go side of each seam is covered in `internal/cli`.

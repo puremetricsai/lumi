@@ -33,7 +33,7 @@ import (
 // that. Replacing the image in place is what makes an upgrade reach a live
 // session without adding the daemon this command refuses to become.
 func (a *app) mcpCommand() *cobra.Command {
-	cmd := &cobra.Command{
+	cmd := emitsNoContent(&cobra.Command{
 		Use:   "mcp",
 		Short: "Serve captured activity to AI agents over MCP (stdio)",
 		Long: "Run a Model Context Protocol server on stdin/stdout, exposing search_events,\n" +
@@ -59,6 +59,11 @@ func (a *app) mcpCommand() *cobra.Command {
 				Name: "lumi", Version: version,
 				DatabasePath: paths.Database,
 				Logger:       logger,
+				// `lumi encrypt` replaces the database by rename, so a session
+				// held across the toggle would keep serving the unlinked
+				// original. store.Stale is the filesystem half of that answer,
+				// which is why it lives there and not in internal/mcp.
+				DatabaseReplaced: s.Stale,
 			}
 			// An agent holds this process for the whole session, so an upgrade
 			// would otherwise keep serving the old build until the user restarted
@@ -77,7 +82,7 @@ func (a *app) mcpCommand() *cobra.Command {
 			}
 			return nil
 		},
-	}
+	})
 	cmd.AddCommand(a.mcpSetupCommand())
 	return cmd
 }

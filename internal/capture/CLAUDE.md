@@ -27,6 +27,22 @@ rows are shaped is `internal/store`'s; the labelling rules the recorder applies 
 - **Never lose captured media.** If Accessibility, Vision, comparison, or transcription fails after a file
   was written, preserve and index the event with diagnostic metadata. Don't convert downstream failures
   into early returns that drop the file.
+- **Sealing is the last thing that touches a captured file, after its row is committed.** That is the
+  never-lose-media rule stated positively: a file that is written and indexed but not yet encrypted is
+  complete and recoverable, and `lumi encrypt` finishes it later because the missing magic header is
+  the whole record of what is left to do. A file encrypted *before* its row exists is neither.
+  `sealCaptured` therefore warns and returns; a seal failure may never cost a capture.
+  - **Nothing above the seal ever sees an encrypted file**, which is why `FrameComparer.Duplicate`,
+    `VisionText.Extract` and the dedupe `os.Remove` need no key. Only readers of *stored* media do.
+  - **Audio seals at the end of `storeAudioChunk`, not beside each `Insert`.** `attributeChunk` runs
+    after the insert loop and reaches `measureInternalEnergy`, which reads the system track back off
+    disk. Sealing per frame works — `ReadAudioEnvelope` unseals — but it pays for a decrypt on the
+    capture path to undo what the same function just did.
+  - **Only frames that became rows are sealed.** A frame whose `Insert` failed is media nothing
+    references, and sealing it would turn a file a person could still open — and `prune --all` could
+    still sweep — into ciphertext with no row and no key path pointing at it.
+  - **`Recorder.Cipher`'s zero value is a working pass-through.** Every path here is written once and
+    is correct whether or not encryption is on; there is no encrypted variant of the pipeline.
 - **Captured filenames are unique per display per instant, and per chunk per track, and something else now
   depends on that.** `internal/compress` pairs a file with an event by swapping its extension, so two
   events whose media differed only by extension would let it overwrite or delete the wrong one. A coarser
@@ -178,7 +194,13 @@ chunks over eight minutes, and the ratio scales with how much the user switches 
 ## Writing origin verdicts (`attributeChunk`)
 
 - **`ReadAudioEnvelope` is the single place that decides how a captured audio file is opened**, and both
-  the recorder and the backfill go through it. `internal/wav` reads mono 16-bit PCM RIFF and nothing else,
+  the recorder and the backfill go through it. It is also the only place that knows a stored chunk may
+  be sealed: the recorder measures a chunk it has just written, which is still plaintext, and the
+  backfill measures chunks off disk, which are not. Both arrive here, so the unseal happens once. That
+  is why `internal/wav` gained `EnvelopeFromBytes` rather than a key — it stays pure Go with no build
+  tag, which is the reason it was split from `internal/macosnative` in the first place.
+
+  The dispatch itself is needed because `internal/wav` reads mono 16-bit PCM RIFF and nothing else,
   deliberately — it is pure Go, so it builds and tests anywhere — while `lumi compress` stores a chunk as
   FLAC. So the split is by half rather than by package: `internal/macosnative` knows containers,
   `internal/wav` measures samples, and this chooses between them on the extension (matched on `.wav`, so

@@ -50,6 +50,9 @@ type handlers struct {
 	// this process is running. Never nil once newServer has built it; it folds an
 	// absent Options hook into a constant false.
 	binaryChanged func() bool
+	// databaseReplaced reports whether the index file this process opened is
+	// still the file at its path. Never nil once newServer has built it.
+	databaseReplaced func() bool
 	// selfUpdating records whether this process can replace itself, which changes
 	// what a staleness notice should tell the caller to do.
 	selfUpdating bool
@@ -92,6 +95,21 @@ func (h *handlers) stalenessNotice(ctx context.Context) string {
 					"because the agent launched it before the upgrade; "+
 					"restart this session to pick up the new build",
 				h.versionLabel()))
+		}
+	}
+	if h.databaseReplaced != nil && h.databaseReplaced() {
+		// This one is worse than a stale build, because the rows still read
+		// correctly: they are simply the rows of a file that no longer has this
+		// name. The most likely cause by far is `lumi encrypt`, which is exactly
+		// when a wrong answer is least acceptable.
+		if h.selfUpdating {
+			parts = append(parts, "Lumi's index was replaced on disk after this server opened it — "+
+				"most likely because encryption was turned on or off — so these results come from the "+
+				"previous file; this process will re-open the current one once the session goes briefly idle")
+		} else {
+			parts = append(parts, "Lumi's index was replaced on disk after this server opened it — "+
+				"most likely because encryption was turned on or off — so these results come from the "+
+				"previous file; restart this session to read the current one")
 		}
 	}
 	if fileVersion, err := h.store.SchemaVersion(ctx); err == nil &&

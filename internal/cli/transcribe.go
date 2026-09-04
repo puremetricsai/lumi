@@ -14,7 +14,7 @@ import (
 // how the words were spoken.
 func (a *app) transcribeCommand() *cobra.Command {
 	var speechLocale string
-	cmd := &cobra.Command{
+	cmd := emitsContent(&cobra.Command{
 		Use:   "transcribe <file>",
 		Short: "Transcribe one audio file with the on-device SpeechAnalyzer",
 		Long: "Transcribe one audio file and print the text, using the same recognizer the\n" +
@@ -29,7 +29,7 @@ func (a *app) transcribeCommand() *cobra.Command {
 			fmt.Fprintln(os.Stdout, text)
 			return nil
 		},
-	}
+	})
 	cmd.Flags().StringVar(&speechLocale, "speech-locale", "en-US", "SpeechAnalyzer recognition locale")
 	return cmd
 }

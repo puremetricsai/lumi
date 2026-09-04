@@ -97,6 +97,17 @@ func ReadEnvelope(path string, windowMS int) ([]float64, Info, error) {
 	if err != nil {
 		return nil, Info{}, err
 	}
+	return EnvelopeFromBytes(raw, windowMS)
+}
+
+// EnvelopeFromBytes is ReadEnvelope over an in-memory file.
+//
+// It exists so that a caller holding a WAV that is not a plain file on disk —
+// an encrypted one, decrypted in memory — reaches the same measurement without
+// this package learning anything about encryption. Keeping the key out of here
+// is what lets internal/wav stay pure Go with no build tag, which is the reason
+// it was split from internal/macosnative in the first place.
+func EnvelopeFromBytes(raw []byte, windowMS int) ([]float64, Info, error) {
 	data, info, err := decodeMono16(raw)
 	if err != nil {
 		return nil, Info{}, err

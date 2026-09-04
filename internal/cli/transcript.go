@@ -28,7 +28,7 @@ func (a *app) transcriptCommand() *cobra.Command {
 		limit                int
 		asJSON, includeBleed bool
 	)
-	cmd := &cobra.Command{
+	cmd := emitsContent(&cobra.Command{
 		Use:   "transcript",
 		Short: "Read captured audio as one ordered, attributed conversation",
 		Long: "Assemble captured audio into a single ordered transcript, labelling every turn\n" +
@@ -52,7 +52,7 @@ func (a *app) transcriptCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			s, _, err := a.openStore(cmd.Context())
+			s, _, err := a.openStoreForContent(cmd.Context())
 			if err != nil {
 				return err
 			}
@@ -80,7 +80,7 @@ func (a *app) transcriptCommand() *cobra.Command {
 			printTranscript(cmd.OutOrStdout(), result)
 			return nil
 		},
-	}
+	})
 	flags := cmd.Flags()
 	flags.StringVar(&since, "since", "1h", "earliest time (RFC3339 or duration such as 2h)")
 	flags.StringVar(&until, "until", "", "latest time (RFC3339); defaults to now")

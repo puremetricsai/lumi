@@ -3,13 +3,21 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/url"
+	"os"
 	"strings"
+	"syscall"
 	"time"
 
-	"modernc.org/sqlite"
+	"github.com/ncruces/go-sqlite3"
+	"github.com/ncruces/go-sqlite3/driver"
+	"github.com/ncruces/go-sqlite3/ext/fts5"
+	_ "github.com/ncruces/go-sqlite3/vfs/adiantum"
 )
 
 type Kind string
@@ -79,30 +87,216 @@ const (
 
 type Store struct {
 	db *sql.DB
+	// path and ident are what Stale answers from. A long-lived reader — only
+	// `lumi mcp` in practice — can outlive `lumi encrypt`, which renames a
+	// converted database over this one; the handle then keeps serving the
+	// unlinked inode with no error anywhere.
+	path  string
+	ident fileIdent
 }
 
-func Open(ctx context.Context, path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+// KeyLen is the length Open requires of a non-empty key. It is the AES-256 key
+// adiantum's default HBSH construction takes, and callers must derive rather
+// than truncate: a short key is an error here, never a padded guess.
+const KeyLen = 32
+
+// Open opens the index at path, decrypting it with key when one is given.
+//
+// A nil or empty key opens a plaintext database on SQLite's default VFS, which
+// is what every caller did before encryption existed. A KeyLen key opens it
+// through the adiantum VFS, which encrypts every page. Any other length is an
+// error: guessing at key material is how a database gets written that nothing
+// can read back.
+func Open(ctx context.Context, path string, key []byte) (*Store, error) {
+	dsn, err := dataSourceName(path, key)
+	if err != nil {
+		return nil, err
+	}
+	db, err := driver.Open(dsn, configureConn(key))
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
+	// One connection, as before. MaxIdleConns matches it because an ncruces
+	// connection is a wazero module instantiation — far more expensive to
+	// create than the modernc one this replaced — so letting the pool close
+	// the only connection between statements would rebuild the interpreter.
 	db.SetMaxOpenConns(1)
-	for _, pragma := range []string{
-		"PRAGMA journal_mode=WAL",
-		"PRAGMA foreign_keys=ON",
-		"PRAGMA busy_timeout=5000",
-	} {
-		if _, err := db.ExecContext(ctx, pragma); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("configure sqlite (%s): %w", pragma, err)
-		}
-	}
-	s := &Store{db: db}
+	db.SetMaxIdleConns(1)
+	s := &Store{db: db, path: path}
 	if err := s.migrate(ctx); err != nil {
 		db.Close()
 		return nil, err
 	}
+	// Identity is taken after migrate, not before: SQLite creates the file
+	// lazily, so a first open of a new data directory would otherwise record
+	// "no such file" as this store's identity and Stale would answer false
+	// forever after.
+	//
+	// That leaves a window — the file could be replaced between the connection
+	// opening and this stat, which would pair a handle on the old inode with the
+	// new inode's identity and make Stale answer false permanently, defeating
+	// the whole check. Reading the identity again and requiring the two to agree
+	// closes it: a replacement mid-open is reported as no identity at all, and
+	// Stale then answers false for a knowable reason rather than a wrong one.
+	// `lumi encrypt` also holds the capture lock across a conversion, so this is
+	// the second line of defence rather than the first.
+	first := identify(path)
+	if second := identify(path); first == second {
+		s.ident = first
+	}
 	return s, nil
+}
+
+// dataSourceName builds the URI Open dials.
+//
+// The key is deliberately *not* in it. adiantum accepts a `hexkey=` URI
+// parameter, but a DSN reaches error strings — `open sqlite: %w` alone would
+// carry it into record.log, `lumi doctor` output, and an MCP notice — so the key
+// goes through a PRAGMA on the open connection instead, where nothing formats it.
+func dataSourceName(path string, key []byte) (string, error) {
+	if len(key) != 0 && len(key) != KeyLen {
+		return "", fmt.Errorf("encryption key is %d bytes, want %d", len(key), KeyLen)
+	}
+	// (&url.URL{Scheme: "file", Path: path}).String() rather than
+	// "file:" + url.PathEscape(path): PathEscape escapes the separators too,
+	// so a path arrives as one %2F-run of a filename. SQLite decodes it back,
+	// which is why that spelling appears to work until a URI parameter is
+	// added and the whole thing has to parse.
+	uri := (&url.URL{Scheme: "file", Path: path}).String()
+	if len(key) == 0 {
+		return uri, nil
+	}
+	return uri + "?vfs=adiantum", nil
+}
+
+// configureConn applies every PRAGMA this store depends on, on each connection
+// as it is dialled.
+//
+// They are applied here rather than with ExecContext after Open because
+// database/sql may discard and re-dial the connection after a driver error, and
+// a pragma set by Exec dies with the connection that ran it. That was survivable
+// when the pragmas were only journal mode and foreign keys. It is not survivable
+// now: the encryption key is one of them, so a silently unkeyed replacement
+// connection fails every subsequent query with "file is not a database" — a bug
+// that reads as file corruption.
+func configureConn(key []byte) func(*sqlite3.Conn) error {
+	hexKey := hex.EncodeToString(key)
+	return func(conn *sqlite3.Conn) error {
+		// The key goes first, before anything that could touch the file.
+		// fts5.Register below reads the schema, and on an existing encrypted
+		// database an unkeyed schema read fails with SQLITE_CANTOPEN — which
+		// reads as a missing or corrupt file rather than as a missing key.
+		// It passes on a *new* database, where there is no schema to read, so
+		// getting this order wrong is invisible until the second open.
+		//
+		// The error deliberately does not wrap the driver's: a failure here is
+		// a wrong or absent key, and the message must not carry the statement
+		// that named it.
+		if hexKey != "" {
+			if err := conn.Exec(`PRAGMA hexkey=` + sqlite3.Quote(hexKey)); err != nil {
+				return errors.New("could not apply the encryption key to a new connection")
+			}
+		}
+		// FTS5 is a registered extension in this driver rather than a compile
+		// flag, so it has to be installed on every connection before any
+		// statement naming events_fts runs — including migration 1, which
+		// creates it. Without this the schema fails with "no such module:
+		// fts5" and every search path is dead.
+		if err := fts5.Register(conn); err != nil {
+			return fmt.Errorf("register fts5: %w", err)
+		}
+		for _, pragma := range []string{
+			"PRAGMA busy_timeout=5000",
+			"PRAGMA journal_mode=WAL",
+			"PRAGMA foreign_keys=ON",
+			// adiantum encrypts temp files under a random key, which costs
+			// real work on every spill. Keeping them in memory skips it, and
+			// no temp file means no plaintext spill either.
+			"PRAGMA temp_store=memory",
+		} {
+			if err := conn.Exec(pragma); err != nil {
+				return fmt.Errorf("configure sqlite (%s): %w", pragma, err)
+			}
+		}
+		return nil
+	}
+}
+
+// fileIdent is a file's identity on disk, which a path is not: `lumi encrypt`
+// renames a converted database over the old one, so the path outlives the file.
+type fileIdent struct {
+	dev int32
+	ino uint64
+	ok  bool
+}
+
+func identify(path string) fileIdent {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fileIdent{}
+	}
+	sys, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fileIdent{}
+	}
+	return fileIdent{dev: sys.Dev, ino: sys.Ino, ok: true}
+}
+
+// Stale reports that the file this store was opened from is no longer the file
+// at its path — the database was replaced underneath a live handle.
+//
+// `lumi encrypt` converts by writing a new file and renaming it into place, so a
+// process holding an open handle keeps reading the unlinked original: correct
+// rows, no error, and an answer the user believes came from an encrypted index.
+// Only a long-lived reader can hit this, which in practice means `lumi mcp`
+// holding a session across the toggle. A stat failure is not staleness — the
+// file is briefly absent mid-rename — for the same reason
+// internal/selfexec.Watcher.Changed refuses to call a stat error an upgrade.
+func (s *Store) Stale() bool {
+	if !s.ident.ok {
+		return false
+	}
+	current := identify(s.path)
+	if !current.ok {
+		return false
+	}
+	return current != s.ident
+}
+
+// Path is the database file this store was opened from.
+func (s *Store) Path() string { return s.path }
+
+// sqliteHeader is the 16-byte magic every plaintext SQLite file starts with.
+const sqliteHeader = "SQLite format 3\x00"
+
+// FileIsEncrypted reports whether the file at path is *not* a plaintext SQLite
+// database.
+//
+// This detects an incomplete conversion; it is not the answer to "is encryption
+// on". That question is the Keychain's — a fresh install with encryption enabled
+// has no database file at all, and reading intent off a missing header would
+// open a plaintext one and strand the next keyed writer. A missing file is
+// therefore reported as not encrypted, and internal/cli compares the two.
+func FileIsEncrypted(path string) (bool, error) {
+	file, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read database header: %w", err)
+	}
+	defer file.Close()
+	header := make([]byte, len(sqliteHeader))
+	n, err := io.ReadFull(file, header)
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		// A file too short to hold a header is empty or half-written, not
+		// encrypted. Either way there is nothing to decrypt.
+		return n != 0, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read database header: %w", err)
+	}
+	return string(header) != sqliteHeader, nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -482,15 +676,6 @@ func (s *Store) UpdateMediaPath(ctx context.Context, id int64, from, to string) 
 // invocation can do just as well.
 var ErrVacuumBusy = errors.New("vacuum could not acquire an exclusive lock")
 
-// sqliteBusy is SQLITE_BUSY. Only the primary result code is compared, because
-// SQLite reports extended codes in the high bits (SQLITE_BUSY_SNAPSHOT is 261)
-// that an equality test would miss.
-//
-// SQLITE_LOCKED (6) is deliberately not treated as busy: it reports contention
-// within this connection or cache rather than another process holding the file,
-// so reporting it as "the database is in use" would name the wrong cause.
-const sqliteBusy = 5
-
 // Vacuum rebuilds the database file, returning free pages to the filesystem.
 //
 // SQLite never releases them on its own, and auto_vacuum cannot be enabled on an
@@ -502,8 +687,15 @@ const sqliteBusy = 5
 // reporting ErrVacuumBusy.
 func (s *Store) Vacuum(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, "VACUUM"); err != nil {
-		var sqliteErr *sqlite.Error
-		if errors.As(err, &sqliteErr) && sqliteErr.Code()&0xff == sqliteBusy {
+		// errors.Is against the primary code, which is what the driver
+		// compares: SQLite reports extended codes in the high bits
+		// (SQLITE_BUSY_SNAPSHOT is 261) that an equality test would miss.
+		//
+		// SQLITE_LOCKED is deliberately not treated as busy: it reports
+		// contention within this connection or cache rather than another
+		// process holding the file, so reporting it as "the database is in
+		// use" would name the wrong cause.
+		if errors.Is(err, sqlite3.BUSY) {
 			return fmt.Errorf("%w: %v", ErrVacuumBusy, err)
 		}
 		return fmt.Errorf("vacuum: %w", err)

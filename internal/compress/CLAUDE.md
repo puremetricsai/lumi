@@ -249,3 +249,26 @@ desktop.
   new file unreferenced, where reconcile can never reach it because its sibling is no longer named by any
   row: a leaked file, not a lost one. The recorder is gated in `internal/cli` because it is the writer with
   the highest contention, not because the others are safe by analysis.
+
+## Encryption
+
+- **The write-verify-fsync-repoint-unlink ordering does not move.** Only the ends change: the source is
+  unsealed into `$TMPDIR` before the encode, and the encode is sealed into its destination after.
+- **The sealed destination is read back and compared, and that check is not redundant.** A pass verifies
+  by reopening what it wrote (`ImageTranscoder`'s contract, `compress.go`) — but with a key set, what it
+  reopened was the plaintext staging file, not what landed on disk. Without the read-back the sequence
+  "good encode, bad seal, unlink the original" is unguarded, and it is the one sequence here that
+  destroys data.
+- **With no key the encode still writes straight to its destination.** `stagedDestination` returns the
+  destination itself, so an unencrypted run costs no extra copy and behaves exactly as it did before
+  encryption existed.
+- **Staging files live in `$TMPDIR`, never beside the media.** `reconcile`'s own walk reads an
+  unrecognised sibling as an orphaned encode, and `internal/retention`'s `--all` sweep deletes any
+  unreferenced file it finds — a plaintext staging copy in a media directory is data loss waiting for
+  the next `prune --all`.
+- **`canAdopt` must unseal first.** It runs on the branch where the row's own media is already gone, so
+  reading a sealed leftover as "does not decode" would strand the last copy of the data.
+- **A `seal.ScratchSuffix` file is skipped by the reconcile walk, not classified.** It is a seal killed
+  mid-write, not a leftover encode; adopting one would repoint a row at a partial file.
+- **Sealing never changes an extension.** `selectWork`'s `done`/`classify`, `ReadAudioEnvelope`'s
+  dispatch, and `hoistMediaDir` all depend on that.

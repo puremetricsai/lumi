@@ -117,7 +117,7 @@ type mcpSetupResultJSON struct {
 // what lets the "already configured?" check be an exact comparison.
 func (a *app) mcpSetupCommand() *cobra.Command {
 	var f mcpSetupFlags
-	cmd := &cobra.Command{
+	cmd := emitsNoContent(&cobra.Command{
 		Use:   "setup",
 		Short: "Register lumi as an MCP server with Claude Code, Claude Desktop, and Codex CLI",
 		Long: "Write the lumi MCP server entry into the configuration of every MCP client\n" +
@@ -131,7 +131,7 @@ func (a *app) mcpSetupCommand() *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return a.runMCPSetup(cmd, f)
 		},
-	}
+	})
 	cmd.Flags().StringVar(&f.client, "client", "all", "which clients to configure (code, desktop, codex, all)")
 	cmd.Flags().StringVar(&f.name, "name", "lumi", "name to register the server under")
 	cmd.Flags().BoolVar(&f.dryRun, "dry-run", false, "report what would change without writing anything")

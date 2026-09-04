@@ -290,3 +290,19 @@ reports is the one enforced.
   the `min_confidence` schema text states the measured 0.6 cliff, because an agent reads the description
   before it ever sees a row. `confidence_filtered` is on the wire as well as in the notice, for the reason
   `resume_from` is: an agent should not have to parse prose to act on a fact.
+
+## Encryption
+
+- **While encryption is on, `lumi mcp` is the only thing that puts captured content anywhere.**
+  `lumi search` and `lumi transcript` refuse (`internal/cli`'s content guard). That makes this
+  package's stdout invariant load-bearing in a second way: it is now the only sanctioned exit for the
+  data, so corrupting the stream does not degrade a feature, it removes the user's only access.
+- **A long-lived handle can outlive the toggle, so staleness has a third kind.** `lumi encrypt`
+  replaces the index by rename, and this process keeps reading the unlinked original — correct rows,
+  no error anywhere, and an answer the user believes came from an encrypted index. `Options.DatabaseReplaced`
+  reports it and `restartNeeded` folds it into the same predicate the binary watcher polls, because
+  re-exec is the same fix for both: a fresh image re-opens whatever is at the path under whatever key
+  is now stored. The filesystem half is `store.Stale`, so the rule that nothing here touches the
+  filesystem still holds.
+- **The notice says it either way.** Whether or not this process can replace itself, an agent reading
+  results from a file that no longer has that name has to be told.

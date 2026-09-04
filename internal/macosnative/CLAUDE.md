@@ -104,3 +104,35 @@ pure file-to-file work needing no TCC grant, so their tests are ordinary build-t
 
 What the recorder does with these reads — and what an `app` on an audio row means — is
 `internal/capture/CLAUDE.md`.
+
+## The Keychain
+
+Lumi's encryption key lives here for the same reason everything else in this package does: it is a
+Security.framework call that needs cgo, and the rest of Lumi is written against a Go function.
+
+- **Nothing in `keychain.m` may write to stdout.** `lumi mcp` reads the key on startup, and one stray
+  byte corrupts the JSON-RPC stream for the whole session. `TestServeWritesOnlyJSONRPCFramesToStdout`
+  does not cover this path, so the rule is kept by construction.
+- **It is the legacy file-based keychain, and that was measured rather than assumed.** The
+  data-protection keychain is better — it refuses other processes outright instead of prompting — but
+  its access control is by application-identifier entitlement, and an ad-hoc build gets
+  `errSecMissingEntitlement` (-34018) from `SecItemAdd`, so no development build could store a key at
+  all. The legacy keychain takes a `SecAccess` ACL naming this binary, which is the per-binary control
+  the feature actually wants. Its cost is that `kSecAttrAccessible*` is ignored there, so the
+  accessibility attribute is deliberately absent rather than set and silently ineffective.
+- **`HasEncryptionKey` asks for attributes, never for data, and that is the whole reason it exists.**
+  Reading the *data* is what the ACL gates, so it prompts anyone who is not this binary — and `lumi
+  search` only needs to know whether to refuse. Implementing it as "try to load the key and see"
+  would pop a Keychain dialog on the way to printing an error. Measured with an ad-hoc signature:
+  this binary reads its own key with no prompt, `/usr/bin/security` asking for the data blocks on a
+  prompt, and an attributes query is ungated for anybody.
+- **`StoreEncryptionKey` deletes before it adds.** An existing item carries an ACL trusting whatever
+  binary wrote it, which after a rebuild is a code identity this process no longer has; re-adding is
+  how the ACL is re-established.
+- **The account name is fixed, not the data directory's path.** Keying it on the path would mean
+  Storage settings' **Choose…** button silently produced a store nothing could decrypt. One key per
+  user covering every data directory is the trade.
+- **Development cost, flagged rather than solved.** `build-app.sh` signs ad-hoc, so the designated
+  requirement is a bare `cdhash` that changes every build and the ACL trusts a binary that no longer
+  exists — expect a Keychain prompt after each `restart-lumi-app.sh`. Same class as the TCC grants a
+  rebuild already destroys (`macos/CLAUDE.md`), and the same non-fix.

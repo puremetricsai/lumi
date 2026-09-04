@@ -74,7 +74,7 @@ type updateStatus struct {
 // invariant because it is the one place Lumi's local-first promise is spent.
 func (a *app) updateCommand() *cobra.Command {
 	var asJSON, apply bool
-	cmd := &cobra.Command{
+	cmd := emitsNoContent(&cobra.Command{
 		Use:   "update",
 		Short: "Check for a newer Lumi release, or install it",
 		Long: "Report whether a newer Lumi release exists, and with --apply install it.\n\n" +
@@ -113,7 +113,7 @@ func (a *app) updateCommand() *cobra.Command {
 			printUpdateStatus(cmd.OutOrStdout(), status)
 			return nil
 		},
-	}
+	})
 	cmd.Flags().BoolVar(&asJSON, "json", false, "emit JSON")
 	cmd.Flags().BoolVar(&apply, "apply", false, "install the latest release and reopen Lumi")
 	return cmd

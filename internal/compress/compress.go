@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/puremetricsai/lumi/internal/macosnative"
+	"github.com/puremetricsai/lumi/internal/seal"
 	"github.com/puremetricsai/lumi/internal/store"
 )
 
@@ -124,6 +125,13 @@ type Options struct {
 	// MediaDirs are swept for leftovers from an interrupted run. Typically
 	// Paths.Screenshots and Paths.Audio.
 	MediaDirs []string
+
+	// Cipher unseals a source before it is re-encoded and seals the replacement
+	// before the row is repointed. Its zero value is a pass-through, and when it
+	// is unset this package behaves exactly as it did before encryption existed
+	// — including writing the encode straight to its destination rather than
+	// through a temporary file.
+	Cipher seal.Key
 
 	// Vacuum rebuilds the database after the passes, reclaiming the free pages
 	// they and every past prune left behind.
@@ -509,7 +517,31 @@ func replaceOne(ctx context.Context, s *store.Store, opts Options, p pass,
 	item work, logger *slog.Logger) (outcome, error) {
 	event, destination := item.event, item.destination
 
-	if err := p.encode(ctx, opts, event.MediaPath, destination); err != nil {
+	// The encoders take paths and read them with framework calls, so a sealed
+	// source needs a plaintext copy for the length of the encode. TempCopy
+	// returns the original path when there is nothing to unseal, so this costs
+	// nothing when encryption is off.
+	source, releaseSource, err := opts.Cipher.TempCopy(event.MediaPath)
+	if err != nil {
+		logger.Warn("could not decrypt media for compression; keeping the original",
+			"event", event.ID, "media", event.MediaPath, "error", err)
+		return outcome{kind: outcomeEncodeFailed}, nil
+	}
+	defer releaseSource()
+
+	// With a key set the encode lands in a temporary file and is sealed into
+	// place afterwards, because a pass verifies by reopening what it wrote and
+	// the encoders cannot read a sealed file. With no key it writes straight to
+	// its destination, exactly as before.
+	encoded, releaseEncoded, err := stagedDestination(opts.Cipher, destination)
+	if err != nil {
+		logger.Warn("could not stage a compressed file; keeping the original",
+			"event", event.ID, "media", event.MediaPath, "error", err)
+		return outcome{kind: outcomeEncodeFailed}, nil
+	}
+	defer releaseEncoded()
+
+	if err := p.encode(ctx, opts, source, encoded); err != nil {
 		var kind outcomeKind
 		switch {
 		case isSkipError(err):
@@ -532,6 +564,20 @@ func replaceOne(ctx context.Context, s *store.Store, opts Options, p pass,
 		// later by reconcile.
 		os.Remove(destination)
 		return outcome{kind: kind}, nil
+	}
+	// Seal the verified encode into its final name, then read it back through
+	// the key and compare.
+	//
+	// This second verification is not redundant with the pass's own. A pass
+	// verifies by reopening what it wrote — which, with a key set, is the
+	// plaintext temporary, not what landed on disk. Without this check the
+	// sequence "good encode, bad seal, unlink the original" is unguarded, and it
+	// is the one sequence in this package that destroys data.
+	if err := placeEncoded(opts.Cipher, encoded, destination); err != nil {
+		logger.Warn("could not encrypt the compressed file; keeping the original",
+			"event", event.ID, "media", destination, "error", err)
+		os.Remove(destination)
+		return outcome{kind: outcomeVerifyFailed}, nil
 	}
 	if err := flushDurably(destination); err != nil {
 		logger.Warn("could not flush compressed media to disk; keeping the original",

@@ -2,8 +2,11 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
+	"github.com/ncruces/go-sqlite3"
+	"github.com/ncruces/go-sqlite3/driver"
+	"github.com/ncruces/go-sqlite3/ext/fts5"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -13,7 +16,7 @@ import (
 func segmentStore(t *testing.T) (*Store, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "segments.db")
-	s, err := Open(context.Background(), path)
+	s, err := Open(context.Background(), path, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +175,12 @@ func TestDeletingAnEventRemovesItsSegmentsWithoutForeignKeys(t *testing.T) {
 	}
 
 	// A second connection with foreign keys explicitly disabled.
-	raw, err := sql.Open("sqlite", path)
+	raw, err := driver.Open((&url.URL{Scheme: "file", Path: path}).String(), func(conn *sqlite3.Conn) error {
+		// The DELETE below fires events_ad, which writes to events_fts, so
+		// even a connection opened only to disable foreign keys needs the
+		// module registered.
+		return fts5.Register(conn)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

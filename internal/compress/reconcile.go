@@ -6,7 +6,9 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 
+	"github.com/puremetricsai/lumi/internal/seal"
 	"github.com/puremetricsai/lumi/internal/store"
 )
 
@@ -107,6 +109,13 @@ func reconcile(ctx context.Context, s *store.Store, opts Options) (ReconcileResu
 				return result, err
 			}
 			if entry.IsDir() {
+				continue
+			}
+			// A scratch file from a seal that was killed mid-write is not a
+			// leftover encode. Adopting one would repoint a row at a partial
+			// file, and counting it as removable is the correct outcome only
+			// by accident — so it is named and skipped rather than classified.
+			if strings.HasSuffix(entry.Name(), seal.ScratchSuffix) {
 				continue
 			}
 			path := filepath.Join(dir, entry.Name())
@@ -210,6 +219,17 @@ func settle(ctx context.Context, s *store.Store, opts Options, leftover string,
 // what is missing — this is the weakest check in the package and it is applied
 // only where the alternative is deleting the last copy of the data.
 func canAdopt(ctx context.Context, opts Options, path string) bool {
+	// A leftover from a run that was interrupted after sealing is sealed, and
+	// both checks below are framework calls over a path. Without unsealing
+	// first every sealed leftover would read as undecodable, and the branch
+	// that reaches here is the one where the row's own media is already gone —
+	// so "does not decode" would strand the last copy of the data.
+	path, release, err := opts.Cipher.TempCopy(path)
+	if err != nil {
+		return false
+	}
+	defer release()
+
 	switch lowerExt(path) {
 	case extHEIC, extJPG, extJPEG:
 		if opts.Images == nil {

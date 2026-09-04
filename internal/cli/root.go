@@ -23,6 +23,7 @@ import (
 	"github.com/puremetricsai/lumi/internal/macosnative"
 	"github.com/puremetricsai/lumi/internal/platform"
 	"github.com/puremetricsai/lumi/internal/retention"
+	"github.com/puremetricsai/lumi/internal/seal"
 	"github.com/puremetricsai/lumi/internal/store"
 	"github.com/spf13/cobra"
 )
@@ -49,16 +50,20 @@ func newRootCommand() *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
-			return platform.Validate()
+			if err := platform.Validate(); err != nil {
+				return err
+			}
+			return a.guardContent(cmd)
 		},
 	}
 	cmd.PersistentFlags().StringVar(&a.dataDir, "data-dir", "", "data directory (default: $LUMI_HOME or ~/Library/Application Support/Lumi)")
 	cmd.AddCommand(a.recordCommand(), a.searchCommand(), a.transcriptCommand(), a.pruneCommand(),
 		a.compressCommand(), a.doctorCommand(), a.permissionsCommand(), a.nativeSmokeCommand(),
-		a.mcpCommand(), a.transcribeCommand(), a.appCommand(), a.updateCommand())
-	cmd.AddCommand(&cobra.Command{Use: "version", Short: "Print the Lumi version", Run: func(*cobra.Command, []string) {
+		a.mcpCommand(), a.transcribeCommand(), a.appCommand(), a.updateCommand(),
+		a.encryptCommand(), a.revealCommand())
+	cmd.AddCommand(emitsNoContent(&cobra.Command{Use: "version", Short: "Print the Lumi version", Run: func(*cobra.Command, []string) {
 		fmt.Fprintln(os.Stdout, version)
-	}})
+	}}))
 	return cmd
 }
 
@@ -104,31 +109,75 @@ func smokeAudioOutputNote(processes []macosnative.AudioProcess, err error) strin
 	return strings.Join(named, ", ")
 }
 
-func (a *app) openStore(ctx context.Context) (*store.Store, config.Paths, error) {
-	paths, err := a.paths()
+// openStoreForContent is openStore for the commands that print captured content.
+//
+// The annotation guard in PersistentPreRunE reads the encryption state once,
+// before the store is opened; a conversion finishing in the gap between that
+// check and the printing would let the command open the newly encrypted store
+// with its key and print from it. This closes that by construction rather than
+// by narrowing the window: a command that needed a key to read the store may not
+// print what it read, whatever the guard decided a moment earlier.
+// sweepAbandonedPlaintext removes decrypted copies a crashed run left behind.
+// A failure is reported and never fatal: it is cleanup, and refusing to record
+// because a stale temporary directory will not delete would be the worse trade.
+func sweepAbandonedPlaintext(out io.Writer) {
+	if err := seal.SweepTemp(); err != nil {
+		fmt.Fprintf(out, "warning: %v\n", err)
+	}
+}
+
+func (a *app) openStoreForContent(ctx context.Context) (*store.Store, config.Paths, error) {
+	s, paths, k, err := a.openStoreWithKeys(ctx)
 	if err != nil {
 		return nil, paths, err
 	}
-	if err := paths.Ensure(); err != nil {
-		return nil, paths, err
-	}
-	s, err := store.Open(ctx, paths.Database)
-	if err != nil {
-		return nil, paths, err
+	if k.enabled() {
+		s.Close()
+		return nil, paths, errEncryptedContent
 	}
 	return s, paths, nil
+}
+
+func (a *app) openStore(ctx context.Context) (*store.Store, config.Paths, error) {
+	s, paths, _, err := a.openStoreWithKeys(ctx)
+	return s, paths, err
+}
+
+// openStoreWithKeys is openStore plus the keys the caller needs to read media.
+//
+// Every command opens the store the same way whether or not encryption is on:
+// the keys are resolved once, here, and a store with no key behaves exactly as
+// it did before this existed. Callers that never touch media use openStore and
+// discard them.
+func (a *app) openStoreWithKeys(ctx context.Context) (*store.Store, config.Paths, keys, error) {
+	paths, err := a.paths()
+	if err != nil {
+		return nil, paths, keys{}, err
+	}
+	if err := paths.Ensure(); err != nil {
+		return nil, paths, keys{}, err
+	}
+	k, err := keysFor(paths.Database)
+	if err != nil {
+		return nil, paths, keys{}, err
+	}
+	s, err := store.Open(ctx, paths.Database, k.database)
+	if err != nil {
+		return nil, paths, keys{}, err
+	}
+	return s, paths, k, nil
 }
 
 // recordCommand is a parent that only holds the start/status/stop
 // subcommands; with no RunE, cobra prints its help when invoked bare.
 func (a *app) recordCommand() *cobra.Command {
-	cmd := &cobra.Command{
+	cmd := emitsNoContent(&cobra.Command{
 		Use:   "record",
 		Short: "Control the background recorder (start, status, stop)",
 		Long: "Manage the background recorder that captures, processes, and indexes screen\n" +
 			"and audio activity. `record start` launches it in the background; `record\n" +
 			"status` reports its state; `record stop` shuts it down gracefully.",
-	}
+	})
 	cmd.AddCommand(a.recordStartCommand(), a.recordStatusCommand(), a.recordStopCommand())
 	return cmd
 }
@@ -184,7 +233,24 @@ func (a *app) runForeground(cmd *cobra.Command, f recordFlags, registerState boo
 	if err := requireRecordingPermissions(cmd.Context(), !f.noScreen, !f.noAudio, !f.noAudio); err != nil {
 		return err
 	}
-	s, paths, err := a.openStore(cmd.Context())
+	paths, err := a.paths()
+	if err != nil {
+		return err
+	}
+	// Held for the whole recording, shared with any other recorder and exclusive
+	// against `lumi encrypt`. Taken before the store is opened, because what it
+	// prevents is a conversion replacing the database out from under the handle
+	// this is about to take.
+	releaseCapture, err := lockRecording(paths)
+	if err != nil {
+		return err
+	}
+	defer releaseCapture()
+	// A plaintext copy stranded by a process that was killed is decrypted
+	// capture sitting in the clear. Nothing else creates them and nothing else
+	// will remove them, so the two long-lived entry points sweep on the way in.
+	sweepAbandonedPlaintext(os.Stderr)
+	s, paths, mediaKeys, err := a.openStoreWithKeys(cmd.Context())
 	if err != nil {
 		return err
 	}
@@ -205,6 +271,7 @@ func (a *app) runForeground(cmd *cobra.Command, f recordFlags, registerState boo
 	recorder := capture.Recorder{
 		Store: s, Paths: paths, ScreenInterval: f.interval, AudioChunk: f.audioChunk,
 		CaptureScreen: !f.noScreen, CaptureAudio: !f.noAudio, Logger: logger,
+		Cipher:  mediaKeys.media,
 		Screen:  capture.NativeScreens{},
 		Text:    capture.VisionText{},
 		Context: capture.AccessibilityContext{},
@@ -304,7 +371,7 @@ func (a *app) searchCommand() *cobra.Command {
 	var kind, since, until, app, window string
 	var limit int
 	var asJSON bool
-	cmd := &cobra.Command{
+	cmd := emitsContent(&cobra.Command{
 		Use:   "search [text]",
 		Short: "Full-text search screen text and audio transcripts",
 		Args:  cobra.MaximumNArgs(1),
@@ -317,7 +384,7 @@ func (a *app) searchCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			s, _, err := a.openStore(cmd.Context())
+			s, _, err := a.openStoreForContent(cmd.Context())
 			if err != nil {
 				return err
 			}
@@ -338,7 +405,7 @@ func (a *app) searchCommand() *cobra.Command {
 			printEvents(events)
 			return nil
 		},
-	}
+	})
 	flags := cmd.Flags()
 	flags.StringVar(&kind, "type", "all", "content type: all, screen, or audio")
 	flags.StringVar(&since, "since", "", "earliest time (RFC3339 or duration such as 8h)")
@@ -354,7 +421,7 @@ func (a *app) pruneCommand() *cobra.Command {
 	var olderThan string
 	var maxBytes int64
 	var dryRun, asJSON, all, yes bool
-	cmd := &cobra.Command{
+	cmd := emitsNoContent(&cobra.Command{
 		Use:   "prune",
 		Short: "Delete old events and their media files",
 		Long: "Delete indexed events and the screenshots or audio they point at.\n" +
@@ -414,7 +481,7 @@ func (a *app) pruneCommand() *cobra.Command {
 			}
 			return nil
 		},
-	}
+	})
 	flags := cmd.Flags()
 	flags.StringVar(&olderThan, "older-than", "", "delete events older than this duration (e.g. 720h) or RFC3339 time")
 	flags.Int64Var(&maxBytes, "max-bytes", 0, "cap total media size in bytes, deleting oldest first (zero disables)")
@@ -441,7 +508,7 @@ func confirmPruneAll(in io.Reader, out io.Writer) (bool, error) {
 
 func (a *app) doctorCommand() *cobra.Command {
 	var speechLocale string
-	cmd := &cobra.Command{
+	cmd := emitsNoContent(&cobra.Command{
 		Use:   "doctor",
 		Short: "Check platform, capture permissions, speech assets, and the data directory",
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -486,6 +553,7 @@ func (a *app) doctorCommand() *cobra.Command {
 				missing = true
 			}
 			fmt.Fprintf(os.Stdout, "data directory\tok\t%s\n", paths.Root)
+			reportEncryption(os.Stdout, paths)
 			if err := reportAttributionHealth(cmd.Context(), os.Stdout, paths); err != nil {
 				return err
 			}
@@ -494,9 +562,38 @@ func (a *app) doctorCommand() *cobra.Command {
 			}
 			return nil
 		},
-	}
+	})
 	cmd.Flags().StringVar(&speechLocale, "speech-locale", "en-US", "SpeechAnalyzer recognition locale")
 	return cmd
+}
+
+// reportEncryption states whether the captured history is encrypted, and
+// whether the two halves of that answer agree.
+//
+// The disagreement is the reason this is a check rather than a line of status.
+// A conversion killed halfway leaves a key with a plaintext database, or an
+// encrypted database with no key — and neither is visible from the rows, which
+// read correctly either way. The second is unrecoverable and is the most
+// important thing `lumi doctor` can ever say.
+//
+// It never sets `missing`: encryption is a choice, and doctor exits non-zero
+// only on an unmet recording requirement.
+func reportEncryption(out io.Writer, paths config.Paths) {
+	state, err := readEncryptionState(paths.Database)
+	if err != nil {
+		fmt.Fprintf(out, "encryption\tdegraded\tcould not tell whether the history is encrypted: %v\n", err)
+		return
+	}
+	switch {
+	case state.Unrecoverable():
+		fmt.Fprintf(out, "encryption\tdegraded\tthe index at %s is encrypted and its key is not in "+
+			"this Mac's Keychain; the captured history cannot be read or recovered\n", state.Database)
+	case state.Enabled:
+		fmt.Fprintf(out, "encryption\tok\ton; `search` and `transcript` do not print captured "+
+			"content, and the MCP server decrypts in memory\n")
+	default:
+		fmt.Fprintf(out, "encryption\tok\toff\n")
+	}
 }
 
 // attributionWindow is how far back doctor measures observed attribution. It is
@@ -522,7 +619,12 @@ func reportAttributionHealth(ctx context.Context, out io.Writer, paths config.Pa
 		}
 		return fmt.Errorf("stat index: %w", err)
 	}
-	s, err := store.Open(ctx, paths.Database)
+	k, err := keysFor(paths.Database)
+	if err != nil {
+		fmt.Fprintf(out, "attribution\tdegraded\tcould not read Lumi's encryption key: %v\n", err)
+		return nil
+	}
+	s, err := store.Open(ctx, paths.Database, k.database)
 	if err != nil {
 		return err
 	}
@@ -565,7 +667,7 @@ func formatPercent(part, total int64) string {
 
 func (a *app) permissionsCommand() *cobra.Command {
 	var request, inputMonitoring, asJSON bool
-	cmd := &cobra.Command{
+	cmd := emitsNoContent(&cobra.Command{
 		Use:   "permissions",
 		Short: "Show or request native macOS capture permissions",
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -599,7 +701,7 @@ func (a *app) permissionsCommand() *cobra.Command {
 			fmt.Fprintf(cmd.OutOrStdout(), "Speech Recognition\t%s\n", permissions.SpeechRecognition)
 			return permissionsRequestIncomplete(request, permissions)
 		},
-	}
+	})
 	cmd.Flags().BoolVar(&request, "request", false, "open the native macOS permission request flows")
 	cmd.Flags().BoolVar(&asJSON, "json", false, "emit JSON")
 	cmd.Flags().BoolVar(&inputMonitoring, "input-monitoring", false,
@@ -621,7 +723,7 @@ func permissionsRequestIncomplete(requested bool, permissions macosnative.Permis
 }
 
 func (a *app) nativeSmokeCommand() *cobra.Command {
-	return &cobra.Command{
+	return emitsNoContent(&cobra.Command{
 		Use:   "native-smoke",
 		Short: "Run a bounded native capture test without indexing media",
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -732,7 +834,7 @@ func (a *app) nativeSmokeCommand() *cobra.Command {
 				smokeAudioOutputNote(audioOutputs, audioOutputsErr))
 			return nil
 		},
-	}
+	})
 }
 
 func requireRecordingPermissions(ctx context.Context, screen, audio, speech bool) error {

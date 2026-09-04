@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/puremetricsai/lumi/internal/config"
+	"github.com/puremetricsai/lumi/internal/seal"
 	"github.com/puremetricsai/lumi/internal/store"
 	"github.com/puremetricsai/lumi/internal/transcript"
 )
@@ -57,6 +58,10 @@ type Recorder struct {
 	// so a supervising app can draw a meter that moves with the room. Nil means
 	// no measurement is taken at all — nothing in the capture pipeline needs it.
 	Levels LevelSink
+	// Cipher seals captured media on disk once its row is committed. Its zero
+	// value is a working pass-through, so every path below is written once and
+	// behaves correctly whether or not encryption is on.
+	Cipher seal.Key
 	// attribution is owned by the screen goroutine alone; captureScreen is the
 	// only reader and writer, so it needs no lock.
 	attribution attributionHealth
@@ -416,6 +421,16 @@ func (r *Recorder) captureScreen(ctx context.Context) {
 		if processErr != nil {
 			r.Logger.Warn("Vision failed; screenshot was still indexed", "error", processErr)
 		}
+		// Sealing is the last thing that touches the file, after its row is
+		// committed. Everything above — the byte hash in Duplicate, Vision's
+		// read — needs the plaintext, and none of it ever sees a sealed file
+		// because of this ordering.
+		//
+		// A failure is a warning and nothing else. The never-lose-media rule
+		// does not bend for encryption: the file is written, the row names it,
+		// and `lumi encrypt on` seals it on its next run because the missing
+		// magic header is the whole record of what is left to do.
+		r.sealCaptured(frame.Path, "screenshot")
 	}
 }
 
@@ -594,6 +609,32 @@ func (r *Recorder) storeAudioChunk(ctx context.Context, chunk AudioChunk) {
 			frame: frame, transcription: transcription, eventID: event.ID, failed: processErr != nil})
 	}
 	r.attributeChunk(ctx, capturedAt, results)
+	// Sealing happens here rather than beside each Insert above, because
+	// attributeChunk reaches measureInternalEnergy, which reads the system
+	// track back off disk. Sealing per frame would work — ReadAudioEnvelope
+	// unseals — but it would pay for a decrypt on the capture path to undo
+	// something this function had just done.
+	// Only frames that became rows. A frame whose Insert failed is media nothing
+	// references, and sealing it would turn a file a person could still open —
+	// and `lumi prune --all` could still sweep — into ciphertext with no row and
+	// no key path pointing at it.
+	for _, result := range results {
+		r.sealCaptured(result.frame.Path, "audio chunk")
+	}
+}
+
+// sealCaptured encrypts a file whose row is already committed.
+//
+// A failure never propagates. By the time this runs the media is written and
+// indexed, so the worst case is a file that stays readable on disk — recoverable,
+// visible to `lumi encrypt`, and reported. Turning it into an error here would
+// mean a seal failure could cost a capture, which is the one thing
+// internal/capture may not do.
+func (r *Recorder) sealCaptured(path, kind string) {
+	if err := r.Cipher.SealFile(path); err != nil {
+		r.Logger.Warn("could not encrypt a captured "+kind+"; it is indexed and still readable",
+			"path", path, "error", err)
+	}
 }
 
 // audioChunkResult is one captured track: what was recorded, what it transcribed
@@ -718,7 +759,7 @@ func (r *Recorder) measureInternalEnergy(ctx context.Context, chunk *transcript.
 	if systemPath == "" || !transcript.NeedsInternalEnergy(*chunk) {
 		return
 	}
-	envelope, _, err := ReadAudioEnvelope(ctx, systemPath, transcript.EnvelopeWindowMS)
+	envelope, _, err := ReadAudioEnvelope(ctx, r.Cipher, systemPath, transcript.EnvelopeWindowMS)
 	if err != nil {
 		// Without the measurement the microphone stays confidently external,
 		// which is the pre-existing behaviour rather than a new risk.

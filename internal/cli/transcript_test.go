@@ -17,7 +17,7 @@ import (
 func transcriptRoot(t *testing.T) (string, *store.Store) {
 	t.Helper()
 	root := t.TempDir()
-	s, err := store.Open(context.Background(), filepath.Join(root, "lumi.db"))
+	s, err := store.Open(context.Background(), filepath.Join(root, "lumi.db"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
