@@ -30,6 +30,41 @@ The app is a supervisor and nothing else — root `CLAUDE.md` states that rule; 
   the app refuse to start a second one over a terminal's. `--emit-levels` feeds the meters, several JSON
   lines a second per track on stderr, measured live inside the capture callback
   (`internal/capture/CLAUDE.md`).
+- **The display pill counts displays being *recorded*, which only the recorder knows.** The count comes from
+  the `screen_capture` line the same `--emit-levels` stream carries, and a missing or stale report is drawn
+  as missing — the levels rule, for the same reason. `NSScreen.screens.count` is not the fallback: it
+  answers how many displays are *connected*, which stopped being the same question when display selection
+  arrived, and a number from it beside a green dot is the display-pill spelling of floor bars and a
+  hardcoded `healthy: true`. Staleness comes off the report's own `interval_ms`, not `Preferences`, so a
+  recorder started from a terminal with its own `--interval` still ages correctly.
+- **Which displays exist, and what is on them, come from `lumi displays --json`.** Swift calls no capture
+  framework: the thumbnails are the binary's, captured through the same path the recorder uses. `NSScreen`
+  supplies the display's *name* and *resolution* and nothing else — labels macOS holds and Lumi has no
+  opinion about, matched on the CoreGraphics display ID Go already reported. Nothing structural may depend
+  on that match: a display macOS does not present as a screen still lists, still previews, and is still
+  selectable by ID. The command runs on tab-appear, on a screen-parameter change, and from Refresh — never
+  on a timer, because every call is a real screen capture.
+- **`loadDisplays` repeats *both* of the picker's branches as guards, and the failed list is emptied rather
+  than left standing.** `.task(id:)` runs its body on first appearance whatever the id evaluates to — the id
+  decides only when it runs *again* — so the guards cannot be left to the id: without `captureScreen`,
+  opening Settings screenshots every display for a picker that renders `EmptyView()`, after the user said
+  not to capture the screen; without the Screen Recording grant, opening Settings is what raises a TCC
+  prompt. And the list is read as the *connected* set by the selection canonicalisation and by
+  `isOnlySelected`, so a stale one is not cosmetic: unchecking a display that is already gone slips past the
+  last-display guard and stores a selection naming nothing connected, which the recorder answers by
+  recording every display — the opposite of what was asked, and it outlives the app. That is why a failed
+  load clears the rows and why an unplugged monitor reloads the list.
+- **Every `Preferences` property is *stored*, seeded from `UserDefaults` in `init` and written back in
+  `didSet`. A computed property over `UserDefaults` is the bug.** The `@Observable` macro instruments
+  stored properties and nothing else, so a view reading a computed `captureScreen` registers no dependency
+  and is never invalidated — the stored value is correct, the flags the recorder is started with are
+  correct, and only the screen never changes. Toggling Capture screen off and back on left the display
+  picker gone until the tab was reopened, which is what surfaced it. The macro relocates `didSet` onto its
+  own backing storage and wraps the accessors, so persistence and observation both hold; the shape needs no
+  convention a new preference could forget, which is why it replaced a hand-kept revision counter.
+  Seeding reads the `defaults` *parameter*, not `self.defaults` — phase-1 initialisation forbids `self`
+  before every stored property has a value, and `didSet` does not fire during `init`, so seeding writes
+  nothing back.
 - **A level's staleness is counted from when the app received it, and a stale one is pruned rather than
   tested at draw time.** Freshness turns on wall-clock, which `@Observable` cannot track: nothing else in
   the recording card changes while capture is healthy, so a draw-time check never re-ran and the meters held

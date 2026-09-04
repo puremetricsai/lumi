@@ -1,7 +1,8 @@
 # internal/capture
 
 `Recorder` runs independent screen and audio goroutines until the context is cancelled, with native
-processors behind small interfaces. Displays are re-enumerated each interval for hotplug. Screen capture is
+processors behind small interfaces. Displays are re-enumerated each interval for hotplug, and a display
+selection is re-applied against that enumeration on every tick rather than resolved once at startup. Screen capture is
 a per-tick call, but audio is a *stream*: `AudioSource.Open` returns an `AudioStream` whose `Next` yields
 chunks while capture keeps running, so transcription, indexing, and attribution all happen alongside the
 next chunk rather than between two recordings. Everything runs in-process — no subprocesses. One
@@ -31,6 +32,18 @@ rows are shaped is `internal/store`'s; the labelling rules the recorder applies 
   depends on that.** `internal/compress` pairs a file with an event by swapping its extension, so two
   events whose media differed only by extension would let it overwrite or delete the wrong one. A coarser
   naming scheme re-arms that; it has a backstop (`findConflicts`) but the naming is the real guarantee.
+- **A display selection that names nothing connected records every display, and says so.** `NativeScreens`
+  takes `DisplayIDs`; empty means every display. The intersection is taken natively, against the very list
+  the capture loop is about to iterate — never against a second enumeration, which could name a display
+  ScreenCaptureKit is not offering and so match nothing, capturing nothing at all. Recording the wrong
+  screen is recoverable; recording no screen is a hole in the index. Nothing in the resulting rows says
+  which happened, so `SelectionFallback` rides on the frame and `captureScreen` logs the transition —
+  **once**, not per tick: at a two-second interval a standing condition logged every tick buries the moment
+  it began. It is kept separate from `CaptureError` because degraded and failed are different questions.
+- **`Screens` is the screen tick's `Levels`.** One `ScreenCapture` per tick naming the displays that tick
+  actually captured, so a supervisor can say how many displays are being *recorded* rather than how many
+  are connected — different numbers as soon as a selection exists, and only the recorder knows the first.
+  It carries its own `IntervalMS` so a reader ages it without assuming a flag's value.
 - **Deduplicate per display, not globally.** `FrameComparer` uses SHA-256 as an exact fast path and a
   sampled RGB histogram for near-duplicates; active input raises sensitivity. Two retention deadlines:
   `MaxSilence` (10s) when bytes *changed* but scored similar (video, advancing slides), and `ExactSilence`

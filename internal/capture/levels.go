@@ -58,6 +58,29 @@ type AudioLevel struct {
 // the level goroutine and must not block.
 type LevelSink func(AudioLevel)
 
+// ScreenCapture is what one screen tick captured, reported so a supervising app
+// can say how many displays are being recorded rather than how many are
+// connected. Those are different numbers as soon as a display selection is in
+// play, and only the recorder knows the first one.
+type ScreenCapture struct {
+	CapturedAt time.Time `json:"captured_at"`
+	// DisplayIDs is derived from the frames the tick actually produced, so it
+	// cannot drift from what was recorded.
+	DisplayIDs []uint32 `json:"display_ids"`
+	// IntervalMS is how often the next one is due, which is how a reader knows
+	// how stale this may get before it stops meaning "recording now". It is
+	// carried rather than assumed: the interval is a flag, and a recorder
+	// started from a terminal need not match the app's own preference.
+	IntervalMS int64 `json:"interval_ms"`
+	// SelectionFallback says the configured display selection named nothing that
+	// was connected, so every display is being recorded instead.
+	SelectionFallback bool `json:"selection_fallback"`
+}
+
+// ScreenSink receives one report per screen tick. It is called from the screen
+// goroutine and must not block. Nil means no report is made.
+type ScreenSink func(ScreenCapture)
+
 // LevelSampler is an AudioStream that can report the sound it has received since
 // the last call, window by window, as mean squares of normalised samples.
 //

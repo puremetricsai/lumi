@@ -9,7 +9,11 @@ package macosnative
 #include <stdbool.h>
 #include <stdint.h>
 
-char *lumi_capture_screens_json(const char *directory, const char *prefix, char **error_message);
+char *lumi_capture_screens_json(const char *directory, const char *prefix,
+                                const char *display_ids_csv, int max_pixel_width,
+                                char **error_message);
+char *lumi_select_displays_json(const char *display_ids_json, const char *allowlist_csv,
+                                char **error_message);
 char *lumi_accessibility_snapshot_json(char **error_message);
 char *lumi_resolve_frontmost_json(const char *windows_json, int active_pid, int workspace_pid,
                                   const char *workspace_app, int self_pid,
@@ -52,6 +56,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -64,11 +70,16 @@ import (
 // CaptureScreens. Displays are enumerated for every call, making capture
 // naturally responsive to display hotplug events.
 type ScreenFrame struct {
-	Path         string `json:"path"`
-	DisplayID    uint32 `json:"display_id"`
-	Width        int    `json:"width"`
-	Height       int    `json:"height"`
-	CaptureError string `json:"capture_error,omitempty"`
+	Path      string `json:"path"`
+	DisplayID uint32 `json:"display_id"`
+	Width     int    `json:"width"`
+	Height    int    `json:"height"`
+	// SelectionFallback reports that a display allowlist named nothing that was
+	// connected, so every display was captured instead. Deliberately not folded
+	// into CaptureError: this is degraded capture, not failed capture, and a
+	// caller that treats them alike either loses the warning or invents one.
+	SelectionFallback bool   `json:"selection_fallback,omitempty"`
+	CaptureError      string `json:"capture_error,omitempty"`
 }
 
 // AccessibilitySnapshot is total: App and InputActive are read from sources that
@@ -242,16 +253,28 @@ func AudioMarkerWindowsIn(windowsJSON string) ([]AudioMarkerWindow, error) {
 	return windows, nil
 }
 
-func CaptureScreens(ctx context.Context, directory, prefix string) ([]ScreenFrame, error) {
+// CaptureScreens captures the connected displays that displayIDs names, or every
+// connected display when it is empty. An allowlist matching no connected display
+// captures every display and marks each frame SelectionFallback, because
+// capturing the wrong screen is recoverable and capturing nothing is not.
+//
+// maxPixelWidth of zero captures at full resolution; a positive value caps the
+// width and scales the height with it, which is what `lumi displays` asks for.
+func CaptureScreens(ctx context.Context, directory, prefix string, displayIDs []uint32,
+	maxPixelWidth int) ([]ScreenFrame, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	directoryC := C.CString(directory)
 	prefixC := C.CString(prefix)
+	displaysC := C.CString(joinDisplayIDs(displayIDs))
 	defer C.free(unsafe.Pointer(directoryC))
 	defer C.free(unsafe.Pointer(prefixC))
+	defer C.free(unsafe.Pointer(displaysC))
 	var nativeErr *C.char
-	result, err := nativeJSON(C.lumi_capture_screens_json(directoryC, prefixC, &nativeErr), nativeErr)
+	result, err := nativeJSON(
+		C.lumi_capture_screens_json(directoryC, prefixC, displaysC, C.int(maxPixelWidth), &nativeErr),
+		nativeErr)
 	if err != nil {
 		return nil, err
 	}
@@ -263,6 +286,52 @@ func CaptureScreens(ctx context.Context, directory, prefix string) ([]ScreenFram
 		return nil, errors.New("ScreenCaptureKit returned no displays")
 	}
 	return frames, nil
+}
+
+// joinDisplayIDs renders an allowlist the way the native side parses it. An
+// empty list renders empty, which native reads as "no filter".
+func joinDisplayIDs(displayIDs []uint32) string {
+	parts := make([]string, 0, len(displayIDs))
+	for _, id := range displayIDs {
+		parts = append(parts, strconv.FormatUint(uint64(id), 10))
+	}
+	return strings.Join(parts, ",")
+}
+
+// DisplaySelection is what the native selection rule decided.
+type DisplaySelection struct {
+	DisplayIDs        []uint32 `json:"display_ids"`
+	SelectionFallback bool     `json:"selection_fallback"`
+}
+
+// selectDisplays drives the native selection rule directly, over a supplied
+// display list. Unexported: it exists for the test. Asserting the rule through a
+// live capture would pass vacuously on a single-display machine, which is most
+// of them.
+func selectDisplays(present []uint32, displayIDs []uint32) (DisplaySelection, error) {
+	if present == nil {
+		// Marshalling a nil slice yields "null", which the native decoder
+		// rejects as not being a list at all.
+		present = []uint32{}
+	}
+	presentJSON, err := json.Marshal(present)
+	if err != nil {
+		return DisplaySelection{}, fmt.Errorf("encode display id list: %w", err)
+	}
+	presentC := C.CString(string(presentJSON))
+	allowC := C.CString(joinDisplayIDs(displayIDs))
+	defer C.free(unsafe.Pointer(presentC))
+	defer C.free(unsafe.Pointer(allowC))
+	var nativeErr *C.char
+	result, err := nativeJSON(C.lumi_select_displays_json(presentC, allowC, &nativeErr), nativeErr)
+	if err != nil {
+		return DisplaySelection{}, err
+	}
+	var selection DisplaySelection
+	if err := json.Unmarshal(result, &selection); err != nil {
+		return DisplaySelection{}, fmt.Errorf("decode display selection: %w", err)
+	}
+	return selection, nil
 }
 
 func Accessibility(ctx context.Context) (AccessibilitySnapshot, error) {

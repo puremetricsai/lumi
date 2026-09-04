@@ -29,7 +29,15 @@ final class RecorderController {
     }
     private(set) var permissions = Permissions()
     private(set) var status: RecordStatus = .notRecording
-    private(set) var displayCount: Int = max(1, NSScreen.screens.count)
+    /// The most recent screen tick, or nil when none has arrived or the last
+    /// one went stale.
+    ///
+    /// Presence *is* freshness here, exactly as it is for `levels`: the poll
+    /// prunes a stale report rather than every reader re-testing the clock. Nil
+    /// therefore means "capture is not reporting", which the UI must draw as
+    /// missing — never as a count borrowed from `NSScreen`, which answers how
+    /// many displays exist rather than how many Lumi is recording.
+    private(set) var screenCapture: ScreenCapture?
     private(set) var lastError: String?
 
     /// The most recent measurement per source, keyed by the recorder's own
@@ -156,6 +164,12 @@ final class RecorderController {
         stderrPipe = nil
         stderrBuffer.removeAll(keepingCapacity: false)
         levels.removeAll()
+        // Alongside the levels, and for the same reason: a report from the child
+        // that has just exited is not a measurement of the one replacing it.
+        // Waiting for the poll to prune it would show the previous recorder's
+        // display count as live across a restart — which is exactly what
+        // changing a display selection does.
+        screenCapture = nil
         pollTask?.cancel()
         pollTask = nil
         if state == .recording {
@@ -188,8 +202,13 @@ final class RecorderController {
         while let newline = stderrBuffer.firstIndex(of: UInt8(ascii: "\n")) {
             let line = stderrBuffer[stderrBuffer.startIndex..<newline]
             stderrBuffer.removeSubrange(stderrBuffer.startIndex...newline)
-            guard let level = Self.parseLevel(line) else { continue }
-            levels[level.source] = level
+            if let level = Self.parseLevel(line) {
+                levels[level.source] = level
+                continue
+            }
+            if let tick = Self.parseScreenCapture(line) {
+                screenCapture = tick
+            }
         }
         // A pathological line with no newline must not grow without bound.
         if stderrBuffer.count > 1 << 20 {
@@ -203,6 +222,14 @@ final class RecorderController {
             return nil
         }
         return level.event == "audio_level" ? level : nil
+    }
+
+    static func parseScreenCapture(_ line: Data) -> ScreenCapture? {
+        guard line.first == UInt8(ascii: "{") else { return nil }
+        guard let tick = try? LumiCLI.decoder.decode(ScreenCapture.self, from: Data(line)) else {
+            return nil
+        }
+        return tick.event == "screen_capture" ? tick : nil
     }
 
     // MARK: - Status and permissions
@@ -222,7 +249,6 @@ final class RecorderController {
     /// `--register-state`, so `record status` sees it exactly as it sees a
     /// recorder started from a terminal.
     func refreshStatus() async {
-        displayCount = max(1, NSScreen.screens.count)
         dropStaleLevels()
         guard let fresh = try? await LumiCLI.json(RecordStatus.self, ["record", "status", "--json"]) else {
             return
@@ -353,5 +379,11 @@ final class RecorderController {
         // Guarded because `levels` is not Equatable, so an unconditional assign
         // would invalidate the window every five seconds for nothing.
         if kept.count != levels.count { levels = kept }
+        // The screen tick ages by the same rule off its own budget, which is
+        // derived from the interval it reports rather than from this app's
+        // preference: a recorder started from a terminal sets its own.
+        if let tick = screenCapture, now.timeIntervalSince(tick.receivedAt) >= tick.staleAfter {
+            screenCapture = nil
+        }
     }
 }

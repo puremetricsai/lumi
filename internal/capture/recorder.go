@@ -57,12 +57,22 @@ type Recorder struct {
 	// so a supervising app can draw a meter that moves with the room. Nil means
 	// no measurement is taken at all — nothing in the capture pipeline needs it.
 	Levels LevelSink
+	// Screens is optional and is the screen tick's counterpart to Levels: one
+	// report per tick naming the displays that tick captured. Nil means no
+	// report is made.
+	Screens ScreenSink
 	// attribution is owned by the screen goroutine alone; captureScreen is the
 	// only reader and writer, so it needs no lock.
 	attribution attributionHealth
 	// timeline is written by the screen and emitter loops and read by the audio
 	// loop at chunk close, so it carries its own lock.
 	timeline *emitterTimeline
+	// selectionFallback is the previous tick's answer, owned by the screen
+	// goroutine alone. It exists so the warning is logged when the state
+	// changes rather than on every tick: at a two-second interval, a standing
+	// condition would otherwise fill the log with one line per tick and bury
+	// the moment it began.
+	selectionFallback bool
 }
 
 // defaultEmitterInterval samples roughly a dozen times per chunk, bounded at
@@ -338,6 +348,26 @@ func (r *Recorder) captureScreen(ctx context.Context) {
 			r.Logger.Error("screen capture failed", "error", err)
 		}
 		return
+	}
+	fallback := len(frames) > 0 && frames[0].SelectionFallback
+	if fallback != r.selectionFallback {
+		if fallback {
+			r.Logger.Warn("none of the selected displays are connected; recording every display")
+		} else {
+			r.Logger.Info("recording the selected displays again")
+		}
+		r.selectionFallback = fallback
+	}
+	if r.Screens != nil {
+		displayIDs := make([]uint32, 0, len(frames))
+		for _, frame := range frames {
+			displayIDs = append(displayIDs, frame.DisplayID)
+		}
+		r.Screens(ScreenCapture{
+			CapturedAt: now, DisplayIDs: displayIDs,
+			IntervalMS:        r.ScreenInterval.Milliseconds(),
+			SelectionFallback: fallback,
+		})
 	}
 	// One focused-window snapshot is taken per tick and its App/Window are
 	// stamped onto every display's frame. On a multi-display setup an app filter

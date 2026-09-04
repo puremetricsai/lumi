@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 /// RecordStatus is `lumi record status --json`, decoded.
@@ -146,6 +147,101 @@ struct PermissionRow: Identifiable {
     let service: PermissionService
     let state: PermissionState
     var id: String { service.id }
+}
+
+/// ScreenCapture is one `{"event":"screen_capture",...}` line from the
+/// recorder's stderr, produced by the same `--emit-levels` stream as AudioLevel.
+///
+/// It is what lets this app say how many displays are being *recorded*. That is
+/// a different number from how many are connected as soon as a display
+/// selection is in play, and only the recorder knows it: the selection is
+/// resolved natively on every tick, against the displays ScreenCaptureKit is
+/// actually offering. `NSScreen.screens.count` answers the other question, and
+/// answering this one with it would be a claim about capture nobody measured.
+struct ScreenCapture: Decodable {
+    var event: String
+    /// The displays this tick captured, derived from the frames themselves.
+    var displayIds: [UInt32]
+    /// How often the next one is due. Carried rather than assumed: `--interval`
+    /// is a flag, and a recorder started from a terminal need not match this
+    /// app's own preference.
+    var intervalMs: Int
+    /// Whether the configured selection named nothing that was connected, so
+    /// every display is being recorded instead.
+    var selectionFallback: Bool
+
+    /// When this app read the report, which is what staleness is counted from —
+    /// the same rule, and the same reasoning, as `AudioLevel.receivedAt`.
+    var receivedAt = Date()
+
+    private enum CodingKeys: String, CodingKey {
+        case event, displayIds, intervalMs, selectionFallback
+    }
+
+    /// How long this report stands before the count it carries stops meaning
+    /// "recording now".
+    ///
+    /// Two intervals is the budget, exactly as `dropStaleLevels` allows two
+    /// chunks: one missed tick is tolerated, a second means capture has stopped.
+    /// Floored so that at the 2s default the budget cannot fall below the 5s
+    /// status poll that prunes it, which would make the pill flap between a
+    /// count and "no signal" while capture was perfectly healthy.
+    var staleAfter: TimeInterval {
+        max(6, TimeInterval(intervalMs) / 1000 * 2)
+    }
+}
+
+/// Display is one row of `lumi displays --json`: a connected display and a
+/// JPEG preview of what is on it.
+///
+/// Which displays exist, and what they look like, are both the binary's answers.
+/// This app adds only the human-readable name, which macOS holds and Lumi does
+/// not (`NSScreen.localizedName`, keyed by the same CoreGraphics display ID).
+struct Display: Decodable, Identifiable {
+    var displayId: UInt32
+    var width: Int
+    var height: Int
+    var thumbnailBase64: String?
+    var captureError: String?
+
+    var id: UInt32 { displayId }
+
+    /// The preview, or nil when the image could not be read back — in which
+    /// case `captureError` may say why. `captureError` can also be set on a row
+    /// that *has* a thumbnail: the binary joins every display's capture failure
+    /// onto every frame that succeeded, and a display it could not capture at
+    /// all never reaches this list. So only read the error when there is no
+    /// image, which is what `thumbnail(for:)` does.
+    var thumbnail: NSImage? {
+        guard let encoded = thumbnailBase64,
+              let data = Data(base64Encoded: encoded) else { return nil }
+        return NSImage(data: data)
+    }
+
+    /// The NSScreen macOS holds for this display, matched on the same
+    /// CoreGraphics display ID the binary reports. Nil for a display macOS is
+    /// not presenting as a screen, which is why nothing structural depends on
+    /// it: it supplies labels, never identity or membership.
+    private var screen: NSScreen? {
+        NSScreen.screens.first { candidate in
+            let number = candidate.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
+            return number?.uint32Value == displayId
+        }
+    }
+
+    /// The name macOS gives this display, or a fallback naming the ID that
+    /// `--displays` actually takes.
+    var name: String { screen?.localizedName ?? "Display \(displayId)" }
+
+    /// The display's own pixel resolution, which is a macOS fact rather than a
+    /// Lumi one. Deliberately not `width`/`height`: those are the *preview's*
+    /// dimensions, since the binary captures thumbnails at a capped width.
+    var resolution: String? {
+        guard let screen else { return nil }
+        let pixels = CGSize(width: screen.frame.width * screen.backingScaleFactor,
+                            height: screen.frame.height * screen.backingScaleFactor)
+        return "\(Int(pixels.width)) × \(Int(pixels.height))"
+    }
 }
 
 /// AudioLevel is one `{"event":"audio_level",...}` line from the recorder's

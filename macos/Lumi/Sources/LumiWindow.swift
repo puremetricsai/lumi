@@ -126,15 +126,30 @@ struct LumiWindow: View {
 
     /// The live sources are behind the same preference gates the recorder itself
     /// is started with: a track that was never asked for has no pill.
+    ///
+    /// The count is the recorder's, reported per tick, and a missing report is
+    /// drawn as missing for the same reason `audioPill` draws a missing level
+    /// that way. `NSScreen.screens.count` is deliberately not the fallback: it
+    /// answers how many displays are *connected*, which stopped being the same
+    /// question the moment a display selection became possible, and a number
+    /// from it beside a green dot would be a claim about capture nobody
+    /// measured. The first tick is immediate, so this clears within seconds of
+    /// capture starting.
     private var displayPill: some View {
-        ToolbarPill {
+        let tick = recorder.screenCapture
+        let count = tick?.displayIds.count
+        let detail = count == nil ? "No signal yet"
+            : tick?.selectionFallback == true
+                ? "recording every display — the selected ones are not connected"
+                : count == 1 ? "1 display" : "\(count!) displays"
+        return ToolbarPill {
             Image(systemName: "display").font(.system(size: 12))
-            Text("\(recorder.displayCount)").font(.system(size: 12, weight: .medium))
-            StatusDot(color: Theme.live, diameter: 6)
+            Text(count.map(String.init) ?? "—").font(.system(size: 12, weight: .medium))
+            StatusDot(color: count == nil ? Theme.attention : Theme.live, diameter: 6)
         }
+        .help("Screen capture — \(detail)")
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(recorder.displayCount == 1
-            ? "Screen capture, 1 display" : "Screen capture, \(recorder.displayCount) displays")
+        .accessibilityLabel("Screen capture, \(detail)")
     }
 
     /// audioPill is one audio track.
