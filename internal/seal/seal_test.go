@@ -283,3 +283,39 @@ func TestNoMasterDerivesNoKeys(t *testing.T) {
 		t.Errorf("DeriveMedia(nil) = %v, %v; want nil, nil", media, err)
 	}
 }
+
+// TestSweepTempRemovesAbandonedPlaintext pins the cleanup that a crash needs.
+//
+// TempCopy's cleanup runs on a deferred close, which a SIGKILL or a power loss
+// never reaches — and what it would have removed is decrypted capture content
+// lying in the clear.
+func TestSweepTempRemovesAbandonedPlaintext(t *testing.T) {
+	abandoned, err := os.MkdirTemp("", TempPrefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaked := filepath.Join(abandoned, "shot.jpg")
+	if err := os.WriteFile(leaked, []byte("decrypted screen content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Something else's temporary directory must survive.
+	other, err := os.MkdirTemp("", "not-lumi-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(other) })
+
+	if err := SweepTemp(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(leaked); !os.IsNotExist(err) {
+		t.Error("an abandoned plaintext copy survived the sweep")
+	}
+	if _, err := os.Stat(other); err != nil {
+		t.Error("the sweep removed a directory that is not Lumi's")
+	}
+	// And it is safe to run when there is nothing to do.
+	if err := SweepTemp(); err != nil {
+		t.Errorf("a second sweep failed: %v", err)
+	}
+}

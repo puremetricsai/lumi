@@ -27,6 +27,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // Magic prefixes every sealed file.
@@ -271,7 +272,7 @@ func (k Key) TempCopy(path string) (string, func(), error) {
 	if err != nil {
 		return "", noop, err
 	}
-	dir, err := os.MkdirTemp("", "lumi-")
+	dir, err := os.MkdirTemp("", TempPrefix)
 	if err != nil {
 		return "", noop, fmt.Errorf("temporary directory: %w", err)
 	}
@@ -286,6 +287,45 @@ func (k Key) TempCopy(path string) (string, func(), error) {
 	return temp, cleanup, nil
 }
 
+// TempPrefix names every directory this package creates for a plaintext copy.
+//
+// It is a constant so that SweepTemp can find them again: cleanup normally runs
+// on the deferred close, which a crash, a SIGKILL, or a power loss never
+// reaches — and what is left behind is decrypted capture content sitting in the
+// clear. macOS clears its per-user temporary directory eventually, but
+// "eventually" is not a guarantee worth resting encryption on.
+const TempPrefix = "lumi-plaintext-"
+
+// SweepTemp removes plaintext copies abandoned by a process that did not exit
+// cleanly.
+//
+// It is called at the start of anything long-lived enough to have left one —
+// the recorder and `lumi encrypt` — rather than on a timer, because the only
+// thing that creates them is this package and the only thing that strands them
+// is a crash. Errors are returned rather than swallowed by the caller's choice;
+// a directory that will not delete is worth saying out loud, since the whole
+// point is that it holds readable capture.
+func SweepTemp() error {
+	root := os.TempDir()
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return err
+	}
+	var failed []string
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), TempPrefix) {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(root, entry.Name())); err != nil {
+			failed = append(failed, entry.Name())
+		}
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("could not remove abandoned plaintext copies: %s", strings.Join(failed, ", "))
+	}
+	return nil
+}
+
 // replaceDurably writes content over path without ever leaving it partial.
 //
 // The scratch file is a sibling so the rename is atomic within one filesystem,
@@ -293,6 +333,15 @@ func (k Key) TempCopy(path string) (string, func(), error) {
 // caller is overwriting the only copy of a captured file.
 func replaceDurably(path string, content []byte) error {
 	scratch := path + ScratchSuffix
+	// A scratch file from a seal killed mid-write is not evidence of anything —
+	// writeNew opens O_EXCL, so leaving it in place would make every future seal
+	// and unseal of this file fail forever. Worse on the way out: an interrupted
+	// unseal leaves a *complete plaintext copy* sitting beside the media until
+	// something removes it. It is named after its target and nothing else reads
+	// it, so removing it is safe and is the only thing that makes the retry work.
+	if err := os.Remove(scratch); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("clear a previous seal attempt on %s: %w", path, err)
+	}
 	if err := writeNew(scratch, content); err != nil {
 		return err
 	}

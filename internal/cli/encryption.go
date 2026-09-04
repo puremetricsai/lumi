@@ -2,6 +2,8 @@ package cli
 
 import (
 	"errors"
+	"fmt"
+	"os"
 
 	"github.com/puremetricsai/lumi/internal/macosnative"
 	"github.com/puremetricsai/lumi/internal/seal"
@@ -54,6 +56,66 @@ type keys struct {
 // whether encryption is on.
 func (k keys) enabled() bool { return k.media.Enabled() }
 
+// keysFor resolves the keys to open one particular store.
+//
+// The Keychain holds one key per *user*, not per data directory — deliberately,
+// so Storage settings' "Choose…" relocation cannot produce a store nothing can
+// decrypt. The consequence is that a stored key says nothing about whether the
+// database in front of this process is encrypted: a second `--data-dir` may be
+// a plaintext store this user also has, and handing it a key opens it as
+// "file is not a database".
+//
+// So the *file* decides, and the Keychain only supplies. A database that is
+// encrypted needs the key; one that is plaintext is opened plaintext whatever
+// the Keychain holds; and one that does not exist yet is created under the key
+// if there is one, which is what makes encrypting a fresh install work.
+func keysFor(databasePath string) (keys, error) {
+	encrypted, err := store.FileIsEncrypted(databasePath)
+	if err != nil {
+		return keys{}, err
+	}
+	if !encrypted {
+		if _, statErr := os.Stat(databasePath); statErr == nil {
+			// A real, plaintext database. Not this user's encrypted store.
+			return keys{}, nil
+		}
+	}
+	k, err := resolveKeys()
+	if err != nil {
+		return keys{}, err
+	}
+	if encrypted && !k.enabled() {
+		return keys{}, fmt.Errorf("the index at %s is encrypted and its key is not in this Mac's "+
+			"Keychain, so it cannot be read", databasePath)
+	}
+	return k, nil
+}
+
+// storeIsProtected reports whether the database at this path is one the
+// Keychain key opens — which is exactly the set of stores the content guard has
+// something to protect.
+//
+// It never reads the key, only asks whether one exists, so refusing a command
+// costs nobody a Keychain prompt.
+func storeIsProtected(databasePath string) (bool, error) {
+	encrypted, err := store.FileIsEncrypted(databasePath)
+	if err != nil {
+		return false, err
+	}
+	if encrypted {
+		return true, nil
+	}
+	if _, err := os.Stat(databasePath); err == nil {
+		// A real, plaintext database: already readable by anything, so a
+		// refusal would protect nothing.
+		return false, nil
+	}
+	// No database yet. If a key exists the next one created is encrypted, so
+	// treat it as protected rather than printing from a store that is about to
+	// become one.
+	return keyring.has()
+}
+
 // resolveKeys reads the master key and derives from it, or returns the zero
 // value when encryption is off.
 //
@@ -78,42 +140,57 @@ func resolveKeys() (keys, error) {
 	return keys{database: database, media: media}, nil
 }
 
-// encryptionState is what `lumi encrypt status` reports and what `lumi doctor`
-// checks. The two halves are separate fields because a conversion killed halfway
-// leaves them disagreeing, and one merged boolean could only report that as a
-// guess.
+// encryptionState is what `lumi encrypt status` reports, what `lumi doctor`
+// checks, and what the app's toggle reads.
+//
+// "Is this store encrypted" is the *file's* answer, not the Keychain's. The
+// Keychain holds one key per user, so a second `--data-dir` that this user keeps
+// in plaintext is simply not encrypted — reporting it as a half-finished
+// conversion because a key exists elsewhere was a diagnosis the evidence does
+// not support, and it named a repair the user does not need.
+//
+// A store with no database yet is reported by the key, because that is the state
+// a fresh install is in immediately after the toggle and the next database it
+// creates really will be encrypted.
 type encryptionState struct {
-	// Enabled is the Keychain's answer: a key exists, so encryption is on.
+	// Enabled is whether this store is encrypted.
 	Enabled bool `json:"enabled"`
-	// DatabaseEncrypted is the file's answer.
+	// DatabaseEncrypted is the file's own header. It differs from Enabled only
+	// before anything has been recorded.
 	DatabaseEncrypted bool `json:"database_encrypted"`
-	// Database is the path the two describe, because `--data-dir` means a
+	// KeyPresent is whether a key exists at all. Enabled without it is the one
+	// unrecoverable state.
+	KeyPresent bool `json:"key_present"`
+	// Database is the path all of this describes, because `--data-dir` means a
 	// process can be looking at a store the user did not expect.
 	Database string `json:"database"`
 }
 
-// Incomplete reports a conversion that did not finish. It is never normal, and
-// the fix is always to re-run `lumi encrypt`, which resumes.
-func (s encryptionState) Incomplete() bool {
-	return s.Enabled != s.DatabaseEncrypted
-}
-
-// Unrecoverable reports the one state nothing can fix: the database is
-// encrypted and the key that opens it is gone.
+// Unrecoverable reports the one state nothing can fix: this store is encrypted
+// and the key that opens it is gone.
 func (s encryptionState) Unrecoverable() bool {
-	return s.DatabaseEncrypted && !s.Enabled
+	return s.DatabaseEncrypted && !s.KeyPresent
 }
 
 func readEncryptionState(databasePath string) (encryptionState, error) {
-	enabled, err := keyring.has()
-	if err != nil {
-		return encryptionState{}, err
-	}
 	encrypted, err := store.FileIsEncrypted(databasePath)
 	if err != nil {
 		return encryptionState{}, err
 	}
-	return encryptionState{Enabled: enabled, DatabaseEncrypted: encrypted, Database: databasePath}, nil
+	present, err := keyring.has()
+	if err != nil {
+		return encryptionState{}, err
+	}
+	enabled, err := storeIsProtected(databasePath)
+	if err != nil {
+		return encryptionState{}, err
+	}
+	return encryptionState{
+		Enabled:           enabled,
+		DatabaseEncrypted: encrypted,
+		KeyPresent:        present,
+		Database:          databasePath,
+	}, nil
 }
 
 // errEncryptedContent is what a content-emitting command refuses with.

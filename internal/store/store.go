@@ -131,7 +131,19 @@ func Open(ctx context.Context, path string, key []byte) (*Store, error) {
 	// lazily, so a first open of a new data directory would otherwise record
 	// "no such file" as this store's identity and Stale would answer false
 	// forever after.
-	s.ident = identify(path)
+	//
+	// That leaves a window — the file could be replaced between the connection
+	// opening and this stat, which would pair a handle on the old inode with the
+	// new inode's identity and make Stale answer false permanently, defeating
+	// the whole check. Reading the identity again and requiring the two to agree
+	// closes it: a replacement mid-open is reported as no identity at all, and
+	// Stale then answers false for a knowable reason rather than a wrong one.
+	// `lumi encrypt` also holds the capture lock across a conversion, so this is
+	// the second line of defence rather than the first.
+	first := identify(path)
+	if second := identify(path); first == second {
+		s.ident = first
+	}
 	return s, nil
 }
 

@@ -54,6 +54,8 @@ it for deduplication, OCR, and transcription, indexes the row, and only then sea
 ordering is required by the never-lose-media rule: a file that is written and indexed is
 recoverable, and a file encrypted before its row exists is not. There is a similar sub-second window
 in `$TMPDIR` whenever OCR, transcription, or `lumi compress` needs to hand a path to a framework.
+Those copies are removed on the way out, and a crash that skips that is swept up by the next
+recording or conversion — but between the crash and the sweep they are readable.
 
 ## Losing the key destroys the data
 
@@ -77,7 +79,15 @@ starts with `LUMIENC1` or it does not; the database either starts with `SQLite f
 not. A run that is killed halfway leaves a directory every reader handles correctly, and re-running
 finishes it — skipping what is already done, with no risk of double-sealing.
 
-A conversion refuses while a recording is in progress, and takes the same lock `lumi compress` does.
+A conversion refuses while a recording is in progress. That is enforced with a lock, not just a
+check: every recorder holds `capture.lock` shared for its whole life and a conversion needs it
+exclusively, so neither can start underneath the other. It also takes `compress.lock`, since both
+rewrite media in place.
+
+Two things a conversion will not do quietly. It never deletes the key while any file is still
+sealed — that file would be gone, so it reports the failure and keeps the key. And it never exits
+zero having left plaintext media behind, because converting the database is what makes every status
+surface say "encrypted".
 
 ## The Keychain item, and why it is the legacy one
 

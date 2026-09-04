@@ -71,10 +71,59 @@ func TestEncryptedCaptureLeavesNoPlaintext(t *testing.T) {
 		t.Fatal("no screen events were indexed under an encrypted store")
 	}
 
-	// 2. Every media file is sealed, and its name is unchanged. The name matters:
-	//    internal/compress classifies work by extension and ReadAudioEnvelope
-	//    dispatches on `.wav`.
-	files := 0
+	// 2. Every file an event row points at is sealed, decrypts to what the fake
+	//    wrote, and kept its name.
+	//
+	//    Rows rather than a directory walk, deliberately. A frame whose Insert
+	//    failed is media nothing references, and the recorder leaves that
+	//    unsealed on purpose — sealing it would turn a file a person could still
+	//    open into ciphertext with no row pointing at it. Asserting over the
+	//    directory made this test fail whenever an insert lost its race with the
+	//    recording deadline, which was the test being wrong rather than the code.
+	all, err := s.AllEvents(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) == 0 {
+		t.Fatal("no events were indexed, so nothing was actually checked")
+	}
+	indexed := map[string]bool{}
+	for _, event := range all {
+		indexed[event.MediaPath] = true
+		raw, err := os.ReadFile(event.MediaPath)
+		if err != nil {
+			t.Errorf("event %d names media that is not there: %v", event.ID, err)
+			continue
+		}
+		if !bytes.HasPrefix(raw, []byte(seal.Magic)) {
+			t.Errorf("%s is indexed but was left unsealed on disk", event.MediaPath)
+			continue
+		}
+		ext := filepath.Ext(event.MediaPath)
+		if ext != ".jpg" && ext != ".wav" {
+			t.Errorf("%s has extension %q; sealing must not rename captured media",
+				event.MediaPath, ext)
+		}
+		// 3. And it decrypts back to exactly what the fake wrote. This is the
+		//    assertion that matters: "does not look like a JPEG" would pass
+		//    against a completely unencrypted file, because the fakes write
+		//    short ASCII strings with no magic of their own.
+		plain, err := mediaKey.ReadFile(event.MediaPath)
+		if err != nil {
+			t.Errorf("%s does not decrypt: %v", event.MediaPath, err)
+			continue
+		}
+		if bytes.HasPrefix(plain, []byte(seal.Magic)) {
+			t.Errorf("%s decrypts to something still sealed", event.MediaPath)
+		}
+		if len(plain) == 0 {
+			t.Errorf("%s decrypts to nothing", event.MediaPath)
+		}
+	}
+
+	// 3b. Anything on disk that no row names is left readable, which is the
+	//     other half of the same rule: unindexed media must stay something a
+	//     person can still open and `lumi encrypt` can still pick up.
 	for _, dir := range []string{paths.Screenshots, paths.Audio} {
 		entries, err := os.ReadDir(dir)
 		if err != nil {
@@ -82,38 +131,17 @@ func TestEncryptedCaptureLeavesNoPlaintext(t *testing.T) {
 		}
 		for _, entry := range entries {
 			path := filepath.Join(dir, entry.Name())
+			if indexed[path] {
+				continue
+			}
 			raw, err := os.ReadFile(path)
 			if err != nil {
 				t.Fatal(err)
 			}
-			files++
-			if !bytes.HasPrefix(raw, []byte(seal.Magic)) {
-				t.Errorf("%s was left unsealed on disk", path)
-				continue
-			}
-			ext := filepath.Ext(entry.Name())
-			if ext != ".jpg" && ext != ".wav" {
-				t.Errorf("%s has extension %q; sealing must not rename captured media", path, ext)
-			}
-			// 3. And it decrypts back to exactly what the fake wrote. This is
-			//    the assertion that matters: "does not look like a JPEG" would
-			//    pass against a completely unencrypted file, because the fakes
-			//    write short ASCII strings with no magic of their own.
-			plain, err := mediaKey.ReadFile(path)
-			if err != nil {
-				t.Errorf("%s does not decrypt: %v", path, err)
-				continue
-			}
-			if bytes.HasPrefix(plain, []byte(seal.Magic)) {
-				t.Errorf("%s decrypts to something still sealed", path)
-			}
-			if len(plain) == 0 {
-				t.Errorf("%s decrypts to nothing", path)
+			if bytes.HasPrefix(raw, []byte(seal.Magic)) {
+				t.Errorf("%s was sealed although no event row names it", path)
 			}
 		}
-	}
-	if files == 0 {
-		t.Fatal("the recorder wrote no media at all, so nothing was actually checked")
 	}
 
 	// 4. The database is encrypted, and carries none of the indexed text.

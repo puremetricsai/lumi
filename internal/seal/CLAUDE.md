@@ -35,6 +35,15 @@ layout.
   leaves one beside the media, where `internal/compress`'s reconcile would read it as an orphaned
   encode and `lumi encrypt`'s resume would try to convert it. Naming it here is what stops either
   guessing.
+- **A stale scratch file is removed before the retry, not skipped.** `writeNew` opens `O_EXCL`, so
+  one left by a killed seal would make every future seal *and unseal* of that file fail forever. On
+  the unseal path it is worse: the scratch is a complete plaintext copy, sitting beside the media
+  until something removes it.
+- **`SweepTemp` exists because `TempCopy`'s cleanup is a deferred call.** A crash, a SIGKILL or a
+  power loss never reaches it, and what it would have removed is decrypted capture content in the
+  clear. The recorder and `lumi encrypt` sweep on the way in — the only two things long-lived enough
+  to have stranded one. `TempPrefix` is exported so `internal/compress` and `lumi reveal` name their
+  own copies the same way and one sweep covers all three.
 - **`SealFile` replaces through a sibling temporary, fsyncing the file and the directory before the
   rename.** It is overwriting the only copy of a captured file.
 - **`SealInto` exists for `internal/compress` alone.** Sealing in place would mean the destination

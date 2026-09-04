@@ -74,7 +74,15 @@ func (a *app) guardContent(cmd *cobra.Command) error {
 		return fmt.Errorf("%s does not declare whether it emits captured content; "+
 			"annotate it with emitsContent or emitsNoContent", cmd.CommandPath())
 	}
-	enabled, err := keyring.has()
+	paths, err := a.paths()
+	if err != nil {
+		return err
+	}
+	// The same predicate openStore uses, and for the same reason: the Keychain
+	// holds one key per user, so a `--data-dir` pointing at a plaintext store
+	// this user also has is not protected by anything and refusing to read it
+	// would buy nothing. What is guarded is a store the key actually opens.
+	protected, err := storeIsProtected(paths.Database)
 	if err != nil {
 		// Refuse rather than guess. A Keychain that cannot be reached is not
 		// evidence that encryption is off, and treating it as such would print
@@ -82,7 +90,7 @@ func (a *app) guardContent(cmd *cobra.Command) error {
 		return fmt.Errorf("could not tell whether Lumi's history is encrypted, so %s will not "+
 			"print captured content: %w", cmd.CommandPath(), err)
 	}
-	if !enabled {
+	if !protected {
 		return nil
 	}
 	return fmt.Errorf("%s is unavailable: %w", cmd.CommandPath(), errEncryptedContent)

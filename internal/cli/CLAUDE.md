@@ -191,6 +191,23 @@ developer's own Claude config.
 - **Clearing `-wal` and `-shm` before the rename is not tidiness.** The write-ahead log holds pages of
   the old database in the old form, so a plaintext `-wal` beside an encrypted `lumi.db` is both a leak
   and a corrupt pair, and neither is visible from the file that was replaced.
+- **The irreversible step of `encrypt off` is gated on every file having made it back.** Deleting the
+  key while anything is still sealed destroys that file permanently, so a partial success may not
+  reach it: the command reports what failed and keeps the key. A key that will not *delete* is the
+  opposite case and is only a warning — everything is already decrypted, and the item is orphaned
+  because its ACL names a binary a rebuild or a rotated certificate replaced.
+- **`encrypt on` fails when it could not seal something, even though it converted the database.**
+  Converting the database is what makes the store read as encrypted, so exiting zero would have every
+  status surface say "on" over files anyone can read.
+- **Two locks, excluding two different things.** `capture.lock` is held *shared* by every recorder for
+  its whole life and *exclusively* by `lumi encrypt`, so neither can start underneath the other.
+  Reading `record.json` cannot do this on its own — a recorder starting after the check is invisible
+  to it — but it is still read first, because "a recording is in progress" is a better message than
+  "the lock is held". `compress.lock` is the separate one, against two writers rewriting one file.
+- **A content command may not print from a store it needed a key to open.** The annotation guard reads
+  the state once in `PersistentPreRunE`, so a conversion finishing between that check and the printing
+  would let the command open the newly encrypted store and print from it. `openStoreForContent` closes
+  that by construction rather than by narrowing the window.
 - **`lumi reveal` is a second content exit, deliberately.** Media that can never be looked at cannot be
   audited. Its plaintext copy is 0600 in `$TMPDIR` and lives only as long as the QuickLook panel —
   `qlmanage -p` blocks for exactly that, which `open -W` does not, since Preview is usually already

@@ -23,6 +23,7 @@ import (
 	"github.com/puremetricsai/lumi/internal/macosnative"
 	"github.com/puremetricsai/lumi/internal/platform"
 	"github.com/puremetricsai/lumi/internal/retention"
+	"github.com/puremetricsai/lumi/internal/seal"
 	"github.com/puremetricsai/lumi/internal/store"
 	"github.com/spf13/cobra"
 )
@@ -108,6 +109,35 @@ func smokeAudioOutputNote(processes []macosnative.AudioProcess, err error) strin
 	return strings.Join(named, ", ")
 }
 
+// openStoreForContent is openStore for the commands that print captured content.
+//
+// The annotation guard in PersistentPreRunE reads the encryption state once,
+// before the store is opened; a conversion finishing in the gap between that
+// check and the printing would let the command open the newly encrypted store
+// with its key and print from it. This closes that by construction rather than
+// by narrowing the window: a command that needed a key to read the store may not
+// print what it read, whatever the guard decided a moment earlier.
+// sweepAbandonedPlaintext removes decrypted copies a crashed run left behind.
+// A failure is reported and never fatal: it is cleanup, and refusing to record
+// because a stale temporary directory will not delete would be the worse trade.
+func sweepAbandonedPlaintext(out io.Writer) {
+	if err := seal.SweepTemp(); err != nil {
+		fmt.Fprintf(out, "warning: %v\n", err)
+	}
+}
+
+func (a *app) openStoreForContent(ctx context.Context) (*store.Store, config.Paths, error) {
+	s, paths, k, err := a.openStoreWithKeys(ctx)
+	if err != nil {
+		return nil, paths, err
+	}
+	if k.enabled() {
+		s.Close()
+		return nil, paths, errEncryptedContent
+	}
+	return s, paths, nil
+}
+
 func (a *app) openStore(ctx context.Context) (*store.Store, config.Paths, error) {
 	s, paths, _, err := a.openStoreWithKeys(ctx)
 	return s, paths, err
@@ -127,7 +157,7 @@ func (a *app) openStoreWithKeys(ctx context.Context) (*store.Store, config.Paths
 	if err := paths.Ensure(); err != nil {
 		return nil, paths, keys{}, err
 	}
-	k, err := resolveKeys()
+	k, err := keysFor(paths.Database)
 	if err != nil {
 		return nil, paths, keys{}, err
 	}
@@ -203,6 +233,23 @@ func (a *app) runForeground(cmd *cobra.Command, f recordFlags, registerState boo
 	if err := requireRecordingPermissions(cmd.Context(), !f.noScreen, !f.noAudio, !f.noAudio); err != nil {
 		return err
 	}
+	paths, err := a.paths()
+	if err != nil {
+		return err
+	}
+	// Held for the whole recording, shared with any other recorder and exclusive
+	// against `lumi encrypt`. Taken before the store is opened, because what it
+	// prevents is a conversion replacing the database out from under the handle
+	// this is about to take.
+	releaseCapture, err := lockRecording(paths)
+	if err != nil {
+		return err
+	}
+	defer releaseCapture()
+	// A plaintext copy stranded by a process that was killed is decrypted
+	// capture sitting in the clear. Nothing else creates them and nothing else
+	// will remove them, so the two long-lived entry points sweep on the way in.
+	sweepAbandonedPlaintext(os.Stderr)
 	s, paths, mediaKeys, err := a.openStoreWithKeys(cmd.Context())
 	if err != nil {
 		return err
@@ -337,7 +384,7 @@ func (a *app) searchCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			s, _, err := a.openStore(cmd.Context())
+			s, _, err := a.openStoreForContent(cmd.Context())
 			if err != nil {
 				return err
 			}
@@ -541,9 +588,6 @@ func reportEncryption(out io.Writer, paths config.Paths) {
 	case state.Unrecoverable():
 		fmt.Fprintf(out, "encryption\tdegraded\tthe index at %s is encrypted and its key is not in "+
 			"this Mac's Keychain; the captured history cannot be read or recovered\n", state.Database)
-	case state.Incomplete():
-		fmt.Fprintf(out, "encryption\tdegraded\ta conversion did not finish; run `lumi encrypt on` "+
-			"or `lumi encrypt off` again to complete it\n")
 	case state.Enabled:
 		fmt.Fprintf(out, "encryption\tok\ton; `search` and `transcript` do not print captured "+
 			"content, and the MCP server decrypts in memory\n")
@@ -575,7 +619,7 @@ func reportAttributionHealth(ctx context.Context, out io.Writer, paths config.Pa
 		}
 		return fmt.Errorf("stat index: %w", err)
 	}
-	k, err := resolveKeys()
+	k, err := keysFor(paths.Database)
 	if err != nil {
 		fmt.Fprintf(out, "attribution\tdegraded\tcould not read Lumi's encryption key: %v\n", err)
 		return nil

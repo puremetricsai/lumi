@@ -320,3 +320,35 @@ func ratio(before, after int64) string {
 	}
 	return fmt.Sprintf("%.1fx", float64(before)/float64(after))
 }
+
+// captureLockName is the file that keeps `lumi encrypt` and a live recorder off
+// each other. Every recorder holds it shared for its whole life; `lumi encrypt`
+// needs it exclusively.
+const captureLockName = "capture.lock"
+
+// lockCapture takes the conversion side of that lock.
+func lockCapture(paths config.Paths) (func(), error) {
+	if err := os.MkdirAll(paths.Root, 0o700); err != nil {
+		return nil, err
+	}
+	release, err := lockFile(filepath.Join(paths.Root, captureLockName))
+	if errors.Is(err, errHeld) {
+		return nil, errors.New("a recording is in progress; stop it before changing encryption " +
+			"(Lumi's menu bar, or `lumi record stop`)")
+	}
+	return release, err
+}
+
+// lockRecording takes the recorder side: shared, so any number of recorders may
+// run, and held for the life of the process so no conversion can start under one.
+func lockRecording(paths config.Paths) (func(), error) {
+	if err := os.MkdirAll(paths.Root, 0o700); err != nil {
+		return nil, err
+	}
+	release, err := lockFileShared(filepath.Join(paths.Root, captureLockName))
+	if errors.Is(err, errHeld) {
+		return nil, errors.New("Lumi is encrypting or decrypting its history; recording can start " +
+			"again when that finishes")
+	}
+	return release, err
+}

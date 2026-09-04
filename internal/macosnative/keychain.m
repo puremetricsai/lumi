@@ -28,11 +28,14 @@ int32_t LumiKeychainStore(const uint8_t *key, size_t length) {
             return errSecParam;
         }
 
-        // Replace rather than update: an existing item carries an ACL trusting
-        // whatever binary wrote it, and after a rebuild that is a code identity
-        // this process no longer has. Adding fresh re-establishes the ACL.
-        SecItemDelete((__bridge CFDictionaryRef)LumiKeychainQuery());
-
+        // Everything that can fail happens *before* the existing item is
+        // touched. Replacing rather than updating is deliberate — an existing
+        // item carries an ACL trusting whatever binary wrote it, and after a
+        // rebuild that is a code identity this process no longer has, so adding
+        // fresh is what re-establishes it. But deleting first means a failure in
+        // any of the three calls below destroys the only key to the user's
+        // captured history, which is the single most damaging thing this file
+        // can do. Build the access reference, then delete, then add.
         SecTrustedApplicationRef self = NULL;
         OSStatus status = SecTrustedApplicationCreateFromPath(NULL, &self);
         if (status != errSecSuccess) {
@@ -48,6 +51,8 @@ int32_t LumiKeychainStore(const uint8_t *key, size_t length) {
             return (int32_t)status;
         }
 
+        SecItemDelete((__bridge CFDictionaryRef)LumiKeychainQuery());
+
         NSMutableDictionary *item = LumiKeychainQuery();
         item[(id)kSecValueData] = [NSData dataWithBytes:key length:length];
         item[(id)kSecAttrAccess] = (__bridge id)access;
@@ -55,6 +60,15 @@ int32_t LumiKeychainStore(const uint8_t *key, size_t length) {
         item[(id)kSecAttrDescription] = @"Encrypts Lumi's screenshots, audio, and search index";
 
         status = SecItemAdd((__bridge CFDictionaryRef)item, NULL);
+        if (status != errSecSuccess) {
+            // The delete already happened, so retry without the ACL rather than
+            // leave the user with no key at all. A key stored under the default
+            // access is weaker — other programs get a prompt from the system
+            // rather than from an ACL naming Lumi — but it is the difference
+            // between a weaker guarantee and unreadable data.
+            [item removeObjectForKey:(id)kSecAttrAccess];
+            status = SecItemAdd((__bridge CFDictionaryRef)item, NULL);
+        }
         CFRelease(access);
         return (int32_t)status;
     }

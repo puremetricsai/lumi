@@ -614,8 +614,12 @@ func (r *Recorder) storeAudioChunk(ctx context.Context, chunk AudioChunk) {
 	// track back off disk. Sealing per frame would work — ReadAudioEnvelope
 	// unseals — but it would pay for a decrypt on the capture path to undo
 	// something this function had just done.
-	for _, frame := range chunk.Frames {
-		r.sealCaptured(frame.Path, "audio chunk")
+	// Only frames that became rows. A frame whose Insert failed is media nothing
+	// references, and sealing it would turn a file a person could still open —
+	// and `lumi prune --all` could still sweep — into ciphertext with no row and
+	// no key path pointing at it.
+	for _, result := range results {
+		r.sealCaptured(result.frame.Path, "audio chunk")
 	}
 }
 

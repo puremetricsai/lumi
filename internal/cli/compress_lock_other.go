@@ -11,3 +11,7 @@ import "errors"
 func lockFile(string) (func(), error) {
 	return nil, errors.New("compression needs an advisory file lock, which is unavailable on this platform")
 }
+
+func lockFileShared(string) (func(), error) {
+	return nil, errors.New("recording needs an advisory file lock, which is unavailable on this platform")
+}

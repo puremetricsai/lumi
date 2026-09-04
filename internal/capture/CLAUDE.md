@@ -38,6 +38,9 @@ rows are shaped is `internal/store`'s; the labelling rules the recorder applies 
     after the insert loop and reaches `measureInternalEnergy`, which reads the system track back off
     disk. Sealing per frame works — `ReadAudioEnvelope` unseals — but it pays for a decrypt on the
     capture path to undo what the same function just did.
+  - **Only frames that became rows are sealed.** A frame whose `Insert` failed is media nothing
+    references, and sealing it would turn a file a person could still open — and `prune --all` could
+    still sweep — into ciphertext with no row and no key path pointing at it.
   - **`Recorder.Cipher`'s zero value is a working pass-through.** Every path here is written once and
     is correct whether or not encryption is on; there is no encrypted variant of the pipeline.
 - **Captured filenames are unique per display per instant, and per chunk per track, and something else now

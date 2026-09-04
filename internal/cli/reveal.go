@@ -10,6 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/puremetricsai/lumi/internal/seal"
 	"github.com/puremetricsai/lumi/internal/store"
 )
 
@@ -75,7 +76,7 @@ func (a *app) revealCommand() *cobra.Command {
 				return nil
 			}
 
-			dir, err := os.MkdirTemp("", "lumi-reveal-")
+			dir, err := os.MkdirTemp("", seal.TempPrefix)
 			if err != nil {
 				return fmt.Errorf("temporary directory: %w", err)
 			}

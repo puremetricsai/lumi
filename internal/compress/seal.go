@@ -24,7 +24,7 @@ func stagedDestination(cipher seal.Key, destination string) (string, func(), err
 	if !cipher.Enabled() {
 		return destination, func() {}, nil
 	}
-	dir, err := os.MkdirTemp("", "lumi-compress-")
+	dir, err := os.MkdirTemp("", seal.TempPrefix)
 	if err != nil {
 		return "", func() {}, fmt.Errorf("staging directory: %w", err)
 	}

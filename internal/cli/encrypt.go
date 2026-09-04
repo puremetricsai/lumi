@@ -122,12 +122,28 @@ func (a *app) runEncrypt(ctx context.Context, cmd *cobra.Command, asJSON, on boo
 	if err := paths.Ensure(); err != nil {
 		return err
 	}
+	// Two locks, because two different things must be excluded.
+	//
+	// The capture lock is exclusive here and shared by every recorder, so a
+	// recorder cannot start underneath a conversion and a conversion cannot
+	// start underneath a recorder. Reading `record.json` is not enough on its
+	// own — a recorder that starts after the check is invisible to it, and would
+	// then write plaintext behind a walk that has already passed it and hold a
+	// handle on a database about to be renamed away. The state file is still
+	// read first, because "a recording is in progress" is a better message than
+	// "the lock is held".
 	if err := refuseEncryptWhileRecording(paths); err != nil {
 		return err
 	}
-	// The same lock `lumi compress` takes, and for the same reason: both rewrite
-	// media in place, and two of them on one file is the state neither ordering
-	// survives.
+	releaseCapture, err := lockCapture(paths)
+	if err != nil {
+		return err
+	}
+	defer releaseCapture()
+	sweepAbandonedPlaintext(cmd.ErrOrStderr())
+	// The compress lock, for the same reason `lumi compress` takes it: both
+	// rewrite media in place, and two of them on one file is the state neither
+	// ordering survives.
 	release, err := lockCompress(paths)
 	if err != nil {
 		return err
@@ -146,7 +162,7 @@ func (a *app) runEncrypt(ctx context.Context, cmd *cobra.Command, asJSON, on boo
 	// that promise false, and the file stayed readable forever with nothing
 	// saying so. Re-running is idempotent by construction; let it run and report
 	// what it found.
-	if !on && !state.Enabled && !state.DatabaseEncrypted {
+	if !on && !state.Enabled && !state.KeyPresent {
 		return errors.New("Lumi's history is not encrypted")
 	}
 	if !on && state.Unrecoverable() {
@@ -183,10 +199,20 @@ func (a *app) encryptOn(ctx context.Context, cmd *cobra.Command, paths config.Pa
 	}
 	// The database last: `encrypt status` reads its header, so converting it
 	// first would report a finished job while the media was still plaintext.
-	if state.DatabaseEncrypted {
-		return nil
+	if !state.DatabaseEncrypted {
+		if err := convertDatabase(ctx, paths.Database, nil, k.database); err != nil {
+			return err
+		}
 	}
-	return convertDatabase(ctx, paths.Database, nil, k.database)
+	// Converting the database is what makes the store read as encrypted, so a
+	// run that left plaintext media behind must not exit reporting success —
+	// every status surface would then say "on" over files anyone can read.
+	// Re-running repairs it; sealed files are skipped by their header.
+	if result.MediaFailed > 0 {
+		return fmt.Errorf("%d file(s) could not be encrypted and are still readable on disk; "+
+			"run `lumi encrypt on` again to retry them", result.MediaFailed)
+	}
+	return nil
 }
 
 func (a *app) encryptOff(ctx context.Context, cmd *cobra.Command, paths config.Paths,
@@ -210,9 +236,28 @@ func (a *app) encryptOff(ctx context.Context, cmd *cobra.Command, paths config.P
 	if err := convertMedia(ctx, cmd, paths, k.media, false, result); err != nil {
 		return err
 	}
-	// The key goes last. Deleting it before the media is unsealed would strand
-	// every file this run had not reached yet.
-	return keyring.delete()
+	// The key goes last, and only if every file made it back. Deleting it while
+	// anything is still sealed destroys that file permanently — this is the one
+	// irreversible step in the command, so a partial success may not reach it.
+	// The run is re-runnable: what is already unsealed is skipped by its header.
+	if result.MediaFailed > 0 {
+		return fmt.Errorf("%d file(s) could not be decrypted, so Lumi's encryption key has been "+
+			"kept — deleting it would destroy them. Fix the cause and run `lumi encrypt off` again",
+			result.MediaFailed)
+	}
+	if err := keyring.delete(); err != nil {
+		// Everything is already decrypted at this point, so a key that will not
+		// delete is orphaned rather than dangerous — and it happens for a
+		// mundane reason: the item's ACL names the binary that created it, and a
+		// rebuild or a rotated signing certificate makes this a different one.
+		// Failing the command here would report a decryption that succeeded as
+		// an error, and send the user looking for data loss that did not happen.
+		fmt.Fprintf(cmd.ErrOrStderr(),
+			"Lumi's history is decrypted, but the old key could not be removed from the Keychain: %v\n"+
+				"It no longer opens anything. Delete the \"Lumi captured history\" item in Keychain "+
+				"Access if you want it gone.\n", err)
+	}
+	return nil
 }
 
 // ensureKey returns the stored key, generating and storing one if there is none.
@@ -392,9 +437,6 @@ func renderEncryptionState(cmd *cobra.Command, state encryptionState) error {
 	case state.Unrecoverable():
 		fmt.Fprintln(out, "Encryption: BROKEN — the database is encrypted and its key is not in this "+
 			"Mac's Keychain. The captured history cannot be read.")
-	case state.Incomplete():
-		fmt.Fprintln(out, "Encryption: incomplete — a conversion did not finish. Run `lumi encrypt on` "+
-			"or `lumi encrypt off` again to complete it.")
 	case state.Enabled:
 		fmt.Fprintln(out, "Encryption: on")
 	default:

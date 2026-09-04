@@ -345,3 +345,62 @@ func TestEncryptOnSweepsMediaLeftUnsealed(t *testing.T) {
 		t.Errorf("the resumed run did not report skipping the files already sealed:\n%s", out)
 	}
 }
+
+// TestEncryptOffKeepsTheKeyWhenAFileWillNotDecrypt is the regression for the
+// worst bug in this feature.
+//
+// `encrypt off` counted failures and deleted the key anyway. The key is the only
+// thing that opens a sealed file, so a single failure meant permanent,
+// unannounced data loss — and the command exited zero.
+func TestEncryptOffKeepsTheKeyWhenAFileWillNotDecrypt(t *testing.T) {
+	fakeKeyring(t)
+	paths, _ := seedDataDir(t)
+	if out, err := runLumi(t, "--data-dir", paths.Root, "encrypt", "on"); err != nil {
+		t.Fatalf("encrypt on: %v\n%s", err, out)
+	}
+
+	// A sealed file this key cannot open: the header says sealed, the body is
+	// not a valid ciphertext. Corruption or a key from another Mac look the same.
+	damaged := filepath.Join(paths.Screenshots, "20260903-140000-display-1.jpg")
+	if err := os.WriteFile(damaged, append([]byte(seal.Magic), bytes.Repeat([]byte{0}, 64)...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := runLumi(t, "--data-dir", paths.Root, "encrypt", "off")
+	if err == nil {
+		t.Fatalf("encrypt off reported success with a file it could not decrypt:\n%s", out)
+	}
+	if has, keyErr := keyring.has(); keyErr != nil || !has {
+		t.Fatal("the key was deleted while a sealed file remained; that data is now unrecoverable")
+	}
+	// Everything it could decrypt still came back, so re-running finishes the job
+	// once the damaged file is dealt with.
+	if !bytes.Contains([]byte(err.Error()), []byte("kept")) {
+		t.Errorf("the error does not say the key was kept: %v", err)
+	}
+}
+
+// `encrypt on` must not report success while plaintext media remains: every
+// status surface would then say "on" over files anyone can read.
+func TestEncryptOnReportsMediaItCouldNotSeal(t *testing.T) {
+	fakeKeyring(t)
+	paths, _ := seedDataDir(t)
+
+	// A file the process cannot open. However it got that way, it is media that
+	// stays readable to anything that *can* open it.
+	blocked := filepath.Join(paths.Screenshots, "20260903-150000-display-1.jpg")
+	if err := os.WriteFile(blocked, []byte("still readable to root"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(blocked, 0o600) })
+
+	out, err := runLumi(t, "--data-dir", paths.Root, "encrypt", "on")
+	if err == nil {
+		t.Fatalf("encrypt on reported success with media it could not seal:\n%s", out)
+	}
+	// The rest of the store is still converted — a partial failure must not
+	// abandon the files it could protect.
+	if encrypted, statErr := store.FileIsEncrypted(paths.Database); statErr != nil || !encrypted {
+		t.Error("the database was left unconverted by a partial media failure")
+	}
+}
