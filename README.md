@@ -109,11 +109,13 @@ Use the install command and none of that applies. All of it goes away with notar
 
 ## Using Lumi
 
-The menu bar item shows capture state and starts and stops recording. The Lumi window shows what is being captured, with live level meters per audio track — a track reading "No signal yet" after the first second is a real answer about that track, not a quiet room.
+The menu bar item shows capture state and starts and stops recording. The Lumi window shows what is being captured, with live level meters per audio track — a track reading "No signal yet" after the first second is a real answer about that track, not a quiet room. The display count beside them is the number of displays actually being recorded, reported by the recorder itself, not the number connected.
+
+On a multi-display Mac, **Settings → Recording** lists every connected display with a live preview of what is on it, so a personal or second screen can be left out. A display that is unplugged stays selected, so reconnecting it resumes recording it; if none of the selected displays are connected, Lumi records every display rather than nothing, and says so in the window and the log.
 
 Settings holds six tabs:
 
-- **Recording** — screen interval, audio chunk length, which sources to capture, and the speech locale. Changing one restarts capture on the new settings.
+- **Recording** — screen interval, audio chunk length, which sources to capture, which displays to record, and the speech locale. Changing one restarts capture on the new settings.
 - **Storage** — where the data lives and how much of it there is.
 - **Permissions** — the four grants Lumi needs, and buttons that request them.
 - **MCP** — connect an AI agent. See below.
