@@ -226,7 +226,7 @@ func (NativeAudio) Open(ctx context.Context, directory string, chunk time.Durati
 	if err != nil {
 		return nil, fmt.Errorf("record system and microphone audio with ScreenCaptureKit: %w", err)
 	}
-	return &nativeAudioStream{session: session}, nil
+	return &nativeAudioStream{session: session, stallAfter: chunk + nativeAudioStallGrace, progress: time.Now()}, nil
 }
 
 // nativeAudioPollInterval bounds how long a Next call sits inside the native
@@ -234,9 +234,20 @@ func (NativeAudio) Open(ctx context.Context, directory string, chunk time.Durati
 // to interrupt a waiting reader, so promptness on shutdown is bought here.
 const nativeAudioPollInterval = 250 * time.Millisecond
 
+// nativeAudioStallGrace is how far past one chunk duration a stream may go
+// without finishing a chunk before it is declared stalled. A wedged replayd can
+// accept a start and then deliver nothing, ever, without calling
+// didStopWithError: Next would poll forever, log nothing, and record nothing.
+// A stall stops the session like cancellation does, so whatever the chunk in
+// flight holds is still delivered before the error.
+const nativeAudioStallGrace = 30 * time.Second
+
 type nativeAudioStream struct {
-	session  *macosnative.AudioSession
-	stopping bool
+	session    *macosnative.AudioSession
+	stopping   bool
+	stallAfter time.Duration
+	progress   time.Time
+	stalled    error
 }
 
 func (s *nativeAudioStream) Next(ctx context.Context) (AudioChunk, error) {
@@ -251,7 +262,18 @@ func (s *nativeAudioStream) Next(ctx context.Context) (AudioChunk, error) {
 		}
 		switch {
 		case len(chunk.Frames) > 0:
+			s.progress = time.Now()
 			return s.adopt(chunk), nil
+		case !chunk.Closed && !s.stopping && time.Since(s.progress) > s.stallAfter:
+			// Checked only when nothing was queued, so slow transcription between
+			// two Next calls never reads as a stalled stream.
+			s.stalled = fmt.Errorf("ScreenCaptureKit delivered no audio for %s: replayd, the system daemon "+
+				"behind every ScreenCaptureKit stream, may be wedged (`killall replayd` restarts it)",
+				s.stallAfter.Round(time.Second))
+			s.stopping = true
+			s.session.Stop()
+		case chunk.Closed && s.stalled != nil:
+			return AudioChunk{}, s.stalled
 		case chunk.Closed && chunk.CaptureError != "":
 			return AudioChunk{}, fmt.Errorf("ScreenCaptureKit audio capture stopped: %s", chunk.CaptureError)
 		case chunk.Closed:
