@@ -32,7 +32,9 @@ struct StorageSettings: View {
     /// UserDefaults copy would be a second one — wrong in exactly the case that
     /// matters, when a conversion was interrupted and the two halves disagree.
     @State private var encryption: EncryptionStatus?
-    @State private var isConverting = false
+    /// The direction of the conversion in progress, or nil. The switch shows it
+    /// while the conversion runs, so it never reads OFF beside "Encrypting…".
+    @State private var converting: Bool?
     @State private var encryptionProblem: String?
     @State private var confirmingDecrypt = false
 
@@ -76,10 +78,10 @@ struct StorageSettings: View {
                     .disabled(encryptionToggleDisabled)
                     .accessibilityLabel("Encrypt Lumi's captured history")
 
-                if isConverting {
+                if let converting {
                     HStack(spacing: 8) {
                         ProgressView().controlSize(.small)
-                        Text(encryption?.enabled == true ? "Decrypting…" : "Encrypting…")
+                        Text(convertingLabel(on: converting))
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -151,7 +153,8 @@ struct StorageSettings: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("Everything Lumi has captured will be written back to this Mac in readable form, "
-                + "where any program running as you can read it. The key is deleted.")
+                + "where any program running as you can read it. The key is deleted, so any other Lumi "
+                + "data folder encrypted on this Mac becomes unreadable.")
         }
     }
 
@@ -164,7 +167,7 @@ struct StorageSettings: View {
     /// disk does not have.
     private var encryptionBinding: Binding<Bool> {
         Binding(
-            get: { encryption?.enabled ?? false },
+            get: { converting ?? encryption?.enabled ?? false },
             set: { wanted in
                 guard wanted != (encryption?.enabled ?? false) else { return }
                 if wanted {
@@ -182,17 +185,28 @@ struct StorageSettings: View {
         guard let encryption else { return true }
         // There is nothing to offer when the key is gone: the data cannot be
         // decrypted, and re-encrypting would not bring it back.
-        return isConverting || encryption.isUnrecoverable
+        return converting != nil || encryption.unrecoverable
+    }
+
+    /// Every media file is rewritten, so the count is the honest size of the job.
+    private func convertingLabel(on: Bool) -> String {
+        let verb = on ? "Encrypting" : "Decrypting"
+        guard let usage else { return "\(verb)…" }
+        let files = usage.screenshotFiles + usage.audioChunks
+        return "\(verb) \(Format.count(files)) files. A large history can take several minutes."
     }
 
     @ViewBuilder
     private func encryptionCaption(for status: EncryptionStatus) -> some View {
-        if status.isUnrecoverable {
+        if status.unrecoverable {
             SettingsCaption("Lumi's encryption key is not in this Mac's Keychain, so the captured "
                 + "history cannot be read or recovered. This happens if the key was deleted, or if "
                 + "this data folder came from another Mac.")
-        } else if status.isIncomplete {
-            SettingsCaption("A previous conversion did not finish. Switch the toggle to complete it.")
+        } else if status.incomplete {
+            SettingsCaption("A change to encryption stopped partway, so part of Lumi's history is still "
+                + "encrypted. Turn encryption on to finish encrypting it, or finish decrypting it.")
+            Button("Finish Decrypting") { confirmingDecrypt = true }
+                .disabled(converting != nil)
         } else if status.enabled {
             SettingsCaption("Screenshots, audio, and the search index are encrypted on disk. The key is "
                 + "in this Mac's Keychain and never leaves it. Your AI assistant still reads your "
@@ -229,10 +243,14 @@ struct StorageSettings: View {
     /// `stop()` returns normally after its timeout with the child still alive,
     /// and converting underneath it is worse than not converting at all.
     private func convertEncryption(to enabled: Bool) async {
-        guard !isConverting else { return }
-        isConverting = true
+        guard converting == nil else { return }
+        converting = enabled
+        LumiApp.isChangingEncryption = true
         encryptionProblem = nil
-        defer { isConverting = false }
+        defer {
+            converting = nil
+            LumiApp.isChangingEncryption = false
+        }
 
         let wasSupervising = recorder.isSupervisingRecorder
         if wasSupervising {
