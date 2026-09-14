@@ -119,9 +119,9 @@ func (a *app) mcpSetupCommand() *cobra.Command {
 	var f mcpSetupFlags
 	cmd := &cobra.Command{
 		Use:   "setup",
-		Short: "Register lumi as an MCP server with Claude Code, Claude Desktop, and Codex CLI",
+		Short: "Register lumi as an MCP server with Claude Code, Claude Desktop, and Codex",
 		Long: "Write the lumi MCP server entry into the configuration of every MCP client\n" +
-			"installed on this machine — Claude Code, Claude Desktop, and Codex CLI.\n" +
+			"installed on this machine — Claude Code, Claude Desktop, and Codex.\n" +
 			"Clients launch `lumi mcp` themselves over stdio, so nothing runs in the\n" +
 			"background and no port is opened.\n\n" +
 			"Setup is idempotent: a second run reports 'unchanged' and writes nothing. An\n" +
