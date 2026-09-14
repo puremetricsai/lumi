@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.7.1](https://github.com/puremetricsai/lumi/compare/v0.7.0...v0.7.1) (2026-09-14)
+
+
+### Bug Fixes
+
+* **capture:** survive a wedged replayd without leaking streams or stalling silently ([1b08cca](https://github.com/puremetricsai/lumi/commit/1b08cca24b96fd66ea8f87079f11d2468263fa72))
+* **capture:** treat an audio stream that delivers nothing as failed ([3d2d834](https://github.com/puremetricsai/lumi/commit/3d2d8344dd36b00d02f4f9d44388b13a65f2f2d0))
+* **macosnative:** stop streams abandoned on a start timeout ([7dc11b3](https://github.com/puremetricsai/lumi/commit/7dc11b382e3a5dad171ef7859be77d33d6c780d8))
+
 ## [0.7.0](https://github.com/puremetricsai/lumi/compare/v0.6.0...v0.7.0) (2026-09-14)
 
 
