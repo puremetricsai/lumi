@@ -268,7 +268,8 @@ func (s *nativeAudioStream) Next(ctx context.Context) (AudioChunk, error) {
 			// Checked only when nothing was queued, so slow transcription between
 			// two Next calls never reads as a stalled stream.
 			s.stalled = fmt.Errorf("ScreenCaptureKit delivered no audio for %s: replayd, the system daemon "+
-				"behind every ScreenCaptureKit stream, may be wedged (`killall replayd` restarts it)",
+				"behind every ScreenCaptureKit stream, may be wedged (restart it with "+
+				"`sudo launchctl kill 9 gui/$(id -u)/com.apple.replayd` or reboot; `killall` can't, it is SIP-protected)",
 				s.stallAfter.Round(time.Second))
 			s.stopping = true
 			s.session.Stop()

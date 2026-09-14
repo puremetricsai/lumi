@@ -93,7 +93,8 @@ pure file-to-file work needing no TCC grant, so their tests are ordinary build-t
 
 Every `SCStream` and every `SCShareableContent` read is served by `replayd`, one per-user daemon shared by
 every capture client on the machine. It can wedge system-wide — `screencapture -v` hangs with no Lumi
-involved — and only restarting it (`killall replayd`; launchd relaunches it) recovers. Lumi cannot fix
+involved — and only restarting it (`sudo launchctl kill 9 gui/$(id -u)/com.apple.replayd`, or a reboot;
+`killall` cannot signal it, replayd is SIP-protected) recovers. Lumi cannot fix
 that state; it must not deepen it, and it must say that is what happened.
 
 - **A start that outlives its wait is abandoned, and whoever sees it succeed afterwards stops it.**

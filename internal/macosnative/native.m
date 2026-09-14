@@ -42,7 +42,9 @@ static NSError *LumiTimeoutError(NSString *operation) {
                            userInfo:@{NSLocalizedDescriptionKey:
                                           [NSString stringWithFormat:@"%@ timed out: replayd, the system daemon "
                                                                      @"behind ScreenCaptureKit, is not responding "
-                                                                     @"(`killall replayd` restarts it)", operation]}];
+                                                                     @"(restart it with `sudo launchctl kill 9 "
+                                                                     @"gui/$(id -u)/com.apple.replayd` or reboot; "
+                                                                     @"`killall` can't, it is SIP-protected)", operation]}];
 }
 
 static BOOL LumiWait(dispatch_semaphore_t semaphore, NSTimeInterval seconds,
