@@ -89,6 +89,21 @@ pure file-to-file work needing no TCC grant, so their tests are ordinary build-t
   `lumi_hid_access_name`) because asserting the live resolution passes vacuously in any foreground process,
   so it would fail only in the daemon, where nothing is asserting.
 
+## replayd
+
+Every `SCStream` and every `SCShareableContent` read is served by `replayd`, one per-user daemon shared by
+every capture client on the machine. It can wedge system-wide — `screencapture -v` hangs with no Lumi
+involved — and only restarting it (`killall replayd`; launchd relaunches it) recovers. Lumi cannot fix
+that state; it must not deepen it, and it must say that is what happened.
+
+- **A start that outlives its wait is abandoned, and whoever sees it succeed afterwards stops it.**
+  Returning `NO` while `startCapture` is still pending leaves replayd holding a stream no client will ever
+  stop, and the recorder retries every second — each retry another orphan inside a daemon that is already
+  too slow to answer. The completion handler and the timeout branch share a lock so neither ordering leaks.
+- **Zero displays from a prompt enumeration is not a timeout.** A sleeping display or closed lid returns
+  an empty list at once; calling that "timed out" filled one index's log with 165k lines pointing at a
+  hung replayd that was not there.
+
 ## Permissions and audio processes
 
 - **Report `denied` separately from `not_determined` wherever macOS lets you**, since they need opposite

@@ -35,10 +35,14 @@ static char *LumiCopyError(NSError *error) {
     return LumiCopyUTF8(error.localizedDescription ?: @"unknown native macOS error");
 }
 
+// Every wait here is on ScreenCaptureKit, which replayd serves for every client on
+// the machine, so a timeout names it and the one thing that recovers it.
 static NSError *LumiTimeoutError(NSString *operation) {
     return [NSError errorWithDomain:@"LumiNative" code:3
                            userInfo:@{NSLocalizedDescriptionKey:
-                                          [NSString stringWithFormat:@"%@ timed out", operation]}];
+                                          [NSString stringWithFormat:@"%@ timed out: replayd, the system daemon "
+                                                                     @"behind ScreenCaptureKit, is not responding "
+                                                                     @"(`killall replayd` restarts it)", operation]}];
 }
 
 static BOOL LumiWait(dispatch_semaphore_t semaphore, NSTimeInterval seconds,
@@ -1655,10 +1659,18 @@ static NSMutableDictionary *LumiAudioFrameDictionary(NSString *path, NSString *s
             contentError = failure;
             dispatch_semaphore_signal(contentReady);
         }];
-        if (!LumiWait(contentReady, 10.0, @"enumerate audio capture content", &contentError) ||
-            content.displays.count == 0) {
+        if (!LumiWait(contentReady, 10.0, @"enumerate audio capture content", &contentError)) {
+            if (error != NULL) *error = contentError;
+            return NO;
+        }
+        // A prompt answer with no displays (display asleep, lid closed) is not a
+        // timeout. Labelling it one sent every overnight log looking for a hung
+        // replayd that was not there.
+        if (content.displays.count == 0) {
             if (error != NULL) {
-                *error = contentError ?: LumiTimeoutError(@"enumerate audio capture content");
+                *error = contentError ?: [NSError errorWithDomain:@"LumiNative" code:22
+                                                         userInfo:@{NSLocalizedDescriptionKey:
+                                                                        @"ScreenCaptureKit returned no displays"}];
             }
             return NO;
         }
@@ -1684,18 +1696,43 @@ static NSMutableDictionary *LumiAudioFrameDictionary(NSString *path, NSString *s
                        sampleHandlerQueue:self.audioQueue error:&addError] ||
             ![self.stream addStreamOutput:self type:SCStreamOutputTypeMicrophone
                        sampleHandlerQueue:self.audioQueue error:&addError]) {
-            if (error != NULL) *error = addError;
+            if (error != NULL) {
+                *error = addError ?: [NSError errorWithDomain:@"LumiNative" code:23
+                                                     userInfo:@{NSLocalizedDescriptionKey:
+                                                                    @"add ScreenCaptureKit audio output"}];
+            }
             return NO;
         }
 
+        // A start that outlives the wait is abandoned, not cancelled: replayd may
+        // still bring the stream up later, with nobody left to stop it. Every
+        // retry would then leave another orphaned stream inside replayd, which is
+        // the last thing a daemon too slow to answer needs. Whichever side sees
+        // the start succeed after abandonment stops it.
+        SCStream *stream = self.stream;
         __block NSError *startError = nil;
+        __block BOOL startFinished = NO;
+        __block BOOL startAbandoned = NO;
         dispatch_semaphore_t started = dispatch_semaphore_create(0);
-        [self.stream startCaptureWithCompletionHandler:^(NSError *failure) {
-            startError = failure;
+        [stream startCaptureWithCompletionHandler:^(NSError *failure) {
+            @synchronized(stream) {
+                startFinished = YES;
+                startError = failure;
+                if (startAbandoned && failure == nil) [stream stopCaptureWithCompletionHandler:^(NSError *e) {}];
+            }
             dispatch_semaphore_signal(started);
         }];
-        if (!LumiWait(started, 10.0, @"start ScreenCaptureKit audio", &startError) || startError != nil) {
-            if (error != NULL) *error = startError ?: LumiTimeoutError(@"start ScreenCaptureKit audio");
+        if (!LumiWait(started, 10.0, @"start ScreenCaptureKit audio", NULL)) {
+            self.stopping = YES;
+            @synchronized(stream) {
+                startAbandoned = YES;
+                if (startFinished && startError == nil) [stream stopCaptureWithCompletionHandler:^(NSError *e) {}];
+            }
+            if (error != NULL) *error = LumiTimeoutError(@"start ScreenCaptureKit audio");
+            return NO;
+        }
+        if (startError != nil) {
+            if (error != NULL) *error = startError;
             return NO;
         }
         return YES;
