@@ -87,9 +87,8 @@ The app is a supervisor and nothing else — root `CLAUDE.md` states that rule; 
 - **Stopping is SIGTERM then wait (`stopTimeout`, 20s), never SIGKILL** — in-flight media is still being
   written and indexed. This is also the app-quit path: `AppDelegate` returns `.terminateLater` while a
   child is held, so ⌘Q asks first and then shuts down gracefully.
-- **The menu bar is the only place Lumi is quit from, and the toolbar's x only hides.** An x in a window
-  is read as "quit" by anyone who has met a menu bar app, so the button says otherwise in its tooltip;
-  capture keeps running with every window closed, which is the point of the app. Nothing outside
+- **The menu bar is the only place Lumi is quit from, and the toolbar has no close button.** Esc hides
+  it; capture keeps running with every window closed, which is the point of the app. Nothing outside
   `AppDelegate.quit()` may end the process — it owns the "Stop recording and quit Lumi?" confirmation and
   the graceful stop above, and `NSApp.terminate` skips the question and shortens the wait.
 - **The window is the toolbar capsule and has no chrome at all.** `.windowStyle(.plain)`, then
@@ -97,8 +96,8 @@ The app is a supervisor and nothing else — root `CLAUDE.md` states that rule; 
   to the top center of its screen — re-pinned on every resize, since the bar's width changes with state.
   It is not movable: a toolbar that can be put anywhere is one that gets lost. The toolbar has no room for
   prose: a source's sentence is its `.help` and its accessibility label, never a caption.
-- **Hiding the window is `AppDelegate.hideWindow()`, reached from three places and implemented once.**
-  The x button and Esc go through `LumiApp.hide`, parked exactly like `openSettings` but set by
+- **Hiding the window is `AppDelegate.hideWindow()`, reached from two places and implemented once.**
+  Esc goes through `LumiApp.hide`, parked exactly like `openSettings` but set by
   `AppDelegate` in `applicationDidFinishLaunching`, since unlike an `OpenSettingsAction` it needs no
   SwiftUI environment to read; the menu bar item calls it directly. Not `\.dismiss`: the menu item is
   titled on `lumiWindow?.isVisible` — `isVisible` alone, because a floating window is routinely visible

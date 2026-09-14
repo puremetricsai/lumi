@@ -8,7 +8,8 @@ import SwiftUI
 /// timer, and no session name — which is why the whole app fits on a strip:
 /// what a user comes here for is "is it capturing, and is it hearing anything".
 ///
-/// The three states differ only in what sits between the mark and the gear.
+/// The three states differ only in what the mark does and what sits between
+/// it and the gear.
 /// Nothing here scrolls, wraps, or resizes; the window is exactly this row.
 struct LumiWindow: View {
     @Environment(RecorderController.self) private var recorder
@@ -26,7 +27,6 @@ struct LumiWindow: View {
                     .accessibilityLabel(error)
             }
             settingsButton
-            hideButton
         }
         .padding(.horizontal, 10)
         .frame(height: Theme.barHeight)
@@ -55,13 +55,32 @@ struct LumiWindow: View {
 
     // MARK: - Mark
 
-    /// The mark is a plain glyph.
+    /// The mark is the start button while idle, and a plain glyph otherwise.
     ///
     /// Drawn exactly as the menu bar draws it: the same template image, at the
-    /// same secondary weight as every other glyph on the bar. It is not a
-    /// button, so it takes no hover treatment — but it is not a logo either,
-    /// and a solid white disc among translucent glyphs read as one.
+    /// same secondary weight as every other glyph on the bar — a solid white
+    /// disc among translucent glyphs read as a logo. Idle, it takes the red
+    /// hover the stop button does, because starting capture is what it does.
+    @ViewBuilder
     private var mark: some View {
+        if recorder.state == .idle {
+            Button {
+                Task { await recorder.start() }
+            } label: {
+                markGlyph
+            }
+            .buttonStyle(ToolbarButtonStyle(hoverTint: Theme.recording))
+            .accessibilityLabel("Start recording")
+            .help("Start recording")
+        } else {
+            markGlyph
+                .foregroundStyle(.secondary)
+                .frame(width: Theme.barItemHeight, height: Theme.barItemHeight)
+                .accessibilityLabel("Lumi")
+        }
+    }
+
+    private var markGlyph: some View {
         Group {
             if let glyph = MenuBarGlyph.template {
                 Image(nsImage: glyph)
@@ -69,13 +88,10 @@ struct LumiWindow: View {
                     .renderingMode(.template)
             }
         }
-        .foregroundStyle(.secondary)
         // A touch larger than the 17pt glyphs beside it: the mark is a filled
         // disc where they are line art, and at the same size it reads smaller
         // than they do.
         .frame(width: 20, height: 20)
-        .frame(width: Theme.barItemHeight, height: Theme.barItemHeight)
-        .accessibilityLabel("Lumi")
     }
 
     // MARK: - States
@@ -97,7 +113,7 @@ struct LumiWindow: View {
                 stopButton
             }
         case .idle:
-            recordButton
+            EmptyView()
         case .needsPermissions:
             permissionsButton
         }
@@ -185,17 +201,6 @@ struct LumiWindow: View {
 
     // MARK: - Buttons
 
-    private var recordButton: some View {
-        Button {
-            Task { await recorder.start() }
-        } label: {
-            Image(systemName: "circle.fill").font(.system(size: 15))
-        }
-        .buttonStyle(ToolbarButtonStyle(tint: .white, hoverTint: Theme.recording))
-        .accessibilityLabel("Start recording")
-        .help("Start recording")
-    }
-
     private var stopButton: some View {
         Button {
             Task { await recorder.stop() }
@@ -242,24 +247,6 @@ struct LumiWindow: View {
         .buttonStyle(ToolbarButtonStyle())
         .accessibilityLabel("Open Settings")
         .help("Settings")
-    }
-
-    /// The x puts the toolbar away; it does not quit Lumi.
-    ///
-    /// An x in the corner of a window is read as "quit" by anyone who has met a
-    /// menu bar app that hides in one, which is why the tooltip says what
-    /// happens to capture. Lumi is quit from the menu bar and nowhere else, so
-    /// this takes the plain tint rather than the red reserved for controls that
-    /// end something.
-    private var hideButton: some View {
-        Button {
-            LumiApp.hide?()
-        } label: {
-            Image(systemName: "xmark").font(.system(size: 13, weight: .medium))
-        }
-        .buttonStyle(ToolbarButtonStyle())
-        .accessibilityLabel("Hide Lumi")
-        .help("Hide the toolbar. Recording continues.")
     }
 }
 
