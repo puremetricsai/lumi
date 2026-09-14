@@ -93,10 +93,10 @@ The app is a supervisor and nothing else — root `CLAUDE.md` states that rule; 
   `AppDelegate.quit()` may end the process — it owns the "Stop recording and quit Lumi?" confirmation and
   the graceful stop above, and `NSApp.terminate` skips the question and shortens the wait.
 - **The window is the toolbar capsule and has no chrome at all.** `.windowStyle(.plain)`, then
-  `WindowChrome` in `LumiWindow` clears the background, floats the window above other apps, and turns
-  `isMovableByWindowBackground` *off* — the Lumi mark's `WindowDragGesture` is the only thing that moves
-  it, so dragging from a button presses the button. The toolbar has no room for prose: a source's
-  sentence is its `.help` and its accessibility label, never a caption.
+  `WindowChrome` in `LumiWindow` clears the background, floats the window above other apps, and pins it
+  to the top center of its screen — re-pinned on every resize, since the bar's width changes with state.
+  It is not movable: a toolbar that can be put anywhere is one that gets lost. The toolbar has no room for
+  prose: a source's sentence is its `.help` and its accessibility label, never a caption.
 - **Hiding the window is `AppDelegate.hideWindow()`, reached from three places and implemented once.**
   The x button and Esc go through `LumiApp.hide`, parked exactly like `openSettings` but set by
   `AppDelegate` in `applicationDidFinishLaunching`, since unlike an `OpenSettingsAction` it needs no

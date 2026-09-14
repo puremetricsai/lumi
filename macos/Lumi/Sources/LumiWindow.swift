@@ -55,16 +55,12 @@ struct LumiWindow: View {
 
     // MARK: - Mark
 
-    /// The mark is the window's drag handle and nothing else.
+    /// The mark is a plain glyph.
     ///
     /// Drawn exactly as the menu bar draws it: the same template image, at the
     /// same secondary weight as every other glyph on the bar. It is not a
     /// button, so it takes no hover treatment — but it is not a logo either,
     /// and a solid white disc among translucent glyphs read as one.
-    ///
-    /// `isMovableByWindowBackground` is off, so this gesture is the only thing
-    /// that moves the window — dragging a button must press it, not slide the
-    /// toolbar out from under the pointer.
     private var mark: some View {
         Group {
             if let glyph = MenuBarGlyph.template {
@@ -79,9 +75,7 @@ struct LumiWindow: View {
         // than they do.
         .frame(width: 20, height: 20)
         .frame(width: Theme.barItemHeight, height: Theme.barItemHeight)
-        .contentShape(Rectangle())
-        .gesture(WindowDragGesture())
-        .accessibilityLabel("Lumi. Drag to move the window")
+        .accessibilityLabel("Lumi")
     }
 
     // MARK: - States
@@ -273,9 +267,9 @@ struct LumiWindow: View {
 ///
 /// `.windowStyle(.plain)` removes the title bar and the traffic lights but
 /// leaves an opaque background behind the capsule's rounded corners, and there
-/// is no SwiftUI API for a window's level or for turning background-dragging
-/// off. All four settings are AppKit-only, so this reaches the `NSWindow` once,
-/// when the view is installed in it.
+/// is no SwiftUI API for a window's level, its movability, or pinning it to a
+/// screen edge. All of these are AppKit-only, so this reaches the `NSWindow`
+/// once, when the view is installed in it.
 private struct WindowChrome: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView { Configurator() }
 
@@ -283,15 +277,18 @@ private struct WindowChrome: NSViewRepresentable {
 
     private final class Configurator: NSView {
         private var escapeMonitor: Any?
+        private var pinObservers: [NSObjectProtocol] = []
 
         deinit {
             if let escapeMonitor { NSEvent.removeMonitor(escapeMonitor) }
+            pinObservers.forEach(NotificationCenter.default.removeObserver)
         }
 
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             guard let window else { return }
             installEscapeMonitor(for: window)
+            installPin(for: window)
             window.hasShadow = true
             // `.plain` leaves a borderless window, and a borderless window
             // cannot become key — so no key press reaches it at all and the
@@ -300,6 +297,12 @@ private struct WindowChrome: NSViewRepresentable {
             // content the whole window, and the title bar it would otherwise
             // draw is made transparent and emptied of its buttons.
             window.styleMask.insert([.titled, .fullSizeContentView])
+            // The title bar still reserves its height as a top safe area, and
+            // SwiftUI sized the window to the capsule plus that inset: an
+            // invisible strip above the bar that AppKit keeps below the menu
+            // bar, so the pinned capsule sat a title bar's height too low.
+            let titlebar = window.frame.height - window.contentLayoutRect.height
+            window.contentView?.additionalSafeAreaInsets.top = -titlebar
             window.titlebarAppearsTransparent = true
             window.titleVisibility = .hidden
             for button in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
@@ -310,14 +313,40 @@ private struct WindowChrome: NSViewRepresentable {
             // Above every other app: the toolbar says whether capture is live,
             // which is worth nothing behind the window being captured.
             window.level = .floating
-            // The mark is the drag handle. Dragging the background would make
-            // every button a place the window slides from.
-            window.isMovableByWindowBackground = false
+            // Pinned, never dragged: a toolbar that can sit anywhere is one the
+            // user has to hunt for. `isMovable`, not only the background flag,
+            // because the hidden title bar strip is a drag region of its own.
+            window.isMovable = false
             // "Open Lumi" must open it where the user is. A window left on the
             // Space it was created in reports `isVisible` while being on
             // nobody's screen, and with no traffic lights and no Dock icon
-            // there is nothing to find it with.
-            window.collectionBehavior.insert(.moveToActiveSpace)
+            // there is nothing to find it with. `.fullScreenAuxiliary` lets it
+            // float over a full-screen app's Space as well.
+            window.collectionBehavior.insert([.moveToActiveSpace, .fullScreenAuxiliary])
+        }
+
+        /// Keeps the capsule at the top center of its screen.
+        ///
+        /// Re-pinned on resize, not only once: the bar's width changes with the
+        /// recorder's state, and a window grows from its origin, so a single
+        /// placement would drift right every time recording started.
+        private func installPin(for window: NSWindow) {
+            guard pinObservers.isEmpty else { return }
+            let pin = { [weak window] in
+                guard let window, let screen = (window.screen ?? NSScreen.main)?.visibleFrame else { return }
+                window.setFrameOrigin(NSPoint(
+                    x: screen.midX - window.frame.width / 2,
+                    y: screen.maxY - window.frame.height - 8))
+            }
+            let center = NotificationCenter.default
+            pinObservers = [
+                center.addObserver(forName: NSWindow.didResizeNotification, object: window, queue: .main) { _ in pin() },
+                center.addObserver(forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main) { _ in pin() },
+                center.addObserver(
+                    forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
+                ) { _ in pin() },
+            ]
+            pin()
         }
 
         /// Esc is handled here rather than with `onExitCommand`.

@@ -18,7 +18,6 @@ struct LumiApp: App {
         // toolbar capsule itself. `WindowChrome` in LumiWindow clears the rest.
         .windowStyle(.plain)
         .windowResizability(.contentSize)
-        .defaultPosition(.center)
         .commandsRemoved()
 
         Settings {
