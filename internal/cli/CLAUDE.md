@@ -1,7 +1,7 @@
 # internal/cli
 
 Cobra commands (`record start`/`status`/`stop`, `search`, `mcp`, `prune`, `compress`, `doctor`,
-`permissions`, `native-smoke`, `transcribe`, `transcript`, `version`, `app`, `update`). This package wires concrete processors into a
+`permissions`, `native-smoke`, `transcribe`, `transcript`, `version`, `app`, `update`, `displays`). This package wires concrete processors into a
 `capture.Recorder`; data flows one way from here and never back. `record start` detaches to the background
 by default (`--foreground` keeps it inline) as a re-exec tracked by a JSON state file and log under the data
 dir (`record_daemon.go`); `record stop` sends SIGTERM and waits for graceful shutdown. `search` offers exact
@@ -30,6 +30,26 @@ developer's own Claude config.
   relaunch it to fix that. `internal/mcp` takes the hooks rather than doing this itself because that package
   touches no filesystem; `internal/selfexec` owns the rules about which path to watch. Losing the watcher
   costs the upgrade path, not the server, so it must never abort startup.
+- **`displays` never opens the store either, for `doctor`'s reason**, and it is where the IDs
+  `record start --displays` takes come from. Its thumbnails are previews: captured into a temporary
+  directory at a capped width, base64'd into the JSON, and deleted before the command returns. They never
+  enter the store, so the rule against losing captured media does not reach them; base64 rather than files
+  because the one caller reads this over a pipe already, and a file on disk would have a lifetime neither
+  side owns. **A display whose preview failed is not listed at all**: `lumi_capture_screens_json` appends a
+  frame only after writing its JPEG, and joins every failure onto the frames that succeeded — so a row's
+  `capture_error` may belong to a display that has no row, which is why the text output only reads it as
+  this display's answer when there is no thumbnail beside it. That is not fixed here because a per-display
+  error frame would carry an empty `Path` into `captureScreen`, which binds `MediaPath: frame.Path` with no
+  guard onto a `media_path` column that is `NOT NULL` but not non-empty: a row naming no media, which is the
+  one thing the recorder may never write.
+- **`--displays` names IDs, not positions, and is ignored under `--no-screen` rather than refused.** A
+  position would have to be resolved against an enumeration made once, and the recorder re-enumerates every
+  tick precisely so a display can be plugged in without restarting it. The refusal is skipped because
+  `Lumi.app` emits the two flags independently, and pairing them is not a user error; contrast
+  `--register-state`, which genuinely cannot work without `--foreground`.
+- **`--emit-levels` gates the whole supervisor stream, not only levels.** `telemetryEmitter` serialises
+  both line types onto stderr — a half-written JSON line is unparseable rather than merely out of order,
+  and two recorder goroutines write now. Off still means the measurement is never taken: the sinks are nil.
 - **`doctor` never opens the store through `openStore`**, which would create a mistyped `--data-dir` and
   then call the empty result healthy. It reports observed attribution from the index alongside permission
   status.

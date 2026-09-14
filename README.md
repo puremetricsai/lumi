@@ -109,11 +109,13 @@ Use the install command and none of that applies. All of it goes away with notar
 
 ## Using Lumi
 
-The menu bar item shows capture state and starts and stops recording. The Lumi window shows what is being captured, with live level meters per audio track — a track reading "No signal yet" after the first second is a real answer about that track, not a quiet room.
+The menu bar item shows capture state and starts and stops recording. The Lumi window shows what is being captured, with live level meters per audio track — a track reading "No signal yet" after the first second is a real answer about that track, not a quiet room. The display count beside them is the number of displays actually being recorded, reported by the recorder itself, not the number connected.
+
+On a multi-display Mac, **Settings → Recording** lists every connected display with a live preview of what is on it, so a personal or second screen can be left out. A display that is unplugged stays selected, so reconnecting it resumes recording it; if none of the selected displays are connected, Lumi records every display rather than nothing, and says so in the window and the log.
 
 Settings holds six tabs:
 
-- **Recording** — screen interval, audio chunk length, which sources to capture, and the speech locale. Changing one restarts capture on the new settings.
+- **Recording** — screen interval, audio chunk length, which sources to capture, which displays to record, and the speech locale. Changing one restarts capture on the new settings.
 - **Storage** — where the data lives and how much of it there is.
 - **Permissions** — the four grants Lumi needs, and buttons that request them.
 - **MCP** — connect an AI agent. See below.
@@ -147,7 +149,7 @@ You never run the server yourself. The agent starts it as a child process when i
 
 - **Claude Code** is configured at user scope through the `claude` CLI, which is the only supported way to modify `~/.claude.json` — that file is live application state, not just settings.
 - **Claude Desktop** has no CLI, so its `claude_desktop_config.json` is edited in place. Every other key is preserved and a `.lumi-backup` copy is written first, though top-level keys come back in alphabetical order. **Quit Claude Desktop before setting up and reopen it afterwards** — it only reads the config at launch, and quitting also avoids racing its own writes. The MCP tab says when this is needed.
-- **Codex CLI** is configured through the `codex` CLI in both directions, which is the only supported writer for `~/.codex/config.toml` and preserves the comments and top-level keys a hand-rolled TOML round-trip would drop. Note that `codex` itself rewrites the whole `mcp_servers` table when it adds an entry, so other servers there may come back reformatted — their values are unchanged, and everything outside that table is untouched.
+- **Codex** is configured through the `codex` CLI in both directions, which is the only supported writer for `~/.codex/config.toml` and preserves the comments and top-level keys a hand-rolled TOML round-trip would drop. Note that `codex` itself rewrites the whole `mcp_servers` table when it adds an entry, so other servers there may come back reformatted — their values are unchanged, and everything outside that table is untouched. One entry covers both the `codex` CLI and Codex threads inside the ChatGPT desktop app, which read the same file. Ask Lumi from a Codex thread rather than from a regular ChatGPT chat — a chat there has not been observed to offer a local MCP server, Lumi's or any other.
 - Clients that are not installed are skipped rather than reported as a failure.
 
 Because the agent keeps that server process for the whole session, upgrading Lumi mid-session would otherwise leave it serving the old build — the replaced file on disk does not affect a process already running. So the server watches its own binary and, once the session is briefly idle, replaces itself in place with the new one. The agent's connection is preserved across the swap and it never sees an interruption. Until that happens, and if the index turns out to have been written by a newer Lumi than the server is running, every tool result says so in its `notice` rather than quietly returning results from the older build.

@@ -28,9 +28,9 @@ enum Theme {
 /// ToolbarButtonStyle is every button in the toolbar capsule.
 ///
 /// One style, not one per control: the hover tint is the only thing that
-/// differs. Red on hover is reserved for the controls that end something —
-/// record's own stop, and quit — so hovering a destructive control says so
-/// before it is clicked. The gear takes the default and merely brightens.
+/// differs. Red on hover is reserved for the controls that start or stop
+/// capture — the idle mark and stop — so hovering one says so before it is
+/// clicked. The gear takes the default and merely brightens.
 struct ToolbarButtonStyle: ButtonStyle {
     var tint: Color = .secondary
     var hoverTint: Color = .primary
@@ -51,7 +51,7 @@ struct ToolbarButtonStyle: ButtonStyle {
 }
 
 /// ToolbarPill is one status group in the recording toolbar: an icon, a
-/// measurement, and a health dot in their own softer capsule.
+/// measurement, and a health dot.
 struct ToolbarPill<Content: View>: View {
     @ViewBuilder var content: Content
 
@@ -61,7 +61,6 @@ struct ToolbarPill<Content: View>: View {
         }
         .padding(.horizontal, 10)
         .frame(height: Theme.barItemHeight)
-        .background(Capsule().fill(Color.primary.opacity(0.07)))
     }
 }
 

@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -243,6 +245,15 @@ func childArgs(dataDir string, f recordFlags) []string {
 	}
 	if f.emitLevels {
 		args = append(args, "--emit-levels")
+	}
+	if len(f.displays) > 0 {
+		// Joined by hand: pflag's own String() renders a slice as "[1,2]",
+		// which the child would then refuse to parse.
+		ids := make([]string, 0, len(f.displays))
+		for _, id := range f.displays {
+			ids = append(ids, strconv.FormatUint(uint64(id), 10))
+		}
+		args = append(args, "--displays", strings.Join(ids, ","))
 	}
 	return args
 }

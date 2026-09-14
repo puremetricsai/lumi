@@ -14,6 +14,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -832,7 +833,7 @@ func TestNativeCaptureSmoke(t *testing.T) {
 	}
 	ctx := context.Background()
 	directory := t.TempDir()
-	frames, err := CaptureScreens(ctx, directory, "smoke")
+	frames, err := CaptureScreens(ctx, directory, "smoke", nil, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1374,5 +1375,61 @@ func TestVisionReadsACompressedFrame(t *testing.T) {
 	}
 	if _, err := RecognizeText(context.Background(), destination); err != nil {
 		t.Fatalf("Apple Vision rejected a compressed frame: %v", err)
+	}
+}
+
+// TestSelectDisplays asserts the rule the capture loop applies to a display
+// allowlist. It drives the native selector over a supplied list rather than a
+// live capture, which on the single-display machine most tests run on could not
+// tell an honoured selection from an ignored one.
+func TestSelectDisplays(t *testing.T) {
+	present := []uint32{1, 2, 3}
+	for _, testCase := range []struct {
+		name     string
+		allow    []uint32
+		want     []uint32
+		fallback bool
+	}{
+		{name: "no selection captures every display", allow: nil, want: present},
+		{name: "selection is honoured", allow: []uint32{3, 1}, want: []uint32{1, 3}},
+		{name: "partial selection keeps what is connected", allow: []uint32{2, 99}, want: []uint32{2}},
+		{
+			name:     "a selection naming nothing connected falls back to every display",
+			allow:    []uint32{99, 100},
+			want:     present,
+			fallback: true,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			selection, err := selectDisplays(present, testCase.allow)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(selection.DisplayIDs, testCase.want) {
+				t.Errorf("chose %v, want %v", selection.DisplayIDs, testCase.want)
+			}
+			if selection.SelectionFallback != testCase.fallback {
+				t.Errorf("fallback = %v, want %v", selection.SelectionFallback, testCase.fallback)
+			}
+		})
+	}
+}
+
+// TestSelectDisplaysWithNoDisplays covers the shape the caller cannot produce
+// but the rule must still answer: an empty present list yields an empty
+// selection. The allowlist matched nothing, so the fallback is reported — and
+// falling back to every display, when there are none, is still none. Nothing
+// downstream ever sees it: the fallback rides on the frames, and a tick with no
+// displays produces none.
+func TestSelectDisplaysWithNoDisplays(t *testing.T) {
+	selection, err := selectDisplays(nil, []uint32{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(selection.DisplayIDs) != 0 {
+		t.Errorf("chose %v, want none", selection.DisplayIDs)
+	}
+	if !selection.SelectionFallback {
+		t.Error("a selection that matched nothing should report the fallback")
 	}
 }

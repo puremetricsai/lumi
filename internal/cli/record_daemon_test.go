@@ -112,6 +112,7 @@ func TestChildArgsForwardsFlags(t *testing.T) {
 		duration:     10 * time.Minute,
 		noAudio:      true,
 		speechLocale: "en-GB",
+		displays:     []uint{7, 12},
 	})
 	joined := strings.Join(args, " ")
 	for _, want := range []string{
@@ -122,6 +123,9 @@ func TestChildArgsForwardsFlags(t *testing.T) {
 		"--speech-locale en-GB",
 		"--duration 10m0s",
 		"--no-audio",
+		// Comma-joined, not pflag's own "[7 12]" rendering, which the child
+		// would refuse to parse.
+		"--displays 7,12",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("childArgs missing %q; got %q", want, joined)
@@ -135,6 +139,12 @@ func TestChildArgsForwardsFlags(t *testing.T) {
 	bare := strings.Join(childArgs("", recordFlags{speechLocale: "en-US"}), " ")
 	if strings.Contains(bare, "--data-dir") || strings.Contains(bare, "--duration") {
 		t.Errorf("childArgs added optional flags unexpectedly; got %q", bare)
+	}
+	// An unset selection must forward nothing: the child's own default is
+	// "every connected display", and an empty --displays would be a third
+	// spelling of it.
+	if strings.Contains(bare, "--displays") {
+		t.Errorf("childArgs added --displays with no selection; got %q", bare)
 	}
 }
 

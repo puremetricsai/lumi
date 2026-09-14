@@ -38,6 +38,21 @@ pure file-to-file work needing no TCC grant, so their tests are ordinary build-t
   round trip rather than write a stub and mislabel it a verification failure. The sub-second tail chunks a
   stopped recording leaves are the real inputs this catches.
 
+## Screen capture
+
+- **The display allowlist is resolved here, over `SCShareableContent.displays`, because that is the list
+  the capture loop iterates.** `LumiSelectDisplays` intersects the caller's IDs with the displays actually
+  on offer and falls back to all of them when the intersection is empty, reporting that as
+  `selection_fallback` on every frame — stamped the way `capture_error` already is, and kept separate from
+  it. Resolving it against a second enumeration (`CGGetOnlineDisplayList`, say) would let an allowlist look
+  satisfiable to the caller and then match nothing here: zero frames, `"ScreenCaptureKit returned no
+  displays"` every tick, and nothing recorded at all. `lumi_select_displays_json` exists for the Go test,
+  like `lumi_resolve_frontmost_json`: asserting the rule through a live capture would pass vacuously on the
+  single-display machine most tests run on.
+- **`max_pixel_width` caps the shot, it does not resize one.** `lumi displays` gets its thumbnails by
+  asking `SCStreamConfiguration` for a smaller image, so there is one capture path rather than a second one
+  or a decode-and-scale step.
+
 ## Attribution
 
 - **The frontmost pid resolves Accessibility → window list → `NSWorkspace`, and `NSWorkspace` coming last is

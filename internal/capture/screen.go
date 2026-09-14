@@ -13,11 +13,17 @@ import (
 // produced it. A source enumerates displays on every capture, so display
 // hotplug does not require restarting the recorder.
 type ScreenFrame struct {
-	Path         string
-	DisplayID    uint32
-	Width        int
-	Height       int
-	CaptureError string
+	Path      string
+	DisplayID uint32
+	Width     int
+	Height    int
+	// SelectionFallback reports that the configured display selection named
+	// nothing that was connected, so every display was captured instead. It
+	// rides on the frame rather than on a return value because that is what
+	// keeps ScreenSource a one-method interface: a source that filters nothing
+	// simply never sets it.
+	SelectionFallback bool
+	CaptureError      string
 }
 
 // ScreenContext is what the recorder knows about the focused application at one
@@ -69,12 +75,24 @@ type ContextExtractor interface {
 	Snapshot(context.Context) (ScreenContext, error)
 }
 
-// NativeScreens captures every currently connected display with
-// ScreenCaptureKit's SCScreenshotManager.
-type NativeScreens struct{}
+// NativeScreens captures connected displays with ScreenCaptureKit's
+// SCScreenshotManager: the ones DisplayIDs names, or every one of them when it
+// is empty.
+//
+// The selection is resolved natively, on every call, against the display list
+// that same call is about to iterate — never against a list enumerated once at
+// startup, which is what keeps capture responsive to hotplug, and never against
+// a second enumeration, which could name a display ScreenCaptureKit does not
+// offer and so match nothing. A selection naming no connected display captures
+// every display and marks the frames SelectionFallback.
+type NativeScreens struct {
+	// DisplayIDs is the CoreGraphics display IDs to capture. Empty means every
+	// connected display.
+	DisplayIDs []uint32
+}
 
-func (NativeScreens) Capture(ctx context.Context, directory, prefix string) ([]ScreenFrame, error) {
-	frames, err := macosnative.CaptureScreens(ctx, directory, prefix)
+func (n NativeScreens) Capture(ctx context.Context, directory, prefix string) ([]ScreenFrame, error) {
+	frames, err := macosnative.CaptureScreens(ctx, directory, prefix, n.DisplayIDs, 0)
 	if err != nil {
 		return nil, fmt.Errorf("capture displays with ScreenCaptureKit: %w", err)
 	}
@@ -82,7 +100,7 @@ func (NativeScreens) Capture(ctx context.Context, directory, prefix string) ([]S
 	for _, frame := range frames {
 		result = append(result, ScreenFrame{
 			Path: frame.Path, DisplayID: frame.DisplayID, Width: frame.Width, Height: frame.Height,
-			CaptureError: frame.CaptureError,
+			SelectionFallback: frame.SelectionFallback, CaptureError: frame.CaptureError,
 		})
 	}
 	return result, nil

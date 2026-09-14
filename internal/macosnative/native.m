@@ -78,7 +78,84 @@ static BOOL LumiWriteJPEG(CGImageRef image, NSString *path, NSError **error) {
     return finalized;
 }
 
-char *lumi_capture_screens_json(const char *directory, const char *prefix, char **error_message) {
+// LumiParseDisplayAllowlist turns a caller's comma-separated display IDs into a
+// set. An absent or empty list means "every display" and yields nil, which every
+// caller reads as "no filter" rather than as "nothing is allowed".
+static NSSet<NSNumber *> *LumiParseDisplayAllowlist(const char *csv) {
+    if (csv == NULL) return nil;
+    NSCharacterSet *blank = NSCharacterSet.whitespaceAndNewlineCharacterSet;
+    NSString *text = [[NSString stringWithUTF8String:csv] stringByTrimmingCharactersInSet:blank];
+    if (text.length == 0) return nil;
+    NSMutableSet<NSNumber *> *ids = [NSMutableSet set];
+    for (NSString *piece in [text componentsSeparatedByString:@","]) {
+        NSString *trimmed = [piece stringByTrimmingCharactersInSet:blank];
+        if (trimmed.length == 0) continue;
+        [ids addObject:@((uint32_t)strtoul(trimmed.UTF8String, NULL, 10))];
+    }
+    return ids.count == 0 ? nil : ids;
+}
+
+// LumiSelectDisplays decides which of the displays that are actually present
+// should be captured, and reports whether the caller's selection was ignored.
+//
+// It resolves the selection against the very list the capture loop iterates,
+// never against a second enumeration. A display that one API lists and the other
+// does not — asleep, mirrored, mid-transition — would otherwise make an
+// allowlist look satisfiable and then match nothing, capturing nothing at all.
+//
+// An allowlist naming no connected display therefore falls back to every
+// display, which is recoverable; capturing nothing is not. A deselected screen
+// being recorded is invisible in the captured data, so the caller is handed
+// `fallback` and is expected to say so out loud.
+static NSArray<NSNumber *> *LumiSelectDisplays(NSArray<NSNumber *> *present,
+                                               NSSet<NSNumber *> *allowed, BOOL *fallback) {
+    if (fallback != NULL) *fallback = NO;
+    if (allowed == nil) return present;
+    NSMutableArray<NSNumber *> *chosen = [NSMutableArray arrayWithCapacity:present.count];
+    for (NSNumber *displayID in present) {
+        if ([allowed containsObject:displayID]) [chosen addObject:displayID];
+    }
+    if (chosen.count > 0) return chosen;
+    if (fallback != NULL) *fallback = YES;
+    return present;
+}
+
+// lumi_select_displays_json drives the selection rule directly, so which
+// displays an allowlist chooses — and when it is ignored — is testable without a
+// live capture session. It exists for the test, like lumi_resolve_frontmost_json:
+// asserting the rule through a real capture would pass vacuously on the
+// single-display machine most tests run on.
+char *lumi_select_displays_json(const char *display_ids_json, const char *allowlist_csv,
+                                char **error_message) {
+    @autoreleasepool {
+        NSString *text = display_ids_json == NULL
+            ? @"[]" : [NSString stringWithUTF8String:display_ids_json];
+        NSError *error = nil;
+        id parsed = [NSJSONSerialization JSONObjectWithData:[text dataUsingEncoding:NSUTF8StringEncoding]
+                                                    options:0
+                                                      error:&error];
+        if (![parsed isKindOfClass:NSArray.class]) {
+            if (error_message != NULL) {
+                *error_message = LumiCopyUTF8(error.localizedDescription ?: @"decode display id list");
+            }
+            return NULL;
+        }
+        BOOL fallback = NO;
+        NSArray<NSNumber *> *chosen =
+            LumiSelectDisplays(parsed, LumiParseDisplayAllowlist(allowlist_csv), &fallback);
+        NSString *json = LumiJSONString(@{@"display_ids": chosen,
+                                          @"selection_fallback": @(fallback)}, &error);
+        if (json == nil) {
+            if (error_message != NULL) *error_message = LumiCopyError(error);
+            return NULL;
+        }
+        return LumiCopyUTF8(json);
+    }
+}
+
+char *lumi_capture_screens_json(const char *directory, const char *prefix,
+                                const char *display_ids_csv, int max_pixel_width,
+                                char **error_message) {
     @autoreleasepool {
         __block SCShareableContent *content = nil;
         __block NSError *contentError = nil;
@@ -103,16 +180,34 @@ char *lumi_capture_screens_json(const char *directory, const char *prefix, char 
         NSString *filePrefix = [NSString stringWithUTF8String:prefix];
         NSMutableArray *frames = [NSMutableArray arrayWithCapacity:content.displays.count];
         NSMutableArray<NSString *> *captureErrors = [NSMutableArray array];
+
+        NSMutableArray<NSNumber *> *present = [NSMutableArray arrayWithCapacity:content.displays.count];
+        for (SCDisplay *display in content.displays) [present addObject:@(display.displayID)];
+        BOOL selectionFallback = NO;
+        NSSet<NSNumber *> *selected = [NSSet setWithArray:
+            LumiSelectDisplays(present, LumiParseDisplayAllowlist(display_ids_csv), &selectionFallback)];
+
         for (SCDisplay *display in content.displays) {
+            if (![selected containsObject:@(display.displayID)]) continue;
             @autoreleasepool {
                 SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display
                                                              excludingApplications:@[]
                                                                   exceptingWindows:@[]];
                 SCShareableContentInfo *info = [SCShareableContent infoForFilter:filter];
                 CGFloat scale = MAX(1.0, info.pointPixelScale);
+                size_t pixelWidth = (size_t)llround((double)display.width * scale);
+                size_t pixelHeight = (size_t)llround((double)display.height * scale);
+                // A capped width is how `lumi displays` gets its thumbnails: the
+                // same capture path, asked for a smaller image, rather than a
+                // second capture path or a resize of the full-resolution shot.
+                if (max_pixel_width > 0 && pixelWidth > (size_t)max_pixel_width) {
+                    double ratio = (double)max_pixel_width / (double)pixelWidth;
+                    pixelWidth = (size_t)max_pixel_width;
+                    pixelHeight = (size_t)MAX(1LL, llround((double)pixelHeight * ratio));
+                }
                 SCStreamConfiguration *configuration = [[SCStreamConfiguration alloc] init];
-                configuration.width = (size_t)llround((double)display.width * scale);
-                configuration.height = (size_t)llround((double)display.height * scale);
+                configuration.width = pixelWidth;
+                configuration.height = pixelHeight;
                 configuration.showsCursor = YES;
                 configuration.shouldBeOpaque = YES;
                 configuration.captureResolution = SCCaptureResolutionBest;
@@ -160,6 +255,12 @@ char *lumi_capture_screens_json(const char *directory, const char *prefix, char 
         if (captureErrors.count > 0) {
             NSString *combined = [captureErrors componentsJoinedByString:@"; "];
             for (NSMutableDictionary *frame in frames) frame[@"capture_error"] = combined;
+        }
+        // Stamped on every frame the way capture_error is, and kept separate from
+        // it: a selection that could not be honoured is degraded capture, not
+        // failed capture, and the caller answers the two differently.
+        if (selectionFallback) {
+            for (NSMutableDictionary *frame in frames) frame[@"selection_fallback"] = @YES;
         }
         NSError *jsonError = nil;
         NSString *json = LumiJSONString(frames, &jsonError);

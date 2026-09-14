@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.6.0](https://github.com/puremetricsai/lumi/compare/v0.5.0...v0.6.0) (2026-09-04)
+
+
+### Features
+
+* **app:** pick which displays to record ([ab04827](https://github.com/puremetricsai/lumi/commit/ab04827922d047382139c3d5fd493d5f4492049b))
+* **capture:** record a chosen subset of displays ([7c10573](https://github.com/puremetricsai/lumi/commit/7c10573c91bf7d0d2b576d4b9c0f2782a9cb7c39))
+* record a chosen subset of displays ([228ac7c](https://github.com/puremetricsai/lumi/commit/228ac7cd46893ec61a307217704e9731c474a20e))
+
 ## [0.5.0](https://github.com/puremetricsai/lumi/compare/v0.4.1...v0.5.0) (2026-08-31)
 
 

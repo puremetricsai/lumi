@@ -4,8 +4,8 @@ Guidance for Claude Code (claude.ai/code) when working in this repository.
 
 ## What Lumi is
 
-A local-first memory app for Apple Silicon Macs: continuously capture all displays plus system and
-microphone audio, extract screen text locally (full-display Apple Vision OCR, with Accessibility for
+A local-first memory app for Apple Silicon Macs: continuously capture every display — or a chosen subset —
+plus system and microphone audio, extract screen text locally (full-display Apple Vision OCR, with Accessibility for
 focused-app attribution), transcribe audio with in-process Apple SpeechAnalyzer, store media on disk, index
 text in SQLite FTS5, and query it. Inspired by screenpipe but deliberately narrower — no server
 or plugins.
