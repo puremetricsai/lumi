@@ -360,7 +360,7 @@ struct MCPSetupResult: Decodable, Identifiable {
         switch target {
         case "claude-code": return "Claude Code"
         case "claude-desktop": return "Claude Desktop"
-        case "codex": return "Codex CLI"
+        case "codex": return "Codex (CLI and ChatGPT Codex threads)"
         default: return target
         }
     }
