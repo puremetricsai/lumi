@@ -29,7 +29,7 @@ func (a *app) compressCommand() *cobra.Command {
 		whileRecording bool
 		dryRun, asJSON bool
 	)
-	cmd := emitsNoContent(&cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "compress",
 		Short: "Re-encode indexed media in place and reclaim database space",
 		Long: "Re-encode the screenshots and audio already on disk into smaller files, leaving every\n" +
@@ -93,14 +93,19 @@ func (a *app) compressCommand() *cobra.Command {
 				defer release()
 			}
 
-			s, paths, mediaKeys, err := a.openStoreWithKeys(cmd.Context())
+			s, paths, k, err := a.openStoreWithKeys(cmd.Context())
 			if err != nil {
 				return err
 			}
 			defer s.Close()
+			// ponytail: compression refuses rather than unsealing and resealing
+			// every file. Compress before turning encryption on; teach compress
+			// about sealed media if encrypted users need it.
+			if k.enabled() {
+				return errors.New("Lumi's history is encrypted, and encrypted history cannot be compressed")
+			}
 
 			result, err := runCompress(cmd.Context(), s, compress.Options{
-				Cipher:       mediaKeys.media,
 				Before:       before,
 				Screens:      screenCodec,
 				Audio:        audioCodec,
@@ -117,7 +122,7 @@ func (a *app) compressCommand() *cobra.Command {
 			})
 			return finishCompress(os.Stdout, result, dryRun, asJSON, err)
 		},
-	})
+	}
 	flags := cmd.Flags()
 	flags.StringVar(&olderThan, "older-than", "48h",
 		"only compress events older than this duration (e.g. 48h) or RFC3339 time")
@@ -333,8 +338,7 @@ func lockCapture(paths config.Paths) (func(), error) {
 	}
 	release, err := lockFile(filepath.Join(paths.Root, captureLockName))
 	if errors.Is(err, errHeld) {
-		return nil, errors.New("a recording is in progress; stop it before changing encryption " +
-			"(Lumi's menu bar, or `lumi record stop`)")
+		return nil, errors.New("a recording is in progress; stop recording before changing encryption")
 	}
 	return release, err
 }
