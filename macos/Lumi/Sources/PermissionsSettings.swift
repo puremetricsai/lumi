@@ -70,31 +70,31 @@ struct PermissionsSettings: View {
     }
 
     private func serviceRow(_ row: PermissionRow) -> some View {
-        HStack(spacing: 10) {
-            HStack(spacing: 12) {
+        // The whole row is the button, so the title, subtitle and status are all
+        // click targets, not just the chevron. VoiceOver reads the row's text as
+        // the button's label and the hint says where it goes.
+        Button {
+            guard let url = row.service.settingsURL else { return }
+            NSWorkspace.shared.open(url)
+        } label: {
+            HStack(spacing: 10) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(row.service.title)
                     SettingsCaption(row.service.subtitle)
                 }
                 Spacer(minLength: 12)
                 Badge(text: pillText(row), tone: pillState(row).tone)
-            }
-            // The title, subtitle and status read as one item. The chevron sits
-            // outside that group so VoiceOver can still reach the button.
-            .accessibilityElement(children: .combine)
-
-            Button {
-                guard let url = row.service.settingsURL else { return }
-                NSWorkspace.shared.open(url)
-            } label: {
                 Image(systemName: "chevron.right")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
             }
-            .buttonStyle(.borderless)
-            .accessibilityLabel("Open \(row.service.title) in System Settings")
-            .help("Open \(row.service.title) in System Settings")
+            // Without this the Spacer's gap is not hit-testable.
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
+        .accessibilityHint("Opens \(row.service.title) in System Settings")
+        .help("Open \(row.service.title) in System Settings")
     }
 
     /// `PermissionState.label` is written for a service capture needs, so a
