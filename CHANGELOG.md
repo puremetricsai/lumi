@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.7.0](https://github.com/puremetricsai/lumi/compare/v0.6.0...v0.7.0) (2026-09-14)
+
+
+### Features
+
+* **app:** pin the toolbar to the top center of the screen ([14ffc70](https://github.com/puremetricsai/lumi/commit/14ffc701ddb2e2e737c24d365c9081ae3ca0d9dd))
+* **app:** simplify the toolbar ([ac24572](https://github.com/puremetricsai/lumi/commit/ac24572977ba75df6cd4f6546ccc7c9b5b960a9f))
+* **app:** simplify the toolbar and pin it to the top center ([582c1f1](https://github.com/puremetricsai/lumi/commit/582c1f1acbca6374d1360bf714019bf8ba701273))
+
+
+### Bug Fixes
+
+* **macos:** make the whole permission row open System Settings ([ce2b390](https://github.com/puremetricsai/lumi/commit/ce2b390160bc203d6f46218ccdb75be3a97c7463))
+* **macos:** make the whole permission row open System Settings ([58b6e15](https://github.com/puremetricsai/lumi/commit/58b6e15791cf79611c126fe5f64f51c305874055))
+* **mcp:** name Codex setup as covering the ChatGPT desktop app ([413044e](https://github.com/puremetricsai/lumi/commit/413044e3db011ce2b3df66cef758a80a4cd5194f))
+* **mcp:** name Codex setup as covering the ChatGPT desktop app ([7f071a9](https://github.com/puremetricsai/lumi/commit/7f071a9af95d9560f141d3866abb15706679738f))
+
 ## [0.6.0](https://github.com/puremetricsai/lumi/compare/v0.5.0...v0.6.0) (2026-09-04)
 
 
