@@ -53,7 +53,7 @@ func seedScreenEvent(t *testing.T, dataDir, name string) string {
 	t.Helper()
 	ctx := context.Background()
 	paths := compressPaths(t, dataDir)
-	s, err := store.Open(ctx, paths.Database)
+	s, err := store.Open(ctx, paths.Database, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

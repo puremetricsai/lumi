@@ -6,7 +6,9 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 
+	"github.com/puremetricsai/lumi/internal/seal"
 	"github.com/puremetricsai/lumi/internal/store"
 )
 
@@ -107,6 +109,13 @@ func reconcile(ctx context.Context, s *store.Store, opts Options) (ReconcileResu
 				return result, err
 			}
 			if entry.IsDir() {
+				continue
+			}
+			// A scratch file from a seal that was killed mid-write is not a
+			// leftover encode. Adopting one would repoint a row at a partial
+			// file, and counting it as removable is the correct outcome only
+			// by accident — so it is named and skipped rather than classified.
+			if strings.HasSuffix(entry.Name(), seal.ScratchSuffix) {
 				continue
 			}
 			path := filepath.Join(dir, entry.Name())

@@ -67,6 +67,9 @@ struct LumiApp: App {
     /// its Install Update button called nothing while the menu bar item — which
     /// is already inside the delegate — worked.
     @MainActor static var installUpdate: (() async -> Void)?
+
+    /// Whether Storage settings is running `lumi encrypt`, so quitting can warn.
+    @MainActor static var isChangingEncryption = false
 }
 
 @MainActor
@@ -124,6 +127,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// stopped gracefully. Returning .terminateNow here would cut the SIGTERM
     /// wait short and lose in-flight media.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if LumiApp.isChangingEncryption {
+            // The conversion is a separate process that survives the app and is
+            // safe to interrupt, but recording stays off until Lumi is reopened.
+            let alert = NSAlert()
+            alert.messageText = "Lumi is still changing encryption"
+            alert.informativeText = "If you quit now, the change keeps running in the background "
+                + "and recording stays off until you reopen Lumi."
+            alert.addButton(withTitle: "Quit Anyway")
+            alert.addButton(withTitle: "Cancel")
+            NSApp.activate(ignoringOtherApps: true)
+            guard alert.runModal() == .alertFirstButtonReturn else { return .terminateCancel }
+        }
         guard recorder.isSupervisingRecorder else { return .terminateNow }
         Task {
             await recorder.stop()

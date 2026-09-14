@@ -35,6 +35,18 @@ type Options struct {
 	// disables that and leaves the process serving the build it started as.
 	BinaryChanged func() bool
 	BinaryExec    func() error
+	// DatabaseReplaced reports that the index file this server opened is no
+	// longer the file at its path.
+	//
+	// `lumi encrypt` converts by writing a new database and renaming it into
+	// place, so a session an agent holds across the toggle keeps reading the
+	// unlinked original: correct-looking rows, no error anywhere, and an answer
+	// the user believes came from an encrypted index. It is the same kind of
+	// invisible skew as an upgraded binary, and it is fixed the same way —
+	// replacing this process re-opens the store under whatever key is now in
+	// the Keychain. Injected for the same reason the two above are: nothing in
+	// this package touches the filesystem.
+	DatabaseReplaced func() bool
 	// Logger receives diagnostics. It must never write to stdout — that is the
 	// JSON-RPC stream. A nil Logger discards them.
 	Logger *slog.Logger
@@ -62,7 +74,7 @@ func Serve(ctx context.Context, s *store.Store, opts Options) error {
 	var transport sdk.Transport = &sdk.StdioTransport{}
 	var updater *selfUpdater
 	if opts.BinaryChanged != nil && opts.BinaryExec != nil {
-		updater = &selfUpdater{changed: opts.BinaryChanged, exec: opts.BinaryExec}
+		updater = &selfUpdater{changed: restartNeeded(opts), exec: opts.BinaryExec}
 		server.AddReceivingMiddleware(updater.middleware())
 		// Both halves are required. The middleware covers a handler that is still
 		// running; this covers the reply being written after it returned, which is
@@ -220,6 +232,9 @@ func newServer(s *store.Store, opts Options) *sdk.Server {
 		},
 		// A build that can replace itself reports skew differently: the fix is
 		// automatic and imminent, not something to tell the user to do.
+		databaseReplaced: func() bool {
+			return opts.DatabaseReplaced != nil && opts.DatabaseReplaced()
+		},
 		selfUpdating: opts.BinaryChanged != nil && opts.BinaryExec != nil,
 	}
 

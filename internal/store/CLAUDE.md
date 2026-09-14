@@ -1,9 +1,45 @@
 # internal/store
 
-Single-file SQLite via `modernc.org/sqlite` (pure Go, no cgo), `MaxOpenConns(1)` plus WAL. Schema changes
-are versioned migrations (`migrations.go`) applied on `Open`, tracked by `user_version`. The `events_fts`
+Single-file SQLite via `github.com/ncruces/go-sqlite3` (pure Go via wazero, no cgo), `MaxOpenConns(1)`
+plus WAL, and optional page-level encryption through the `adiantum` VFS. Schema changes are versioned
+migrations (`migrations.go`) applied on `Open`, tracked by `user_version`. The `events_fts`
 external-content table is trigger-synced, so writes go only to `events`. Timestamps are UTC strings compared
 lexicographically — any new time column must go through `FormatCapturedAt` or range filters break.
+
+## Opening
+
+- **Every PRAGMA is applied in the connection-init callback, never with `ExecContext` after `Open`.**
+  `database/sql` may discard and re-dial the single connection after a driver error, and a pragma set
+  by `Exec` dies with the connection that ran it. That was survivable when the pragmas were journal
+  mode and foreign keys. It is not survivable now: the encryption key is one of them, so a silently
+  unkeyed replacement connection fails every later query with "file is not a database" — a bug that
+  reads as file corruption.
+- **The key goes first in that callback, before `fts5.Register`.** FTS5 is a registered extension in
+  this driver rather than a compile flag, and registering it reads the schema. On a *new* database
+  there is no schema to read, so getting the order wrong passes every first-open test and fails only
+  on the second open, as `SQLITE_CANTOPEN` — which reads as a missing file rather than a missing key.
+- **The key never appears in the DSN.** adiantum accepts a `hexkey=` URI parameter, and using it would
+  put the key into `fmt.Errorf("open sqlite: %w", …)` and from there into `record.log`, `lumi doctor`
+  output, and MCP notices. `PRAGMA hexkey` on the open connection is where nothing formats it. The one
+  exception is `ConvertTo`'s `VACUUM INTO` target, which has no connection to run a PRAGMA on.
+- **`Open` takes a key that is empty or exactly `KeyLen`, and never guesses.** Padding or truncating
+  writes a database that nothing can open again.
+- **`ConvertTo`'s target URI must name its VFS explicitly.** `VACUUM INTO` is `ATTACH` underneath, and
+  ATTACH inherits the *connection's* VFS unless the URI overrides it — so a bare `file:out.db` target
+  from an encrypted source opens the output through adiantum with no key, and the reverse mistake
+  writes a file that looks fine and cannot be read.
+- **`FileIsEncrypted` detects an incomplete conversion; it is not the answer to "is encryption on".**
+  That answer is the Keychain's, and `internal/cli` owns it: a fresh install with encryption enabled
+  has no database file at all, so reading intent off a missing header would create a plaintext one and
+  strand the next keyed writer. A missing file is reported as not encrypted, deliberately.
+- **`Stale` exists because a path outlives a file.** `lumi encrypt` replaces the database by rename,
+  and a long-lived reader keeps serving the unlinked original: correct rows, no error, and an answer
+  the user believes came from an encrypted index. Identity is taken *after* `migrate`, since SQLite
+  creates the file lazily and a pre-migrate stat would record "no such file" as the identity forever.
+  A stat failure is not staleness — the file is briefly absent mid-rename, the same reason
+  `internal/selfexec.Watcher.Changed` refuses to call a stat error an upgrade.
+- **`temp_store=memory`** because adiantum encrypts temp files under a random key: keeping them in
+  memory skips that work, and no temp file means no plaintext spill either.
 
 ## Timestamps
 

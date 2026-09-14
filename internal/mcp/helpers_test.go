@@ -2,14 +2,14 @@ package mcp
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
+	"github.com/ncruces/go-sqlite3/driver"
+	"net/url"
 	"path/filepath"
 	"testing"
 
 	"github.com/puremetricsai/lumi/internal/store"
-	_ "modernc.org/sqlite"
 )
 
 func testStore(t *testing.T) *store.Store {
@@ -23,7 +23,7 @@ func testStore(t *testing.T) *store.Store {
 func testStoreWithPath(t *testing.T) (*store.Store, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "lumi.db")
-	s, err := store.Open(context.Background(), path)
+	s, err := store.Open(context.Background(), path, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,7 +41,7 @@ func testStoreWithPath(t *testing.T) (*store.Store, string) {
 // one already has open.
 func bumpSchemaVersion(t *testing.T, ctx context.Context, path string, version int) {
 	t.Helper()
-	db, err := sql.Open("sqlite", path)
+	db, err := driver.Open((&url.URL{Scheme: "file", Path: path}).String())
 	if err != nil {
 		t.Fatal(err)
 	}

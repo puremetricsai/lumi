@@ -27,7 +27,7 @@ func seed(t *testing.T, ctx context.Context, s *store.Store, dir, name string, a
 func newStore(t *testing.T, ctx context.Context) (*store.Store, string) {
 	t.Helper()
 	dir := t.TempDir()
-	s, err := store.Open(ctx, filepath.Join(dir, "lumi.db"))
+	s, err := store.Open(ctx, filepath.Join(dir, "lumi.db"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

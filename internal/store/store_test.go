@@ -9,13 +9,15 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ncruces/go-sqlite3"
 )
 
 // newTestStore opens a store in a temp directory and closes it with the test,
 // mirroring internal/retention's helper of the same shape.
 func newTestStore(t *testing.T, ctx context.Context) *Store {
 	t.Helper()
-	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -25,7 +27,7 @@ func newTestStore(t *testing.T, ctx context.Context) *Store {
 
 func TestInsertAndSearch(t *testing.T) {
 	ctx := context.Background()
-	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +63,7 @@ func TestInsertAndSearch(t *testing.T) {
 
 func TestSearchTreatsFTSSyntaxAsText(t *testing.T) {
 	ctx := context.Background()
-	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +79,7 @@ func TestSearchTreatsFTSSyntaxAsText(t *testing.T) {
 
 func TestSearchFiltersByApp(t *testing.T) {
 	ctx := context.Background()
-	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +128,7 @@ func TestSearchFiltersByApp(t *testing.T) {
 // `lumi mcp`.
 func TestSearchFiltersApplyUnderMatchAny(t *testing.T) {
 	ctx := context.Background()
-	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +155,7 @@ func TestSearchFiltersApplyUnderMatchAny(t *testing.T) {
 
 func TestSearchFiltersByWindowSubstring(t *testing.T) {
 	ctx := context.Background()
-	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +182,7 @@ func TestSearchFiltersByWindowSubstring(t *testing.T) {
 
 func TestExpiredAndDeleteByIDs(t *testing.T) {
 	ctx := context.Background()
-	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,7 +235,7 @@ func TestExpiredAndDeleteByIDs(t *testing.T) {
 // timestamped far in the future that a bounded Expired cutoff would miss.
 func TestAllEventsReturnsEveryRow(t *testing.T) {
 	ctx := context.Background()
-	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -267,7 +269,7 @@ func TestAllEventsReturnsEveryRow(t *testing.T) {
 
 func TestDeleteByIDsWithNoIDs(t *testing.T) {
 	ctx := context.Background()
-	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,7 +287,7 @@ func TestDeleteByIDsWithNoIDs(t *testing.T) {
 // A window filter containing LIKE wildcards must be treated as literal text.
 func TestSearchWindowFilterEscapesWildcards(t *testing.T) {
 	ctx := context.Background()
-	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -307,7 +309,7 @@ func TestSearchWindowFilterEscapesWildcards(t *testing.T) {
 
 func TestDeleteByIDsBatchesLargeIDSets(t *testing.T) {
 	ctx := context.Background()
-	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,7 +354,7 @@ func TestDeleteByIDsBatchesLargeIDSets(t *testing.T) {
 // real transcripts out of a recency pass. Whitespace-only text counts as absent.
 func TestSearchRequireTextDropsEmptyAndBlankText(t *testing.T) {
 	ctx := context.Background()
-	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -388,7 +390,7 @@ func TestSearchRequireTextDropsEmptyAndBlankText(t *testing.T) {
 
 func TestEventByIDReturnsTheStoredEvent(t *testing.T) {
 	ctx := context.Background()
-	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -429,7 +431,7 @@ func TestEventByIDReturnsTheStoredEvent(t *testing.T) {
 // distinguishes that from a real query failure with errors.Is.
 func TestEventByIDUnknownIDIsNotFound(t *testing.T) {
 	ctx := context.Background()
-	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -577,7 +579,7 @@ func TestVacuumRebuildsAnIdleDatabase(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "lumi.db")
-	s, err := Open(ctx, path)
+	s, err := Open(ctx, path, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -688,19 +690,22 @@ func TestVacuumBusyIsRecognisable(t *testing.T) {
 	}
 	for _, tc := range []struct {
 		name string
-		code int
+		code sqlite3.ExtendedErrorCode
 		want bool
 	}{
 		{"SQLITE_BUSY", 5, true},
 		// Extended busy codes carry the primary code in their low byte;
-		// an equality test would miss every one of them.
+		// an equality test would miss every one of them. The driver's
+		// ErrorCode is a uint8, so the truncation that isolates the primary
+		// code is the type's rather than an explicit mask — which is exactly
+		// what this pins, since a widened type would silently stop matching.
 		{"SQLITE_BUSY_SNAPSHOT", 517, true},
 		{"SQLITE_BUSY_RECOVERY", 261, true},
 		// Contention inside this connection, not another process holding the file.
 		{"SQLITE_LOCKED", 6, false},
 		{"SQLITE_CORRUPT", 11, false},
 	} {
-		if got := tc.code&0xff == sqliteBusy; got != tc.want {
+		if got := errors.Is(tc.code, sqlite3.BUSY); got != tc.want {
 			t.Errorf("%s (%d) classified as busy=%v, want %v", tc.name, tc.code, got, tc.want)
 		}
 	}

@@ -178,3 +178,37 @@ developer's own Claude config.
   return would kill the installer mid-download. Being orphaned to launchd is what lets it outlive both
   the app quitting and this process's own bundle being replaced.
 - **The binary refuses to run on anything but `darwin/arm64`** (`platform.Validate` in `PersistentPreRunE`).
+
+## Encryption
+
+- **The database file decides whether a store is encrypted; the Keychain only supplies the key.** The
+  Keychain holds one key per user, so a key says nothing about the store in front of this process — a
+  second plaintext `--data-dir` is simply not encrypted. A store with no database yet is decided by the
+  key, which is what lets a fresh install be encrypted before anything is recorded.
+- **`encrypt status` makes every judgement the app shows.** `incomplete` is a key beside a plaintext
+  database with at least one sealed file — the state an interrupted run in either direction leaves,
+  and what tells it apart from a second data directory. The media walk only happens in that rare case,
+  and status never reads the key, so checking costs nobody a Keychain prompt.
+- **`encrypt on` seals media before converting the database, and stops if any file failed.** The
+  database converted over plaintext media would report "on" over files anyone can read; left
+  plaintext, status reports the run as incomplete and turning encryption on again retries it.
+- **`encrypt off` deletes the key last, and only if every file came back.** Deleting it while anything
+  is still sealed destroys that file. A key that will not *delete* is only a warning: everything is
+  already decrypted.
+- **There is no journal; the headers are the resume state.** `ensureKey` reuses a stored key rather than
+  minting one, because a fresh key on the retry would strand everything the first run sealed.
+- **Directories are flushed once per conversion, not per file.** `seal.SealFile` flushes each file
+  before its rename; a crash that loses the rename leaves the original beside a complete scratch file,
+  which the next attempt removes. The directory flush is needed only before the next irreversible step.
+- **Clearing `-wal` and `-shm` before the database rename is not tidiness.** The write-ahead log holds
+  pages of the old database in the old form: a plaintext `-wal` beside an encrypted `lumi.db` is both a
+  leak and a corrupt pair.
+- **Two locks.** `capture.lock` is held *shared* by every recorder and *exclusively* by `lumi encrypt`, so
+  neither starts under the other — including a recorder the app starts after being quit mid-conversion
+  and reopened. `compress.lock` excludes the other in-place media rewriter.
+- **`search` and `transcript` open the store through `openStoreForContent`, which refuses a store that
+  needed a key.** Deciding at open time, not before, means a conversion finishing in between cannot let
+  one print. `compress` refuses an encrypted store rather than unsealing and resealing every file.
+- **It is a speed bump, not a boundary, and no wording here may say otherwise.** `lumi mcp` reads the key
+  without prompting, so anything that can spawn it can drive JSON-RPC by hand. `docs/encryption.md` is
+  the honest statement.

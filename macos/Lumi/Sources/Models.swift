@@ -469,3 +469,22 @@ struct CompressResult: Decodable {
     var alreadyDone: Int64 { screens.alreadyDone + audio.alreadyDone }
     var untouched: Int64 { screens.untouched + audio.untouched }
 }
+
+/// EncryptionStatus is `lumi encrypt status --json`.
+///
+/// Every judgement here is Go's. The app displays these fields and derives
+/// nothing from them — an interrupted conversion and a lost key are decided by
+/// rules `internal/cli` owns, and a Swift copy of either would drift.
+struct EncryptionStatus: Decodable {
+    let enabled: Bool
+    /// A conversion stopped partway. Either direction finishes it.
+    let incomplete: Bool
+    /// The index is encrypted and its key is gone. Nothing can undo this.
+    let unrecoverable: Bool
+    let database: String
+}
+
+/// EncryptResult is `lumi encrypt on|off --json`.
+struct EncryptResult: Decodable {
+    let enabled: Bool
+}

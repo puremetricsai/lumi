@@ -249,3 +249,11 @@ desktop.
   new file unreferenced, where reconcile can never reach it because its sibling is no longer named by any
   row: a leaked file, not a lost one. The recorder is gated in `internal/cli` because it is the writer with
   the highest contention, not because the others are safe by analysis.
+
+## Encryption
+
+- **`lumi compress` refuses an encrypted store.** The encoders take plaintext paths; unsealing and
+  resealing every file is a second in-place rewrite path this package does not carry. Compress before
+  turning encryption on.
+- **A `seal.ScratchSuffix` file is skipped by the reconcile walk, not classified.** It is a seal killed
+  mid-write, not a leftover encode; adopting one would repoint a row at a partial file.

@@ -71,7 +71,7 @@ func TestReadAudioEnvelopeReadsWAVsWithoutTheNativeDecoder(t *testing.T) {
 	// test rather than quietly producing the same numbers by luck.
 	decoded := stubDecoder(t, nil, 0, errors.New("the native decoder must not be used for a WAV"))
 
-	envelope, info, err := ReadAudioEnvelope(context.Background(), path, transcript.EnvelopeWindowMS)
+	envelope, info, err := ReadAudioEnvelope(context.Background(), nil, path, transcript.EnvelopeWindowMS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +93,7 @@ func TestReadAudioEnvelopeDecodesCompressedAudioNatively(t *testing.T) {
 	samples := envelopeSamples()
 	wavPath := filepath.Join(t.TempDir(), "chunk.wav")
 	writeEnvelopeWAV(t, wavPath, samples)
-	fromWAV, _, err := ReadAudioEnvelope(context.Background(), wavPath, transcript.EnvelopeWindowMS)
+	fromWAV, _, err := ReadAudioEnvelope(context.Background(), nil, wavPath, transcript.EnvelopeWindowMS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +104,7 @@ func TestReadAudioEnvelopeDecodesCompressedAudioNatively(t *testing.T) {
 	}
 	decoded := stubDecoder(t, samples, 16000, nil)
 
-	fromFLAC, info, err := ReadAudioEnvelope(context.Background(), flacPath, transcript.EnvelopeWindowMS)
+	fromFLAC, info, err := ReadAudioEnvelope(context.Background(), nil, flacPath, transcript.EnvelopeWindowMS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +136,7 @@ func TestReadAudioEnvelopeSendsAnyNonWAVContainerToTheDecoder(t *testing.T) {
 				t.Fatal(err)
 			}
 			decoded := stubDecoder(t, envelopeSamples(), 16000, nil)
-			if _, _, err := ReadAudioEnvelope(context.Background(), path, transcript.EnvelopeWindowMS); err != nil {
+			if _, _, err := ReadAudioEnvelope(context.Background(), nil, path, transcript.EnvelopeWindowMS); err != nil {
 				t.Fatal(err)
 			}
 			if *decoded != path {
@@ -150,7 +150,7 @@ func TestReadAudioEnvelopeMatchesTheExtensionCaseInsensitively(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "chunk.WAV")
 	writeEnvelopeWAV(t, path, envelopeSamples())
 	decoded := stubDecoder(t, nil, 0, errors.New("the native decoder must not be used for a WAV"))
-	if _, _, err := ReadAudioEnvelope(context.Background(), path, transcript.EnvelopeWindowMS); err != nil {
+	if _, _, err := ReadAudioEnvelope(context.Background(), nil, path, transcript.EnvelopeWindowMS); err != nil {
 		t.Fatal(err)
 	}
 	if *decoded != "" {
@@ -164,7 +164,7 @@ func TestReadAudioEnvelopeReportsADecodeFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	stubDecoder(t, nil, 0, errors.New("unsupported file type"))
-	if _, _, err := ReadAudioEnvelope(context.Background(), path, transcript.EnvelopeWindowMS); err == nil {
+	if _, _, err := ReadAudioEnvelope(context.Background(), nil, path, transcript.EnvelopeWindowMS); err == nil {
 		t.Error("a failed decode was reported as a successful measurement")
 	}
 }

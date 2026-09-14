@@ -177,7 +177,7 @@ func TestRecorderReportsLevelsWhileAChunkIsStillRecording(t *testing.T) {
 	if err := paths.Ensure(); err != nil {
 		t.Fatal(err)
 	}
-	s, err := store.Open(t.Context(), paths.Database)
+	s, err := store.Open(t.Context(), paths.Database, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -264,7 +264,7 @@ func TestRecorderSurvivesAFailingLevelSampler(t *testing.T) {
 	if err := paths.Ensure(); err != nil {
 		t.Fatal(err)
 	}
-	s, err := store.Open(t.Context(), paths.Database)
+	s, err := store.Open(t.Context(), paths.Database, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

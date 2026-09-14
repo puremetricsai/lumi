@@ -42,7 +42,7 @@ func TestReportAttributionHealthWarnsOnUnattributedEvents(t *testing.T) {
 	if err := paths.Ensure(); err != nil {
 		t.Fatal(err)
 	}
-	s, err := store.Open(ctx, paths.Database)
+	s, err := store.Open(ctx, paths.Database, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -27,6 +27,17 @@ struct StorageSettings: View {
     @State private var isMeasuring = false
     @State private var revealProblem: String?
 
+    /// Whether the store is encrypted is read from `lumi encrypt status --json`
+    /// on every appearance, never from Preferences. It is Go's answer, and a
+    /// UserDefaults copy would be a second one — wrong in exactly the case that
+    /// matters, when a conversion was interrupted and the two halves disagree.
+    @State private var encryption: EncryptionStatus?
+    /// The direction of the conversion in progress, or nil. The switch shows it
+    /// while the conversion runs, so it never reads OFF beside "Encrypting…".
+    @State private var converting: Bool?
+    @State private var encryptionProblem: String?
+    @State private var confirmingDecrypt = false
+
     var body: some View {
         Form {
             Section("Data location") {
@@ -59,6 +70,27 @@ struct StorageSettings: View {
 
                 if let previous = notice.previousDirectory {
                     relocationNotice(previous: previous)
+                }
+            }
+
+            Section("Encryption") {
+                Toggle("Encrypt captured history", isOn: encryptionBinding)
+                    .disabled(encryptionToggleDisabled)
+                    .accessibilityLabel("Encrypt Lumi's captured history")
+
+                if let converting {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text(convertingLabel(on: converting))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                if let encryption {
+                    encryptionCaption(for: encryption)
+                }
+                if let encryptionProblem {
+                    SettingsCaption(encryptionProblem)
                 }
             }
 
@@ -111,6 +143,138 @@ struct StorageSettings: View {
         .task(id: dataDirectory) {
             await measure(reset: true)
         }
+        .task(id: dataDirectory) {
+            await refreshEncryption()
+        }
+        .confirmationDialog("Turn off encryption?", isPresented: $confirmingDecrypt) {
+            Button("Turn Off Encryption", role: .destructive) {
+                Task { await convertEncryption(to: false) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Everything Lumi has captured will be written back to this Mac in readable form, "
+                + "where any program running as you can read it. The key is deleted, so any other Lumi "
+                + "data folder encrypted on this Mac becomes unreadable.")
+        }
+    }
+
+    // MARK: - Encryption
+
+    /// The toggle's binding runs the conversion rather than mutating state.
+    ///
+    /// `encryption` is only ever set from what the CLI reported, so a conversion
+    /// that fails leaves the switch where it was instead of showing a state the
+    /// disk does not have.
+    private var encryptionBinding: Binding<Bool> {
+        Binding(
+            get: { converting ?? encryption?.enabled ?? false },
+            set: { wanted in
+                guard wanted != (encryption?.enabled ?? false) else { return }
+                if wanted {
+                    Task { await convertEncryption(to: true) }
+                } else {
+                    // Turning it off is the destructive direction: it writes
+                    // months of captured screen and audio back to disk in
+                    // readable form. Turning it on needs no confirmation.
+                    confirmingDecrypt = true
+                }
+            })
+    }
+
+    private var encryptionToggleDisabled: Bool {
+        guard let encryption else { return true }
+        // There is nothing to offer when the key is gone: the data cannot be
+        // decrypted, and re-encrypting would not bring it back.
+        return converting != nil || encryption.unrecoverable
+    }
+
+    /// Every media file is rewritten, so the count is the honest size of the job.
+    private func convertingLabel(on: Bool) -> String {
+        let verb = on ? "Encrypting" : "Decrypting"
+        guard let usage else { return "\(verb)…" }
+        let files = usage.screenshotFiles + usage.audioChunks
+        return "\(verb) \(Format.count(files)) files. A large history can take several minutes."
+    }
+
+    @ViewBuilder
+    private func encryptionCaption(for status: EncryptionStatus) -> some View {
+        if status.unrecoverable {
+            SettingsCaption("Lumi's encryption key is not in this Mac's Keychain, so the captured "
+                + "history cannot be read or recovered. This happens if the key was deleted, or if "
+                + "this data folder came from another Mac.")
+        } else if status.incomplete {
+            SettingsCaption("A change to encryption stopped partway, so part of Lumi's history is still "
+                + "encrypted. Turn encryption on to finish encrypting it, or finish decrypting it.")
+            Button("Finish Decrypting") { confirmingDecrypt = true }
+                .disabled(converting != nil)
+        } else if status.enabled {
+            SettingsCaption("Screenshots, audio, and the search index are encrypted on disk. The key is "
+                + "in this Mac's Keychain and never leaves it. Your AI assistant still reads your "
+                + "history through Lumi's MCP server, which decrypts in memory.")
+        } else {
+            SettingsCaption("Anything running as you can read Lumi's screenshots, audio, and search "
+                + "index. Turning this on encrypts them, and only Lumi's MCP server can read them back."
+                + "\n\nIf the key is lost — you erase this Mac, reset your login Keychain, or move this "
+                + "folder to another Mac — nothing can recover what Lumi captured. There is no password "
+                + "and no recovery code.")
+        }
+    }
+
+    private func refreshEncryption() async {
+        do {
+            encryption = try await LumiCLI.json(EncryptionStatus.self, ["encrypt", "status", "--json"])
+            encryptionProblem = nil
+        } catch {
+            encryption = nil
+            encryptionProblem = "Could not read Lumi's encryption status. \(error.localizedDescription)"
+        }
+    }
+
+    /// Stopping the recorder first is load-bearing, not tidiness.
+    ///
+    /// The conversion rewrites every media file and replaces the index by
+    /// rename. A live recorder would be writing new plaintext behind a walk that
+    /// has already passed, and holding a handle on a file that is about to stop
+    /// being the one at that path. `lumi encrypt` refuses while a recorder is
+    /// registered, so without this the button would simply fail.
+    ///
+    /// `stopFailed` is checked before the conversion for the same reason
+    /// `confirmAndInstallUpdate` checks it before starting the installer:
+    /// `stop()` returns normally after its timeout with the child still alive,
+    /// and converting underneath it is worse than not converting at all.
+    private func convertEncryption(to enabled: Bool) async {
+        guard converting == nil else { return }
+        converting = enabled
+        LumiApp.isChangingEncryption = true
+        encryptionProblem = nil
+        defer {
+            converting = nil
+            LumiApp.isChangingEncryption = false
+        }
+
+        let wasSupervising = recorder.isSupervisingRecorder
+        if wasSupervising {
+            await recorder.stop()
+            if recorder.stopFailed {
+                encryptionProblem = "Recording did not stop, so Lumi left the history as it was. "
+                    + "Try again in a moment."
+                return
+            }
+        }
+
+        do {
+            _ = try await LumiCLI.json(EncryptResult.self, ["encrypt", enabled ? "on" : "off", "--json"])
+        } catch {
+            encryptionProblem = "Could not \(enabled ? "encrypt" : "decrypt") Lumi's history. "
+                + error.localizedDescription
+        }
+        await refreshEncryption()
+        // Restart whatever was running, whether or not the conversion worked:
+        // leaving capture off is not an outcome the user asked for.
+        if wasSupervising {
+            await recorder.start()
+        }
+        await measure(reset: false)
     }
 
     // MARK: - Relocation

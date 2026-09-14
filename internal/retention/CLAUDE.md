@@ -25,3 +25,10 @@ directories. No background scheduler.
   whose extension-swapped sibling is named by a row, which fresh capture never has.
 
 The interactive confirmation `--all` requires lives in `internal/cli/CLAUDE.md`.
+
+## Encryption reaches nothing here
+
+Retention only stats and removes; it never reads a media file's contents, so it needs no key and has no
+encrypted variant. Sizes are on-disk sizes, which is what a size-based prune should measure either way.
+`sweepOrphans` deleting a `seal.ScratchSuffix` file is correct rather than incidental — it runs only
+under `--all`, which is deleting everything regardless.

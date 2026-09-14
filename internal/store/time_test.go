@@ -59,7 +59,7 @@ func TestLexicographicOrderMatchesChronologicalOrder(t *testing.T) {
 // way drops a row rendered the other.
 func TestBoundsCoverBothStoredRenderings(t *testing.T) {
 	ctx := context.Background()
-	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +115,7 @@ VALUES ('screen', ?, 'legacy boundary row', '', '', 'legacy.jpg', 0, 'vision', 1
 // outlives its evidence, since the WAV is pruned and the claim is not.
 func TestMicrophoneRowsCannotBeAttributedAtTheStore(t *testing.T) {
 	ctx := context.Background()
-	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +165,7 @@ func TestMicrophoneRowsCannotBeAttributedAtTheStore(t *testing.T) {
 // that microphone audio never names an application.
 func TestUndecodableSourceAppsAreRejected(t *testing.T) {
 	ctx := context.Background()
-	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"))
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "lumi.db"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

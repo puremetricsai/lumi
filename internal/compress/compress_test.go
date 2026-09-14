@@ -162,7 +162,7 @@ func newHarness(t *testing.T) *harness {
 	t.Helper()
 	ctx := context.Background()
 	root := t.TempDir()
-	s, err := store.Open(ctx, filepath.Join(root, "lumi.db"))
+	s, err := store.Open(ctx, filepath.Join(root, "lumi.db"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

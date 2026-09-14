@@ -178,7 +178,7 @@ func TestSearchPunctuationOnlyQueryFallsBackToRecency(t *testing.T) {
 
 func testStore(t *testing.T) *Store {
 	t.Helper()
-	s, err := Open(context.Background(), filepath.Join(t.TempDir(), "lumi.db"))
+	s, err := Open(context.Background(), filepath.Join(t.TempDir(), "lumi.db"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -52,7 +52,7 @@ func (a *app) transcriptCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			s, _, err := a.openStore(cmd.Context())
+			s, _, err := a.openStoreForContent(cmd.Context())
 			if err != nil {
 				return err
 			}
