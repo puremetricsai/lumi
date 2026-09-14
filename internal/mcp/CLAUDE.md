@@ -294,7 +294,7 @@ reports is the one enforced.
 ## Encryption
 
 - **While encryption is on, `lumi mcp` is the only thing that puts captured content anywhere.**
-  `lumi search` and `lumi transcript` refuse (`internal/cli`'s content guard). That makes this
+  `lumi search` and `lumi transcript` refuse (`internal/cli`'s `openStoreForContent`). That makes this
   package's stdout invariant load-bearing in a second way: it is now the only sanctioned exit for the
   data, so corrupting the stream does not degrade a feature, it removes the user's only access.
 - **A long-lived handle can outlive the toggle, so staleness has a third kind.** `lumi encrypt`

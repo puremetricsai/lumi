@@ -49,11 +49,10 @@ type Display struct {
 // result. The thumbnails it captures are previews, written to a temporary
 // directory and deleted before the command returns — they are never indexed and
 // never enter the store, so the rule against losing captured media does not
-// reach them. For the same reason it emits no captured content: a preview of
-// the screen as it is now is not the history the encryption guard protects.
+// reach them.
 func (a *app) displaysCommand() *cobra.Command {
 	var asJSON bool
-	cmd := emitsNoContent(&cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "displays",
 		Short: "List the connected displays and preview what is on each",
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -82,7 +81,7 @@ func (a *app) displaysCommand() *cobra.Command {
 			}
 			return nil
 		},
-	})
+	}
 	cmd.Flags().BoolVar(&asJSON, "json", false, "emit JSON")
 	return cmd
 }

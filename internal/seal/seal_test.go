@@ -222,27 +222,6 @@ func TestTempCopyIsPlaintextOutsideTheMediaDirectory(t *testing.T) {
 	}
 }
 
-func TestSealIntoWritesASealedCopyAndRefusesToOverwrite(t *testing.T) {
-	key := testKey(t, 8)
-	dir := t.TempDir()
-	source := write(t, dir, "encoded.heic", []byte("compressed bytes"))
-	destination := filepath.Join(dir, "shot.heic")
-
-	if err := key.SealInto(source, destination); err != nil {
-		t.Fatal(err)
-	}
-	got, err := key.ReadFile(destination)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != "compressed bytes" {
-		t.Errorf("SealInto produced %q", got)
-	}
-	if err := key.SealInto(source, destination); err == nil {
-		t.Error("SealInto overwrote an existing destination")
-	}
-}
-
 // The two derived keys must differ, or the split buys nothing.
 func TestDerivedKeysDiffer(t *testing.T) {
 	master := bytes.Repeat([]byte{0x5a}, 32)
@@ -281,41 +260,5 @@ func TestNoMasterDerivesNoKeys(t *testing.T) {
 	media, err := DeriveMedia(nil)
 	if err != nil || media != nil {
 		t.Errorf("DeriveMedia(nil) = %v, %v; want nil, nil", media, err)
-	}
-}
-
-// TestSweepTempRemovesAbandonedPlaintext pins the cleanup that a crash needs.
-//
-// TempCopy's cleanup runs on a deferred close, which a SIGKILL or a power loss
-// never reaches — and what it would have removed is decrypted capture content
-// lying in the clear.
-func TestSweepTempRemovesAbandonedPlaintext(t *testing.T) {
-	abandoned, err := os.MkdirTemp("", TempPrefix)
-	if err != nil {
-		t.Fatal(err)
-	}
-	leaked := filepath.Join(abandoned, "shot.jpg")
-	if err := os.WriteFile(leaked, []byte("decrypted screen content"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	// Something else's temporary directory must survive.
-	other, err := os.MkdirTemp("", "not-lumi-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(other) })
-
-	if err := SweepTemp(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(leaked); !os.IsNotExist(err) {
-		t.Error("an abandoned plaintext copy survived the sweep")
-	}
-	if _, err := os.Stat(other); err != nil {
-		t.Error("the sweep removed a directory that is not Lumi's")
-	}
-	// And it is safe to run when there is nothing to do.
-	if err := SweepTemp(); err != nil {
-		t.Errorf("a second sweep failed: %v", err)
 	}
 }

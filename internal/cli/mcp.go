@@ -33,7 +33,7 @@ import (
 // that. Replacing the image in place is what makes an upgrade reach a live
 // session without adding the daemon this command refuses to become.
 func (a *app) mcpCommand() *cobra.Command {
-	cmd := emitsNoContent(&cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "mcp",
 		Short: "Serve captured activity to AI agents over MCP (stdio)",
 		Long: "Run a Model Context Protocol server on stdin/stdout, exposing search_events,\n" +
@@ -82,7 +82,7 @@ func (a *app) mcpCommand() *cobra.Command {
 			}
 			return nil
 		},
-	})
+	}
 	cmd.AddCommand(a.mcpSetupCommand())
 	return cmd
 }

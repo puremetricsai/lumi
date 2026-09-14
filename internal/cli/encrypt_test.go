@@ -258,32 +258,57 @@ func TestEncryptOnBeforeAnythingIsRecorded(t *testing.T) {
 	}
 }
 
-// `encrypt status` is what the app's toggle reads, so its shape is a contract.
-func TestEncryptStatusReportsBothHalves(t *testing.T) {
+// `encrypt status` is what the app's toggle reads, so its judgements are a
+// contract: the app shows these fields and derives nothing.
+func TestEncryptStatusJudgesEveryState(t *testing.T) {
 	fakeKeyring(t)
-	paths, _ := seedDataDir(t)
+	paths, media := seedDataDir(t)
+	status := func() string {
+		t.Helper()
+		out, err := runLumi(t, "--data-dir", paths.Root, "encrypt", "status", "--json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	want := func(out string, fields ...string) {
+		t.Helper()
+		for _, field := range fields {
+			if !bytes.Contains([]byte(out), []byte(field)) {
+				t.Errorf("status JSON is missing %s:\n%s", field, out)
+			}
+		}
+	}
 
-	out, err := runLumi(t, "--data-dir", paths.Root, "encrypt", "status", "--json")
+	want(status(), `"enabled":false`, `"incomplete":false`, `"unrecoverable":false`, `"database":`)
+
+	// A key beside a plaintext store with nothing sealed is a second data
+	// directory, not an interrupted run.
+	master := bytes.Repeat([]byte{7}, 32)
+	if err := keyring.store(master); err != nil {
+		t.Fatal(err)
+	}
+	want(status(), `"enabled":false`, `"incomplete":false`)
+
+	// The same with a sealed file is a conversion that stopped partway.
+	k, err := resolveKeys()
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{`"enabled":false`, `"database_encrypted":false`, `"database":`} {
-		if !bytes.Contains([]byte(out), []byte(key)) {
-			t.Errorf("status JSON is missing %s:\n%s", key, out)
-		}
+	if err := k.media.SealFile(media[0]); err != nil {
+		t.Fatal(err)
 	}
+	want(status(), `"enabled":false`, `"incomplete":true`)
 
 	if _, err := runLumi(t, "--data-dir", paths.Root, "encrypt", "on"); err != nil {
 		t.Fatal(err)
 	}
-	out, err = runLumi(t, "--data-dir", paths.Root, "encrypt", "status", "--json")
-	if err != nil {
+	want(status(), `"enabled":true`, `"incomplete":false`, `"unrecoverable":false`)
+
+	if err := keyring.delete(); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains([]byte(out), []byte(`"enabled":true`)) ||
-		!bytes.Contains([]byte(out), []byte(`"database_encrypted":true`)) {
-		t.Errorf("status did not report an encrypted store:\n%s", out)
-	}
+	want(status(), `"unrecoverable":true`)
 }
 
 // A conversion that cannot be undone must say so rather than fail obscurely
@@ -340,10 +365,6 @@ func TestEncryptOnSweepsMediaLeftUnsealed(t *testing.T) {
 	if !sealed {
 		t.Error("a file left unsealed by a failed capture-time seal was never picked up")
 	}
-	// And the files already done were skipped rather than sealed twice.
-	if !bytes.Contains([]byte(out), []byte("already done")) {
-		t.Errorf("the resumed run did not report skipping the files already sealed:\n%s", out)
-	}
 }
 
 // TestEncryptOffKeepsTheKeyWhenAFileWillNotDecrypt is the regression for the
@@ -380,8 +401,9 @@ func TestEncryptOffKeepsTheKeyWhenAFileWillNotDecrypt(t *testing.T) {
 	}
 }
 
-// `encrypt on` must not report success while plaintext media remains: every
-// status surface would then say "on" over files anyone can read.
+// `encrypt on` must not report success while plaintext media remains, and must
+// leave the database plaintext so status reports the run as incomplete rather
+// than "on" over files anyone can read.
 func TestEncryptOnReportsMediaItCouldNotSeal(t *testing.T) {
 	fakeKeyring(t)
 	paths, _ := seedDataDir(t)
@@ -398,9 +420,28 @@ func TestEncryptOnReportsMediaItCouldNotSeal(t *testing.T) {
 	if err == nil {
 		t.Fatalf("encrypt on reported success with media it could not seal:\n%s", out)
 	}
-	// The rest of the store is still converted — a partial failure must not
-	// abandon the files it could protect.
-	if encrypted, statErr := store.FileIsEncrypted(paths.Database); statErr != nil || !encrypted {
-		t.Error("the database was left unconverted by a partial media failure")
+	if encrypted, statErr := store.FileIsEncrypted(paths.Database); statErr != nil || encrypted {
+		t.Error("the database was converted over media left unsealed")
+	}
+	state, err := readEncryptionState(paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !state.Incomplete || state.Enabled {
+		t.Errorf("status after a partial seal = %+v, want incomplete and not enabled", state)
+	}
+}
+
+// Compress rewrites media through framework encoders that cannot read a sealed
+// file, so it refuses an encrypted store rather than failing file by file.
+func TestCompressRefusesAnEncryptedStore(t *testing.T) {
+	fakeKeyring(t)
+	paths, _ := seedDataDir(t)
+	if _, err := runLumi(t, "--data-dir", paths.Root, "encrypt", "on"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := runLumi(t, "--data-dir", paths.Root, "compress")
+	if err == nil || !bytes.Contains([]byte(err.Error()), []byte("encrypted")) {
+		t.Errorf("compress on an encrypted store = %v, want a refusal", err)
 	}
 }

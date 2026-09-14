@@ -46,7 +46,7 @@ func (a *app) transcriptBackfillCommand() *cobra.Command {
 		pace                   time.Duration
 		speechLocale           string
 	)
-	cmd := emitsNoContent(&cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "backfill",
 		Short: "Attribute captured audio that has no origin labels yet",
 		Long: "Derive origin labels for audio chunks that have none, so `lumi transcript`\n" +
@@ -92,7 +92,7 @@ func (a *app) transcriptBackfillCommand() *cobra.Command {
 				Locale: speechLocale, Cipher: mediaKeys.media,
 			})
 		},
-	})
+	}
 	flags := cmd.Flags()
 	flags.StringVar(&since, "since", "", "only attribute chunks captured at or after this time")
 	flags.StringVar(&until, "until", "", "only attribute chunks captured at or before this time (RFC3339)")

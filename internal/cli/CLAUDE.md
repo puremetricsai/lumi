@@ -181,54 +181,34 @@ developer's own Claude config.
 
 ## Encryption
 
-- **The Keychain is the authority on whether encryption is on; the file headers only say how far a
-  conversion got.** Reading intent off a header breaks the case that matters most: turn encryption on
-  before anything is recorded and there is no `lumi.db` at all, so a header check reads "plaintext",
-  `openStore` creates a plaintext database, and the next keyed writer fails with "file is not a
-  database" on a store the user believes was encrypted from the first frame. `encryptionEnabled` asks
-  the Keychain, for attributes only, so refusing a command costs nobody a prompt. The two disagreeing
-  is a half-finished conversion — `lumi doctor` reports it and `lumi encrypt` resumes it.
-- **The content guard is a cobra annotation whose default is to refuse.** A command that declares
-  nothing does not run. A new content-emitting command therefore fails closed on its author's machine
-  rather than leaking on a user's, and `TestEveryCommandDeclaresItsContent` — walking the tree from
-  `newRootCommand` — is the enforcement, not code review.
-- **An unreadable Keychain refuses rather than guesses.** Treating "could not ask" as "encryption is
-  off" would print the whole index on exactly the machine where something is already wrong.
-- **It is a speed bump, not a boundary, and no wording here may say otherwise.** `lumi mcp` reads the
-  key without prompting, so anything that can spawn it can drive JSON-RPC by hand. What the guard buys
-  is that ambient access reaches ciphertext and that reading the history takes going through the MCP
-  surface the user granted on purpose. `docs/encryption.md` is the honest statement.
-- **`lumi encrypt`'s ordering is asymmetric on purpose.** On: store the key, seal the media, convert
-  the database. Off: convert the database, unseal the media, delete the key. The irreversible step
-  goes where a crash cannot strand anything — the key is written before the first file needs it and
-  deleted after the last file stops needing it. And the database goes last on the way in because
-  `encrypt status` reads its header, so converting it first would report a finished job while months
-  of media were still plaintext.
-- **There is no journal and no progress file; the headers are the resume state.** A run killed halfway
-  leaves a directory every reader handles correctly, and re-running finishes it. `ensureKey` reuses a
-  stored key rather than minting one, because a fresh key on the retry would make everything the first
-  run sealed permanently unreadable while reporting success.
-- **Clearing `-wal` and `-shm` before the rename is not tidiness.** The write-ahead log holds pages of
-  the old database in the old form, so a plaintext `-wal` beside an encrypted `lumi.db` is both a leak
-  and a corrupt pair, and neither is visible from the file that was replaced.
-- **The irreversible step of `encrypt off` is gated on every file having made it back.** Deleting the
-  key while anything is still sealed destroys that file permanently, so a partial success may not
-  reach it: the command reports what failed and keeps the key. A key that will not *delete* is the
-  opposite case and is only a warning — everything is already decrypted, and the item is orphaned
-  because its ACL names a binary a rebuild or a rotated certificate replaced.
-- **`encrypt on` fails when it could not seal something, even though it converted the database.**
-  Converting the database is what makes the store read as encrypted, so exiting zero would have every
-  status surface say "on" over files anyone can read.
-- **Two locks, excluding two different things.** `capture.lock` is held *shared* by every recorder for
-  its whole life and *exclusively* by `lumi encrypt`, so neither can start underneath the other.
-  Reading `record.json` cannot do this on its own — a recorder starting after the check is invisible
-  to it — but it is still read first, because "a recording is in progress" is a better message than
-  "the lock is held". `compress.lock` is the separate one, against two writers rewriting one file.
-- **A content command may not print from a store it needed a key to open.** The annotation guard reads
-  the state once in `PersistentPreRunE`, so a conversion finishing between that check and the printing
-  would let the command open the newly encrypted store and print from it. `openStoreForContent` closes
-  that by construction rather than by narrowing the window.
-- **`lumi reveal` is a second content exit, deliberately.** Media that can never be looked at cannot be
-  audited. Its plaintext copy is 0600 in `$TMPDIR` and lives only as long as the QuickLook panel —
-  `qlmanage -p` blocks for exactly that, which `open -W` does not, since Preview is usually already
-  running and it would return before the file was drawn.
+- **The database file decides whether a store is encrypted; the Keychain only supplies the key.** The
+  Keychain holds one key per user, so a key says nothing about the store in front of this process — a
+  second plaintext `--data-dir` is simply not encrypted. A store with no database yet is decided by the
+  key, which is what lets a fresh install be encrypted before anything is recorded.
+- **`encrypt status` makes every judgement the app shows.** `incomplete` is a key beside a plaintext
+  database with at least one sealed file — the state an interrupted run in either direction leaves,
+  and what tells it apart from a second data directory. The media walk only happens in that rare case,
+  and status never reads the key, so checking costs nobody a Keychain prompt.
+- **`encrypt on` seals media before converting the database, and stops if any file failed.** The
+  database converted over plaintext media would report "on" over files anyone can read; left
+  plaintext, status reports the run as incomplete and turning encryption on again retries it.
+- **`encrypt off` deletes the key last, and only if every file came back.** Deleting it while anything
+  is still sealed destroys that file. A key that will not *delete* is only a warning: everything is
+  already decrypted.
+- **There is no journal; the headers are the resume state.** `ensureKey` reuses a stored key rather than
+  minting one, because a fresh key on the retry would strand everything the first run sealed.
+- **Directories are flushed once per conversion, not per file.** `seal.SealFile` flushes each file
+  before its rename; a crash that loses the rename leaves the original beside a complete scratch file,
+  which the next attempt removes. The directory flush is needed only before the next irreversible step.
+- **Clearing `-wal` and `-shm` before the database rename is not tidiness.** The write-ahead log holds
+  pages of the old database in the old form: a plaintext `-wal` beside an encrypted `lumi.db` is both a
+  leak and a corrupt pair.
+- **Two locks.** `capture.lock` is held *shared* by every recorder and *exclusively* by `lumi encrypt`, so
+  neither starts under the other — including a recorder the app starts after being quit mid-conversion
+  and reopened. `compress.lock` excludes the other in-place media rewriter.
+- **`search` and `transcript` open the store through `openStoreForContent`, which refuses a store that
+  needed a key.** Deciding at open time, not before, means a conversion finishing in between cannot let
+  one print. `compress` refuses an encrypted store rather than unsealing and resealing every file.
+- **It is a speed bump, not a boundary, and no wording here may say otherwise.** `lumi mcp` reads the key
+  without prompting, so anything that can spawn it can drive JSON-RPC by hand. `docs/encryption.md` is
+  the honest statement.

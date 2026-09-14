@@ -1,6 +1,6 @@
 // Package seal encrypts captured media files in place.
 //
-// It holds one format and the six operations Lumi performs on it, and nothing
+// It holds one format and the operations Lumi performs on it, and nothing
 // else: no database, no filesystem layout, no knowledge of what a screenshot or
 // a WAV is. That is deliberate — like internal/wav and internal/transcript it is
 // pure Go with no build tag, so the rules it enforces are exercisable anywhere.
@@ -27,7 +27,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
 // Magic prefixes every sealed file.
@@ -39,10 +38,8 @@ const KeyLen = 32
 // ScratchSuffix names the temporary file a seal writes before renaming it over
 // its target.
 //
-// It is exported because two other packages have to recognise it: a crash
-// mid-seal leaves one beside the media, where internal/compress's reconcile
-// walk would read it as an orphaned encode and `lumi encrypt`'s resume would try
-// to convert it. Naming it here is what stops either of them guessing.
+// It is exported because a crash mid-seal leaves one beside the media, where
+// internal/compress's reconcile walk and `lumi encrypt`'s resume must skip it.
 const ScratchSuffix = ".lumi-sealing"
 
 // ErrNotSealed reports that a file does not carry the magic header.
@@ -205,27 +202,6 @@ func (k Key) UnsealFile(path string) error {
 	return replaceDurably(path, plain)
 }
 
-// SealInto writes a sealed copy of source at destination, which must not exist.
-//
-// This is internal/compress's write side: it encodes into a plaintext temporary
-// file and then needs the result to land, sealed, at the path an event row will
-// be repointed at. Sealing in place would mean the destination existed
-// unsealed first, which is the one moment compress cannot have.
-func (k Key) SealInto(source, destination string) error {
-	raw, err := os.ReadFile(source)
-	if err != nil {
-		return err
-	}
-	if !k.Enabled() {
-		return writeNew(destination, raw)
-	}
-	sealed, err := k.seal(raw)
-	if err != nil {
-		return err
-	}
-	return writeNew(destination, sealed)
-}
-
 func (k Key) seal(plain []byte) ([]byte, error) {
 	aead, err := k.aead()
 	if err != nil {
@@ -272,7 +248,7 @@ func (k Key) TempCopy(path string) (string, func(), error) {
 	if err != nil {
 		return "", noop, err
 	}
-	dir, err := os.MkdirTemp("", TempPrefix)
+	dir, err := os.MkdirTemp("", "lumi-plaintext-")
 	if err != nil {
 		return "", noop, fmt.Errorf("temporary directory: %w", err)
 	}
@@ -287,50 +263,15 @@ func (k Key) TempCopy(path string) (string, func(), error) {
 	return temp, cleanup, nil
 }
 
-// TempPrefix names every directory this package creates for a plaintext copy.
-//
-// It is a constant so that SweepTemp can find them again: cleanup normally runs
-// on the deferred close, which a crash, a SIGKILL, or a power loss never
-// reaches — and what is left behind is decrypted capture content sitting in the
-// clear. macOS clears its per-user temporary directory eventually, but
-// "eventually" is not a guarantee worth resting encryption on.
-const TempPrefix = "lumi-plaintext-"
-
-// SweepTemp removes plaintext copies abandoned by a process that did not exit
-// cleanly.
-//
-// It is called at the start of anything long-lived enough to have left one —
-// the recorder and `lumi encrypt` — rather than on a timer, because the only
-// thing that creates them is this package and the only thing that strands them
-// is a crash. Errors are returned rather than swallowed by the caller's choice;
-// a directory that will not delete is worth saying out loud, since the whole
-// point is that it holds readable capture.
-func SweepTemp() error {
-	root := os.TempDir()
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		return err
-	}
-	var failed []string
-	for _, entry := range entries {
-		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), TempPrefix) {
-			continue
-		}
-		if err := os.RemoveAll(filepath.Join(root, entry.Name())); err != nil {
-			failed = append(failed, entry.Name())
-		}
-	}
-	if len(failed) > 0 {
-		return fmt.Errorf("could not remove abandoned plaintext copies: %s", strings.Join(failed, ", "))
-	}
-	return nil
-}
-
 // replaceDurably writes content over path without ever leaving it partial.
 //
 // The scratch file is a sibling so the rename is atomic within one filesystem,
-// and both it and the directory are flushed before the rename, because the
-// caller is overwriting the only copy of a captured file.
+// and it is flushed before the rename, because the caller is overwriting the
+// only copy of a captured file. The directory is not flushed here: a crash that
+// loses the rename leaves the original in place beside a complete scratch file,
+// which the next attempt removes. A caller whose next step depends on the rename
+// having landed — `lumi encrypt off` deleting the key — calls SyncDir once per
+// directory instead of paying for it on every file.
 func replaceDurably(path string, content []byte) error {
 	scratch := path + ScratchSuffix
 	// A scratch file from a seal killed mid-write is not evidence of anything —
@@ -349,7 +290,7 @@ func replaceDurably(path string, content []byte) error {
 		os.Remove(scratch)
 		return fmt.Errorf("replace %s: %w", path, err)
 	}
-	return SyncDir(filepath.Dir(path))
+	return nil
 }
 
 func writeNew(path string, content []byte) error {

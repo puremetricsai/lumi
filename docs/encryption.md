@@ -21,7 +21,7 @@ With encryption on:
 | `lumi.db` | encrypted page by page through the `adiantum` SQLite VFS |
 | every screenshot and audio file | `LUMIENC1` ‖ nonce ‖ AES-256-GCM, in place, name unchanged |
 | the key | 32 random bytes in the login Keychain, ACL'd to Lumi's own code identity |
-| `lumi search`, `lumi transcript`, `lumi transcribe` | refuse |
+| `lumi search`, `lumi transcript`, `lumi compress` | refuse |
 | `lumi mcp` | works — it decrypts in memory and writes only JSON-RPC frames |
 
 Plaintext exists only inside a running `lumi` process.
@@ -53,15 +53,16 @@ append-only log with a whole-file cipher would mean rewriting it on every line.
 it for deduplication, OCR, and transcription, indexes the row, and only then seals the file. That
 ordering is required by the never-lose-media rule: a file that is written and indexed is
 recoverable, and a file encrypted before its row exists is not. There is a similar sub-second window
-in `$TMPDIR` whenever OCR, transcription, or `lumi compress` needs to hand a path to a framework.
-Those copies are removed on the way out, and a crash that skips that is swept up by the next
-recording or conversion — but between the crash and the sweep they are readable.
+in `$TMPDIR` whenever re-transcription needs to hand a sealed chunk's path to SpeechAnalyzer. That
+copy is removed on the way out; a crash that skips the removal leaves it for macOS to clear.
 
 ## Losing the key destroys the data
 
 There is no password, no recovery code, and no second copy. If the Keychain item goes — the Mac is
 erased, the login keychain is reset, or the data folder is moved to another machine — the captured
-history is gone. `lumi doctor` reports that state explicitly, because it is the one thing about the
+history is gone. So is every other data folder encrypted with it once encryption is turned off in
+any one of them: there is one key per user, and turning encryption off deletes it. `lumi doctor` reports
+an unreadable store explicitly, because it is the one thing about the
 index that cannot be inferred from the rows.
 
 No recovery-key export is planned. One would be a second copy of the key sitting wherever the user
@@ -70,24 +71,26 @@ put it, which is the file the threat model above is about.
 ## How a conversion behaves
 
 `lumi encrypt on` stores the key, seals the media, then converts the database. `lumi encrypt off`
-converts the database, unseals the media, then deletes the key. Both orderings put the irreversible
-step where a crash cannot strand anything: the key is written before the first file needs it and
-deleted after the last file stops needing it.
+converts the database, unseals the media, then deletes the key. The key is written before the first
+file needs it and deleted after the last file stops needing it.
 
-Neither writes a journal or a progress file. **The headers are the record.** A media file either
-starts with `LUMIENC1` or it does not; the database either starts with `SQLite format 3` or it does
-not. A run that is killed halfway leaves a directory every reader handles correctly, and re-running
-finishes it — skipping what is already done, with no risk of double-sealing.
+Every media file is rewritten, so the time is set by the file count: a few milliseconds a file, which
+is a couple of minutes for tens of thousands of files and longer for a large history. Recording is off
+for the whole run. Settings shows the file count while it runs.
 
-A conversion refuses while a recording is in progress. That is enforced with a lock, not just a
-check: every recorder holds `capture.lock` shared for its whole life and a conversion needs it
-exclusively, so neither can start underneath the other. It also takes `compress.lock`, since both
+Neither direction writes a journal. **The headers are the record.** A media file either starts with
+`LUMIENC1` or it does not; the database either starts with `SQLite format 3` or it does not. A run that
+is killed or fails partway leaves a key, a plaintext database, and some sealed files. `lumi encrypt
+status` reports that as *incomplete*, and running either direction again finishes it.
+
+A conversion refuses while a recording is in progress, enforced with a lock: every recorder holds
+`capture.lock` shared and a conversion needs it exclusively. It also takes `compress.lock`, since both
 rewrite media in place.
 
-Two things a conversion will not do quietly. It never deletes the key while any file is still
-sealed — that file would be gone, so it reports the failure and keeps the key. And it never exits
-zero having left plaintext media behind, because converting the database is what makes every status
-surface say "encrypted".
+It never deletes the key while any file is still sealed, and `on` never converts the database while any
+file is still plaintext.
+
+`lumi compress` refuses an encrypted store. Compress before turning encryption on.
 
 ## The Keychain item, and why it is the legacy one
 
@@ -116,13 +119,3 @@ Developer ID, or accept the prompt.
 
 Rotating the release signing certificate invalidates the ACL for every existing user, exactly as it
 invalidates their TCC grants. `docs/signing-and-notarization.md` owns that half.
-
-## Reading a screenshot yourself
-
-`lumi reveal <event-id>` decrypts one event's media and opens it in QuickLook. The decrypted copy is
-0600, lives in `$TMPDIR`, and is deleted the moment the preview window closes — `qlmanage -p` blocks
-for exactly that long, which `open -W` does not, because Preview is usually already running.
-
-This is a second way to get captured content out of the CLI, and it is deliberate rather than an
-oversight: media that can never be looked at is media the user cannot audit. The bound on its
-lifetime is what keeps it from being an id-enumeration hole.

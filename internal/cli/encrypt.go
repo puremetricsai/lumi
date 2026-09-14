@@ -20,24 +20,17 @@ import (
 
 // `lumi encrypt` converts a data directory between plaintext and encrypted.
 //
-// The ordering is the whole design, and it is asymmetric on purpose.
+// On: store the key, seal the media, then convert the database. Off: convert
+// the database, unseal the media, then delete the key. The key is written before
+// the first file needs it and deleted after the last file stops needing it, and
+// the database is converted last on the way in, so a run that could not seal
+// everything leaves a plaintext database that `encrypt status` reports as
+// incomplete rather than a finished one.
 //
-// Turning encryption **on**: store the key first, then seal the media, then
-// convert the database. The key goes first because sealing a file against a key
-// that was never persisted destroys it. The database goes last because
-// `encrypt status` reads the database header, so converting it first would
-// report a finished conversion while months of media were still plaintext.
-//
-// Turning it **off**: convert the database, then unseal the media, then delete
-// the key — last, so it outlives every file that still needs it.
-//
-// Neither direction writes a journal or a progress file. The magic header on a
-// media file and the SQLite header on the database *are* the record of what has
-// been done, so a run that is killed halfway leaves a directory that every
-// reader handles correctly and that a re-run finishes. That is the entire payoff
-// of putting a header on the format.
+// There is no journal: the header on each file is the record of what is done,
+// so a run killed halfway is finished by running either direction again.
 func (a *app) encryptCommand() *cobra.Command {
-	cmd := emitsNoContent(&cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "encrypt",
 		Short: "Encrypt Lumi's captured history, or turn encryption off",
 		Long: "Encrypt the screenshots, audio, and search index in the data directory.\n\n" +
@@ -48,7 +41,7 @@ func (a *app) encryptCommand() *cobra.Command {
 			"decrypts in memory.\n\n" +
 			"If the Keychain item is lost, the captured history is unrecoverable. There is no\n" +
 			"password, no recovery code, and no second copy.",
-	})
+	}
 	cmd.AddCommand(
 		a.encryptDirectionCommand("on", "Encrypt the data directory", true),
 		a.encryptDirectionCommand("off", "Decrypt the data directory and forget the key", false),
@@ -60,21 +53,21 @@ func (a *app) encryptCommand() *cobra.Command {
 // they convert.
 func (a *app) encryptDirectionCommand(use, short string, on bool) *cobra.Command {
 	var asJSON bool
-	cmd := emitsNoContent(&cobra.Command{
+	cmd := &cobra.Command{
 		Use:   use,
 		Short: short,
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return a.runEncrypt(cmd.Context(), cmd, asJSON, on)
 		},
-	})
+	}
 	cmd.Flags().BoolVar(&asJSON, "json", false, "emit the result as JSON")
 	return cmd
 }
 
 func (a *app) encryptStatusCommand() *cobra.Command {
 	var asJSON bool
-	cmd := emitsNoContent(&cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "Report whether the data directory is encrypted",
 		Args:  cobra.NoArgs,
@@ -83,7 +76,7 @@ func (a *app) encryptStatusCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			state, err := readEncryptionState(paths.Database)
+			state, err := readEncryptionState(paths)
 			if err != nil {
 				return err
 			}
@@ -92,26 +85,15 @@ func (a *app) encryptStatusCommand() *cobra.Command {
 			}
 			return renderEncryptionState(cmd, state)
 		},
-	})
+	}
 	cmd.Flags().BoolVar(&asJSON, "json", false, "emit the status as JSON")
 	return cmd
 }
 
-// EncryptResult is what a conversion reports.
+// EncryptResult is what a successful conversion reports. A conversion that
+// leaves anything unconverted fails instead, so there are no counts to read.
 type EncryptResult struct {
-	// Enabled is the state after the run.
 	Enabled bool `json:"enabled"`
-	// MediaConverted counts files this run sealed or unsealed; MediaSkipped
-	// counts those already in the target state, which is what a resumed run
-	// finds. They are separate because "nothing to do" and "did nothing" are
-	// different answers.
-	MediaConverted int `json:"media_converted"`
-	MediaSkipped   int `json:"media_skipped"`
-	// MediaFailed counts files that could not be converted. They keep their
-	// current form and a later run retries them, because the header on each file
-	// is the record of what is left.
-	MediaFailed  int    `json:"media_failed"`
-	DatabasePath string `json:"database_path"`
 }
 
 func (a *app) runEncrypt(ctx context.Context, cmd *cobra.Command, asJSON, on bool) error {
@@ -122,16 +104,10 @@ func (a *app) runEncrypt(ctx context.Context, cmd *cobra.Command, asJSON, on boo
 	if err := paths.Ensure(); err != nil {
 		return err
 	}
-	// Two locks, because two different things must be excluded.
-	//
-	// The capture lock is exclusive here and shared by every recorder, so a
-	// recorder cannot start underneath a conversion and a conversion cannot
-	// start underneath a recorder. Reading `record.json` is not enough on its
-	// own — a recorder that starts after the check is invisible to it, and would
-	// then write plaintext behind a walk that has already passed it and hold a
-	// handle on a database about to be renamed away. The state file is still
-	// read first, because "a recording is in progress" is a better message than
-	// "the lock is held".
+	// The capture lock is exclusive here and shared by every recorder, so neither
+	// can start underneath the other — including a recorder the app starts after
+	// it quit mid-conversion and was reopened. `record.json` is read first only
+	// for the better message.
 	if err := refuseEncryptWhileRecording(paths); err != nil {
 		return err
 	}
@@ -140,118 +116,80 @@ func (a *app) runEncrypt(ctx context.Context, cmd *cobra.Command, asJSON, on boo
 		return err
 	}
 	defer releaseCapture()
-	sweepAbandonedPlaintext(cmd.ErrOrStderr())
-	// The compress lock, for the same reason `lumi compress` takes it: both
-	// rewrite media in place, and two of them on one file is the state neither
-	// ordering survives.
+	// Both this and `lumi compress` rewrite media in place.
 	release, err := lockCompress(paths)
 	if err != nil {
 		return err
 	}
 	defer release()
 
-	state, err := readEncryptionState(paths.Database)
-	if err != nil {
-		return err
-	}
-	// `on` never refuses for being already on. The headers are this command's
-	// only record of what is done, and they are per file — so a store whose key
-	// and database agree can still hold plaintext media: a seal that failed at
-	// capture time is logged and left readable on purpose (the never-lose-media
-	// rule), on the promise that the next run picks it up. Refusing here made
-	// that promise false, and the file stayed readable forever with nothing
-	// saying so. Re-running is idempotent by construction; let it run and report
-	// what it found.
-	if !on && !state.Enabled && !state.KeyPresent {
-		return errors.New("Lumi's history is not encrypted")
-	}
-	if !on && state.Unrecoverable() {
-		return errors.New("the database is encrypted and its key is not in this Mac's Keychain, " +
-			"so it cannot be decrypted; there is no way to recover it")
-	}
-
-	result := EncryptResult{Enabled: on, DatabasePath: paths.Database}
 	if on {
-		err = a.encryptOn(ctx, cmd, paths, state, &result)
+		err = encryptOn(ctx, paths)
 	} else {
-		err = a.encryptOff(ctx, cmd, paths, &result)
+		err = encryptOff(ctx, cmd, paths)
 	}
 	if err != nil {
 		return err
 	}
 	if asJSON {
-		return json.NewEncoder(cmd.OutOrStdout()).Encode(result)
+		return json.NewEncoder(cmd.OutOrStdout()).Encode(EncryptResult{Enabled: on})
 	}
-	return renderEncryptResult(cmd, result, on)
-}
-
-func (a *app) encryptOn(ctx context.Context, cmd *cobra.Command, paths config.Paths,
-	state encryptionState, result *EncryptResult) error {
-	// The key is persisted before a single byte is sealed. A file encrypted
-	// under a key that was never written down is gone, and no ordering after
-	// that point can get it back.
-	k, err := ensureKey()
-	if err != nil {
-		return err
-	}
-	if err := convertMedia(ctx, cmd, paths, k.media, true, result); err != nil {
-		return err
-	}
-	// The database last: `encrypt status` reads its header, so converting it
-	// first would report a finished job while the media was still plaintext.
-	if !state.DatabaseEncrypted {
-		if err := convertDatabase(ctx, paths.Database, nil, k.database); err != nil {
-			return err
-		}
-	}
-	// Converting the database is what makes the store read as encrypted, so a
-	// run that left plaintext media behind must not exit reporting success —
-	// every status surface would then say "on" over files anyone can read.
-	// Re-running repairs it; sealed files are skipped by their header.
-	if result.MediaFailed > 0 {
-		return fmt.Errorf("%d file(s) could not be encrypted and are still readable on disk; "+
-			"run `lumi encrypt on` again to retry them", result.MediaFailed)
+	if on {
+		fmt.Fprintln(cmd.OutOrStdout(), "Encrypted Lumi's history. The key is in this Mac's login Keychain; "+
+			"if it is lost, nothing can recover the captured history.")
+	} else {
+		fmt.Fprintln(cmd.OutOrStdout(), "Decrypted Lumi's history.")
 	}
 	return nil
 }
 
-func (a *app) encryptOff(ctx context.Context, cmd *cobra.Command, paths config.Paths,
-	result *EncryptResult) error {
+func encryptOn(ctx context.Context, paths config.Paths) error {
+	k, err := ensureKey()
+	if err != nil {
+		return err
+	}
+	// `on` never refuses for being already on: a seal that failed at capture
+	// time leaves a readable file in an encrypted store, and re-running is what
+	// picks it up. Sealed files are skipped by their header.
+	if err := convertMedia(ctx, paths, k.media, true); err != nil {
+		return err
+	}
+	encrypted, err := store.FileIsEncrypted(paths.Database)
+	if err != nil || encrypted {
+		return err
+	}
+	return convertDatabase(ctx, paths.Database, nil, k.database)
+}
+
+func encryptOff(ctx context.Context, cmd *cobra.Command, paths config.Paths) error {
+	encrypted, err := store.FileIsEncrypted(paths.Database)
+	if err != nil {
+		return err
+	}
 	k, err := resolveKeys()
 	if err != nil {
 		return err
 	}
 	if !k.enabled() {
-		return errors.New("Lumi's encryption key is not in this Mac's Keychain")
-	}
-	encrypted, err := store.FileIsEncrypted(paths.Database)
-	if err != nil {
-		return err
+		if encrypted {
+			return errors.New("the database is encrypted and its key is not in this Mac's Keychain, " +
+				"so it cannot be decrypted; there is no way to recover it")
+		}
+		return errors.New("Lumi's history is not encrypted")
 	}
 	if encrypted {
 		if err := convertDatabase(ctx, paths.Database, k.database, nil); err != nil {
 			return err
 		}
 	}
-	if err := convertMedia(ctx, cmd, paths, k.media, false, result); err != nil {
-		return err
-	}
-	// The key goes last, and only if every file made it back. Deleting it while
-	// anything is still sealed destroys that file permanently — this is the one
-	// irreversible step in the command, so a partial success may not reach it.
-	// The run is re-runnable: what is already unsealed is skipped by its header.
-	if result.MediaFailed > 0 {
-		return fmt.Errorf("%d file(s) could not be decrypted, so Lumi's encryption key has been "+
-			"kept — deleting it would destroy them. Fix the cause and run `lumi encrypt off` again",
-			result.MediaFailed)
+	// The key goes last, and only if every file made it back: deleting it while
+	// anything is still sealed destroys that file.
+	if err := convertMedia(ctx, paths, k.media, false); err != nil {
+		return fmt.Errorf("%w; Lumi kept its encryption key, because deleting it would destroy them", err)
 	}
 	if err := keyring.delete(); err != nil {
-		// Everything is already decrypted at this point, so a key that will not
-		// delete is orphaned rather than dangerous — and it happens for a
-		// mundane reason: the item's ACL names the binary that created it, and a
-		// rebuild or a rotated signing certificate makes this a different one.
-		// Failing the command here would report a decryption that succeeded as
-		// an error, and send the user looking for data loss that did not happen.
+		// Everything is already decrypted, so the key is orphaned rather than
+		// dangerous. The usual cause is an ACL naming a binary a rebuild replaced.
 		fmt.Fprintf(cmd.ErrOrStderr(),
 			"Lumi's history is decrypted, but the old key could not be removed from the Keychain: %v\n"+
 				"It no longer opens anything. Delete the \"Lumi captured history\" item in Keychain "+
@@ -336,16 +274,64 @@ func clearWAL(path string) error {
 	return nil
 }
 
-// convertMedia seals or unseals every captured file.
+// convertMedia seals or unseals every captured file, skipping those already in
+// the target state. A file that fails keeps its current form, the rest are still
+// converted, and the run then fails naming the first failure — so the caller
+// never takes the next step over files left behind.
 //
-// A file already in the target state is skipped by reading its header, which is
-// what makes this resumable. A file that fails is counted and left alone: it
-// keeps whichever form it has, every reader still handles it, and the next run
-// tries again. Failing the whole conversion over one unreadable file would leave
-// the directory in exactly the mixed state it is trying to leave, minus the
-// chance to finish the rest.
-func convertMedia(ctx context.Context, cmd *cobra.Command, paths config.Paths,
-	key seal.Key, sealing bool, result *EncryptResult) error {
+// Each directory is flushed once at the end rather than after every file. A
+// rename lost to a crash leaves the original beside a complete scratch file,
+// which the next attempt removes, so only the caller's next step — converting
+// the database, or deleting the key — needs the renames to have landed.
+func convertMedia(ctx context.Context, paths config.Paths, key seal.Key, sealing bool) error {
+	failed := 0
+	var first error
+	err := eachMedia(paths, func(path string) (bool, error) {
+		if err := ctx.Err(); err != nil {
+			return true, err
+		}
+		var err error
+		if sealing {
+			err = key.SealFile(path)
+		} else {
+			err = key.UnsealFile(path)
+		}
+		if err != nil {
+			if failed == 0 {
+				first = err
+			}
+			failed++
+		}
+		return false, nil
+	})
+	if err != nil {
+		return err
+	}
+	for _, dir := range []string{paths.Screenshots, paths.Audio} {
+		if err := seal.SyncDir(dir); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d file(s) could not be converted (first: %v)", failed, first)
+	}
+	return nil
+}
+
+// anyMediaSealed reports whether any captured file carries the seal header.
+func anyMediaSealed(paths config.Paths) (bool, error) {
+	found := false
+	err := eachMedia(paths, func(path string) (bool, error) {
+		sealed, err := seal.IsSealed(path)
+		found = err == nil && sealed
+		return found, nil
+	})
+	return found, err
+}
+
+// eachMedia calls visit for every captured media file until it returns true.
+// A scratch file from an interrupted seal is not captured media and is skipped.
+func eachMedia(paths config.Paths, visit func(path string) (stop bool, err error)) error {
 	for _, dir := range []string{paths.Screenshots, paths.Audio} {
 		entries, err := os.ReadDir(dir)
 		if errors.Is(err, fs.ErrNotExist) {
@@ -355,39 +341,13 @@ func convertMedia(ctx context.Context, cmd *cobra.Command, paths config.Paths,
 			return fmt.Errorf("scan %s: %w", dir, err)
 		}
 		for _, entry := range entries {
-			if err := ctx.Err(); err != nil {
+			if entry.IsDir() || filepath.Ext(entry.Name()) == seal.ScratchSuffix {
+				continue
+			}
+			stop, err := visit(filepath.Join(dir, entry.Name()))
+			if stop || err != nil {
 				return err
 			}
-			if entry.IsDir() {
-				continue
-			}
-			// A scratch file from a seal that was interrupted is not captured
-			// media. Converting one would produce a sealed fragment that looks
-			// like a real capture to the next run.
-			if filepath.Ext(entry.Name()) == seal.ScratchSuffix {
-				continue
-			}
-			path := filepath.Join(dir, entry.Name())
-			done, err := seal.IsSealed(path)
-			if err != nil {
-				result.MediaFailed++
-				continue
-			}
-			if done == sealing {
-				result.MediaSkipped++
-				continue
-			}
-			if sealing {
-				err = key.SealFile(path)
-			} else {
-				err = key.UnsealFile(path)
-			}
-			if err != nil {
-				result.MediaFailed++
-				fmt.Fprintf(cmd.ErrOrStderr(), "could not convert %s: %v\n", path, err)
-				continue
-			}
-			result.MediaConverted++
 		}
 	}
 	return nil
@@ -404,29 +364,7 @@ func refuseEncryptWhileRecording(paths config.Paths) error {
 		return err
 	}
 	if ok && processAlive(state.PID) {
-		return errors.New("a recording is in progress; stop it before changing encryption " +
-			"(Lumi's menu bar, or `lumi record stop`)")
-	}
-	return nil
-}
-
-func renderEncryptResult(cmd *cobra.Command, result EncryptResult, on bool) error {
-	out := cmd.OutOrStdout()
-	verb := "Encrypted"
-	if !on {
-		verb = "Decrypted"
-	}
-	fmt.Fprintf(out, "%s Lumi's history: %d files converted", verb, result.MediaConverted)
-	if result.MediaSkipped > 0 {
-		fmt.Fprintf(out, ", %d already done", result.MediaSkipped)
-	}
-	if result.MediaFailed > 0 {
-		fmt.Fprintf(out, ", %d could not be converted (run this again to retry them)", result.MediaFailed)
-	}
-	fmt.Fprintln(out, ".")
-	if on {
-		fmt.Fprintln(out, "The key is in this Mac's login Keychain. If it is lost, nothing can recover "+
-			"the captured history.")
+		return errors.New("a recording is in progress; stop recording before changing encryption")
 	}
 	return nil
 }
@@ -434,9 +372,11 @@ func renderEncryptResult(cmd *cobra.Command, result EncryptResult, on bool) erro
 func renderEncryptionState(cmd *cobra.Command, state encryptionState) error {
 	out := cmd.OutOrStdout()
 	switch {
-	case state.Unrecoverable():
+	case state.Unrecoverable:
 		fmt.Fprintln(out, "Encryption: BROKEN — the database is encrypted and its key is not in this "+
 			"Mac's Keychain. The captured history cannot be read.")
+	case state.Incomplete:
+		fmt.Fprintln(out, "Encryption: incomplete — a conversion stopped partway; run either direction to finish it")
 	case state.Enabled:
 		fmt.Fprintln(out, "Encryption: on")
 	default:

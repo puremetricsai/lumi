@@ -139,7 +139,7 @@ func processAlive(pid int) bool {
 func (a *app) recordStartCommand() *cobra.Command {
 	var f recordFlags
 	var foreground, registerState bool
-	cmd := emitsNoContent(&cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "start",
 		Short: "Start recording (in the background, or with --foreground in this terminal)",
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -154,7 +154,7 @@ func (a *app) recordStartCommand() *cobra.Command {
 			}
 			return a.startBackground(cmd, f)
 		},
-	})
+	}
 	f.bind(cmd)
 	cmd.Flags().BoolVar(&foreground, "foreground", false, "run in this terminal instead of detaching to the background")
 	// Default off, so today's --foreground is byte-for-byte what it was: a
@@ -309,7 +309,7 @@ func confirmAlive(pid int, window time.Duration) bool {
 
 func (a *app) recordStatusCommand() *cobra.Command {
 	var asJSON bool
-	cmd := emitsNoContent(&cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "Report whether a recording is in progress",
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -357,13 +357,13 @@ func (a *app) recordStatusCommand() *cobra.Command {
 			}
 			return nil
 		},
-	})
+	}
 	cmd.Flags().BoolVar(&asJSON, "json", false, "emit JSON")
 	return cmd
 }
 
 func (a *app) recordStopCommand() *cobra.Command {
-	return emitsNoContent(&cobra.Command{
+	return &cobra.Command{
 		Use:   "stop",
 		Short: "Stop the background recording and wait for it to exit",
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -399,7 +399,7 @@ func (a *app) recordStopCommand() *cobra.Command {
 			fmt.Fprintf(cmd.OutOrStdout(), "recording stopped (pid %d)\n", state.PID)
 			return nil
 		},
-	})
+	}
 }
 
 // stopProcess sends SIGTERM and waits up to timeout for the process to exit,
