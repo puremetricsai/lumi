@@ -18,7 +18,6 @@ struct LumiApp: App {
         // toolbar capsule itself. `WindowChrome` in LumiWindow clears the rest.
         .windowStyle(.plain)
         .windowResizability(.contentSize)
-        .defaultPosition(.center)
         .commandsRemoved()
 
         Settings {
@@ -55,8 +54,8 @@ struct LumiApp: App {
     /// `@NSApplicationDelegateAdaptor` — but set by `AppDelegate` itself, since
     /// unlike an `OpenSettingsAction` it needs no SwiftUI environment to read.
     ///
-    /// The x button, Esc, and the menu bar's toggle are three ways to hide one
-    /// window; this is what keeps them one implementation of hiding it. Not
+    /// Esc and the menu bar's toggle are two ways to hide one window; this is
+    /// what keeps them one implementation of hiding it. Not
     /// `\.dismiss`, which closes the window without telling the menu bar item,
     /// leaving it offering "Hide Lumi" for a window that is already gone.
     @MainActor static var hide: (() -> Void)?
@@ -207,8 +206,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
-        // The window has no traffic lights. Its own x button and Esc are the
-        // other two routes to the same `hideWindow()`.
+        // The window has no traffic lights and no close button. Esc is the
+        // other route to the same `hideWindow()`.
         let open = NSMenuItem(
             title: lumiWindow?.isVisible == true ? "Hide Lumi" : "Open Lumi",
             action: #selector(openWindow), keyEquivalent: "")
@@ -324,7 +323,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// hideWindow is the one implementation of putting the toolbar away: the
-    /// window's x button, Esc, and the menu bar's toggle all end here.
+    /// Esc and the menu bar's toggle both end here.
     ///
     /// The `updateStatusItem()` is why this exists rather than SwiftUI's
     /// `\.dismiss`. The menu item is titled on `lumiWindow?.isVisible`, so a

@@ -8,7 +8,8 @@ import SwiftUI
 /// timer, and no session name — which is why the whole app fits on a strip:
 /// what a user comes here for is "is it capturing, and is it hearing anything".
 ///
-/// The three states differ only in what sits between the mark and the gear.
+/// The three states differ only in what the mark does and what sits between
+/// it and the gear.
 /// Nothing here scrolls, wraps, or resizes; the window is exactly this row.
 struct LumiWindow: View {
     @Environment(RecorderController.self) private var recorder
@@ -26,7 +27,6 @@ struct LumiWindow: View {
                     .accessibilityLabel(error)
             }
             settingsButton
-            hideButton
         }
         .padding(.horizontal, 10)
         .frame(height: Theme.barHeight)
@@ -55,17 +55,32 @@ struct LumiWindow: View {
 
     // MARK: - Mark
 
-    /// The mark is the window's drag handle and nothing else.
+    /// The mark is the start button while idle, and a plain glyph otherwise.
     ///
     /// Drawn exactly as the menu bar draws it: the same template image, at the
-    /// same secondary weight as every other glyph on the bar. It is not a
-    /// button, so it takes no hover treatment — but it is not a logo either,
-    /// and a solid white disc among translucent glyphs read as one.
-    ///
-    /// `isMovableByWindowBackground` is off, so this gesture is the only thing
-    /// that moves the window — dragging a button must press it, not slide the
-    /// toolbar out from under the pointer.
+    /// same secondary weight as every other glyph on the bar — a solid white
+    /// disc among translucent glyphs read as a logo. Idle, it takes the red
+    /// hover the stop button does, because starting capture is what it does.
+    @ViewBuilder
     private var mark: some View {
+        if recorder.state == .idle {
+            Button {
+                Task { await recorder.start() }
+            } label: {
+                markGlyph
+            }
+            .buttonStyle(ToolbarButtonStyle(hoverTint: Theme.recording))
+            .accessibilityLabel("Start recording")
+            .help("Start recording")
+        } else {
+            markGlyph
+                .foregroundStyle(.secondary)
+                .frame(width: Theme.barItemHeight, height: Theme.barItemHeight)
+                .accessibilityLabel("Lumi")
+        }
+    }
+
+    private var markGlyph: some View {
         Group {
             if let glyph = MenuBarGlyph.template {
                 Image(nsImage: glyph)
@@ -73,15 +88,10 @@ struct LumiWindow: View {
                     .renderingMode(.template)
             }
         }
-        .foregroundStyle(.secondary)
         // A touch larger than the 17pt glyphs beside it: the mark is a filled
         // disc where they are line art, and at the same size it reads smaller
         // than they do.
         .frame(width: 20, height: 20)
-        .frame(width: Theme.barItemHeight, height: Theme.barItemHeight)
-        .contentShape(Rectangle())
-        .gesture(WindowDragGesture())
-        .accessibilityLabel("Lumi. Drag to move the window")
     }
 
     // MARK: - States
@@ -103,7 +113,7 @@ struct LumiWindow: View {
                 stopButton
             }
         case .idle:
-            recordButton
+            EmptyView()
         case .needsPermissions:
             permissionsButton
         }
@@ -191,17 +201,6 @@ struct LumiWindow: View {
 
     // MARK: - Buttons
 
-    private var recordButton: some View {
-        Button {
-            Task { await recorder.start() }
-        } label: {
-            Image(systemName: "circle.fill").font(.system(size: 15))
-        }
-        .buttonStyle(ToolbarButtonStyle(tint: .white, hoverTint: Theme.recording))
-        .accessibilityLabel("Start recording")
-        .help("Start recording")
-    }
-
     private var stopButton: some View {
         Button {
             Task { await recorder.stop() }
@@ -249,33 +248,15 @@ struct LumiWindow: View {
         .accessibilityLabel("Open Settings")
         .help("Settings")
     }
-
-    /// The x puts the toolbar away; it does not quit Lumi.
-    ///
-    /// An x in the corner of a window is read as "quit" by anyone who has met a
-    /// menu bar app that hides in one, which is why the tooltip says what
-    /// happens to capture. Lumi is quit from the menu bar and nowhere else, so
-    /// this takes the plain tint rather than the red reserved for controls that
-    /// end something.
-    private var hideButton: some View {
-        Button {
-            LumiApp.hide?()
-        } label: {
-            Image(systemName: "xmark").font(.system(size: 13, weight: .medium))
-        }
-        .buttonStyle(ToolbarButtonStyle())
-        .accessibilityLabel("Hide Lumi")
-        .help("Hide the toolbar. Recording continues.")
-    }
 }
 
 /// WindowChrome strips the window down to the capsule the toolbar draws.
 ///
 /// `.windowStyle(.plain)` removes the title bar and the traffic lights but
 /// leaves an opaque background behind the capsule's rounded corners, and there
-/// is no SwiftUI API for a window's level or for turning background-dragging
-/// off. All four settings are AppKit-only, so this reaches the `NSWindow` once,
-/// when the view is installed in it.
+/// is no SwiftUI API for a window's level, its movability, or pinning it to a
+/// screen edge. All of these are AppKit-only, so this reaches the `NSWindow`
+/// once, when the view is installed in it.
 private struct WindowChrome: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView { Configurator() }
 
@@ -283,15 +264,18 @@ private struct WindowChrome: NSViewRepresentable {
 
     private final class Configurator: NSView {
         private var escapeMonitor: Any?
+        private var pinObservers: [NSObjectProtocol] = []
 
         deinit {
             if let escapeMonitor { NSEvent.removeMonitor(escapeMonitor) }
+            pinObservers.forEach(NotificationCenter.default.removeObserver)
         }
 
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             guard let window else { return }
             installEscapeMonitor(for: window)
+            installPin(for: window)
             window.hasShadow = true
             // `.plain` leaves a borderless window, and a borderless window
             // cannot become key — so no key press reaches it at all and the
@@ -300,6 +284,12 @@ private struct WindowChrome: NSViewRepresentable {
             // content the whole window, and the title bar it would otherwise
             // draw is made transparent and emptied of its buttons.
             window.styleMask.insert([.titled, .fullSizeContentView])
+            // The title bar still reserves its height as a top safe area, and
+            // SwiftUI sized the window to the capsule plus that inset: an
+            // invisible strip above the bar that AppKit keeps below the menu
+            // bar, so the pinned capsule sat a title bar's height too low.
+            let titlebar = window.frame.height - window.contentLayoutRect.height
+            window.contentView?.additionalSafeAreaInsets.top = -titlebar
             window.titlebarAppearsTransparent = true
             window.titleVisibility = .hidden
             for button in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
@@ -310,14 +300,40 @@ private struct WindowChrome: NSViewRepresentable {
             // Above every other app: the toolbar says whether capture is live,
             // which is worth nothing behind the window being captured.
             window.level = .floating
-            // The mark is the drag handle. Dragging the background would make
-            // every button a place the window slides from.
-            window.isMovableByWindowBackground = false
+            // Pinned, never dragged: a toolbar that can sit anywhere is one the
+            // user has to hunt for. `isMovable`, not only the background flag,
+            // because the hidden title bar strip is a drag region of its own.
+            window.isMovable = false
             // "Open Lumi" must open it where the user is. A window left on the
             // Space it was created in reports `isVisible` while being on
             // nobody's screen, and with no traffic lights and no Dock icon
-            // there is nothing to find it with.
-            window.collectionBehavior.insert(.moveToActiveSpace)
+            // there is nothing to find it with. `.fullScreenAuxiliary` lets it
+            // float over a full-screen app's Space as well.
+            window.collectionBehavior.insert([.moveToActiveSpace, .fullScreenAuxiliary])
+        }
+
+        /// Keeps the capsule at the top center of its screen.
+        ///
+        /// Re-pinned on resize, not only once: the bar's width changes with the
+        /// recorder's state, and a window grows from its origin, so a single
+        /// placement would drift right every time recording started.
+        private func installPin(for window: NSWindow) {
+            guard pinObservers.isEmpty else { return }
+            let pin = { [weak window] in
+                guard let window, let screen = (window.screen ?? NSScreen.main)?.visibleFrame else { return }
+                window.setFrameOrigin(NSPoint(
+                    x: screen.midX - window.frame.width / 2,
+                    y: screen.maxY - window.frame.height - 8))
+            }
+            let center = NotificationCenter.default
+            pinObservers = [
+                center.addObserver(forName: NSWindow.didResizeNotification, object: window, queue: .main) { _ in pin() },
+                center.addObserver(forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main) { _ in pin() },
+                center.addObserver(
+                    forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
+                ) { _ in pin() },
+            ]
+            pin()
         }
 
         /// Esc is handled here rather than with `onExitCommand`.
