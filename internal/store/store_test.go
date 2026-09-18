@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -711,8 +712,8 @@ func TestVacuumBusyIsRecognisable(t *testing.T) {
 // share one by construction, and 21% of live rows share theirs — so without
 // e.id the order inside a tie group is whatever the query plan produced, and two
 // identical calls can return different subsets of a group the LIMIT cuts
-// through. `lumi mcp` hands the oldest captured_at on a page back as `until`,
-// which needs the same boundary every time.
+// through. `lumi mcp` pages on the last row's (captured_at, id), which needs the
+// same boundary every time.
 func TestSearchBreaksCapturedAtTiesByDescendingID(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t, ctx)
@@ -792,6 +793,146 @@ func TestSearchBreaksRankedTiesByDescendingID(t *testing.T) {
 	}
 	if got[0].ID != tie[1].ID || got[1].ID != tie[0].ID {
 		t.Fatalf("ranked tie order = %v, want descending id %v", ids(got), []int64{tie[1].ID, tie[0].ID})
+	}
+}
+
+// TestSearchKeysetPagesThroughATieGroup walks a captured_at tie group wider than
+// the page. The tie group is the case the inclusive `until` bound could not
+// advance past at all: every row in it carries the boundary value, so a bound
+// naming that value returns the same group forever. The strict (captured_at, id)
+// cursor walks it, and the walk must reproduce the unpaginated order exactly —
+// no gap, no repeat.
+func TestSearchKeysetPagesThroughATieGroup(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, ctx)
+	base := time.Now().UTC().Truncate(time.Second)
+	insertAll(t, ctx, s, Event{Kind: KindScreen, CapturedAt: base.Add(-time.Hour), Text: "older row"})
+	tie := make([]Event, 5)
+	for i := range tie {
+		tie[i] = Event{Kind: KindScreen, CapturedAt: base, Text: fmt.Sprintf("tie row %d", i)}
+	}
+	insertAll(t, ctx, s, tie...)
+
+	whole, err := s.Search(ctx, SearchOptions{Limit: 50})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(whole) != 6 {
+		t.Fatalf("got %d events, want 6", len(whole))
+	}
+
+	var walked []int64
+	var cursor *SearchCursor
+	// Six rows in pages of two is three pages plus an empty one; the bound is a
+	// runaway guard, not the expected count.
+	for range 10 {
+		page, err := s.Search(ctx, SearchOptions{Limit: 2, Before: cursor})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		if cursor != nil && page[0].ID == cursor.ID {
+			t.Fatalf("page repeated the cursor row %d", cursor.ID)
+		}
+		walked = append(walked, ids(page)...)
+		last := page[len(page)-1]
+		cursor = &SearchCursor{CapturedAt: last.CapturedAtRaw, ID: last.ID}
+	}
+	if !slices.Equal(walked, ids(whole)) {
+		t.Fatalf("walked %v, want %v", walked, ids(whole))
+	}
+}
+
+// TestSearchKeysetIsExactAcrossBothStoredRenderings is why SearchCursor carries
+// the stored string and not a time.Time. The index renders one instant two ways,
+// and they sort against each other rather than as equals, so a cursor rebuilt
+// from CapturedAt by picking a layout walks straight past a row.
+func TestSearchKeysetIsExactAcrossBothStoredRenderings(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, ctx)
+
+	// Trailing zeros are where the two renderings differ, and ".12Z" sorts above
+	// ".120000000Z" for the same instant. The legacy row goes in first so it
+	// carries the *lower* id: under a rebuilt fixed-width key the second row then
+	// ties on captured_at with a higher id and falls outside a strict bound.
+	at := time.Date(2026, 7, 30, 19, 33, 48, 120000000, time.UTC)
+	legacy := at.UTC().Format(time.RFC3339Nano)
+	if legacy == FormatCapturedAt(at) {
+		t.Fatalf("fixture is not a legacy rendering: %q", legacy)
+	}
+	if _, err := s.db.ExecContext(ctx, `
+INSERT INTO events(kind, captured_at, text, app, window, media_path, duration_ms,
+                   text_source, display_id, audio_source, metadata_json)
+VALUES ('screen', ?, 'legacy rendering row', '', '', 'legacy.jpg', 0, 'vision', 1, '', '{}')`,
+		legacy); err != nil {
+		t.Fatal(err)
+	}
+	fresh := Event{Kind: KindScreen, CapturedAt: at, Text: "fixed width rendering row", MediaPath: "fresh.jpg"}
+	if err := s.Insert(ctx, &fresh); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := s.Search(ctx, SearchOptions{Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 1 || first[0].CapturedAtRaw != legacy {
+		t.Fatalf("first page = %#v, want the legacy-rendered row", first)
+	}
+
+	second, err := s.Search(ctx, SearchOptions{Limit: 1,
+		Before: &SearchCursor{CapturedAt: first[0].CapturedAtRaw, ID: first[0].ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second) != 1 || second[0].ID != fresh.ID {
+		t.Fatalf("second page = %v, want the fixed-width row %d", ids(second), fresh.ID)
+	}
+
+	// The negative half: the same cursor rebuilt from the instant loses the row.
+	rebuilt, err := s.Search(ctx, SearchOptions{Limit: 1,
+		Before: &SearchCursor{CapturedAt: FormatCapturedAt(first[0].CapturedAt), ID: first[0].ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rebuilt) != 0 {
+		t.Fatalf("a rebuilt key returned %v; the fixture no longer demonstrates the gap", ids(rebuilt))
+	}
+}
+
+// TestSearchOffsetPagesRankedResults: ranked mode has no stored sort key to
+// keyset on, so it pages with OFFSET. Two pages, no repeat, and together the
+// whole result.
+func TestSearchOffsetPagesRankedResults(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, ctx)
+	base := time.Now().UTC().Truncate(time.Second)
+	rows := make([]Event, 4)
+	for i := range rows {
+		rows[i] = Event{Kind: KindScreen, CapturedAt: base.Add(-time.Duration(i) * time.Minute),
+			Text: "postgres index maintenance"}
+	}
+	insertAll(t, ctx, s, rows...)
+
+	whole, err := s.Search(ctx, SearchOptions{Query: "postgres", Limit: 50})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(whole) != 4 {
+		t.Fatalf("got %d hits, want 4", len(whole))
+	}
+	first, err := s.Search(ctx, SearchOptions{Query: "postgres", Limit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.Search(ctx, SearchOptions{Query: "postgres", Limit: 2, Offset: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := append(ids(first), ids(second)...); !slices.Equal(got, ids(whole)) {
+		t.Fatalf("offset walk = %v, want %v", got, ids(whole))
 	}
 }
 

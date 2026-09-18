@@ -9,6 +9,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/puremetricsai/lumi/internal/store"
 )
 
@@ -621,9 +622,12 @@ func TestSearchEventsCapNoticeIsAnElseBranch(t *testing.T) {
 	s := testStore(t)
 	base := time.Now().UTC().Truncate(time.Second)
 	for i := 0; i < 3; i++ {
+		// Distinct text per frame: these three exercise the cap notice, and
+		// collapsing is now the default, so identical screens would fold to one
+		// and the counts under test would be the fold's rather than the cap's.
 		insertEvents(t, ctx, s, store.Event{
 			Kind: store.KindScreen, CapturedAt: base.Add(time.Duration(i) * time.Second),
-			Text: "roadmap", MediaPath: "/tmp/a.jpg",
+			Text: fmt.Sprintf("roadmap milestone %d", i), MediaPath: "/tmp/a.jpg",
 		})
 	}
 	h := &handlers{store: s}
@@ -663,7 +667,8 @@ func TestSearchEventsClampsLimitToMax(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
 	for i := 0; i < 3; i++ {
-		insertEvents(t, ctx, s, store.Event{Kind: store.KindScreen, Text: "roadmap", MediaPath: "/tmp/a.jpg"})
+		insertEvents(t, ctx, s, store.Event{Kind: store.KindScreen,
+			Text: fmt.Sprintf("roadmap milestone %d", i), MediaPath: "/tmp/a.jpg"})
 	}
 	h := &handlers{store: s}
 
@@ -962,11 +967,28 @@ func TestSourceAppReachesTheWire(t *testing.T) {
 	}
 }
 
-// TestToolDescriptionsStateTheMicrophoneCaveat is acceptance criterion 4. The
-// description text loads into an agent's context before any row is fetched, so it
-// is the actual contract — not documentation about one.
+// TestToolDescriptionsStateTheMicrophoneCaveat pins the provenance contract to
+// where it is now delivered, and pins the saving that moving it bought.
+//
+// It used to assert these phrases were in search_events' description, which
+// meant every client loaded 1753 characters on every tools/list — a third of
+// Lumi's whole description payload — including the ones that only ever read
+// screen text. They now ride the notice of a page that actually holds an audio
+// row, so the test is two-sided: present when there is an audio row to explain,
+// and ABSENT otherwise. The absence half is the one that fails if the contract
+// creeps back into the description, which is the only way the saving is lost.
 func TestToolDescriptionsStateTheMicrophoneCaveat(t *testing.T) {
-	search := findToolDescription(t, "search_events")
+	ctx := context.Background()
+	s := testStore(t)
+	base := time.Now().UTC().Truncate(time.Second)
+	pair := audioPair(t, ctx, s, base, "the quarterly numbers are on the next slide", "and the room agreed")
+	screenRows := insertEvents(t, ctx, s, store.Event{
+		Kind: store.KindScreen, CapturedAt: base.Add(time.Minute),
+		App: "Comet", Text: "an invoice for eleven thousand dollars", MediaPath: "/tmp/a.jpg",
+	})
+	h := &handlers{store: s}
+
+	audio := callSearch(t, ctx, h, searchEventsInput{Kind: "audio"}).Notice
 	for _, required := range []string{
 		"audio_source is the capture DEVICE",
 		"source_app",
@@ -976,13 +998,12 @@ func TestToolDescriptionsStateTheMicrophoneCaveat(t *testing.T) {
 		"other people present",
 		// The pairing clauses. Merging a chunk's two rows on a shared timestamp
 		// once discarded a whole microphone transcript while the result still
-		// read as complete, so the description has to say both that a pair
+		// read as complete, so the contract has to say both that a pair
 		// shares an interval rather than a sound and that neither row may be
 		// treated as the other's duplicate.
 		"Audio rows come in PAIRS sharing one captured_at",
 		"not necessarily a sound",
 		"never assume one row of a pair is redundant",
-		"get_transcript answers both questions",
 		// And it must not over-correct into promising delivery of both rows.
 		// Filters are per-row, so a lone row is routine — see
 		// TestSearchEventsMicrophoneOnlyHitIsNotReplaced. Claiming both arrive
@@ -991,22 +1012,60 @@ func TestToolDescriptionsStateTheMicrophoneCaveat(t *testing.T) {
 		"applied per ROW",
 		"is NOT evidence that the chunk held one track",
 	} {
-		if !strings.Contains(search, required) {
-			t.Errorf("search_events description omits %q", required)
+		if !strings.Contains(audio, required) {
+			t.Errorf("a page holding audio omits %q from its notice", required)
 		}
 	}
-	// Every tool that can surface audio must carry the caveat, since an agent may
-	// reach the data through any of them.
+
+	// The saving. A screen-only page explains nothing about audio, and no
+	// description carries the contract either — that is the whole point of the
+	// move, and a description that quietly regained it would still pass the half
+	// above.
+	screen := callSearch(t, ctx, h, searchEventsInput{Kind: "screen"}).Notice
+	for _, forbidden := range []string{"audio_source is the capture DEVICE", "emitting_process",
+		"Audio rows come in PAIRS sharing one captured_at"} {
+		if strings.Contains(screen, forbidden) {
+			t.Errorf("a screen-only page still pays for %q in its notice", forbidden)
+		}
+	}
+	for _, name := range []string{"search_events", "get_event", "list_apps", "get_transcript"} {
+		if strings.Contains(findToolDescription(t, name), "audio_source is the capture DEVICE") {
+			t.Errorf("%s description carries the provenance contract again; it belongs in the notice", name)
+		}
+	}
+
+	// get_event renders the same three fields and is where an agent goes for the
+	// complete version of a row it half-read, so it carries the contract too —
+	// and only for an audio event.
+	_, audioEvent, err := h.getEvent(ctx, nil, getEventInput{ID: pair[0].ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(audioEvent.Notice, "Microphone audio has NO reliable source") {
+		t.Errorf("get_event on an audio event omits the contract: %q", audioEvent.Notice)
+	}
+	_, screenEvent, err := h.getEvent(ctx, nil, getEventInput{ID: screenRows[0].ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(screenEvent.Notice, "audio_source is the capture DEVICE") {
+		t.Errorf("get_event on a screen event pays for the contract: %q", screenEvent.Notice)
+	}
+
+	// Every tool that can surface audio still has to name the field an agent
+	// will see, so it knows there is something to read about.
 	for _, name := range []string{"get_event", "list_apps", "get_transcript"} {
 		description := findToolDescription(t, name)
 		if !strings.Contains(description, "source_app") {
 			t.Errorf("%s description never mentions source_app", name)
 		}
 	}
-	// Each of them states the ambiguity as a fact about the row rather than as a
+	// get_transcript states the ambiguity as a fact about the row rather than a
 	// rule about what the caller may conclude: the microphone records the room,
-	// and what it caught may be a person or anything else audible.
-	for _, name := range []string{"search_events", "get_event", "get_transcript"} {
+	// and what it caught may be a person or anything else audible. search_events
+	// hands that to the notice with the rest of the contract; get_event keeps its
+	// own sentence because a microphone event is the whole of its answer.
+	for _, name := range []string{"get_event", "get_transcript"} {
 		description := findToolDescription(t, name)
 		if !strings.Contains(description, "other people present") {
 			t.Errorf("%s description never says what microphone audio may have caught", name)
@@ -1078,22 +1137,73 @@ func screenRun(t *testing.T, ctx context.Context, s *store.Store, base time.Time
 	return insertEvents(t, ctx, s, events...)
 }
 
-// TestSearchEventsCollapseIsOffByDefault: nothing an existing agent expects may
-// disappear un-asked, so the fold only ever happens on request.
-func TestSearchEventsCollapseIsOffByDefault(t *testing.T) {
+// TestSearchEventsCollapsesByDefault pins the default and its escape hatch
+// together. The fold used to be opt-in, and an agent that did not know to ask
+// for it paid for the same screen four times over; 76% of adjacent same-app
+// pairs are more than 0.9 identical, so off-by-default was the wrong way round.
+// Nothing becomes unreachable — collapsed_ids names every folded row — and
+// expand_similar returns the page unfolded for a caller that wants each frame.
+func TestSearchEventsCollapsesByDefault(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
 	screenRun(t, ctx, s, time.Now().UTC().Truncate(time.Second), "Ghostty", 3)
 	h := &handlers{store: s}
 
-	out := callSearch(t, ctx, h, searchEventsInput{})
-	if len(out.Events) != 3 {
-		t.Fatalf("default search returned %d events, want all 3 uncollapsed", len(out.Events))
+	folded := callSearch(t, ctx, h, searchEventsInput{})
+	if len(folded.Events) != 1 {
+		t.Fatalf("default search returned %d events, want the run folded to 1", len(folded.Events))
 	}
-	for _, rec := range out.Events {
+	if folded.Events[0].CollapsedCount != 2 {
+		t.Fatalf("representative folded %d rows, want 2", folded.Events[0].CollapsedCount)
+	}
+
+	expanded := callSearch(t, ctx, h, searchEventsInput{ExpandSimilar: true})
+	if len(expanded.Events) != 3 {
+		t.Fatalf("expand_similar returned %d events, want all 3", len(expanded.Events))
+	}
+	for _, rec := range expanded.Events {
 		if len(rec.CollapsedIDs) != 0 || rec.CollapsedCount != 0 {
-			t.Fatalf("a record carries collapse metadata with the flag off: %#v", rec)
+			t.Fatalf("a record carries collapse metadata under expand_similar: %#v", rec)
 		}
+	}
+}
+
+// TestSearchEventsHonoursTheDeprecatedCollapseFlag: collapse_similar outlives
+// its own meaning because a cached tools/list is not a hypothetical here —
+// `lumi mcp` replaces its own image mid-session while the client keeps the tool
+// list it has, and additionalProperties: false turns an unknown field into a
+// failed call rather than an ignored argument.
+func TestSearchEventsHonoursTheDeprecatedCollapseFlag(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	screenRun(t, ctx, s, time.Now().UTC().Truncate(time.Second), "Ghostty", 3)
+
+	// Over the protocol, not through the handler: the point of keeping the field
+	// is that the SDK validates arguments against the generated schema before a
+	// handler ever runs, and additionalProperties: false rejects a name the
+	// schema does not carry. Calling the handler directly would pass whether the
+	// field were advertised or not.
+	session := connect(t, ctx, s)
+	res, err := session.CallTool(ctx, &sdk.CallToolParams{
+		Name:      "search_events",
+		Arguments: map[string]any{"collapse_similar": true},
+	})
+	if err != nil {
+		t.Fatalf("collapse_similar was rejected by the generated schema: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("collapse_similar returned a tool error: %v", res.Content)
+	}
+	var out searchEventsOutput
+	encoded, err := json.Marshal(res.StructuredContent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(encoded, &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Events) != 1 {
+		t.Fatalf("collapse_similar: true returned %d events, want the fold it asks for", len(out.Events))
 	}
 }
 
@@ -1111,7 +1221,7 @@ func TestSearchEventsCollapseCarriesEveryDroppedID(t *testing.T) {
 	})
 	h := &handlers{store: s}
 
-	out := callSearch(t, ctx, h, searchEventsInput{CollapseSimilar: true})
+	out := callSearch(t, ctx, h, searchEventsInput{})
 	if len(out.Events) != 2 {
 		t.Fatalf("collapse returned %d records, want 2 (one per app)", len(out.Events))
 	}
@@ -1151,16 +1261,19 @@ func TestSearchEventsCollapsedNoticeReportsBothCounts(t *testing.T) {
 	screenRun(t, ctx, s, time.Now().UTC().Truncate(time.Second), "Ghostty", 4)
 	h := &handlers{store: s}
 
-	out := callSearch(t, ctx, h, searchEventsInput{Limit: 4, CollapseSimilar: true})
+	out := callSearch(t, ctx, h, searchEventsInput{Limit: 4})
 	if len(out.Events) != 1 {
 		t.Fatalf("collapse returned %d records, want 1", len(out.Events))
 	}
 	if !strings.Contains(out.Notice, "4 fetched, collapsed to 1") {
 		t.Fatalf("notice must report both counts honestly, got %q", out.Notice)
 	}
-	// Browse mode names the real cursor rather than telling the agent to guess.
-	if !strings.Contains(out.Notice, "until=") {
-		t.Fatalf("a browse-mode capped notice must name the page boundary, got %q", out.Notice)
+	// The page boundary is a cursor, not advice to guess at a time window.
+	if !strings.Contains(out.Notice, "cursor=next_cursor") {
+		t.Fatalf("a capped notice must point at the cursor, got %q", out.Notice)
+	}
+	if out.NextCursor == "" {
+		t.Fatal("a capped page must carry next_cursor")
 	}
 }
 
@@ -1189,5 +1302,205 @@ func TestSearchEventsExcerptCentersOnTheMatch(t *testing.T) {
 	}
 	if want := utf8.RuneCountInString(text); rec.TextLength != want {
 		t.Fatalf("text_length = %d, want the whole text's %d", rec.TextLength, want)
+	}
+}
+
+// TestSearchEventsCursorWalksATieGroup is the test the old `until=` cursor
+// could not have passed. captured_at is not unique — a chunk's two audio tracks
+// share one by construction, and 21% of live rows share theirs — and the old
+// bound was inclusive, so the boundary group repeated on every page and a tie
+// group larger than limit could not advance at all. The cursor is a keyset on
+// (captured_at, id), so the walk is exact.
+func TestSearchEventsCursorWalksATieGroup(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	shared := time.Now().UTC().Truncate(time.Second)
+	// Five rows on one timestamp, wider than the page, plus an older row to
+	// prove the walk leaves the group rather than stalling in it.
+	for i := 0; i < 5; i++ {
+		insertEvents(t, ctx, s, store.Event{
+			Kind: store.KindScreen, CapturedAt: shared, App: "Comet",
+			Text: fmt.Sprintf("invoice line item %d", i), MediaPath: "/tmp/a.jpg",
+		})
+	}
+	insertEvents(t, ctx, s, store.Event{
+		Kind: store.KindScreen, CapturedAt: shared.Add(-time.Hour), App: "Comet",
+		Text: "an older page about shipping", MediaPath: "/tmp/a.jpg",
+	})
+	h := &handlers{store: s}
+
+	seen := []int64{}
+	cursor := ""
+	for page := 0; page < 10; page++ {
+		// ExpandSimilar so the walk is purely about paging: a fold mid-page would
+		// reorder what a page contains without changing what it advanced past,
+		// and this test is not the one that covers that.
+		out := callSearch(t, ctx, h, searchEventsInput{Limit: 2, Cursor: cursor, ExpandSimilar: true})
+		for _, rec := range out.Events {
+			seen = append(seen, rec.ID)
+		}
+		if out.NextCursor == "" {
+			break
+		}
+		if out.NextCursor == cursor {
+			t.Fatal("the cursor did not advance")
+		}
+		cursor = out.NextCursor
+	}
+
+	want := callSearch(t, ctx, h, searchEventsInput{Limit: 500, ExpandSimilar: true})
+	if len(want.Events) != 6 {
+		t.Fatalf("fixture returned %d events unpaginated, want 6", len(want.Events))
+	}
+	if len(seen) != len(want.Events) {
+		t.Fatalf("the walk saw %d ids (%v), want %d — a gap or a repeat", len(seen), seen, len(want.Events))
+	}
+	for i, rec := range want.Events {
+		if seen[i] != rec.ID {
+			t.Fatalf("the walk returned %v; position %d is event %d, want %d — "+
+				"paging must not reorder or skip", seen, i, seen[i], rec.ID)
+		}
+	}
+}
+
+// TestSearchEventsRankedCursorPagesWithoutRepeating covers the other ordering.
+// Ranked mode has no stored key to resume from, so it counts rows; the contract
+// is only that a walk neither repeats nor skips while the index is still.
+func TestSearchEventsRankedCursorPagesWithoutRepeating(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	base := time.Now().UTC().Truncate(time.Second)
+	for i := 0; i < 4; i++ {
+		insertEvents(t, ctx, s, store.Event{
+			Kind: store.KindScreen, CapturedAt: base.Add(time.Duration(i) * time.Minute),
+			App: "Comet", Text: fmt.Sprintf("the invoice total on page %d", i), MediaPath: "/tmp/a.jpg",
+		})
+	}
+	h := &handlers{store: s}
+
+	seen := map[int64]bool{}
+	cursor := ""
+	for page := 0; page < 10; page++ {
+		out := callSearch(t, ctx, h, searchEventsInput{Query: "invoice", Limit: 2, Cursor: cursor})
+		for _, rec := range out.Events {
+			if seen[rec.ID] {
+				t.Fatalf("ranked paging returned event %d twice", rec.ID)
+			}
+			seen[rec.ID] = true
+		}
+		if out.NextCursor == "" {
+			break
+		}
+		cursor = out.NextCursor
+	}
+	if len(seen) != 4 {
+		t.Fatalf("ranked walk saw %d of 4 events", len(seen))
+	}
+}
+
+// TestSearchEventsRejectsACursorFromTheOtherOrdering: browse resumes from a
+// timestamp and ranked from a row count, so a cursor crossing between them
+// names no place in the search it is handed to. Passing it through would return
+// a narrowed range that looks exactly like a page.
+func TestSearchEventsRejectsACursorFromTheOtherOrdering(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	base := time.Now().UTC().Truncate(time.Second)
+	for i := 0; i < 3; i++ {
+		insertEvents(t, ctx, s, store.Event{
+			Kind: store.KindScreen, CapturedAt: base.Add(time.Duration(i) * time.Minute),
+			App: "Comet", Text: fmt.Sprintf("the invoice total on page %d", i), MediaPath: "/tmp/a.jpg",
+		})
+	}
+	h := &handlers{store: s}
+
+	browse := callSearch(t, ctx, h, searchEventsInput{Limit: 1})
+	if browse.NextCursor == "" {
+		t.Fatal("a capped browse page must carry next_cursor")
+	}
+	if _, _, err := h.searchEvents(ctx, nil, searchEventsInput{Query: "invoice", Cursor: browse.NextCursor}); err == nil {
+		t.Fatal("a browse cursor was accepted by a ranked search")
+	}
+	if _, _, err := h.searchEvents(ctx, nil, searchEventsInput{Cursor: "not-a-cursor"}); err == nil {
+		t.Fatal("a malformed cursor was accepted")
+	}
+}
+
+// TestSearchEventsCursorPinsARelativeWindow is the defect a review found in the
+// first cut of the cursor: `since: "1h"` resolves against the clock on every
+// call, so a walk that resends the same arguments walks a window sliding out
+// from under it. Ranked mode pages with an OFFSET counted in the previous
+// result set, so a row falling off the old end of the window makes that offset
+// skip a row that still matches — silently, and with no error anywhere.
+//
+// The cursor therefore pins the window its first page was computed in. This
+// fixture puts one row a fraction of a second inside a 1h bound so it expires
+// between the two calls.
+func TestSearchEventsCursorPinsARelativeWindow(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	now := time.Now().UTC()
+	rows := insertEvents(t, ctx, s,
+		store.Event{Kind: store.KindScreen, CapturedAt: now.Add(-time.Hour + 900*time.Millisecond),
+			App: "Comet", Text: "invoice", MediaPath: "/tmp/a.jpg"},
+		store.Event{Kind: store.KindScreen, CapturedAt: now.Add(-30 * time.Minute),
+			App: "Comet", Text: "invoice plus several extra words that rank this one lower",
+			MediaPath: "/tmp/b.jpg"},
+	)
+	h := &handlers{store: s}
+
+	first := callSearch(t, ctx, h, searchEventsInput{Query: "invoice", Since: "1h", Limit: 1})
+	if len(first.Events) != 1 || first.NextCursor == "" {
+		t.Fatalf("page 1: %d events, cursor %q", len(first.Events), first.NextCursor)
+	}
+
+	// The 1h bound now excludes the older row. Without the pin, the offset of 1
+	// is applied to a one-row result set and returns nothing.
+	time.Sleep(1200 * time.Millisecond)
+
+	second := callSearch(t, ctx, h,
+		searchEventsInput{Query: "invoice", Since: "1h", Limit: 1, Cursor: first.NextCursor})
+	seen := map[int64]bool{first.Events[0].ID: true}
+	for _, rec := range second.Events {
+		seen[rec.ID] = true
+	}
+	for _, row := range rows {
+		if !seen[row.ID] {
+			t.Fatalf("event %d matches and was inside the window the walk started in, "+
+				"but no page returned it; seen %v", row.ID, seen)
+		}
+	}
+}
+
+// TestSearchEventsExhaustedCursorDoesNotBlameTheFilters: a walk whose last page
+// exactly fills the limit still gets a cursor, so there is always one more call
+// returning nothing. That is pagination finishing. Answering it with the
+// no-match notice sends an agent to widen a time range or drop an app filter
+// that were working correctly the whole time.
+func TestSearchEventsExhaustedCursorDoesNotBlameTheFilters(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	base := time.Now().UTC().Truncate(time.Second)
+	insertEvents(t, ctx, s,
+		store.Event{Kind: store.KindScreen, CapturedAt: base, App: "Comet",
+			Text: "alpha one", MediaPath: "/tmp/a.jpg"},
+		store.Event{Kind: store.KindScreen, CapturedAt: base.Add(-time.Minute), App: "Comet",
+			Text: "beta two", MediaPath: "/tmp/b.jpg"},
+	)
+	h := &handlers{store: s}
+
+	first := callSearch(t, ctx, h, searchEventsInput{Limit: 2})
+	if len(first.Events) != 2 || first.NextCursor == "" {
+		t.Fatalf("page 1: %d events, cursor %q", len(first.Events), first.NextCursor)
+	}
+	last := callSearch(t, ctx, h, searchEventsInput{Limit: 2, Cursor: first.NextCursor})
+	if len(last.Events) != 0 {
+		t.Fatalf("page 2 returned %d events, want none", len(last.Events))
+	}
+	if strings.Contains(last.Notice, "widening") || strings.Contains(last.Notice, "matched these filters") {
+		t.Fatalf("an exhausted cursor blames the filters: %q", last.Notice)
+	}
+	if !strings.Contains(last.Notice, "end of the results") {
+		t.Fatalf("an exhausted cursor must say the walk is done, got %q", last.Notice)
 	}
 }

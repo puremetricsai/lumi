@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -150,8 +151,8 @@ type EventRecord struct {
 	// from a missing key the one thing this pair exists to state outright.
 	Truncated  bool `json:"truncated"`
 	TextLength int  `json:"text_length"`
-	// CollapsedIDs names the events this record stands for when collapse_similar
-	// folded a run of near-identical adjacent screen rows into it, so nothing is
+	// CollapsedIDs names the events this record stands for when the fold ran on a
+	// run of near-identical adjacent screen rows, so nothing is
 	// silently lost and get_event still reaches every dropped row.
 	// CollapsedCount is len(CollapsedIDs): redundant by construction, and present
 	// so an agent does not have to count a list to learn its page is short.
@@ -420,11 +421,27 @@ type searchEventsInput struct {
 	// The numbers in limit's description are store.DefaultSearchLimit and
 	// store.MaxSearchLimit; a struct tag cannot interpolate them, so
 	// TestSearchLimitDescriptionMatchesStoreBounds fails if they drift apart.
-	Limit           int    `json:"limit,omitempty" jsonschema:"maximum events to return; defaults to 20 and is capped at 500"`
-	Match           string `json:"match,omitempty" jsonschema:"\"all\" (default) requires every query term; \"any\" requires one and ranks by relevance"`
-	RequireText     bool   `json:"require_text,omitempty" jsonschema:"drop events whose text or transcript is empty or only whitespace"`
-	MaxTextChars    *int   `json:"max_text_chars,omitempty" jsonschema:"per-event character cap on text; defaults to 600, and 0 means no cap"`
-	CollapseSimilar bool   `json:"collapse_similar,omitempty" jsonschema:"fold a run of adjacent screen results showing the same app, window and display with near-identical text into one, carrying the folded ids as collapsed_ids; audio rows are never folded; off by default"`
+	Limit         int    `json:"limit,omitempty" jsonschema:"maximum events to return; defaults to 20 and is capped at 500"`
+	Match         string `json:"match,omitempty" jsonschema:"\"all\" (default) requires every query term; \"any\" requires one and ranks by relevance"`
+	RequireText   bool   `json:"require_text,omitempty" jsonschema:"drop events whose text or transcript is empty or only whitespace"`
+	MaxTextChars  *int   `json:"max_text_chars,omitempty" jsonschema:"per-event character cap on text; defaults to 600, and 0 means no cap"`
+	ExpandSimilar bool   `json:"expand_similar,omitempty" jsonschema:"return every row instead of folding a run of adjacent screen results showing the same app, window and display with near-identical text into one representative carrying the folded ids as collapsed_ids; audio rows are never folded either way"`
+	// CollapseSimilar is the old name for the inverse of ExpandSimilar, kept
+	// because removing it would make a cached tools/list fail rather than degrade:
+	// jsonschema-go puts additionalProperties: false on every inferred schema, and
+	// `lumi mcp` replaces its own process image mid-session (internal/selfexec)
+	// while the client keeps the tool list it already has. Under the new default
+	// collapse_similar: true asks for what already happens, so it validates and
+	// changes nothing. collapse_similar: false cannot be seen at all — omitempty
+	// erases it, which is why the field was inverted rather than defaulted — so it
+	// is documented as the no-op it now is instead of silently meaning its
+	// opposite.
+	CollapseSimilar bool `json:"collapse_similar,omitempty" jsonschema:"deprecated and ignored: collapsing is now the default, so true asks for what already happens; use expand_similar to turn it off"`
+	// Cursor pages this tool's RESULTS, which MCP itself says nothing about — the
+	// protocol's cursor covers list methods only. It is opaque because its
+	// contents are this package's business and because a raw timestamp on the wire
+	// would be the one payload value not in the local zone.
+	Cursor string `json:"cursor,omitempty" jsonschema:"next_cursor from a previous call, to read the page after it; resend the same filters alongside it. The cursor pins the time window its first page was computed in, so since and until are ignored while paging — a different window means starting a new search without a cursor"`
 }
 
 type searchEventsOutput struct {
@@ -434,11 +451,111 @@ type searchEventsOutput struct {
 	// kinds this page actually returned files for, and omits a kind whose files
 	// came from more than one directory, whose records then hold whole paths.
 	MediaDir map[string]string `json:"media_dir,omitempty"`
+	// NextCursor resumes after the last row of this page. It is present only when
+	// the page was full, and its ABSENCE is how a caller learns there is no next
+	// page — the one field here that means something by not appearing, against
+	// this package's rule that a doubt label must always be visible. The rule is
+	// waived because every cursor protocol already works this way, and an agent
+	// that reads an empty cursor as a valid one pages forever.
+	NextCursor string `json:"next_cursor,omitempty"`
 	// Notice explains an empty Events array, which is otherwise ambiguous:
 	// nothing recorded yet and nothing matching these filters call for
 	// different next moves.
 	Notice string `json:"notice,omitempty"`
 }
+
+// searchCursor is the opaque page key. It carries the ordering key and nothing
+// else: a cursor that also carried the filters would let a caller change them
+// and the page boundary independently, and the two disagreeing is not a state
+// worth being able to reach. Ranked mode has no stored key to resume from —
+// bm25 is recomputed per query — so it counts rows instead.
+type searchCursor struct {
+	// Ranked is true for a cursor issued by a call that had a query, and is
+	// checked against the current call: a browse key resumed under a query, or the
+	// reverse, would silently page the wrong ordering.
+	Ranked bool `json:"r,omitempty"`
+	// CapturedAt is store.Event.CapturedAtRaw, the column's own bytes. Browse
+	// mode only.
+	CapturedAt string `json:"t,omitempty"`
+	ID         int64  `json:"i,omitempty"`
+	// Offset is the number of ranked rows already served. Ranked mode only.
+	Offset int `json:"o,omitempty"`
+	// Since and Until pin the time window the page set was computed in, as
+	// RFC3339Nano, empty when the call had no bound. They are here because
+	// `since: "2h"` resolves against the clock on EVERY call, so a walk that
+	// resends the same arguments is walking a window that slides out from under
+	// it — and a ranked Offset counts rows in a result set that just lost its
+	// oldest member, which skips a row that still matches. Browse's keyset only
+	// loses the far end early, but the same pin makes both finish the walk they
+	// started.
+	Since string `json:"s,omitempty"`
+	Until string `json:"u,omitempty"`
+}
+
+// window reads the pinned bounds back. A bound that fails to parse is dropped
+// rather than fatal: the cursor is this package's own writing, and a walk that
+// widens by one bound beats one that cannot continue at all.
+func (c searchCursor) window() (since, until *time.Time) {
+	parse := func(value string) *time.Time {
+		if value == "" {
+			return nil
+		}
+		at, err := time.Parse(time.RFC3339Nano, value)
+		if err != nil {
+			return nil
+		}
+		return &at
+	}
+	return parse(c.Since), parse(c.Until)
+}
+
+func formatBound(at *time.Time) string {
+	if at == nil {
+		return ""
+	}
+	return at.Format(time.RFC3339Nano)
+}
+
+func encodeCursor(c searchCursor) string {
+	raw, err := json.Marshal(c)
+	if err != nil {
+		// searchCursor is four scalars; Marshal cannot fail on it.
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(raw)
+}
+
+// decodeCursor rejects a cursor that does not belong to this call rather than
+// passing it to the store, where a browse key under a query would quietly
+// return a narrowed range that looks like a page.
+func decodeCursor(encoded string, ranked bool) (searchCursor, error) {
+	var c searchCursor
+	raw, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err == nil {
+		err = json.Unmarshal(raw, &c)
+	}
+	if err != nil {
+		return c, errNotACursor
+	}
+	if c.Ranked != ranked {
+		from, to := "without a query", "with one"
+		if c.Ranked {
+			from, to = "with a query", "without one"
+		}
+		return c, fmt.Errorf("this cursor came from a search %s and was passed back to one %s: "+
+			"the two order results differently, so the cursor names no place in this one; "+
+			"start the new search without a cursor", from, to)
+	}
+	// A browse cursor without its key would page from the beginning of time and
+	// look like a valid page. Only a hand-forged one reaches this.
+	if !ranked && c.CapturedAt == "" {
+		return c, errNotACursor
+	}
+	return c, nil
+}
+
+var errNotACursor = errors.New(
+	"cursor is not a value this tool issued; pass back next_cursor exactly as returned")
 
 func (h *handlers) searchEvents(ctx context.Context, _ *sdk.CallToolRequest, in searchEventsInput) (*sdk.CallToolResult, searchEventsOutput, error) {
 	var empty searchEventsOutput
@@ -474,6 +591,32 @@ func (h *handlers) searchEvents(ctx context.Context, _ *sdk.CallToolRequest, in 
 	}
 	limit := clampLimit(in.Limit, store.DefaultSearchLimit, store.MaxSearchLimit)
 	opts.Limit = limit
+	// Which cursor a mode uses is not a style choice: browse orders by
+	// captured_at, which every row carries and can be resumed from exactly, while
+	// ranked orders by a bm25 score recomputed per query, which no row carries at
+	// all.
+	ranked := in.Query != ""
+	var cursor searchCursor
+	if in.Cursor != "" {
+		if cursor, err = decodeCursor(in.Cursor, ranked); err != nil {
+			return nil, empty, err
+		}
+		// The pinned window wins over since/until, which are still parsed above so
+		// a malformed one is still an error. A caller cannot tell us whether a
+		// changed bound is a deliberate narrowing or the same relative string
+		// resolving a second later, so the cursor decides and the description says
+		// so: a different window means starting without a cursor.
+		opts.Since, opts.Until = cursor.window()
+		if ranked {
+			// ponytail: OFFSET, whose ceiling is that bm25 shifts as rows arrive, so
+			// a boundary can drift mid-capture and a row can be served twice or
+			// missed. A keyset on a recomputed float would not be better; storing the
+			// whole result set would be a different tool.
+			opts.Offset = cursor.Offset
+		} else {
+			opts.Before = &store.SearchCursor{CapturedAt: cursor.CapturedAt, ID: cursor.ID}
+		}
+	}
 	events, err := h.store.Search(ctx, opts)
 	if err != nil {
 		return nil, empty, fmt.Errorf("search the activity index: %w", err)
@@ -504,11 +647,14 @@ func (h *handlers) searchEvents(ctx context.Context, _ *sdk.CallToolRequest, in 
 	// a representative that folded older rows cannot push the boundary back up
 	// the page.
 	fetched := len(events)
-	var oldest string
+	next := searchCursor{Ranked: ranked,
+		Since: formatBound(opts.Since), Until: formatBound(opts.Until)}
 	if fetched > 0 {
-		oldest = localStamp(events[fetched-1].CapturedAt)
+		last := events[fetched-1]
+		next.CapturedAt, next.ID = last.CapturedAtRaw, last.ID
+		next.Offset = cursor.Offset + fetched
 	}
-	if in.CollapseSimilar {
+	if !in.ExpandSimilar {
 		// ponytail: one store page in, collapsed page out — a collapsed page is
 		// short. Over-fetch in a loop only if short pages prove to cost more calls
 		// than they save tokens.
@@ -523,6 +669,13 @@ func (h *handlers) searchEvents(ctx context.Context, _ *sdk.CallToolRequest, in 
 	// a page of 20 that folds to 6 has still exhausted the limit.
 	capped := fetched == limit
 	switch {
+	case len(out.Events) == 0 && in.Cursor != "":
+		// A walk that ends on an exactly-full page gets one more call returning
+		// nothing. That is pagination finishing, not a search that failed, and
+		// telling an agent to widen its filters here sends it to repair something
+		// that was never broken.
+		parts = append(parts, "this is the end of the results; the previous page was the last one "+
+			"with rows in it, so there is nothing further to page to")
 	case len(out.Events) == 0:
 		notice, err := h.noResultNotice(ctx,
 			"no events matched these filters; try widening the time range, dropping the app filter, or match: \"any\"")
@@ -535,16 +688,14 @@ func (h *handlers) searchEvents(ctx context.Context, _ *sdk.CallToolRequest, in 
 		// this many results" unless we say so: an agent that gets exactly the
 		// limit back cannot otherwise tell it saw a recency-truncated slice.
 		//
-		// How to continue is mode-dependent, and only browse mode has an answer.
-		// Its ORDER BY is captured_at DESC (closed by e.id DESC, so the boundary
-		// does not reshuffle), which makes the oldest stamp on the page a real
-		// cursor. Ranked mode keeps wording that implies no cursor exists,
-		// because none does.
-		continuation := "narrow since/until or raise limit to see them"
-		if in.Query == "" && oldest != "" {
-			continuation = fmt.Sprintf("pass until=%s to continue; the rows sharing that timestamp "+
-				"repeat, since the bound is inclusive and a chunk's two audio tracks share one stamp "+
-				"by design; a tie group larger than limit cannot advance, which needs limit: 1", oldest)
+		// Both modes have an answer now, and they are not the same answer, so the
+		// notice says which one this is. Browse resumes exactly. Ranked counts
+		// rows, and a caller that will act on the boundary should know that.
+		out.NextCursor = encodeCursor(next)
+		continuation := "pass cursor=next_cursor with the same filters to continue"
+		if ranked {
+			continuation += "; ranked paging counts rows, so a result captured while you page " +
+				"can shift the boundary — narrow since/until if that matters"
 		}
 		if collapsed := len(out.Events); collapsed < fetched {
 			// Reporting only one number would contradict the payload: "capped at
@@ -564,6 +715,16 @@ func (h *handlers) searchEvents(ctx context.Context, _ *sdk.CallToolRequest, in 
 	if h.hasAttributedAudio(ctx, events) {
 		parts = append(parts, "some results are audio: get_transcript returns these as one ordered "+
 			"conversation with per-turn origin labels and the machine's own speech deduplicated")
+	}
+	// The provenance contract goes last, because it is longer than everything
+	// before it and a caller reads the front of a notice first: the operational
+	// clauses would be buried behind it. It is gated on the page actually holding
+	// an audio row and NOT on hasAttributedAudio, which asks whether
+	// get_transcript has anything to show — an unattributed, silent or
+	// not-yet-backfilled audio row has no segments and still renders every field
+	// the contract explains.
+	if holdsAudio(out.Events) {
+		parts = append(parts, audioProvenanceContract)
 	}
 	out.Notice = h.withStaleness(ctx, strings.Join(parts, "; "))
 	return nil, out, nil
@@ -656,6 +817,18 @@ func nearlyIdentical(a, b string) bool {
 		longer = len(right)
 	}
 	return float64(shared)/float64(longer) >= threshold
+}
+
+// holdsAudio reports whether a page carries a row the provenance contract
+// applies to. It reads the records rather than asking the store, because the
+// question is about what this response renders and nothing else.
+func holdsAudio(records []EventRecord) bool {
+	for _, record := range records {
+		if record.Kind == string(store.KindAudio) {
+			return true
+		}
+	}
+	return false
 }
 
 // hasAttributedAudio reports whether any returned audio event's chunk holds
@@ -758,10 +931,20 @@ func (h *handlers) getEvent(ctx context.Context, _ *sdk.CallToolRequest, in getE
 	// result is read back out of. One record cannot split a kind across two
 	// directories, so the map it returns holds at most this event's own kind.
 	dirs := hoistMediaDir(records)
+	// An audio event renders foreground_app, source_app and attribution here the
+	// same way a search hit does, and this is where an agent comes for the
+	// complete version of a row it has already half-read — so the contract has to
+	// reach it here too, not only through search_events.
+	var notice string
+	if holdsAudio(records) {
+		notice = audioProvenanceContract
+	}
 	return nil, getEventOutput{
 		Event:    records[0],
 		MediaDir: dirs[records[0].Kind],
-		Notice:   h.stalenessNotice(ctx),
+		// withStaleness rather than stalenessNotice, so skew still comes first
+		// once this tool has a body to put after it.
+		Notice: h.withStaleness(ctx, notice),
 	}, nil
 }
 

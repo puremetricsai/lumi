@@ -18,8 +18,11 @@ lexicographically — any new time column must go through `FormatCapturedAt` or 
   renderings: rows written before `CapturedAtLayout` existed carry `RFC3339Nano`'s trimmed form, rows
   since carry the fixed-width one. So no equality lookup may mint its key from a `time.Time` — every one
   here (`SegmentsForChunk`, `ReplaceChunkSegments`, `AudioEventsAt`) is handed the stored string, from
-  `ChunksMissingSegments` or `AudioChunkTimes` or from the recorder's own stamp. Two successive designs of
-  a since-removed whole-chunk reader got this wrong in opposite directions — one truncating, one padding —
+  `ChunksMissingSegments` or `AudioChunkTimes` or from the recorder's own stamp. `Event.CapturedAtRaw` is
+  how those bytes leave this package at all — a search cursor is a key too, and it is tagged `json:"-"`
+  because `lumi search --json` exports a bare `[]store.Event` that must not carry one field twice. Two
+  successive designs of a since-removed whole-chunk reader got this wrong in opposite directions — one
+  truncating, one padding —
   and both failed the same way: the lookup matched nothing and a real two-track chunk read as empty, with
   no error anywhere. Passing the stored bytes through is what removes the question.
 - **A range bound covers both renderings; an equality key must be exact.**
@@ -104,9 +107,25 @@ and `transcript.Segment` — shadow each other the way `internal/mcp`'s `Attribu
 - **`Search` closes both its orderings with `e.id DESC`.** `captured_at` is not unique — a chunk's two
   tracks share one by construction, and 21% of live rows share theirs — so without a tiebreaker the order
   inside a tie group is unspecified, and two identical calls can return different subsets of a group the
-  `LIMIT` cuts through. `lumi mcp` pages browse results by handing the oldest `captured_at` on a page back
-  as `until`, which needs the same boundary every time. `DESC` so it agrees with `captured_at DESC` and
-  keeps the newest row of a tie group first.
+  `LIMIT` cuts through. `lumi mcp` pages browse results on `(captured_at, id)`, which needs the same
+  boundary every time. `DESC` so it agrees with `captured_at DESC` and keeps the newest row of a tie group
+  first.
+- **`SearchOptions.Before` is strict where `Until` is inclusive, and it carries the stored string rather
+  than an instant.** It is the last row of a page named by the whole ordering key —
+  `(captured_at, id) < (?, ?)` — so the next page resumes *after* that row. `Until` cannot express it and
+  was never meant to: an inclusive bound returns the boundary group again on every page, and against a tie
+  group larger than `Limit` it does not advance at all — a chunk's two tracks tie by construction, so that
+  group is not hypothetical. The `captured_at` half is `Event.CapturedAtRaw` for the reason the timestamp
+  section gives: a cursor is an equality key on one side of a comparison, and one rebuilt from a
+  `time.Time` steps over a row whose rendering differs, with no error anywhere. `Expired` is the other
+  strict bound here. It is browse mode's cursor and only that: it is a timestamp predicate, so under a
+  query — where the ordering is rank-first — it narrows the range instead of paging it, and drops
+  higher-ranked rows newer than the cursor.
+- **`SearchOptions.Offset` pages the ranked ordering, and its boundary can drift.** bm25 is recomputed on
+  every query, so there is no stored key to resume from; a row captured between two calls reorders what
+  follows it and can be returned twice or skipped. That ceiling is accepted rather than fixed — the
+  alternative is materializing a result set for a page an agent reads once, and browse mode, which is
+  where paging a live index actually matters, has the exact keyset above.
 - **`Search`'s `app`/`window` filters are unqualified SQL predicates, so an app-shaped query spans both
   row kinds.** Callers that need to mean one of them say so: `ListAttribution` takes a `Kind`, and never
   sums the two into a single count — see `internal/mcp/CLAUDE.md` for what that conflation looked like.

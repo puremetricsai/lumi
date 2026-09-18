@@ -49,6 +49,45 @@ rows are shaped is `internal/store`'s; the labelling rules the recorder applies 
   `MaxSilence` (10s) when bytes *changed* but scored similar (video, advancing slides), and `ExactSilence`
   (5min) when bytes are identical, so a frozen screen leaves a bounded presence marker instead of
   re-indexing the same JPEG. `ExactSilence` is clamped up to `MaxSilence`.
+- **A second, text-similarity dedup at ingest is deferred, and its shape is why.** An agent reading the
+  index through `lumi mcp` asked for near-identical OCR text to be collapsed at capture. Such a gate can
+  only sit after Vision (`recorder.go:411`), since `Duplicate` (`compare.go:33-85`) already runs before
+  the extractor: it would save index rows and JPEGs and **zero OCR cost**. Right lever for index noise,
+  wrong one for CPU. It would also have to carry both deadlines above — a text gate fires strictly more
+  often than a pixel one, so without `MaxSilence`/`ExactSilence` a static document leaves the index
+  entirely instead of leaving a bounded presence marker.
+  - **Keying it on `(display, window)` is not what it sounds like.** `FrameComparer` keys on `displayID`
+    alone (`compare.go:51`), and the window in such a pair would be the one per-tick snapshot stamped
+    onto every display's frame — a window that may not be on that display at all, for the reason the top
+    of this file gives.
+  - **The suite cannot currently tell a correct text gate from one that indexes the first frame and
+    drops the rest.** `fakeVision` returns one constant string for every frame
+    (`recorder_test.go:78-80`), so a gate that over-fires looks exactly like a gate that works. The pixel
+    gate is invisible for a separate reason worth knowing before trusting a green run here: `fakeScreen`
+    writes `[]byte("fake-jpeg-N")`, which does not decode, and `Duplicate` records comparer state only
+    after a successful decode (`compare.go:57-60` against `:81-83`), so neither the histogram nor the
+    hash fast path can ever fire for an undecodable frame. Only the two tests feeding a real
+    `writeSolidJPEG` exercise dedup at all —
+    `TestRecorderDeletesPerceptualDuplicatesFromDiskAndIndex:499` and
+    `TestRecorderHandlesDisplayHotplugBetweenCaptures:579`, the latter being the one exact per-display
+    count assertion and the one that fails if the gate is keyed globally rather than per display.
+    Anything landing here needs a text fake that varies per call before it needs the gate.
+  - Storing a reference rather than a new row is additionally a schema migration
+    (`internal/store/migrations.go`).
+- **Full-display OCR stays full-display; a `focused_window_only` crop is declined, not deferred.** Vision
+  over the whole screenshot is the primary text source precisely because it reads the windows
+  Accessibility cannot (`screen.go:109-112`, `:146-149`). A crop narrows the index permanently — a
+  message in a background window stops being findable at all — while the complaint behind the request is
+  a read-side one that `internal/mcp`'s `excerptAround` already answers, centring the returned text on
+  the earliest match instead of cutting a blind prefix. What would flip this is a demand for *region
+  filtering*, not for shorter excerpts, and even then the step is regions in metadata rather than a
+  narrower capture: every `VNRecognizedTextObservation` carries a `boundingBox` the recognition loop
+  never reads (`native.m:998-1003` keeps only `candidate.string`), and the focused window's full `CGRect`
+  is built and then reduced to a display ID (`native.m:337-358` on the Accessibility path, `:695-699` on
+  the window-list fallback). Carrying both into `metadata_json` needs no migration, but it does turn the
+  Vision bridge from a joined string into JSON across `native.m`, `native.go`, `native_stub.go` and
+  `TextExtractor`, and it owes three conversions on the way: normalized to points, image-relative to
+  global, bottom-left to top-left — plus a Retina points-versus-pixels check.
 - **Capture retries without discarding completed work.** Screen failures retry on the next interval; an
   audio stream that fails is reopened after one second. Media returned during cancellation gets a short
   cancellation-free window for insertion. A stream that finishes no chunk for one chunk duration plus 30 s
