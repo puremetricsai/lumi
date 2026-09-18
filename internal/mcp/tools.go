@@ -421,7 +421,7 @@ type searchEventsInput struct {
 	// The numbers in limit's description are store.DefaultSearchLimit and
 	// store.MaxSearchLimit; a struct tag cannot interpolate them, so
 	// TestSearchLimitDescriptionMatchesStoreBounds fails if they drift apart.
-	Limit         int    `json:"limit,omitempty" jsonschema:"maximum events to return; defaults to 20 and is capped at 500"`
+	Limit         int    `json:"limit,omitempty" jsonschema:"maximum rows to read from the index, counted BEFORE the fold: a page of 20 that collapses adjacent near-identical screen rows can return fewer events than this, and the notice reports both counts; defaults to 20 and is capped at 500"`
 	Match         string `json:"match,omitempty" jsonschema:"\"all\" (default) requires every query term; \"any\" requires one and ranks by relevance"`
 	RequireText   bool   `json:"require_text,omitempty" jsonschema:"drop events whose text or transcript is empty or only whitespace"`
 	MaxTextChars  *int   `json:"max_text_chars,omitempty" jsonschema:"per-event character cap on text; defaults to 600, and 0 means no cap"`
