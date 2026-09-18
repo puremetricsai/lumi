@@ -584,3 +584,48 @@ func TestGetTranscriptRoundsTurnConfidenceAndKeepsResumeExact(t *testing.T) {
 		t.Fatalf("resume_from = %q lost its nanoseconds; a bound handed back must round-trip exactly", paged.ResumeFrom)
 	}
 }
+
+// TestLatestTranscriptNoticeDoesNotSendTheAgentToAMissingResumeFrom pins the
+// half of `latest` that lives in this package.
+//
+// The capped notice tells an agent to pass resume_from as since. A latest page
+// dropped its turns from the other end and deliberately carries no resume_from,
+// so repeating that sentence would send the agent to read a field that is not
+// there — and, worse, to page forward over turns it already holds.
+func TestLatestTranscriptNoticeDoesNotSendTheAgentToAMissingResumeFrom(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	h := &handlers{store: s}
+
+	base := time.Now().UTC().Add(-50 * time.Minute)
+	for c := range 6 {
+		attributedChunk(t, ctx, s, base.Add(time.Duration(c)*5*time.Minute), store.Segment{
+			Origin: store.OriginExternal, SourceTrack: "microphone",
+			Text: fmt.Sprintf("Turn %d.", c), Confidence: 0.9, OrderConfidence: "sequence"})
+	}
+
+	head := callTranscript(t, ctx, h, getTranscriptInput{Since: "1h", MaxTurns: 2})
+	tail := callTranscript(t, ctx, h, getTranscriptInput{Since: "1h", MaxTurns: 2, Latest: true})
+
+	if head.ResumeFrom == "" {
+		t.Fatal("the head cut offered no resume_from, so this test is not comparing two cuts")
+	}
+	if tail.ResumeFrom != "" {
+		t.Errorf("a latest page carries resume_from %q", tail.ResumeFrom)
+	}
+	// Matched on the instruction, not the word: the notice says "there is no
+	// resume_from" on purpose, and the defect is telling the agent to use one.
+	if strings.Contains(tail.Notice, "since=") ||
+		strings.Contains(tail.Notice, "continue from there") {
+		t.Errorf("the latest notice points at a resume point it did not return: %s", tail.Notice)
+	}
+	if !strings.Contains(tail.Notice, "max_turns") {
+		t.Errorf("the latest notice does not name the control that capped it: %s", tail.Notice)
+	}
+	// And the two cuts really are different turns, or the notice is describing
+	// something that did not happen.
+	if len(tail.Turns) != 2 || tail.Turns[0].Text == head.Turns[0].Text {
+		t.Errorf("latest returned %d turns starting %q; head started %q",
+			len(tail.Turns), tail.Turns[0].Text, head.Turns[0].Text)
+	}
+}

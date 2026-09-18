@@ -33,6 +33,16 @@ type TranscriptOptions struct {
 	// has no way of knowing were omitted.
 	MinConfidence float64
 	MaxTurns      int
+	// Latest keeps the MaxTurns turns at the END of the range instead of the
+	// start, because "what was just said" is the question a transcript is most
+	// often asked and the head-cut answers it with the oldest turns of the
+	// window — an hour holding more than MaxTurns turns defeats the default
+	// window's own purpose. It tails rather than reversing: turns stay
+	// chronological, so nothing downstream has to know which cut produced them.
+	//
+	// A tailed page reports no ResumeFrom, since what it omitted lies before it
+	// and paging backwards is not offered.
+	Latest bool
 	// IncludeBleed keeps the microphone's re-recording of machine audio, which is
 	// otherwise excluded so a phrase appears once. For debugging only.
 	IncludeBleed bool
@@ -97,7 +107,8 @@ type TranscriptResult struct {
 	// deliberately open — the column carries no CHECK so a machine-side
 	// participant can be distinguished later without a migration.
 	ConfidenceFiltered map[string]int `json:"confidence_filtered,omitempty"`
-	// Capped reports that turns were dropped from the tail to satisfy MaxTurns.
+	// Capped reports that turns were dropped to satisfy MaxTurns: from the tail,
+	// or from the head under Latest.
 	Capped bool `json:"capped,omitempty"`
 	// Truncated reports that the window held more segments than one call reads,
 	// so the transcript stops before the end of the requested range.
@@ -114,11 +125,14 @@ type TranscriptResult struct {
 	// dropped the tail.
 	CoveredUntil time.Time `json:"covered_until"`
 	// ResumeFrom is what a follow-up request should pass as Since; it is zero
-	// when the transcript is complete.
+	// when the transcript is complete, and also when Latest tailed it — a tailed
+	// page is Capped with nothing to resume to, because what it dropped lies
+	// before it rather than after it.
 	//
 	// It is a separate field from CoveredUntil because the two need opposite
 	// inclusivity and one value cannot be both. Coverage is measured over
-	// [Since, CoveredUntil] and the segment read is inclusive at both ends, so a
+	// [Since, CoveredUntil] — or from the first kept turn, when Latest tailed the
+	// page — and the segment read is inclusive at both ends, so a
 	// caller resuming at CoveredUntil re-reads that whole chunk and sees its
 	// turns a second time. ResumeFrom is the first chunk the transcript did not
 	// cover — except where a single chunk is itself too large to return whole, or
@@ -217,6 +231,20 @@ func (s *Store) Transcript(ctx context.Context, opts TranscriptOptions) (Transcr
 		return TranscriptResult{}, err
 	}
 	segments, truncated, nextChunk := trimToWholeChunks(segments)
+	if truncated && opts.Latest {
+		// The read is ascending and stopped early, so the newest segments of the
+		// range were never loaded: tailing what did arrive would return the oldest
+		// turns under the flag that promises the newest, and nothing in the payload
+		// could reveal it. Refusing says so.
+		//
+		// ponytail: refuse rather than read descending. It needs a window of
+		// roughly a day to fire at all; add a DESC SegmentsBetween and reverse
+		// trimToWholeChunks if tailing a range that large turns out to matter.
+		return TranscriptResult{}, fmt.Errorf(
+			"this range holds more audio than one call reads, so the newest turns in it were " +
+				"not loaded and latest cannot honour its own promise; narrow since to use latest, " +
+				"or drop latest to read the range forward from since")
+	}
 	coveredUntil, resumeFrom := opts.Until, time.Time{}
 	if truncated && len(segments) > 0 {
 		coveredUntil, resumeFrom = segments[len(segments)-1].CapturedAt, nextChunk
@@ -286,18 +314,31 @@ func (s *Store) Transcript(ctx context.Context, opts TranscriptOptions) (Transcr
 		result.Turns = append(result.Turns, row)
 		kept = append(kept, turn)
 	}
+	// Coverage is bounded at BOTH ends, because a tailed page does not reach
+	// Since any more than a capped one reaches Until, and Chunks may never
+	// describe more ground than the turns do.
+	coveredFrom := opts.Since
 	if len(result.Turns) > limit {
-		result.Turns, result.Capped = result.Turns[:limit], true
-		// The cap stops the transcript earlier than truncation did, so both the
-		// coverage bound and the resume point move back to it. Leaving them where
-		// truncation put them would count chunks past the last returned turn and
-		// send a follow-up request beyond the turns that were dropped — the cap
-		// would silently delete them instead of paginating them.
-		coveredUntil = kept[limit-1].LastCapturedAt
-		// The first dropped turn's own chunk, which may be the chunk the last kept
-		// turn ended in: a chunk holding turns on both sides of the cap has to be
-		// re-read, since the alternative is skipping its later turns.
-		resumeFrom = kept[limit].CapturedAt
+		result.Capped = true
+		if opts.Latest {
+			drop := len(result.Turns) - limit
+			result.Turns, kept = result.Turns[drop:], kept[drop:]
+			// The transcript still reaches Until, so only the near bound moves, and
+			// there is nothing to resume to: what was dropped lies before this page.
+			coveredFrom = kept[0].CapturedAt
+		} else {
+			result.Turns = result.Turns[:limit]
+			// The cap stops the transcript earlier than truncation did, so both the
+			// coverage bound and the resume point move back to it. Leaving them where
+			// truncation put them would count chunks past the last returned turn and
+			// send a follow-up request beyond the turns that were dropped — the cap
+			// would silently delete them instead of paginating them.
+			coveredUntil = kept[limit-1].LastCapturedAt
+			// The first dropped turn's own chunk, which may be the chunk the last kept
+			// turn ended in: a chunk holding turns on both sides of the cap has to be
+			// re-read, since the alternative is skipping its later turns.
+			resumeFrom = kept[limit].CapturedAt
+		}
 	}
 	result.CoveredUntil, result.ResumeFrom = coveredUntil, resumeFrom
 
@@ -326,9 +367,18 @@ func (s *Store) Transcript(ctx context.Context, opts TranscriptOptions) (Transcr
 	// from its own accounting; the overlap is accepted exactly as it is for the
 	// turns themselves. That licence stops at the chunk on the boundary:
 	// a later chunk was never this page's ground, and the next page reports it.
-	// A zero ResumeFrom means the transcript is complete and all of it is ours.
+	// A zero ResumeFrom means no page follows this one, so everything from
+	// coveredFrom on is ours: the whole transcript on a complete page, and
+	// everything from the first kept turn on a tailed one.
+	// The near bound is coveredFrom, which equals Since on every page but a
+	// tailed one, so this clause is a no-op there: a removed turn is never
+	// before Since. Under Latest it is the only thing keeping the count off
+	// ground the page dropped and will never serve.
 	overlapping := !resumeFrom.IsZero() && !resumeFrom.After(coveredUntil)
 	for _, turn := range removed {
+		if turn.CapturedAt.Before(coveredFrom) {
+			continue
+		}
 		if !resumeFrom.IsZero() && !turn.CapturedAt.Before(resumeFrom) &&
 			!(overlapping && turn.CapturedAt.Equal(resumeFrom)) {
 			continue
@@ -341,7 +391,7 @@ func (s *Store) Transcript(ctx context.Context, opts TranscriptOptions) (Transcr
 
 	// Coverage is measured over what the turns reach, not over what was asked
 	// for; see TranscriptResult.Chunks.
-	chunks, attributed, err := s.SegmentCoverage(ctx, opts.Since, coveredUntil)
+	chunks, attributed, err := s.SegmentCoverage(ctx, coveredFrom, coveredUntil)
 	if err != nil {
 		return TranscriptResult{}, err
 	}
@@ -349,7 +399,7 @@ func (s *Store) Transcript(ctx context.Context, opts TranscriptOptions) (Transcr
 	if chunks > attributed {
 		// Only asked when there is a gap to explain, so a complete transcript
 		// costs nothing.
-		failed, err := s.ChunksFailedTranscription(ctx, opts.Since, coveredUntil)
+		failed, err := s.ChunksFailedTranscription(ctx, coveredFrom, coveredUntil)
 		if err != nil {
 			return TranscriptResult{}, err
 		}

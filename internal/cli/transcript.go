@@ -27,6 +27,7 @@ func (a *app) transcriptCommand() *cobra.Command {
 		minConfidence        float64
 		limit                int
 		asJSON, includeBleed bool
+		latest               bool
 	)
 	cmd := &cobra.Command{
 		Use:   "transcript",
@@ -48,7 +49,7 @@ func (a *app) transcriptCommand() *cobra.Command {
 		Args:         cobra.NoArgs,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			opts, err := transcriptOptions(since, until, origin, minConfidence, limit, includeBleed)
+			opts, err := transcriptOptions(since, until, origin, minConfidence, limit, latest, includeBleed)
 			if err != nil {
 				return err
 			}
@@ -90,6 +91,8 @@ func (a *app) transcriptCommand() *cobra.Command {
 			"largest attribution penalties apply to microphone turns alone, so a threshold near\n"+
 			"0.6 can remove every external turn and no internal one")
 	flags.IntVar(&limit, "limit", store.DefaultTranscriptTurns, "maximum turns")
+	flags.BoolVar(&latest, "latest", false,
+		"keep the last --limit turns of the range instead of the first, for what was just said")
 	flags.BoolVar(&asJSON, "json", false, "emit JSON")
 	flags.BoolVar(&includeBleed, "include-bleed", false,
 		"also show the microphone's re-recording of machine audio, which is otherwise excluded")
@@ -116,10 +119,10 @@ func confidenceRemovalWarning(result store.TranscriptResult) string {
 // checked before the query rather than left to it so a typo is reported as a bad
 // flag instead of silently returning nothing; which values are valid is
 // store.ParseOrigin's to say, since the column is what they have to be valid for.
-func transcriptOptions(since, until, origin string, minConfidence float64, limit int, includeBleed bool) (store.TranscriptOptions, error) {
+func transcriptOptions(since, until, origin string, minConfidence float64, limit int, latest, includeBleed bool) (store.TranscriptOptions, error) {
 	opts := store.TranscriptOptions{
 		Since: time.Now().Add(-time.Hour), Until: time.Now(),
-		MinConfidence: minConfidence, MaxTurns: limit, IncludeBleed: includeBleed,
+		MinConfidence: minConfidence, MaxTurns: limit, Latest: latest, IncludeBleed: includeBleed,
 	}
 	parsed, err := store.ParseOrigin(origin)
 	if err != nil {
@@ -221,9 +224,10 @@ func printTranscript(out io.Writer, result store.TranscriptResult) {
 	// Truncation is reported before capping because it is the worse fact: a
 	// capped page ends where the reader asked it to, while a truncated one stops
 	// short of the requested range with nothing in the turns to show it.
-	// Both notices offer ResumeFrom, never CoveredUntil: coverage ends inclusively
-	// at the last chunk the turns reach and the segment read is inclusive too, so
-	// re-running with that value would print the same chunk's turns again.
+	// A notice that offers a resume point offers ResumeFrom, never CoveredUntil:
+	// coverage ends inclusively at the last chunk the turns reach and the segment
+	// read is inclusive too, so re-running with that value would print the same
+	// chunk's turns again. A --latest page offers none — see the branch below.
 	// Local, like every other time this command prints, and like the CoveredUntil
 	// in the sentence just below. Rendering this one UTC put two timestamps
 	// describing adjacent moments in one paragraph hours apart, which reads as a
@@ -237,7 +241,14 @@ func printTranscript(out io.Writer, result store.TranscriptResult) {
 			"Re-run with --since %s to continue from there.\n",
 			result.CoveredUntil.Local().Format(time.RFC3339), resume)
 	}
-	if result.Capped {
+	if result.Capped && resume == "" {
+		// A tailed page (--latest) dropped its turns on the near side, so there is
+		// no resume point: the sentence above would print a bare `--since` and send
+		// the reader to re-read the turns they are already looking at.
+		fmt.Fprintf(out, "\nThese are the last %d turns of the range; older turns in it were dropped "+
+			"rather than deferred, so there is nothing to resume from. Raise --limit or drop "+
+			"--latest to read the range forward from --since.\n", len(result.Turns))
+	} else if result.Capped {
 		fmt.Fprintf(out, "\nStopped at %d turns; re-run with --since %s to continue from there, "+
 			"or raise --limit.\n", len(result.Turns), resume)
 	}

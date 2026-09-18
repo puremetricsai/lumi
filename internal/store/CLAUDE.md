@@ -70,8 +70,9 @@ the reverse, so re-deriving them is always safe — that is what makes the backf
 queue, so there is no state file to go stale and a failed write needs no retry loop. `Transcript` is the
 only way callers reach turn assembly, and it clamps its own limits so the number `get_transcript`
 documents is the number enforced. It also owns the two ways a transcript can be short — `Capped` (turns
-dropped after assembly) and `Truncated` (segments dropped before it, with `CoveredUntil` naming where to
-resume) — and measures coverage over what the turns reach, never over what was asked for.
+dropped after assembly, from the tail, or from the head under `Latest`) and `Truncated` (segments dropped
+before it, with `CoveredUntil` naming where to resume) — and measures coverage over what the turns reach,
+never over what was asked for.
 `HasSpeechSegments` answers "is there anything to read", which `SegmentCoverage` deliberately does not:
 a silent chunk is attributed but holds nothing.
 
@@ -189,7 +190,13 @@ and `transcript.Segment` — shadow each other the way `internal/mcp`'s `Attribu
   omission instead. A transcript also never ends mid-chunk, which is what lets the boundary be exact rather
   than an estimate. Both ways a transcript can stop short move that boundary: truncation *and* the turn cap,
   which is measured from the last retained turn's `LastCapturedAt` — `Turn.CapturedAt` is where a turn
-  *began*, so a turn spanning chunks would bound the page short of text it already printed.
+  *began*, so a turn spanning chunks would bound the page short of text it already printed. **`Latest`
+  bounds the other end by the same rule**: a tailed page still reaches `Until` but no longer starts at
+  `Since`, so coverage is measured from its first kept turn and the `ConfidenceFiltered` accounting gains a
+  matching lower bound. The clause is a no-op on every other page, since a removed turn is never before
+  `Since`. `Latest` is refused outright when the read `Truncated`, because an ascending read that stopped
+  early never loaded the newest segments and tailing it would return the oldest turns under the flag that
+  promises the newest.
 - **`MinConfidence` sorts turns by origin at least as much as by quality, so what it removed is
   reported.** A turn's confidence is the recognizer's own score multiplied by penalties for how uncertain
   its attribution is. On the timed path `internal/transcript` reaches microphone-derived segments alone —
