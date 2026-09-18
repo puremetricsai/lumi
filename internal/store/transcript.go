@@ -69,8 +69,10 @@ type TranscriptTurn struct {
 type TranscriptResult struct {
 	Turns []TranscriptTurn `json:"turns"`
 	// Chunks and AttributedChunks describe coverage over the range the turns
-	// actually reach — which is the requested window unless Truncated cut it
-	// short. They are what lets a caller say a transcript has holes instead of
+	// actually reach, which is the requested window only when nothing shortened
+	// it: Truncated and the turn cap both pull the far end in, and Latest pulls
+	// the near end in instead. They are what lets a caller say a transcript has
+	// holes instead of
 	// serving a partial one that looks complete, so they must never describe more
 	// ground than the turns do: counting the whole window while the text stopped
 	// two hours in would corroborate exactly the illusion they exist to prevent.
@@ -122,7 +124,8 @@ type TranscriptResult struct {
 	// CoveredUntil is the last capture time the turns reach. It equals the
 	// requested Until unless the transcript stopped short, either because the
 	// window held more segments than one call reads or because the turn cap
-	// dropped the tail.
+	// dropped the tail. A Latest page dropped its turns from the other end, so
+	// this still equals Until there and the near bound moves instead.
 	CoveredUntil time.Time `json:"covered_until"`
 	// ResumeFrom is what a follow-up request should pass as Since; it is zero
 	// when the transcript is complete, and also when Latest tailed it — a tailed

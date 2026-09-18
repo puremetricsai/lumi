@@ -71,8 +71,10 @@ queue, so there is no state file to go stale and a failed write needs no retry l
 only way callers reach turn assembly, and it clamps its own limits so the number `get_transcript`
 documents is the number enforced. It also owns the two ways a transcript can be short — `Capped` (turns
 dropped after assembly, from the tail, or from the head under `Latest`) and `Truncated` (segments dropped
-before it, with `CoveredUntil` naming where to resume) — and measures coverage over what the turns reach,
-never over what was asked for.
+before it) — and measures coverage over what the turns reach, never over what was asked for. `ResumeFrom`
+names where to resume in both cases, never `CoveredUntil`: the two need opposite inclusivity, which is why
+they are separate fields at all. A `Latest` page has no resume point, because what it dropped lies before
+it.
 `HasSpeechSegments` answers "is there anything to read", which `SegmentCoverage` deliberately does not:
 a silent chunk is attributed but holds nothing.
 
@@ -222,7 +224,10 @@ and `transcript.Segment` — shadow each other the way `internal/mcp`'s `Attribu
   falling inside a chunk); and accepting the whole page when they are equal counts *later* chunks this
   page never covered, which the next page then reports as well. The rule that survives all three: count
   everything strictly before `ResumeFrom`, plus the chunk exactly on it when `ResumeFrom` has not moved
-  past `CoveredUntil`.
+  past `CoveredUntil`. A `Latest` page adds the mirror of that bound and nothing else: its `ResumeFrom` is
+  zero — which for a forward page means "all of it is ours" — so the near bound is what keeps the count off
+  the turns it dropped. The clause is a no-op on every other page, since a removed turn is never before
+  `Since`.
 - **The asymmetry is not the whole hazard, so nothing here may claim only microphone turns are
   penalised.** `TextPathPenalty` applies to every segment the text path emits, system ones included
   (`attribute.go`'s shared `segment` closure, and the untimed `internalOnly` fallback), so a chunk with no

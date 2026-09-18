@@ -1470,3 +1470,79 @@ func TestLatestRefusesARangeWhoseNewestSegmentsWereNeverRead(t *testing.T) {
 		t.Errorf("the refusal does not name a way out: %v", err)
 	}
 }
+
+// TestLatestPageCountsOnlyTheFailuresItCovers is the second coverage query, and
+// it needs its own fixture because the first one cannot reach it.
+//
+// ChunksFailedTranscription runs only when Chunks exceeds AttributedChunks, so
+// a fully attributed range — which every other Latest test is — skips the call
+// entirely and pins nothing about its bounds. The two queries take coveredFrom
+// as separate arguments and are separately editable; sharing one variable makes
+// today's code consistent, not protected. Reverting this one alone to opts.Since
+// counts a failure from the chunks the page dropped against the gap in the
+// chunks it kept, and RecoverableChunks then reports a hole no backfill can
+// move — the exact advice the count exists to keep off the notice.
+func TestLatestPageCountsOnlyTheFailuresItCovers(t *testing.T) {
+	ctx := context.Background()
+	s, _ := segmentStore(t)
+	base := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+	const failed = `{"audio_source":"microphone","processor_error":"recognizer unavailable"}`
+	const clean = `{"audio_source":"microphone"}`
+
+	insert := func(at time.Time, text, metadata string) *Event {
+		t.Helper()
+		event := &Event{Kind: KindAudio, CapturedAt: at, Text: text,
+			MediaPath: "/tmp/microphone.wav", AudioSource: "microphone",
+			Metadata: json.RawMessage(metadata)}
+		if err := s.Insert(ctx, event); err != nil {
+			t.Fatal(err)
+		}
+		return event
+	}
+	speech := func(at time.Time, text string) {
+		t.Helper()
+		event := insert(at, text, clean)
+		if err := s.ReplaceChunkSegments(ctx, formatTime(at), []Segment{{
+			EventID: event.ID, Seq: 0, Origin: OriginExternal, SourceTrack: "microphone",
+			Text: text, Confidence: 0.9, OrderConfidence: "sequence"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Chunk 0 failed recognition and lies before the tailed page.
+	insert(base, "", failed)
+	// Chunks 1-5 carry turns; the page keeps the last three of them.
+	for c := 1; c <= 5; c++ {
+		speech(base.Add(time.Duration(c)*time.Hour), fmt.Sprintf("turn %d", c))
+	}
+	// Chunk 6 is unattributed but never failed, so it is the recoverable hole
+	// inside the page — the one a backfill can actually move.
+	insert(base.Add(6*time.Hour), "", clean)
+
+	page, err := s.Transcript(ctx, TranscriptOptions{
+		Since: base.Add(-time.Hour), Until: base.Add(24 * time.Hour),
+		MaxTurns: 3, Latest: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !page.Capped || len(page.Turns) != 3 || page.Turns[0].Text != "turn 3" {
+		t.Fatalf("got %d turns capped=%v starting %q; want 3 starting at turn 3",
+			len(page.Turns), page.Capped, page.Turns[0].Text)
+	}
+	// Chunks 3, 4, 5 and the unattributed 6: four covered, three attributed.
+	if page.MissingChunks() != 1 {
+		t.Fatalf("the page reports %d holes; the fixture has exactly one inside it",
+			page.MissingChunks())
+	}
+	if page.FailedChunks != 0 {
+		t.Errorf("a tailed page counts %d failed chunks; chunk 0's failure lies among the "+
+			"turns it dropped, not the ones it covers", page.FailedChunks)
+	}
+	// And the consequence the count exists for: the hole it does have is one a
+	// backfill can fill, so the notice must still say to run it.
+	if page.RecoverableChunks() != 1 {
+		t.Errorf("RecoverableChunks = %d; an old failure was charged against a hole that "+
+			"a backfill can still move, suppressing the one useful recommendation",
+			page.RecoverableChunks())
+	}
+}

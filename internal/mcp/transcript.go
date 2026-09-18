@@ -247,7 +247,8 @@ func (h *handlers) transcriptNotice(ctx context.Context, opts store.TranscriptOp
 		return notice, nil
 	}
 
-	// Both notices point at ResumeFrom rather than CoveredUntil. The two differ by
+	// A notice offering a resume point points at ResumeFrom, never CoveredUntil —
+	// a latest page offers none, and its branch below says so. The two differ by
 	// design: coverage ends inclusively at the last chunk the turns reach, and the
 	// segment read is inclusive too, so resuming at that value would serve the
 	// same chunk's turns again on every page.
