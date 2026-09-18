@@ -46,6 +46,13 @@ func TestServerAdvertisesEveryToolWithSchemas(t *testing.T) {
 		if tool.InputSchema == nil {
 			t.Fatalf("tool %q has no generated input schema", tool.Name)
 		}
+		// The output schema is what lets a client render a result without
+		// parsing it, and AddTool derives it from the handler's output struct —
+		// so it appears by construction and would vanish the same way, silently,
+		// if a handler were ever changed to return `any`.
+		if tool.OutputSchema == nil {
+			t.Fatalf("tool %q has no generated output schema", tool.Name)
+		}
 	}
 	for _, want := range []string{"search_events", "get_event", "list_apps", "get_transcript"} {
 		if !found[want] {
