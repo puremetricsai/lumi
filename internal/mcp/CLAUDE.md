@@ -1,6 +1,6 @@
 # internal/mcp
 
-Stdio MCP server on `github.com/modelcontextprotocol/go-sdk` (pinned v1.6.1; import aliased as `sdk`, since
+Stdio MCP server on `github.com/modelcontextprotocol/go-sdk` (pinned v1.8.0; import aliased as `sdk`, since
 our package is also named `mcp`). `Serve(ctx, *store.Store, Options)` registers four read-only tools —
 `search_events`, `get_event`, `list_apps`, `get_transcript` — and runs until stdin closes or the context is
 cancelled. It depends on `internal/store` and nothing else of Lumi's; the binary-watching and
@@ -42,7 +42,7 @@ reports is the one enforced.
 - **`lumi mcp` replaces its own process image when its binary changes, and the handshake is what has to
   survive.** `syscall.Exec` preserves fds 0/1/2, so the client keeps talking to the same pid on the same
   pipes and never learns anything happened — that is the whole reason this works where a client-side restart
-  would not. But the 2025-11-25 protocol this SDK pins gates every method on having seen `initialize`
+  would not. But every protocol revision this SDK speaks gates every method on having seen `initialize`
   (go-sdk's `ServerSession.handle`), so a replacement that came up cold would reject the client's next
   request with "method is invalid during session initialization" — and fail on request N+1, not at startup.
   `reexec.go` therefore stashes `sdk.ServerSessionState` in `LUMI_MCP_SESSION_STATE` across the exec and
@@ -84,10 +84,28 @@ reports is the one enforced.
   interception taken out. `TestRequestBytesAreNotConsumedDuringReplacement` pins the earlier raw-transport
   boundary. `TestReplacementIsAtomicWithTheIdlenessCheck` probes inside the check-to-exec window
   via the `state()` callback and fails when `claimIdle` is reduced to check-then-act;
-  `TestUpdaterMustNotBeIdleWhileAReplyIsStillBeingWritten` blocks a reply mid-write.
+  `TestUpdaterMustNotBeIdleWhileAReplyIsStillBeingWritten` blocks a reply mid-write, and states the
+  *property* rather than either mechanism: the reply it stalls is a `tools/call`'s, whose ID sits in
+  `outstanding` until that write returns, so it stays non-idle with `begin`/`end` deleted — the vacuity this
+  bullet exists to catch, caught here by the bullet itself.
+  `TestUpdaterIsNotIdleInsideAWriteWithNothingOutstanding` is the mechanism, and the only test that fails
+  when the write counter goes: it writes a message that was never read, so `outstanding` is empty and
+  `begin`/`end` is all that is left to report the session busy. The case is real — a server-to-client
+  notification carries no ID and retires nothing — and both tests are kept, because the property is what
+  actually matters and the mechanism is what silently rots.
   `TestUpdaterIsIdleOnceTheReplyHasBeenWritten` pins the other direction, because a guard that never lets go
   means the upgrade never happens. `reexecQuietPeriod` is a margin on top of these guarantees — it covers the
   gap *between* two requests of one exchange — and is not what makes the replacement safe.
+- **A fake `io.Reader` in these tests resumes mid-frame, and the one that did not took a Go upgrade to
+  expose.** `pipeReader` returned one frame per `Read` and let `copy` drop whatever the buffer could not
+  hold — correct only while the buffer stayed larger than every frame. `encoding/json`'s old decoder
+  reserved at least 512 bytes per read; the `jsonv2` one that replaced it as the default offers 64 on the
+  first, measured both ways against `GOEXPERIMENT=nojsonv2`, and 64 is smaller than the 147-byte handshake
+  frame these tests send. The handshake then failed to parse, no reply was ever written, and
+  `TestUpdaterMustNotBeIdleWhileAReplyIsStillBeingWritten` spent 20 seconds failing on its own harness guard
+  instead of on the thing it tests. Nothing in `internal/mcp` was wrong; `guardedReader` delegates to
+  `os.File.Read` and always honoured the contract. The lesson is that a fake standing in for a real
+  interface has to satisfy that interface's contract and not just the caller's current habits.
 - **Nothing may write to stdout in the `lumi mcp` path except JSON-RPC frames.** A stray `fmt.Println`,
   default `slog` handler, or cobra usage dump silently corrupts the session and the user just sees the agent
   lose Lumi. `mcpCommand` (in `internal/cli`) sets `SilenceUsage`/`SilenceErrors` explicitly; every
@@ -96,6 +114,14 @@ reports is the one enforced.
   joined to an event's `media_file` is a path the user can open themselves. There is no `read_media`, and no
   filesystem-reading call anywhere in this package — `hoistMediaDir` splits a string and never touches the
   disk. No test can prove this negative; keep it true by construction.
+- **And the path is two fields rather than a `resource_link` block, which was asked for and declined.** A
+  link per row carries the whole path on every event, which is the cost the `media_dir` split exists to
+  remove — measured below as two thirds of each path and the largest constant on a page — so it would be
+  paid back out of the same budget the provenance contract's move into the notice just freed. It also
+  cannot be added without setting `Content` by hand, which silences the go-sdk's text fallback that two of
+  the three clients `mcpsetup` registers render and nothing else, the failure the next bullet records. The
+  affordance a client gains is a URI it could already build from two fields the contract tells it how to
+  join.
 - **A payload crosses the wire twice, on purpose, and `Content` is never a summary of it.** Every handler
   returns a nil `*sdk.CallToolResult`, so the go-sdk fills `Content` with the serialized output
   (`mcp/server.go`, the `res.Content == nil` branch) — the same bytes in `structuredContent` and again as
@@ -200,7 +226,17 @@ reports is the one enforced.
   the rest means FTS5-reported offsets, a new `Event` field and an opt-in plumbed through `Search`, spent on
   a better window for the minority of rows that already sit at the floor. That is why it was declined and
   not merely deferred.
-- **The collapse is screen-only, and no flag may ever let an audio row into it.** `collapse_similar` folds a
+- **Collapsing is the default, and the flag is named for turning it off.** It shipped opt-in so nothing an
+  existing caller expected would disappear un-asked, and that was the wrong way round: at a 2–10s cadence a
+  page of screen results is mostly the same screen, an agent that did not know to ask paid for it four times
+  over, and `collapsed_ids` means the un-asked-for change removes nothing it cannot reach. The parameter is
+  `expand_similar` rather than a defaulted `collapse_similar` because a plain `bool` cannot tell absent from
+  `false` and a `*bool` advertises a schema allowing an explicit null. `collapse_similar` itself is kept and
+  documented as a no-op, which is not politeness: `jsonschema-go` puts `additionalProperties: false` on
+  every inferred schema, and `internal/selfexec` replaces this process mid-session while the client keeps
+  the tool list it already has — so removing the field turns a stale client's next search into a validation
+  error instead of an ignored argument.
+- **The collapse is screen-only, and no flag may ever let an audio row into it.** The fold takes a
   run of adjacent screen results sharing `app` + `window` + `display_id` whose text is near-identical into
   one representative, because 76% of adjacent same-app screen pairs are more than 0.9 identical at a 2–10s
   capture cadence. Audio is the same shape and the opposite case. All 967 audio pairs on the live index
@@ -212,14 +248,51 @@ reports is the one enforced.
   not content, so the microphone's account of the room leaves the visible result and the only way back is a
   `get_event` the agent has no reason to make. `kind == "screen"` is therefore a precondition of the
   collapse and not a filter layered over it, and a test asserts an audio pair survives
-  `collapse_similar: true` as two rows.
+  `expand_similar` unset as two rows.
 - **The collapse runs after `LIMIT`, so the notice reports both counts.** The store returns `limit` rows and
   the fold happens on the way out, so a page of 20 that collapses to 6 has still exhausted the limit: a
   notice saying "capped at 20" beside six events contradicts its own payload, and one saying "capped at 6"
   invents a cap nothing enforced. It states what was fetched and what survived. Refilling the page by
   over-fetching was declined deliberately — a short page costs one clause of explanation, a refill loop
   costs an unbounded number of store round-trips to hide it, and nothing has shown short pages cost more
-  calls than the tokens the fold saves.
+  calls than the tokens the fold saves — and a short page costs less now that the notice hands back a
+  cursor rather than a time bound to guess at.
+- **`search_events` pages with an opaque cursor, and the two orderings page differently.** MCP's own cursor
+  covers list methods only, so this is Lumi's field and the description says so. Browse mode keysets on
+  `(captured_at, id)` carried as `store.Event.CapturedAtRaw` — the column's own bytes, because the index
+  renders one instant two ways and a key rebuilt from a `time.Time` by picking a layout misses the other
+  rendering. It replaces `until=<oldest stamp>`, which was inclusive and therefore repeated the boundary
+  group on every page and could not advance at all past a tie group larger than `limit`; `captured_at` is
+  not unique, so that was reachable from one audio chunk. Ranked mode counts rows instead, because bm25 is
+  recomputed per query and no row carries it — the ceiling is that a capture landing mid-walk shifts the
+  boundary, which the notice says rather than hides. The key is snapped off the last **fetched** row before
+  the collapse, for the same reason the old stamp was. A cursor from one ordering handed to the other is
+  rejected rather than passed through, because a browse key under a query silently narrows the range into
+  something shaped exactly like a page. **The cursor also pins the resolved time window, and that pin beats
+  `since`/`until` on every page after the first** — `since: "2h"` resolves against the clock on each call,
+  so a walk resending its own arguments walks a window sliding out from under it, and a ranked `Offset`
+  counted in a result set that just lost its oldest row skips a row that still matches, silently. Browse
+  only loses the far end early, but one rule for both is shorter than two. A caller cannot signal whether a
+  changed bound is a deliberate narrowing or the same relative string a second later, so the cursor decides
+  and the description says so: a different window means a new search without a cursor. And an exhausted
+  walk is not a failed one — a last page that exactly fills the limit still carries a cursor, so there is
+  always one more call returning nothing, and answering it with the no-match notice sends an agent to widen
+  filters that were working. It says the walk is done instead. And `next_cursor` is absent when there is no next page: the one
+  field here that means something by *not* appearing, against the doubt-label rule, waived because every
+  cursor protocol works that way and an agent reading an empty cursor as valid pages forever.
+- **The audio provenance contract is delivered in the notice, and belongs in exactly one place.** It was a
+  third of the description payload every client loaded on every `tools/list`, including the ones that only
+  ever read screen text. In the notice it costs nothing until a page actually holds an audio row, and then
+  arrives with the row it explains. It is gated on the page *containing* an audio row and deliberately not
+  on `hasAttributedAudio`, which asks a different question — whether `get_transcript` has segments to show
+  — and answers "no" for exactly the unattributed, silent and not-yet-backfilled rows that still render
+  every field the contract is about. The move also cost the contract its closing sentence: it used to name
+  `get_transcript`, `searchEvents` names it too under the segments gate, and two copies of one routing rule
+  sharing a single notice string means the ungated copy wins. `TestToolDescriptionsStateTheMicrophoneCaveat`
+  asserts the phrases both ways — present on an audio page and **absent** on a screen-only one and from
+  every description — because only the absence half pins the saving. An MCP resource was the shape the
+  finding proposed and fails the way a Claude Code skill fails, below: pull, one client of three, and an
+  agent that never reads it is the defect the text exists to prevent.
 - **A rule about the store is read from the store, not reimplemented here.** `HasSearchableTerms` exists
   because this package had copied the unexported term-drop rule, and the drift was invisible to both test
   suites (`internal/store/CLAUDE.md`).
