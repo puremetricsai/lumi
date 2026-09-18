@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -619,5 +620,59 @@ func TestCappedTranscriptPrintsWhereToContinue(t *testing.T) {
 	resume := "--since " + base.Add(2*time.Hour).Local().Format(time.RFC3339Nano)
 	if !strings.Contains(out, resume) {
 		t.Errorf("a capped transcript does not point at the first dropped turn (%s): %s", resume, out)
+	}
+}
+
+// TestTranscriptLatestTailsTheRangeAndOffersNoResumePoint is the CLI half of
+// `latest`, which nothing else here reaches.
+//
+// The flag is two lines — a BoolVar and one struct field — and both are exactly
+// the kind that a refactor drops silently: with the field unset the command
+// still succeeds, still prints turns, and still exits zero, having answered the
+// opposite question. The footer is the other half, because the capped sentence
+// it would otherwise print interpolates a resume point a tailed page does not
+// have, and used to render it as a bare `--since`.
+func TestTranscriptLatestTailsTheRangeAndOffersNoResumePoint(t *testing.T) {
+	root, s := transcriptRoot(t)
+	base := time.Now().UTC().Add(-50 * time.Minute)
+	for c := range 4 {
+		audioChunkWithText(t, s, base.Add(time.Duration(c)*10*time.Minute),
+			fmt.Sprintf("machine line %d", c),
+			fmt.Sprintf("machine line %d and a room line %d", c, c))
+	}
+	if _, err := runCLI(t, "--data-dir", root, "transcript", "backfill"); err != nil {
+		t.Fatal(err)
+	}
+
+	head, err := runCLI(t, "--data-dir", root, "transcript", "--since", "1h", "--limit", "2")
+	if err != nil {
+		t.Fatalf("%v\n%s", err, head)
+	}
+	tail, err := runCLI(t, "--data-dir", root, "transcript", "--since", "1h", "--limit", "2", "--latest")
+	if err != nil {
+		t.Fatalf("%v\n%s", err, tail)
+	}
+	if head == tail {
+		t.Fatal("--latest returned the head of the range; the flag reached nothing")
+	}
+	// The two cuts are opposite ends of the same range: the first chunk's words
+	// belong to the head alone and the last chunk's to the tail alone.
+	if !strings.Contains(head, "line 0") || strings.Contains(tail, "line 0") {
+		t.Errorf("--latest kept the oldest chunk:\nhead: %s\ntail: %s", head, tail)
+	}
+	if !strings.Contains(tail, "line 3") {
+		t.Errorf("--latest did not reach the newest chunk: %s", tail)
+	}
+	// The footer must not offer a resume point it does not have. `--since ` with
+	// nothing after it is the exact shape of the defect.
+	if strings.Contains(tail, "--since \n") || strings.Contains(tail, "--since  ") {
+		t.Errorf("the --latest footer interpolated an empty resume point: %s", tail)
+	}
+	if !strings.Contains(tail, "--limit") || !strings.Contains(tail, "--latest") {
+		t.Errorf("the --latest footer does not say how to see the rest: %s", tail)
+	}
+	// And the head cut keeps the sentence that does have a resume point.
+	if !strings.Contains(head, "--since") {
+		t.Errorf("a capped forward page stopped offering a resume point: %s", head)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -1283,5 +1284,265 @@ func TestCompleteTranscriptOffersNoResumePoint(t *testing.T) {
 	}
 	if !result.ResumeFrom.IsZero() {
 		t.Errorf("a complete transcript names a resume point at %s", result.ResumeFrom)
+	}
+}
+
+// TestLatestTranscriptTailsTheRange pins the cut the default cannot make.
+//
+// MaxTurns keeps the head of the range, so "what was just said" over a wide
+// since returned the oldest turns of it — the question a transcript is most
+// often asked, answered with the wrong end. Latest tails instead, and the
+// assertions below are the three things that must move with the cut: the turns
+// themselves, the coverage claim (which may never describe ground the page
+// dropped), and ResumeFrom, which must be absent because what was dropped lies
+// before the page rather than after it.
+func TestLatestTranscriptTailsTheRange(t *testing.T) {
+	ctx := context.Background()
+	s, _ := segmentStore(t)
+	base := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+
+	// An hour apart, so no two turns merge and the cut lands on a chunk boundary.
+	const chunks = 10
+	for c := range chunks {
+		at := base.Add(time.Duration(c) * time.Hour)
+		event := &Event{Kind: KindAudio, CapturedAt: at, Text: "x",
+			MediaPath: "/tmp/microphone.wav", AudioSource: "microphone"}
+		if err := s.Insert(ctx, event); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.ReplaceChunkSegments(ctx, formatTime(at), []Segment{{
+			EventID: event.ID, Seq: 0, Origin: OriginExternal, SourceTrack: "microphone",
+			Text: fmt.Sprintf("turn %d", c), Confidence: 0.9,
+			OrderConfidence: "sequence"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	opts := TranscriptOptions{Since: base.Add(-time.Hour), Until: base.Add(24 * time.Hour), MaxTurns: 3}
+	head, err := s.Transcript(ctx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts.Latest = true
+	tail, err := s.Transcript(ctx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !head.Capped || !tail.Capped {
+		t.Fatalf("capped head=%v tail=%v; both pages dropped turns", head.Capped, tail.Capped)
+	}
+	if len(tail.Turns) != 3 {
+		t.Fatalf("latest returned %d turns at a limit of 3", len(tail.Turns))
+	}
+	// The two cuts must be opposite ends of the same range, not the same rows.
+	if got, want := tail.Turns[0].Text, "turn 7"; got != want {
+		t.Errorf("latest page starts at %q, want %q — it did not tail the range", got, want)
+	}
+	if got, want := tail.Turns[2].Text, "turn 9"; got != want {
+		t.Errorf("latest page ends at %q, want %q", got, want)
+	}
+	if head.Turns[0].Text == tail.Turns[0].Text {
+		t.Error("latest returned the same turns as the head cut")
+	}
+	// Chronological, not reversed: nothing downstream may have to know which cut
+	// produced the page.
+	if !tail.Turns[0].CapturedAt.Before(tail.Turns[2].CapturedAt) {
+		t.Error("latest reversed the turns instead of tailing them")
+	}
+	// Coverage bounded at the near end, for the reason the head cut bounds the
+	// far one: counting the seven dropped chunks would vouch for ground this
+	// page's text never reached. Both counts, since a near bound that moved only
+	// Chunks would report three chunks of which ten are attributed.
+	if tail.Chunks != 3 || tail.AttributedChunks != 3 {
+		t.Errorf("coverage counts %d chunks / %d attributed for a page holding 3 turns",
+			tail.Chunks, tail.AttributedChunks)
+	}
+	// And the FAR bound must not move with it. A tailed page still reaches until,
+	// so pulling CoveredUntil back to the last returned chunk — which is right for
+	// the head cut and wrong here — would understate the ground it covered.
+	if !tail.CoveredUntil.Equal(opts.Until) {
+		t.Errorf("covered_until %s is short of until %s; a tailed page still reaches the end "+
+			"of the range", tail.CoveredUntil, opts.Until)
+	}
+	if !tail.ResumeFrom.IsZero() {
+		t.Errorf("latest offered resume_from %s; paging forward from a tailed page "+
+			"re-reads turns it already returned", tail.ResumeFrom)
+	}
+}
+
+// TestLatestPageCountsOnlyTheRemovalsBehindIt pins the accounting clause the
+// tail cut needed.
+//
+// ConfidenceFiltered promises every turn this page's threshold removed from the
+// ground this page covers, and the bound was the far end alone — right for a
+// head cut, where the page starts at Since and a removal is never before it.
+// A tailed page starts at its first kept turn, so without a near bound it would
+// report removals from the seven chunks it dropped and will never serve: a
+// number pointing at turns no page ever offers.
+func TestLatestPageCountsOnlyTheRemovalsBehindIt(t *testing.T) {
+	ctx := context.Background()
+	s, _ := segmentStore(t)
+	base := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+
+	// Turns 2 and 8 fall below the threshold: one before the tailed page's near
+	// bound, one inside it.
+	const chunks = 10
+	for c := range chunks {
+		at := base.Add(time.Duration(c) * time.Hour)
+		event := &Event{Kind: KindAudio, CapturedAt: at, Text: "x",
+			MediaPath: "/tmp/microphone.wav", AudioSource: "microphone"}
+		if err := s.Insert(ctx, event); err != nil {
+			t.Fatal(err)
+		}
+		confidence := 0.9
+		if c == 2 || c == 8 {
+			confidence = 0.3
+		}
+		if err := s.ReplaceChunkSegments(ctx, formatTime(at), []Segment{{
+			EventID: event.ID, Seq: 0, Origin: OriginExternal, SourceTrack: "microphone",
+			Text: fmt.Sprintf("turn %d", c), Confidence: confidence,
+			OrderConfidence: "sequence"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	page, err := s.Transcript(ctx, TranscriptOptions{
+		Since: base.Add(-time.Hour), Until: base.Add(24 * time.Hour),
+		MinConfidence: 0.5, MaxTurns: 3, Latest: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Eight turns survive the threshold; the last three are 6, 7 and 9.
+	if len(page.Turns) != 3 || page.Turns[0].Text != "turn 6" {
+		t.Fatalf("got %d turns starting %q; want 3 starting at turn 6",
+			len(page.Turns), page.Turns[0].Text)
+	}
+	if got := page.ConfidenceFiltered[OriginExternal]; got != 1 {
+		t.Errorf("a tailed page reports %d removals; want 1 — only turn 8 lies on "+
+			"ground this page covers, turn 2 belongs to the turns it dropped", got)
+	}
+}
+
+// TestLatestRefusesARangeWhoseNewestSegmentsWereNeverRead pins the refusal.
+//
+// The segment read is ascending, so a range holding more than the ceiling stops
+// before the newest segments are loaded. Tailing what did arrive would return
+// the oldest turns of the range under the flag that promises the newest — and
+// nothing in the payload could reveal it, which is the undetectable wrong answer
+// this package refuses everywhere else. Serving it is worse than erroring, so
+// the error is the behaviour under test.
+func TestLatestRefusesARangeWhoseNewestSegmentsWereNeverRead(t *testing.T) {
+	ctx := context.Background()
+	s, _ := segmentStore(t)
+	at := time.Date(2026, 7, 30, 9, 0, 0, 0, time.UTC)
+	event := &Event{Kind: KindAudio, CapturedAt: at, Text: "x",
+		MediaPath: "/tmp/microphone.wav", AudioSource: "microphone"}
+	if err := s.Insert(ctx, event); err != nil {
+		t.Fatal(err)
+	}
+	// One segment past the ceiling, so the read truncates.
+	rows := make([]Segment, 0, maxTranscriptSegments+1)
+	for i := range maxTranscriptSegments + 1 {
+		rows = append(rows, Segment{EventID: event.ID, Seq: i, Origin: OriginExternal,
+			SourceTrack: "microphone", Text: "word", Confidence: 0.9, OrderConfidence: "sequence"})
+	}
+	if err := s.ReplaceChunkSegments(ctx, formatTime(at), rows); err != nil {
+		t.Fatal(err)
+	}
+
+	opts := TranscriptOptions{Since: at.Add(-time.Hour), Until: at.Add(time.Hour), MaxTurns: 3}
+	forward, err := s.Transcript(ctx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !forward.Truncated {
+		t.Fatal("the fixture did not truncate, so this test is not exercising the refusal")
+	}
+	opts.Latest = true
+	tailed, err := s.Transcript(ctx, opts)
+	if err == nil {
+		t.Fatalf("latest served %d turns off a truncated read; they are the OLDEST turns of the "+
+			"range under a flag promising the newest", len(tailed.Turns))
+	}
+	// And it says which of the two controls to reach for, or the caller is told
+	// only that it failed.
+	if !strings.Contains(err.Error(), "latest") || !strings.Contains(err.Error(), "since") {
+		t.Errorf("the refusal does not name a way out: %v", err)
+	}
+}
+
+// TestLatestPageCountsOnlyTheFailuresItCovers is the second coverage query, and
+// it needs its own fixture because the first one cannot reach it.
+//
+// ChunksFailedTranscription runs only when Chunks exceeds AttributedChunks, so
+// a fully attributed range — which every other Latest test is — skips the call
+// entirely and pins nothing about its bounds. The two queries take coveredFrom
+// as separate arguments and are separately editable; sharing one variable makes
+// today's code consistent, not protected. Reverting this one alone to opts.Since
+// counts a failure from the chunks the page dropped against the gap in the
+// chunks it kept, and RecoverableChunks then reports a hole no backfill can
+// move — the exact advice the count exists to keep off the notice.
+func TestLatestPageCountsOnlyTheFailuresItCovers(t *testing.T) {
+	ctx := context.Background()
+	s, _ := segmentStore(t)
+	base := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+	const failed = `{"audio_source":"microphone","processor_error":"recognizer unavailable"}`
+	const clean = `{"audio_source":"microphone"}`
+
+	insert := func(at time.Time, text, metadata string) *Event {
+		t.Helper()
+		event := &Event{Kind: KindAudio, CapturedAt: at, Text: text,
+			MediaPath: "/tmp/microphone.wav", AudioSource: "microphone",
+			Metadata: json.RawMessage(metadata)}
+		if err := s.Insert(ctx, event); err != nil {
+			t.Fatal(err)
+		}
+		return event
+	}
+	speech := func(at time.Time, text string) {
+		t.Helper()
+		event := insert(at, text, clean)
+		if err := s.ReplaceChunkSegments(ctx, formatTime(at), []Segment{{
+			EventID: event.ID, Seq: 0, Origin: OriginExternal, SourceTrack: "microphone",
+			Text: text, Confidence: 0.9, OrderConfidence: "sequence"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Chunk 0 failed recognition and lies before the tailed page.
+	insert(base, "", failed)
+	// Chunks 1-5 carry turns; the page keeps the last three of them.
+	for c := 1; c <= 5; c++ {
+		speech(base.Add(time.Duration(c)*time.Hour), fmt.Sprintf("turn %d", c))
+	}
+	// Chunk 6 is unattributed but never failed, so it is the recoverable hole
+	// inside the page — the one a backfill can actually move.
+	insert(base.Add(6*time.Hour), "", clean)
+
+	page, err := s.Transcript(ctx, TranscriptOptions{
+		Since: base.Add(-time.Hour), Until: base.Add(24 * time.Hour),
+		MaxTurns: 3, Latest: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !page.Capped || len(page.Turns) != 3 || page.Turns[0].Text != "turn 3" {
+		t.Fatalf("got %d turns capped=%v starting %q; want 3 starting at turn 3",
+			len(page.Turns), page.Capped, page.Turns[0].Text)
+	}
+	// Chunks 3, 4, 5 and the unattributed 6: four covered, three attributed.
+	if page.MissingChunks() != 1 {
+		t.Fatalf("the page reports %d holes; the fixture has exactly one inside it",
+			page.MissingChunks())
+	}
+	if page.FailedChunks != 0 {
+		t.Errorf("a tailed page counts %d failed chunks; chunk 0's failure lies among the "+
+			"turns it dropped, not the ones it covers", page.FailedChunks)
+	}
+	// And the consequence the count exists for: the hole it does have is one a
+	// backfill can fill, so the notice must still say to run it.
+	if page.RecoverableChunks() != 1 {
+		t.Errorf("RecoverableChunks = %d; an old failure was charged against a hole that "+
+			"a backfill can still move, suppressing the one useful recommendation",
+			page.RecoverableChunks())
 	}
 }

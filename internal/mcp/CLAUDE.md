@@ -249,14 +249,18 @@ reports is the one enforced.
   `get_event` the agent has no reason to make. `kind == "screen"` is therefore a precondition of the
   collapse and not a filter layered over it, and a test asserts an audio pair survives
   `expand_similar` unset as two rows.
-- **The collapse runs after `LIMIT`, so the notice reports both counts.** The store returns `limit` rows and
+- **The collapse runs after `LIMIT`, so the notice reports both counts, and `limit`'s own description says the count is pre-fold.** The store returns `limit` rows and
   the fold happens on the way out, so a page of 20 that collapses to 6 has still exhausted the limit: a
   notice saying "capped at 20" beside six events contradicts its own payload, and one saying "capped at 6"
   invents a cap nothing enforced. It states what was fetched and what survived. Refilling the page by
   over-fetching was declined deliberately — a short page costs one clause of explanation, a refill loop
   costs an unbounded number of store round-trips to hide it, and nothing has shown short pages cost more
   calls than the tokens the fold saves — and a short page costs less now that the notice hands back a
-  cursor rather than a time bound to guess at.
+  cursor rather than a time bound to guess at. What the fold does owe the caller is an accurate
+  parameter: `limit` said "maximum events to return", which the default fold made false — an agent asking
+  for five rows and getting two reads that as a broken limit, not as a fold it never opted into. The
+  description now says the number is rows read from the index before the fold, and points at the notice for
+  both counts. `TestSearchLimitDescriptionMatchesStoreBounds` still pins the two literals inside it.
 - **`search_events` pages with an opaque cursor, and the two orderings page differently.** MCP's own cursor
   covers list methods only, so this is Lumi's field and the description says so. Browse mode keysets on
   `(captured_at, id)` carried as `store.Event.CapturedAtRaw` — the column's own bytes, because the index
@@ -280,6 +284,26 @@ reports is the one enforced.
   filters that were working. It says the walk is done instead. And `next_cursor` is absent when there is no next page: the one
   field here that means something by *not* appearing, against the doubt-label rule, waived because every
   cursor protocol works that way and an agent reading an empty cursor as valid pages forever.
+- **`max_turns` keeps the head of the range, and `latest: true` is how a caller asks for the tail.** The
+  head cut is right for paging — it pairs with `resume_from` and walks a long range forward — but it is
+  wrong for the question a transcript is most often asked. `defaultTranscriptWindow` is an hour precisely
+  because "a transcript with no window is almost always *what was just said*", and an hour holding more
+  than `max_turns` turns answered that with the oldest hundred: the default's stated purpose, defeated by
+  the default's own cap, and nothing in the payload said which end was cut. `latest` tails instead. It does
+  not reverse — the description promises turns are chronological, and `order: desc` would have to fight
+  that promise and the `resume_from` contract both — so a tailed page is the same rows in the same order,
+  chosen from the other end. Three things move with the cut and all three live in `store.Transcript`,
+  because the rule about what a transcript contains is the store's: the turns, the coverage bound (`Chunks`
+  may never describe ground the page dropped, so a tailed page's near bound is its first kept turn, not
+  `Since`), and the `ConfidenceFiltered` count, whose accounting clause gains a lower bound that is a
+  no-op on every page but a tailed one. **`ResumeFrom` is deliberately zero on a tailed page** and the
+  notice says the opposite thing from the capped one, because what a tail dropped lies *before* it: an
+  agent handed the capped sentence would page forward over turns it already holds. Paging backwards is not
+  offered, and neither is flipping the default, which would silently change what every existing
+  `resume_from` walker reads. `Truncated` + `latest` is refused rather than served: the segment read is
+  ascending, so a range too large for one call never loaded the newest segments, and tailing what did
+  arrive would return the oldest turns under the flag that promises the newest — undetectable from the
+  data, which is the failure this package refuses everywhere else.
 - **The audio provenance contract is delivered in the notice, and belongs in exactly one place.** It was a
   third of the description payload every client loaded on every `tools/list`, including the ones that only
   ever read screen text. In the notice it costs nothing until a page actually holds an audio row, and then
