@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.8.0](https://github.com/puremetricsai/lumi/compare/v0.7.1...v0.8.0) (2026-09-18)
+
+
+### ⚠ BREAKING CHANGES
+
+* **mcp:** collapse_similar no longer controls the fold. Collapsing is on by default and expand_similar turns it off. The parameter is inverted rather than defaulted because a plain bool cannot tell absent from false and a *bool advertises a schema allowing an explicit null. collapse_similar is still accepted and documented as a no-op: jsonschema-go puts additionalProperties: false on every inferred schema, and internal/selfexec replaces this process mid-session while the client keeps the tool list it already has, so removing the field would turn a stale client's next search into a validation error rather than an ignored argument.
+
+### Features
+
+* **mcp:** page search_events with a cursor and collapse by default ([99896c9](https://github.com/puremetricsai/lumi/commit/99896c99b5fc6a1cf493c1313f70fd91ef1a9350))
+* **mcp:** page search_events with a cursor and stop charging every session for the audio contract ([7ead1ab](https://github.com/puremetricsai/lumi/commit/7ead1abb25407675396669856c50700e8efa0d27))
+* **mcp:** tail a transcript with latest, and correct what search_events limit counts ([9b2a7e2](https://github.com/puremetricsai/lumi/commit/9b2a7e23aaff67e5fba84378bd838247f9cac857))
+* **mcp:** tail a transcript with latest, so "what was just said" is one call ([d7e5a9c](https://github.com/puremetricsai/lumi/commit/d7e5a9ca06258aec60f07e59e092ab8d1b74f638))
+* **store:** add a keyset cursor and an offset to Search ([da1f65c](https://github.com/puremetricsai/lumi/commit/da1f65c2a902d82ade06254b9b9a72a8973df081))
+
+
+### Bug Fixes
+
+* **mcp:** make the writerace test fake honour the io.Reader contract ([a390159](https://github.com/puremetricsai/lumi/commit/a3901594867f30106c257c571075e5a7f61d2fb3))
+
+
+### Performance Improvements
+
+* **mcp:** move the audio provenance contract out of the tool description ([ea4d4d9](https://github.com/puremetricsai/lumi/commit/ea4d4d9df9602e12408866788f0c760c4c5f371f))
+
 ## [0.7.1](https://github.com/puremetricsai/lumi/compare/v0.7.0...v0.7.1) (2026-09-14)
 
 
