@@ -249,14 +249,18 @@ reports is the one enforced.
   `get_event` the agent has no reason to make. `kind == "screen"` is therefore a precondition of the
   collapse and not a filter layered over it, and a test asserts an audio pair survives
   `expand_similar` unset as two rows.
-- **The collapse runs after `LIMIT`, so the notice reports both counts.** The store returns `limit` rows and
+- **The collapse runs after `LIMIT`, so the notice reports both counts, and `limit`'s own description says the count is pre-fold.** The store returns `limit` rows and
   the fold happens on the way out, so a page of 20 that collapses to 6 has still exhausted the limit: a
   notice saying "capped at 20" beside six events contradicts its own payload, and one saying "capped at 6"
   invents a cap nothing enforced. It states what was fetched and what survived. Refilling the page by
   over-fetching was declined deliberately — a short page costs one clause of explanation, a refill loop
   costs an unbounded number of store round-trips to hide it, and nothing has shown short pages cost more
   calls than the tokens the fold saves — and a short page costs less now that the notice hands back a
-  cursor rather than a time bound to guess at.
+  cursor rather than a time bound to guess at. What the fold does owe the caller is an accurate
+  parameter: `limit` said "maximum events to return", which the default fold made false — an agent asking
+  for five rows and getting two reads that as a broken limit, not as a fold it never opted into. The
+  description now says the number is rows read from the index before the fold, and points at the notice for
+  both counts. `TestSearchLimitDescriptionMatchesStoreBounds` still pins the two literals inside it.
 - **`search_events` pages with an opaque cursor, and the two orderings page differently.** MCP's own cursor
   covers list methods only, so this is Lumi's field and the description says so. Browse mode keysets on
   `(captured_at, id)` carried as `store.Event.CapturedAtRaw` — the column's own bytes, because the index
