@@ -31,7 +31,8 @@ type getTranscriptInput struct {
 	// an agent mid-task than a schema rejection.
 	Origin        string   `json:"origin,omitempty" jsonschema:"restrict to one origin: \"internal\" for sound this machine produced, \"external\" for sound its microphone picked up from the room, or \"unknown\"; omit for all"`
 	MinConfidence *float64 `json:"min_confidence,omitempty" jsonschema:"drop turns below this confidence, from 0 to 1; defaults to 0 so every turn is returned and its confidence speaks for itself. A turn's confidence combines the recognizer's own score with penalties for how uncertain its attribution is, and the largest of those penalties apply to microphone turns alone, so this threshold does not sort turns by quality alone: measured on a live index, internal turns scored 0.682-0.983 and external turns 0.331-0.592, so 0.6 removed every external turn and no internal one. Whatever it removes is reported back in confidence_filtered and in the notice. Prefer reading each turn's confidence over filtering on it"`
-	MaxTurns      int      `json:"max_turns,omitempty" jsonschema:"maximum turns to return; defaults to 100 and is capped at 1000"`
+	MaxTurns      int      `json:"max_turns,omitempty" jsonschema:"maximum turns to return; defaults to 100 and is capped at 1000. It keeps the OLDEST turns of the range and paginates the rest through resume_from, unless latest is set"`
+	Latest        bool     `json:"latest,omitempty" jsonschema:"keep the last max_turns turns of the range instead of the first, for \"what was just said\" over a wide since; turns stay chronological and the page still ends at until, but it no longer starts at since, so there is no resume_from — what was dropped lies before the page. Raise max_turns or drop latest to read the range forward"`
 	MaxTextChars  *int     `json:"max_text_chars,omitempty" jsonschema:"per-turn character cap on text; defaults to 600, and 0 means no cap"`
 }
 
@@ -59,7 +60,9 @@ type TranscriptTurnRecord struct {
 type getTranscriptOutput struct {
 	Turns []TranscriptTurnRecord `json:"turns"`
 	// ResumeFrom is what to pass as since to continue past a transcript that
-	// stopped short, and is absent when there is nothing left to read. It is
+	// stopped short, and is absent when there is no page after this one: either
+	// the transcript is complete, or latest tailed it and what it dropped lies
+	// before it rather than after it. It is
 	// given as a value rather than left to the notice's prose because an agent
 	// paging through a long range should not have to parse a sentence to do it.
 	//
@@ -109,6 +112,7 @@ func (h *handlers) getTranscript(ctx context.Context, _ *sdk.CallToolRequest, in
 		// The store clamps this itself, so the number the schema documents is the
 		// number enforced.
 		MaxTurns: store.ClampTranscriptTurns(in.MaxTurns),
+		Latest:   in.Latest,
 	}
 	if since != nil {
 		opts.Since = *since
@@ -257,7 +261,15 @@ func (h *handlers) transcriptNotice(ctx context.Context, opts store.TranscriptOp
 				"rather than at until; request since=%s to continue from there",
 			result.CoveredUntil.Local().Format(time.RFC3339), resume))
 	}
-	if result.Capped {
+	if result.Capped && opts.Latest {
+		// The opposite advice from the branch below, because the dropped turns are
+		// on the opposite side: resume_from is deliberately absent, and telling an
+		// agent to page from it would send it to read a field that is not there.
+		parts = append(parts, fmt.Sprintf(
+			"these are the last %d turns of the range, capped by max_turns; older turns in it "+
+				"were dropped rather than deferred, so there is no resume_from — raise max_turns "+
+				"or drop latest to read the range forward from since", len(result.Turns)))
+	} else if result.Capped {
 		parts = append(parts, fmt.Sprintf(
 			"results were capped at %d turns; request since=%s to continue from there, "+
 				"or raise max_turns", len(result.Turns), resume))

@@ -312,9 +312,12 @@ func newServer(s *store.Store, opts Options) *sdk.Server {
 			"known, and \"approximate\" means the position was inferred. " +
 			"Turns may overlap in time when both parties spoke at once; those are marked overlaps. " +
 			"A transcript that stops short — because the range held more audio than one call returns, " +
-			"or because max_turns capped it — says so in its notice and returns resume_from: pass that " +
-			"as since to read the next page. Continue from resume_from and not from the last turn's " +
+			"or because max_turns capped a forward page — says so in its notice and returns resume_from " +
+			"(latest pages are the exception, below): pass that as since to read the next page. Continue from resume_from and not from the last turn's " +
 			"time, which would repeat turns you already have. " +
+			"max_turns keeps the OLDEST turns of the range, so for \"what was just said\" over a wide " +
+			"since, set latest: true to keep the last max_turns instead; a latest page ends at until " +
+			"and carries no resume_from, because what it dropped lies before it. " +
 			"Use event_ids with get_event to read either track's raw, undeduplicated transcript. " +
 			"A turn's origin names provenance relative to this machine and is a different axis from an " +
 			"event's source_app. \"external\" audio came from the room's microphone and may be the " +
