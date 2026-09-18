@@ -17,7 +17,7 @@ import (
 
 // sessionStateEnv carries the MCP handshake across a re-exec.
 //
-// The 2025-11-25 protocol this SDK speaks gates every method on having seen
+// Every protocol revision this SDK speaks gates every method on having seen
 // `initialize`: a fresh process that inherited a live connection would reject
 // the client's next request with "method is invalid during session
 // initialization" (go-sdk's ServerSession.handle). The replacement therefore has
