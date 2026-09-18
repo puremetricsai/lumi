@@ -20,17 +20,25 @@ const (
 )
 
 type Event struct {
-	ID          int64     `json:"id"`
-	Kind        Kind      `json:"kind"`
-	CapturedAt  time.Time `json:"captured_at"`
-	Text        string    `json:"text"`
-	App         string    `json:"app,omitempty"`
-	Window      string    `json:"window,omitempty"`
-	MediaPath   string    `json:"media_path"`
-	DurationMS  int64     `json:"duration_ms,omitempty"`
-	TextSource  string    `json:"text_source,omitempty"`
-	DisplayID   uint32    `json:"display_id,omitempty"`
-	AudioSource string    `json:"audio_source,omitempty"`
+	ID         int64     `json:"id"`
+	Kind       Kind      `json:"kind"`
+	CapturedAt time.Time `json:"captured_at"`
+	// CapturedAtRaw is the captured_at column exactly as stored, before it was
+	// parsed into CapturedAt. The index renders one instant two ways, so a key
+	// naming this row's place in the captured_at ordering cannot be rebuilt from
+	// CapturedAt by picking a layout — see CLAUDE.md. SearchOptions.Before is the
+	// one caller: paging past a row means passing that row's own bytes back.
+	// Kept out of JSON because `lumi search --json` emits a bare []Event, and a
+	// faithful export must not carry two renderings of a field it already has.
+	CapturedAtRaw string `json:"-"`
+	Text          string `json:"text"`
+	App           string `json:"app,omitempty"`
+	Window        string `json:"window,omitempty"`
+	MediaPath     string `json:"media_path"`
+	DurationMS    int64  `json:"duration_ms,omitempty"`
+	TextSource    string `json:"text_source,omitempty"`
+	DisplayID     uint32 `json:"display_id,omitempty"`
+	AudioSource   string `json:"audio_source,omitempty"`
 	// AudioAttribution says how SourceApps was earned; see AudioAttribution.
 	// Empty on screen rows and on audio rows predating the column.
 	AudioAttribution string `json:"audio_attribution,omitempty"`
@@ -64,6 +72,40 @@ type SearchOptions struct {
 	// a recency pass. It stays opt-in so `search` and the JSON export still see
 	// every stored row. See CLAUDE.md.
 	RequireText bool
+	// Before is browse mode's cursor: it resumes strictly after the last row of a
+	// previous page, on the same (captured_at, id) key that ordering uses. It is
+	// not expressible as Until, which is inclusive by design: an inclusive bound
+	// repeats the boundary group and cannot advance at all past a tie group larger
+	// than Limit.
+	//
+	// It is a timestamp predicate, not a rank one, so under a Query — where the
+	// ordering is rank-first — it narrows the range rather than paging it, and
+	// drops higher-ranked rows newer than the cursor. Ranked mode pages with
+	// Offset.
+	Before *SearchCursor
+	// Offset skips rows after the ordering is applied, and is how ranked mode
+	// pages: bm25 is recomputed per query, so there is no stored key to keyset on.
+	// SQLite requires a LIMIT before an OFFSET; Search always applies a clamped
+	// one, so this needs no limit of its own.
+	//
+	// ponytail: a ranked page boundary drifts. bm25 shifts as rows arrive, so a
+	// row captured between two calls can be seen twice or not at all while
+	// recording is live. Upgrade path is materializing the result set, which is a
+	// lot of machinery for a page an agent reads once.
+	Offset int
+}
+
+// SearchCursor names the last row of a page so the next call can resume strictly
+// after it, ordering by (captured_at, id) descending.
+//
+// CapturedAt is the raw stored string — Event.CapturedAtRaw — and never
+// FormatCapturedAt of an instant: the index holds two renderings of the same
+// instant that sort differently, so a rebuilt key skips or repeats the boundary
+// row with no error anywhere. This is the same rule the equality lookups here
+// follow (see CLAUDE.md); a cursor is a key, not a bound.
+type SearchCursor struct {
+	CapturedAt string
+	ID         int64
 }
 
 const (
@@ -243,6 +285,13 @@ func (s *Store) Search(ctx context.Context, opts SearchOptions) ([]Event, error)
 		where = append(where, "e.captured_at <= ?")
 		args = append(args, UpperCapturedAtBound(*opts.Until))
 	}
+	if opts.Before != nil {
+		// Strict, and on the whole ordering key: Expired is the other strict
+		// bound here. The row-value comparison is the tuple test SQLite has had
+		// since 3.15, and is exactly the ORDER BY below read backwards.
+		where = append(where, "(e.captured_at, e.id) < (?, ?)")
+		args = append(args, opts.Before.CapturedAt, opts.Before.ID)
+	}
 	query := `SELECT ` + prefixedEventColumns("e.") + `,
 ` + rank + ` AS rank FROM ` + from
 	if len(where) > 0 {
@@ -254,8 +303,9 @@ func (s *Store) Search(ctx context.Context, opts SearchOptions) ([]Event, error)
 	// order inside a tie group is whatever the query plan happened to produce, so
 	// two identical calls can return different subsets of a group the LIMIT cuts
 	// through. `lumi mcp` now depends on that not happening: its browse-mode page
-	// boundary is the oldest captured_at on the page, handed back as `until`, and
-	// a boundary that reshuffles under the cap is one an agent cannot walk.
+	// boundary is the last row's (captured_at, id), handed back as
+	// SearchOptions.Before, and a boundary that reshuffles under the cap is one an
+	// agent cannot walk.
 	// DESC, so it agrees with captured_at DESC and keeps the newest row of a tie
 	// group first.
 	if match != "" {
@@ -265,6 +315,10 @@ func (s *Store) Search(ctx context.Context, opts SearchOptions) ([]Event, error)
 	}
 	query += " LIMIT ?"
 	args = append(args, opts.Limit)
+	if opts.Offset > 0 {
+		query += " OFFSET ?"
+		args = append(args, opts.Offset)
+	}
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("search events: %w", err)
@@ -325,6 +379,7 @@ func scanEvent(row rowScanner, event *Event, extra ...any) error {
 		return fmt.Errorf("parse event timestamp %q: %w", capturedAt, err)
 	}
 	event.CapturedAt = parsed
+	event.CapturedAtRaw = capturedAt
 	if streamOffset.Valid {
 		value := streamOffset.Int64
 		event.StreamOffsetMS = &value
