@@ -103,15 +103,28 @@ func Serve(ctx context.Context, s *store.Store, opts Options) error {
 	}
 }
 
-// audioProvenanceContract is the part of search_events' description that keeps
-// an audio row's three provenance fields from being read as one.
+// audioProvenanceContract keeps an audio row's three provenance fields from
+// being read as one. It lives with the descriptions and the instructions
+// because it is the same thing they are — tool text, and the only account of
+// these fields anywhere on the wire. The three answer different questions and
+// routinely disagree: the ordinary case is a video playing in a background
+// browser while the user works somewhere else.
 //
-// It is stated here, in the tool text, because that text is loaded into an
-// agent's context before any row is fetched — so it is the real contract, and a
-// field an agent misreads once it has the data is a field the description
-// failed. The three fields answer different questions and routinely disagree:
-// the ordinary case is a video playing in a background browser while the user
-// works somewhere else.
+// It reaches an agent through the notice of a page that holds an audio row, not
+// through search_events' description. In the description every client paid 1753
+// characters on every tools/list, including the ones that only ever read screen
+// text — a third of Lumi's whole description payload, spent most often on a
+// caller who will never see an audio row. In the notice it costs nothing until
+// an audio row is actually returned, and then arrives in the same response as
+// the row it explains, which is where an agent reads it anyway.
+//
+// It is not an MCP resource. That was the shape the finding asked for, and it
+// fails the same way a Claude Code skill fails (see serverInstructions):
+// mcpsetup registers three clients, a resource is reliably read by one of them,
+// and an agent that never reads it interprets audio rows with nothing — the
+// exact defect this text exists to prevent. A notice is pushed, so no client
+// can decline it. go-sdk's `ttlMs`/`cacheScope` hints would let a client cache
+// such a catalog, but caching text nobody reads changes nothing.
 //
 // The microphone sentence is the load-bearing one. Lumi cannot tell what made a
 // sound in the room and does not try, so the honest output is an ambiguity
@@ -133,6 +146,18 @@ func Serve(ctx context.Context, s *store.Store, opts Options) error {
 // strength of a shared captured_at, which asserted they held the same sound
 // when all they shared was a 30-second interval; a whole microphone transcript
 // could be dropped and the result still read as finished.
+//
+// It names no tool to resolve that with, and that is the second thing the move
+// out of the description changed. The contract used to close by pointing at
+// get_transcript, which searchEvents also does in its own clause — and that
+// clause is gated on the audio having segments, because an unattributed, silent
+// or not-yet-backfilled chunk sends an agent to a tool with nothing to show.
+// Two copies of a routing rule under two different gates is the drift every
+// CLAUDE.md here exists to prevent, and in the notice they would sit in one
+// string, where the ungated copy wins. So the contract states the ambiguity and
+// the gated clause names the tool; a page where get_transcript has nothing says
+// so by not offering it. TestSearchEventsPointsAtTranscriptOnlyWhenAudioIsAttributed
+// is what caught the collision.
 //
 // They say what this tool does *not* do rather than what a caller will receive,
 // which is the only version that stays true. Every filter here is a predicate on
@@ -163,9 +188,7 @@ const audioProvenanceContract = "Audio results keep three different things apart
 	"chunk held one track, and must never be read as the whole chunk. A pair also shares a 30-second " +
 	"interval, not necessarily a sound: the microphone re-records whatever the speakers play, so the " +
 	"two rows may transcribe the same speech twice, or hold two entirely different conversations. " +
-	"Nothing in a search result tells you which, so never assume one row of a pair is redundant. " +
-	"get_transcript answers both questions — it reads each chunk whole and returns the conversation " +
-	"once, in order, with the machine's own speech deduplicated."
+	"Nothing in a search result tells you which, so never assume one row of a pair is redundant."
 
 // newServer builds the server and registers the tools. It is separate from
 // Serve so tests can drive it over an in-memory transport.
@@ -235,12 +258,16 @@ func newServer(s *store.Store, opts Options) *sdk.Server {
 			"with a query, result[0] is the best match, not necessarily the most recent. " +
 			"Text is capped per event — when results say truncated, raise max_text_chars (0 uncaps) and " +
 			"search again rather than calling get_event per row; get_event is for one specific event, " +
-			"not for a page. Set collapse_similar to fold runs of near-identical consecutive screen " +
-			"results into one representative naming the ids it stands for. " +
+			"not for a page. Runs of near-identical consecutive screen results are folded into one " +
+			"representative naming the ids it stands for; set expand_similar to see every row. " +
+			"A full page returns next_cursor: pass it back as cursor to read the next one. " +
 			"Returns text and metadata only: screenshots and audio never leave the user's machine. " +
 			"Each event names its capture file in media_file; join that to media_dir's entry for the " +
 			"event's kind for a local path the user can open themselves. " +
-			audioProvenanceContract,
+			"Audio results carry three different claims that are easy to confuse — the capture device, " +
+			"the observed source, and what the user was focused on — and come in pairs that are never " +
+			"merged. A page holding audio spells that contract out in its notice; read it before you " +
+			"read an audio row.",
 	}, h.searchEvents)
 
 	sdk.AddTool(server, &sdk.Tool{
@@ -250,8 +277,9 @@ func newServer(s *store.Store, opts Options) *sdk.Server {
 			"Join media_dir to the event's media_file for a local path the user can open themselves. " +
 			"An audio event carries foreground_app (what the user had focused), source_app (what was " +
 			"observed producing the sound), and attribution (how that was earned) as three separate " +
-			"fields; see search_events. A microphone event records the room and carries no source_app: " +
-			"what it picked up may be the user, other people present, a TV, or ambient playback.",
+			"fields, and its notice spells out how to read them. A microphone event records the room " +
+			"and carries no source_app: what it picked up may be the user, other people present, a TV, " +
+			"or ambient playback.",
 	}, h.getEvent)
 
 	sdk.AddTool(server, &sdk.Tool{
