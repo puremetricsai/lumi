@@ -40,17 +40,35 @@ func (w *blockingWriter) Close() error { return nil }
 
 // pipeReader feeds pre-written frames to the server and then blocks, so the
 // session stays open rather than ending at EOF.
+//
+// It resumes mid-frame, and must: io.Reader may hand back fewer bytes than the
+// buffer holds, so the caller reads again from where the last one stopped. A
+// version that returned one frame per Read and let copy truncate the rest
+// silently dropped the tail of every frame longer than the buffer. That went
+// unnoticed for as long as the buffer happened to be big enough: encoding/json's
+// old decoder reserved at least 512 bytes per read, and the jsonv2 one that
+// replaced it as the default offers 64 on the first — measured, the same probe
+// prints 512 under GOEXPERIMENT=nojsonv2 — which is smaller than this test's own
+// 147-byte handshake frame. The
+// handshake then failed to parse, no reply was ever written, and the test failed
+// on its harness guard rather than on the guard it exists to check.
 type pipeReader struct {
 	frames []string
 	next   int
+	// offset is how far into frames[next] the last Read stopped.
+	offset int
 	done   chan struct{}
 }
 
 func (r *pipeReader) Read(p []byte) (int, error) {
 	if r.next < len(r.frames) {
 		frame := r.frames[r.next] + "\n"
-		r.next++
-		return copy(p, frame), nil
+		n := copy(p, frame[r.offset:])
+		if r.offset += n; r.offset == len(frame) {
+			r.next++
+			r.offset = 0
+		}
+		return n, nil
 	}
 	<-r.done
 	return 0, io.EOF
@@ -142,6 +160,82 @@ func TestUpdaterMustNotBeIdleWhileAReplyIsStillBeingWritten(t *testing.T) {
 	if idle {
 		t.Fatalf("updater reports the session idle while a reply is still being written: " +
 			"re-execing here would drop that reply and hang the client")
+	}
+}
+
+// stallingConn is a Connection whose Write blocks, so a test can hold the
+// updater inside exactly one Write and nothing else.
+type stallingConn struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (c *stallingConn) Read(context.Context) (jsonrpc.Message, error) {
+	<-c.release
+	return nil, io.EOF
+}
+func (c *stallingConn) Write(context.Context, jsonrpc.Message) error {
+	close(c.started)
+	<-c.release
+	return nil
+}
+func (c *stallingConn) Close() error      { return nil }
+func (c *stallingConn) SessionID() string { return "" }
+
+// stallingTransport hands back one stallingConn.
+type stallingTransport struct{ conn *stallingConn }
+
+func (t *stallingTransport) Connect(context.Context) (sdk.Connection, error) { return t.conn, nil }
+
+// TestUpdaterIsNotIdleInsideAWriteWithNothingOutstanding isolates the write
+// counter, which the protocol-level test above cannot.
+//
+// That test blocks a tools/call reply, and a tools/call is also a request whose
+// ID sits in `outstanding` until the write completes — so it stays non-idle if
+// EITHER guard is intact, and passes with begin/end deleted. It pins the
+// property and not the mechanism, which is the vacuity this file's own rule
+// warns about.
+//
+// Here there is no request at all: the message being written was never read, so
+// `outstanding` is empty and begin/end is the only thing that can report the
+// session busy. Deleting it makes this fail and that one still pass. The case is
+// real and not contrived: the message written here is a server-to-client
+// notification, which this server does send — it advertises listChanged — and
+// which carries no ID, so nothing retires it and nothing else can see it in
+// flight. Carrying one away in an execve loses it silently.
+func TestUpdaterIsNotIdleInsideAWriteWithNothingOutstanding(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	conn := &stallingConn{started: make(chan struct{}), release: make(chan struct{})}
+	updater := &selfUpdater{
+		changed: func() bool { return true }, exec: func() error { return nil },
+		checkInterval: time.Millisecond, quietPeriod: 50 * time.Millisecond,
+	}
+	tracked, err := updater.trackWrites(&stallingTransport{conn: conn}).Connect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Non-zero lastActivity first: a never-used updater is never idle, so an
+	// assertion made against a zero one would pass with every guard deleted.
+	updater.begin()
+	updater.end()
+
+	go func() {
+		_ = tracked.Write(ctx, &jsonrpc.Request{Method: "notifications/tools/list_changed"})
+	}()
+	select {
+	case <-conn.started:
+	case <-ctx.Done():
+		t.Fatal("the write never began; the harness did not reach the case under test")
+	}
+
+	time.Sleep(4 * updater.quietPeriod)
+	idle := updater.idleFor(updater.quietPeriod)
+	close(conn.release)
+	if idle {
+		t.Fatal("updater reports the session idle inside a write with nothing outstanding: " +
+			"only begin/end can see this one, and re-execing here carries the message away")
 	}
 }
 
