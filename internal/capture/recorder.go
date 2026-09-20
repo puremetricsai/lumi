@@ -335,9 +335,29 @@ func (r *Recorder) sampleEmitters(ctx context.Context, withForeground bool) Emit
 	if !withForeground {
 		return observation
 	}
-	screenContext, err := r.Context.Snapshot(ctx)
+	screenContext, err := r.snapshotContext(ctx)
 	r.timeline.observeForeground(ForegroundObservation{At: now, Context: screenContext, Err: err})
 	return observation
+}
+
+// snapshotContext is the only way the recorder reads a focused-window snapshot,
+// so the normalization below cannot be bypassed. All three readers go through
+// it: the screen tick, emitterLoop's own foreground sample (the sole source of
+// focus in --no-screen mode, where no screen tick runs), and audioAttribution's
+// fallback for a chunk that no foreground observation landed inside.
+//
+// A title that only repeats the application name is not a title: it answers
+// nothing App does not already answer, and because events_fts indexes app and
+// window as separate columns, keeping it collects bm25 weight twice for one
+// fact. TitleSource is deliberately left alone — Accessibility did answer, and
+// that its answer was uninformative is a different question from where it came
+// from.
+func (r *Recorder) snapshotContext(ctx context.Context) (ScreenContext, error) {
+	screenContext, err := r.Context.Snapshot(ctx)
+	if strings.EqualFold(strings.TrimSpace(screenContext.Window), strings.TrimSpace(screenContext.App)) {
+		screenContext.Window = ""
+	}
+	return screenContext, err
 }
 
 func (r *Recorder) captureScreen(ctx context.Context) {
@@ -379,7 +399,7 @@ func (r *Recorder) captureScreen(ctx context.Context) {
 	var contextErr error
 	if r.Context != nil {
 		processingCtx, cancel := preservationContext(ctx)
-		screenContext, contextErr = r.Context.Snapshot(processingCtx)
+		screenContext, contextErr = r.snapshotContext(processingCtx)
 		cancel()
 	}
 	r.noteAttribution(now, screenContext, contextErr)
@@ -450,12 +470,16 @@ func (r *Recorder) captureScreen(ctx context.Context) {
 }
 
 // substantiveAXText reports whether the Accessibility snapshot carries more than
-// the window title. It mirrors the render-time heuristic in
-// internal/cli/context.go (screenEvidence) so "useful screen text" means the same
-// thing at capture and at query time.
+// the window title or the application name.
+//
+// Both comparisons are load-bearing, and the App one is only there because of
+// snapshotContext: once a title that merely repeated the app name is cleared,
+// AX text reading "Claude" has no matching Window left to be rejected against,
+// and a failed Vision pass would promote it into Event.Text. That trades a
+// useless title for a useless body, which is worse — text is what search reads.
 func substantiveAXText(c ScreenContext) bool {
 	text := strings.TrimSpace(c.Text)
-	return text != "" && text != strings.TrimSpace(c.Window)
+	return text != "" && text != strings.TrimSpace(c.Window) && !strings.EqualFold(text, strings.TrimSpace(c.App))
 }
 
 func screenMetadata(frame ScreenFrame, textSource, axText string, screenContext ScreenContext,
@@ -842,7 +866,7 @@ func (r *Recorder) audioAttribution(ctx context.Context, capturedAt time.Time, c
 		sample.foregroundSamples = len(foreground)
 		sample.foregroundApps = distinctForegroundApps(foreground)
 	} else if r.Context != nil {
-		sample.screen, sample.screenErr = r.Context.Snapshot(sampleCtx)
+		sample.screen, sample.screenErr = r.snapshotContext(sampleCtx)
 		sample.foregroundSamples = 1
 		sample.foregroundApps = 1
 	}
