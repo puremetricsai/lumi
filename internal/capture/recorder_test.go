@@ -121,6 +121,15 @@ func (titleOnlyContext) Snapshot(context.Context) (ScreenContext, error) {
 	return ScreenContext{App: "Zed", Window: "lumi — .env", Text: "lumi — .env", DisplayID: 1}, nil
 }
 
+// appNamedWindowContext mimics an app whose focused window carries no title of
+// its own, so Accessibility hands back the application name (Claude, ChatGPT,
+// Signal and Lumi all do this).
+type appNamedWindowContext struct{}
+
+func (appNamedWindowContext) Snapshot(context.Context) (ScreenContext, error) {
+	return ScreenContext{App: "Claude", Window: "Claude", Text: "screen text", DisplayID: 1, AppSource: "accessibility", TitleSource: "accessibility"}, nil
+}
+
 // degradedContext mimics the production failure this fallback exists for: the
 // Accessibility read failed, but NSWorkspace still named the frontmost app and
 // the window list still supplied a title.
@@ -413,6 +422,160 @@ func TestRecorderUsesFullScreenVisionAndPreservesAccessibility(t *testing.T) {
 	}
 	if !strings.Contains(string(events[0].Metadata), "Accessibility primary text") {
 		t.Fatalf("substantive Accessibility text was not preserved in metadata: %s", events[0].Metadata)
+	}
+}
+
+// appNamedEverythingContext is the shape that makes substantiveAXText's App
+// comparison load-bearing: the focused window has no title of its own, so
+// Accessibility reports the application name as the window title *and* as the
+// only text it could read.
+type appNamedEverythingContext struct{}
+
+func (appNamedEverythingContext) Snapshot(context.Context) (ScreenContext, error) {
+	return ScreenContext{App: "Claude", Window: "Claude", Text: "Claude", DisplayID: 1, AppSource: "accessibility", TitleSource: "accessibility"}, nil
+}
+
+// TestRecorderDropsWindowTitleInAudioOnlyCapture covers the path that has no
+// screen tick at all. With --no-screen, emitterLoop takes the only focus
+// samples there are, so a rule applied solely on the screen tick would not
+// reach an audio row's attribution.
+func TestRecorderDropsWindowTitleInAudioOnlyCapture(t *testing.T) {
+	ctx := context.Background()
+	paths, err := config.FromRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := paths.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(ctx, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	recorder := Recorder{
+		Store: s, Paths: paths, CaptureScreen: false, CaptureAudio: true,
+		AudioChunk: 8 * time.Millisecond, EmitterInterval: 4 * time.Millisecond,
+		Audio: dualAudio{}, Transcriber: fakeTranscriber{}, Context: appNamedWindowContext{},
+		AudioOutputs: fakeAudioOutputs{},
+	}
+	recordCtx, cancel := context.WithTimeout(ctx, 35*time.Millisecond)
+	defer cancel()
+	if err := recorder.Run(recordCtx); err != nil {
+		t.Fatal(err)
+	}
+
+	events, err := s.Search(ctx, store.SearchOptions{Kind: store.KindAudio})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) == 0 {
+		t.Fatal("audio-only capture produced no events")
+	}
+	for _, event := range events {
+		if event.App != "Claude" {
+			t.Fatalf("audio-only capture lost the app name: %#v", event)
+		}
+		if event.Window != "" {
+			t.Fatalf("audio-only capture kept a window title that only repeats the app: %q", event.Window)
+		}
+	}
+}
+
+// TestRecorderDoesNotIndexAnAppNameAsScreenText pins the other half of the
+// rule. Clearing a redundant title must not promote Accessibility text that is
+// itself only the app name into the event body when Vision returns nothing.
+func TestRecorderDoesNotIndexAnAppNameAsScreenText(t *testing.T) {
+	ctx := context.Background()
+	paths, err := config.FromRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := paths.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(ctx, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	recorder := Recorder{
+		Store: s, Paths: paths, CaptureScreen: true,
+		ScreenInterval: 8 * time.Millisecond,
+		Screen:         &fakeScreen{}, Text: failingText{}, Context: appNamedEverythingContext{},
+	}
+	recordCtx, cancel := context.WithTimeout(ctx, 35*time.Millisecond)
+	defer cancel()
+	if err := recorder.Run(recordCtx); err != nil {
+		t.Fatal(err)
+	}
+
+	events, err := s.Search(ctx, store.SearchOptions{Kind: store.KindScreen})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) == 0 {
+		t.Fatal("screen capture produced no events")
+	}
+	for _, event := range events {
+		if strings.TrimSpace(event.Text) != "" {
+			t.Fatalf("indexed the app name as screen text: %q (source %q)", event.Text, event.TextSource)
+		}
+		if _, err := os.Stat(event.MediaPath); err != nil {
+			t.Fatalf("screen media was not preserved: %v", err)
+		}
+	}
+}
+
+// TestRecorderDropsWindowTitleThatOnlyRepeatsTheApp pins the rule that a title
+// repeating the application name is not a title. It is dropped once, on the
+// per-tick snapshot, so the screen stamp and the audio stamp — which reads the
+// same ScreenContext back through observeForeground — cannot disagree.
+func TestRecorderDropsWindowTitleThatOnlyRepeatsTheApp(t *testing.T) {
+	ctx := context.Background()
+	paths, err := config.FromRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := paths.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(ctx, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	recorder := Recorder{
+		Store: s, Paths: paths, CaptureScreen: true, CaptureAudio: true,
+		ScreenInterval: 8 * time.Millisecond, AudioChunk: 8 * time.Millisecond,
+		Screen: &fakeScreen{}, Text: fakeVision{}, Context: appNamedWindowContext{},
+		Audio: fakeAudio{}, Transcriber: fakeTranscriber{},
+	}
+	recordCtx, cancel := context.WithTimeout(ctx, 35*time.Millisecond)
+	defer cancel()
+	if err := recorder.Run(recordCtx); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, kind := range []store.Kind{store.KindScreen, store.KindAudio} {
+		events, err := s.Search(ctx, store.SearchOptions{Kind: kind})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(events) == 0 {
+			t.Fatalf("%s pipeline produced no events", kind)
+		}
+		for _, event := range events {
+			if event.App != "Claude" {
+				t.Fatalf("%s attribution lost the app name: %#v", kind, event)
+			}
+			if event.Window != "" {
+				t.Fatalf("%s kept a window title that only repeats the app: %q", kind, event.Window)
+			}
+		}
 	}
 }
 
