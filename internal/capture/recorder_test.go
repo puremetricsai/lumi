@@ -2551,7 +2551,7 @@ func waitUntil(t *testing.T, what string, condition func() bool) {
 	}
 }
 
-// Workers take the Run context, which is already cancelled when they reach the
+// The worker takes the Run context, which is already cancelled when it reaches the
 // queued frames; every file captured before shutdown must still get its row.
 func TestRecorderIndexesQueuedScreenshotsOnShutdown(t *testing.T) {
 	paths, s := recorderPaths(t)
@@ -2567,7 +2567,7 @@ func TestRecorderIndexesQueuedScreenshotsOnShutdown(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- recorder.Run(recordCtx) }()
 
-	// Two frames held by the workers and at least three waiting in the queue.
+	// One frame held by the worker and at least four waiting in the queue.
 	waitUntil(t, "five captures", func() bool { return screen.count.Load() >= 5 })
 	if text.finished.Load() != 0 {
 		t.Fatal("a frame was processed before release")

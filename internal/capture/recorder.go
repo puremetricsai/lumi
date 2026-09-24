@@ -85,11 +85,12 @@ type Recorder struct {
 }
 
 // Vision OCR runs off the screen tick so a slow frame does not delay the next
-// capture. Two workers overlap a multi-display tick; inserts serialize on the
-// store's single connection anyway. The queue absorbs a few slow ticks before
-// dispatch falls back to inline processing, which bounds the backlog.
+// capture. One worker is enough because Vision serializes recognition itself:
+// measured on real frames, a second worker gained at most 5% throughput, dense
+// or light. The queue absorbs a few slow ticks before dispatch falls back to
+// inline processing, which bounds the backlog.
 const (
-	screenWorkers = 2
+	screenWorkers = 1
 	screenQueue   = 8
 )
 

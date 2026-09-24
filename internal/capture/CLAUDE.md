@@ -70,13 +70,15 @@ rows are shaped is `internal/store`'s; the labelling rules the recorder applies 
   `MaxSilence` (10s) when bytes *changed* but scored similar (video, advancing slides), and `ExactSilence`
   (5min) when bytes are identical, so a frozen screen leaves a bounded presence marker instead of
   re-indexing the same JPEG. `ExactSilence` is clamped up to `MaxSilence`.
-- **Vision and the insert run on a worker pool; everything stateful stays on the tick.** `captureScreen`
+- **Vision and the insert run on one worker behind a queue; everything stateful stays on the tick.** `captureScreen`
   keeps capture, the focus snapshot, attribution, and `Comparer.Duplicate`, so `Comparer`,
   `selectionFallback`, and attribution state have one owner; only a non-duplicate frame becomes a
-  `screenJob`. Workers have no `ctx.Done` case: a queued job names a file already on disk, so they drain
-  until `screenLoop` closes the channel, and `Run`'s `wg.Wait` covers them. A nil channel (tests calling
+  `screenJob`. The worker has no `ctx.Done` case: a queued job names a file already on disk, so it drains
+  until `screenLoop` closes the channel, and `Run`'s `wg.Wait` covers it. A nil channel (tests calling
   `captureScreen` directly) and a full queue both process inline, so nothing is dropped and the backlog
-  stays bounded. Anything added after Vision now runs on a worker, where its state is shared.
+  stays bounded. Anything added after Vision now runs off the tick, alongside inline fallbacks, so its state is shared.
+  One worker, not more: Vision serializes recognition itself, and a second worker measured at most 5%
+  more throughput on real frames.
   `TestRecorderIndexesQueuedScreenshotsOnShutdown` pins the drain.
 - **A second, text-similarity dedup at ingest is deferred, and its shape is why.** An agent reading the
   index through `lumi mcp` asked for near-identical OCR text to be collapsed at capture. Such a gate can
