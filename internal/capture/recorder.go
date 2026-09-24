@@ -73,7 +73,26 @@ type Recorder struct {
 	// condition would otherwise fill the log with one line per tick and bury
 	// the moment it began.
 	selectionFallback bool
+	// screenJobs hands non-duplicate frames from the screen tick to the OCR
+	// workers. Nil means captureScreen processes every frame inline: Run is the
+	// only thing that creates it and starts the workers, and tests that call
+	// captureScreen directly rely on the nil default.
+	screenJobs chan screenJob
+	// screenQueueFull is the previous dispatch's answer, owned by the screen
+	// goroutine alone, so falling behind is logged once when it starts rather
+	// than on every frame while it lasts.
+	screenQueueFull bool
 }
+
+// Vision OCR runs off the screen tick so a slow frame does not delay the next
+// capture. One worker is enough because Vision serializes recognition itself:
+// measured on real frames, a second worker gained at most 5% throughput, dense
+// or light. The queue absorbs a few slow ticks before dispatch falls back to
+// inline processing, which bounds the backlog.
+const (
+	screenWorkers = 1
+	screenQueue   = 8
+)
 
 // defaultEmitterInterval samples roughly a dozen times per chunk, bounded at
 // both ends because AudioChunk is a flag: a one-second chunk must not sample
@@ -243,6 +262,14 @@ func (r *Recorder) Run(ctx context.Context) error {
 	}
 	var wg sync.WaitGroup
 	if r.CaptureScreen {
+		r.screenJobs = make(chan screenJob, screenQueue)
+		for range screenWorkers {
+			wg.Add(1)
+			go func(jobs <-chan screenJob) {
+				defer wg.Done()
+				r.screenWorker(ctx, jobs)
+			}(r.screenJobs)
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -267,6 +294,7 @@ func (r *Recorder) Run(ctx context.Context) error {
 }
 
 func (r *Recorder) screenLoop(ctx context.Context) {
+	defer close(r.screenJobs)
 	r.captureScreen(ctx)
 	ticker := time.NewTicker(r.ScreenInterval)
 	defer ticker.Stop()
@@ -410,52 +438,93 @@ func (r *Recorder) captureScreen(ctx context.Context) {
 			}
 			continue
 		}
-		// Full-display Vision OCR is the primary screen-text source: the
-		// screenshot already contains the entire display, so OCR captures every
-		// visible window rather than only the focused window's Accessibility text.
-		// The Accessibility tree still supplies App/Window/InputActive attribution,
-		// and its focused-window text is preserved in metadata when substantive so
-		// no information is lost.
-		textSource := "vision"
-		processingCtx, cancel := preservationContext(ctx)
-		text, processErr := r.Text.Extract(processingCtx, frame.Path)
-		cancel()
+		job := screenJob{frame: frame, capturedAt: now, screenContext: screenContext,
+			contextErr: contextErr, similarity: similarity, compareErr: compareErr}
+		select {
+		case r.screenJobs <- job:
+			r.screenQueueFull = false
+		default:
+			// A full queue is processed inline rather than dropped: the file is
+			// already on disk, and stalling the tick is what bounds the backlog.
+			if r.screenJobs != nil && !r.screenQueueFull {
+				r.Logger.Warn("screen processing is behind; processing inline", "path", frame.Path)
+				r.screenQueueFull = true
+			}
+			r.processScreenJob(ctx, job)
+		}
+	}
+}
 
-		// No contextErr guard: a degraded snapshot may still carry substantive
-		// Accessibility text, and substantiveAXText already rejects the empty
-		// text a failed read leaves behind.
-		axText := ""
-		if substantiveAXText(screenContext) &&
-			(screenContext.DisplayID == 0 || screenContext.DisplayID == frame.DisplayID) {
-			axText = screenContext.Text
-		}
-		// If Vision produced no usable text, fall back to indexing the substantive
-		// Accessibility text so the event stays searchable: events_fts and search
-		// read Event.Text, not metadata. Otherwise keep the AX text as supplementary
-		// provenance in metadata alongside the full-screen OCR body.
-		axMetadata := axText
-		if strings.TrimSpace(text) == "" && axText != "" {
-			text = axText
-			textSource = "accessibility"
-			axMetadata = ""
-		}
-		metadata := screenMetadata(frame, textSource, axMetadata, screenContext,
-			similarity, processErr, contextErr, compareErr)
-		event := &store.Event{Kind: store.KindScreen, CapturedAt: now, Text: text,
-			App: screenContext.App, Window: screenContext.Window, MediaPath: frame.Path,
-			TextSource: textSource, DisplayID: frame.DisplayID, Metadata: metadata}
-		storeCtx, cancel := preservationContext(ctx)
-		err := r.Store.Insert(storeCtx, event)
-		cancel()
-		if err != nil {
-			r.Logger.Error("store screen event", "path", frame.Path, "error", err)
-			continue
-		}
-		r.Logger.Info("captured screen", "id", event.ID, "display", frame.DisplayID,
-			"app", screenContext.App, "text_source", textSource, "characters", len(text))
-		if processErr != nil {
-			r.Logger.Warn("Vision failed; screenshot was still indexed", "error", processErr)
-		}
+// screenJob is one non-duplicate frame and everything its tick learned about it.
+type screenJob struct {
+	frame         ScreenFrame
+	capturedAt    time.Time
+	screenContext ScreenContext
+	contextErr    error
+	similarity    float64
+	compareErr    error
+}
+
+func (r *Recorder) screenWorker(ctx context.Context, jobs <-chan screenJob) {
+	// No ctx.Done case: jobs still queued at shutdown name files already on
+	// disk, so the worker drains until screenLoop closes the channel.
+	for job := range jobs {
+		r.processScreenJob(ctx, job)
+	}
+}
+
+func (r *Recorder) processScreenJob(ctx context.Context, job screenJob) {
+	frame, screenContext := job.frame, job.screenContext
+	// Full-display Vision OCR is the primary screen-text source: the
+	// screenshot already contains the entire display, so OCR captures every
+	// visible window rather than only the focused window's Accessibility text.
+	// The Accessibility tree still supplies App/Window/InputActive attribution,
+	// and its focused-window text is preserved in metadata when substantive so
+	// no information is lost.
+	textSource := "vision"
+	processingCtx, cancel := preservationContext(ctx)
+	ocrStart := time.Now()
+	text, processErr := r.Text.Extract(processingCtx, frame.Path)
+	ocrMS := time.Since(ocrStart).Milliseconds()
+	cancel()
+
+	// No contextErr guard: a degraded snapshot may still carry substantive
+	// Accessibility text, and substantiveAXText already rejects the empty
+	// text a failed read leaves behind.
+	axText := ""
+	if substantiveAXText(screenContext) &&
+		(screenContext.DisplayID == 0 || screenContext.DisplayID == frame.DisplayID) {
+		axText = screenContext.Text
+	}
+	// If Vision produced no usable text, fall back to indexing the substantive
+	// Accessibility text so the event stays searchable: events_fts and search
+	// read Event.Text, not metadata. Otherwise keep the AX text as supplementary
+	// provenance in metadata alongside the full-screen OCR body.
+	axMetadata := axText
+	if strings.TrimSpace(text) == "" && axText != "" {
+		text = axText
+		textSource = "accessibility"
+		axMetadata = ""
+	}
+	metadata := screenMetadata(frame, textSource, axMetadata, screenContext,
+		job.similarity, processErr, job.contextErr, job.compareErr)
+	event := &store.Event{Kind: store.KindScreen, CapturedAt: job.capturedAt, Text: text,
+		App: screenContext.App, Window: screenContext.Window, MediaPath: frame.Path,
+		TextSource: textSource, DisplayID: frame.DisplayID, Metadata: metadata}
+	storeCtx, cancel := insertContext(ctx)
+	insertStart := time.Now()
+	err := r.Store.Insert(storeCtx, event)
+	insertMS := time.Since(insertStart).Milliseconds()
+	cancel()
+	if err != nil {
+		r.Logger.Error("store screen event", "path", frame.Path, "error", err)
+		return
+	}
+	r.Logger.Info("captured screen", "id", event.ID, "display", frame.DisplayID,
+		"app", screenContext.App, "text_source", textSource, "characters", len(text),
+		"ocr_ms", ocrMS, "insert_ms", insertMS)
+	if processErr != nil {
+		r.Logger.Warn("Vision failed; screenshot was still indexed", "error", processErr, "ocr_ms", ocrMS)
 	}
 }
 
@@ -589,15 +658,33 @@ func (r *Recorder) storeAudioChunk(ctx context.Context, chunk AudioChunk) {
 	}
 	capturedAt = capturedAt.UTC()
 	attribution := r.audioAttribution(ctx, capturedAt, chunk)
+	// No semaphore: audioLoop hands over one chunk at a time, and a chunk has at
+	// most one frame per track, so this never runs more than two recognizers.
+	type transcribed struct {
+		transcription Transcription
+		err           error
+		ms            int64
+	}
+	transcriptions := make([]transcribed, len(chunk.Frames))
+	var wg sync.WaitGroup
+	for i, frame := range chunk.Frames {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if ctx.Err() != nil {
+				transcriptions[i].err = fmt.Errorf("transcription skipped after capture stopped: %w", ctx.Err())
+				return
+			}
+			start := time.Now()
+			transcriptions[i].transcription, transcriptions[i].err = r.Transcriber.Transcribe(ctx, frame.Path)
+			transcriptions[i].ms = time.Since(start).Milliseconds()
+		}()
+	}
+	wg.Wait()
+	// Rows are inserted in frame order: a chunk's audio rows are read back by id.
 	results := make([]audioChunkResult, 0, len(chunk.Frames))
-	for _, frame := range chunk.Frames {
-		var transcription Transcription
-		var processErr error
-		if ctx.Err() != nil {
-			processErr = fmt.Errorf("transcription skipped after capture stopped: %w", ctx.Err())
-		} else {
-			transcription, processErr = r.Transcriber.Transcribe(ctx, frame.Path)
-		}
+	for i, frame := range chunk.Frames {
+		transcription, processErr := transcriptions[i].transcription, transcriptions[i].err
 		// The verdict is per track: the microphone is unattributed however loudly
 		// the machine was playing, and only the system track may name a source.
 		verdict := DecideAudioAttribution(attribution.inputFor(frame.Source))
@@ -616,15 +703,18 @@ func (r *Recorder) storeAudioChunk(ctx context.Context, chunk AudioChunk) {
 			StreamOffsetMS:   chunk.StreamOffsetMS,
 			Metadata: audioMetadata(frame.Source, frame.CaptureError, processErr, attribution,
 				verdict, chunk)}
-		storeCtx, cancel := preservationContext(ctx)
+		storeCtx, cancel := insertContext(ctx)
+		insertStart := time.Now()
 		err := r.Store.Insert(storeCtx, event)
+		insertMS := time.Since(insertStart).Milliseconds()
 		cancel()
 		if err != nil {
 			r.Logger.Error("store audio event", "path", frame.Path, "error", err)
 			continue
 		}
 		r.Logger.Info("captured audio", "id", event.ID, "source", frame.Source,
-			"characters", len(transcription.Text), "segments", len(transcription.Segments))
+			"characters", len(transcription.Text), "segments", len(transcription.Segments),
+			"transcribe_ms", transcriptions[i].ms, "insert_ms", insertMS)
 		if processErr != nil {
 			r.Logger.Warn("transcription failed; audio was still indexed", "source", frame.Source, "error", processErr)
 		}
@@ -777,6 +867,15 @@ func preservationContext(ctx context.Context) (context.Context, context.CancelFu
 		return ctx, func() {}
 	}
 	return context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+}
+
+// insertContext detaches an event insert from recording cancellation for its
+// whole run, not only when it starts after it. preservationContext hands back the
+// live context otherwise, so a stop arriving while an insert waits on the store's
+// single connection interrupted it and left the media on disk with no row. The
+// bound is well above busy_timeout, so it only caps a wedged database.
+func insertContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 }
 
 // audioAttributionSample is what a chunk could learn about its own provenance:

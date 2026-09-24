@@ -2,6 +2,7 @@ package capture
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -2520,4 +2521,255 @@ func TestRecorderReportsAnUnhonouredDisplaySelectionOnce(t *testing.T) {
 	if ticks[len(ticks)-1].SelectionFallback {
 		t.Error("the last tick should report the selection honoured again")
 	}
+}
+
+// gatedText holds every Extract until release closes, so a test decides exactly
+// how many frames are still unprocessed when it cancels. The timeout only keeps
+// a broken recorder from hanging the suite.
+type gatedText struct {
+	release  chan struct{}
+	finished atomic.Int64
+}
+
+func (g *gatedText) Extract(context.Context, string) (string, error) {
+	defer g.finished.Add(1)
+	select {
+	case <-g.release:
+	case <-time.After(5 * time.Second):
+	}
+	return "gated screen text", nil
+}
+
+func waitUntil(t *testing.T, what string, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !condition() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// The worker takes the Run context, which is already cancelled when it reaches the
+// queued frames; every file captured before shutdown must still get its row.
+func TestRecorderIndexesQueuedScreenshotsOnShutdown(t *testing.T) {
+	paths, s := recorderPaths(t)
+	screen := &fakeScreen{}
+	text := &gatedText{release: make(chan struct{})}
+	recorder := Recorder{
+		Store: s, Paths: paths, CaptureScreen: true, ScreenInterval: 2 * time.Millisecond,
+		Screen: screen, Text: text, Context: fakeContext{},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	recordCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- recorder.Run(recordCtx) }()
+
+	// One frame held by the worker and at least four waiting in the queue.
+	waitUntil(t, "five captures", func() bool { return screen.count.Load() >= 5 })
+	if text.finished.Load() != 0 {
+		t.Fatal("a frame was processed before release")
+	}
+	cancel()
+	close(text.release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return after cancellation")
+	}
+
+	entries, err := os.ReadDir(paths.Screenshots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := s.Search(context.Background(), store.SearchOptions{Kind: store.KindScreen, Limit: 500})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) < 5 || len(events) != len(entries) {
+		t.Fatalf("%d screenshots on disk but %d screen events; every captured file needs a row",
+			len(entries), len(events))
+	}
+}
+
+// secondCaptureScreen closes second when the tick after the first one captures.
+type secondCaptureScreen struct {
+	fakeScreen
+	second chan struct{}
+}
+
+func (s *secondCaptureScreen) Capture(ctx context.Context, directory, prefix string) ([]ScreenFrame, error) {
+	frames, err := s.fakeScreen.Capture(ctx, directory, prefix)
+	if s.count.Load() == 2 {
+		close(s.second)
+	}
+	return frames, err
+}
+
+// secondCaptureText blocks the first frame's OCR until the next tick captures.
+// Were Vision on the tick, that capture could not happen and the wait would
+// time out.
+type secondCaptureText struct {
+	second  <-chan struct{}
+	blocked atomic.Bool
+}
+
+func (t *secondCaptureText) Extract(context.Context, string) (string, error) {
+	select {
+	case <-t.second:
+	case <-time.After(2 * time.Second):
+		t.blocked.Store(true)
+	}
+	return "screen text", nil
+}
+
+func TestScreenCaptureIsNotBlockedByVision(t *testing.T) {
+	paths, s := recorderPaths(t)
+	screen := &secondCaptureScreen{second: make(chan struct{})}
+	text := &secondCaptureText{second: screen.second}
+	recorder := Recorder{
+		Store: s, Paths: paths, CaptureScreen: true, ScreenInterval: 2 * time.Millisecond,
+		Screen: screen, Text: text, Context: fakeContext{},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	recordCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- recorder.Run(recordCtx) }()
+	waitUntil(t, "a second capture", func() bool { return screen.count.Load() >= 2 })
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if text.blocked.Load() {
+		t.Fatal("the next capture waited for Vision to finish the previous frame")
+	}
+}
+
+// barrierTranscriber returns only once both of a chunk's tracks are in flight,
+// so a recorder that transcribes them one after the other times out instead.
+type barrierTranscriber struct {
+	inFlight, maxInFlight atomic.Int64
+	both                  chan struct{}
+	once                  sync.Once
+}
+
+func (b *barrierTranscriber) Transcribe(_ context.Context, path string) (Transcription, error) {
+	current := b.inFlight.Add(1)
+	defer b.inFlight.Add(-1)
+	for {
+		seen := b.maxInFlight.Load()
+		if current <= seen || b.maxInFlight.CompareAndSwap(seen, current) {
+			break
+		}
+	}
+	if current == 2 {
+		b.once.Do(func() { close(b.both) })
+	}
+	select {
+	case <-b.both:
+	case <-time.After(2 * time.Second):
+	}
+	return Transcription{Text: "transcript of " + filepath.Base(path)}, nil
+}
+
+func TestChunkTracksTranscribeConcurrentlyAndInsertInFrameOrder(t *testing.T) {
+	paths, s := recorderPaths(t)
+	transcriber := &barrierTranscriber{both: make(chan struct{})}
+	recorder := Recorder{
+		Store: s, Segments: s, Paths: paths, AudioChunk: time.Second,
+		Transcriber: transcriber, timeline: newEmitterTimeline(1, 1),
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	startedAt := time.Now().UTC()
+	chunk := AudioChunk{StartedAt: startedAt}
+	for _, source := range []string{"system", "microphone"} {
+		path := filepath.Join(paths.Audio, fileStamp(startedAt)+"-"+source+".wav")
+		if err := os.WriteFile(path, []byte("fake-wave"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		chunk.Frames = append(chunk.Frames, AudioFrame{Path: path, Source: source, DurationMS: 1000})
+	}
+	recorder.storeAudioChunk(context.Background(), chunk)
+
+	if got := transcriber.maxInFlight.Load(); got != 2 {
+		t.Fatalf("max concurrent transcriptions = %d, want 2", got)
+	}
+	events := audioEventsFrom(t, s)
+	sort.Slice(events, func(i, j int) bool { return events[i].ID < events[j].ID })
+	if len(events) != 2 || events[0].AudioSource != "system" || events[1].AudioSource != "microphone" {
+		t.Fatalf("audio rows not inserted in frame order: %#v", events)
+	}
+}
+
+// A cancellation that lands while an insert is already waiting on the database
+// must not cost the row: the screenshot is on disk, and only the insert makes it
+// findable. A second connection holds the write lock so the insert is provably
+// in flight when recording stops.
+func TestInsertSurvivesCancellationWhileWaitingOnTheDatabase(t *testing.T) {
+	paths, err := config.FromRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := paths.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(context.Background(), paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	holder, err := sql.Open("sqlite", paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close()
+	lock, err := holder.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if _, err := lock.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err != nil {
+		t.Fatal(err)
+	}
+
+	frame := writeScreenFrame(t, paths.Screenshots)
+	recorder := Recorder{Store: s, Paths: paths, Text: fakeVision{},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		recorder.processScreenJob(ctx, screenJob{frame: frame, capturedAt: time.Now().UTC()})
+	}()
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+	time.Sleep(200 * time.Millisecond)
+	if _, err := lock.ExecContext(context.Background(), "ROLLBACK"); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+
+	events, err := s.Search(context.Background(), store.SearchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("screenshot on disk has %d event rows after cancellation mid-insert, want 1", len(events))
+	}
+}
+
+func writeScreenFrame(t *testing.T, directory string) ScreenFrame {
+	t.Helper()
+	path := filepath.Join(directory, "held-display-1.jpg")
+	if err := os.WriteFile(path, []byte("fake-jpeg"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return ScreenFrame{Path: path, DisplayID: 1}
 }
