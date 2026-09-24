@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.8.1](https://github.com/puremetricsai/lumi/compare/v0.8.0...v0.8.1) (2026-09-24)
+
+
+### Features
+
+* **mcp:** set up Pi through lumi mcp setup ([537cae3](https://github.com/puremetricsai/lumi/commit/537cae394b66b1fadc23f1abe7999a17d469cf26))
+* **mcp:** set up Pi through lumi mcp setup ([439b6bf](https://github.com/puremetricsai/lumi/commit/439b6bfed243459156f9ee5ad06fab75c57b68a9))
+
+
+### Bug Fixes
+
+* **capture:** compare AX text to the title case-insensitively; tighten tests ([f51c5e8](https://github.com/puremetricsai/lumi/commit/f51c5e8fd4d062a9578002c3f0f1403ecaed00d3))
+* **capture:** drop a window title that only repeats the app name ([f5d834c](https://github.com/puremetricsai/lumi/commit/f5d834c45f190a7eccec0bf57ff76115193c46b5))
+* **capture:** drop a window title that only repeats the app name ([1570f82](https://github.com/puremetricsai/lumi/commit/1570f8216c3925ddfc4181ecb547035137726f7d))
+* **capture:** keep event inserts alive through cancellation ([a54229e](https://github.com/puremetricsai/lumi/commit/a54229ea6cf53342e08a0e2487e7b0708188bea5))
+
+
+### Performance Improvements
+
+* **capture:** run screen OCR on a single worker ([4bf82f5](https://github.com/puremetricsai/lumi/commit/4bf82f595b8610d770975621596c534fcfaea90b))
+* **capture:** run Vision OCR on a worker pool and transcribe tracks concurrently ([647fcec](https://github.com/puremetricsai/lumi/commit/647fcec95d9ccc8d2b36e3554ea9d6ee8e72fe5c))
+* **capture:** skip transcription for digitally silent audio tracks ([ea133f0](https://github.com/puremetricsai/lumi/commit/ea133f06fd54c79b9cea9f3958cd86baa8aab628))
+* **capture:** skip transcription for digitally silent audio tracks ([3efd506](https://github.com/puremetricsai/lumi/commit/3efd5065e79f7a5f8b446ca3d22c4fe8768ed79e))
+* **capture:** take Vision OCR off the screen tick and transcribe tracks concurrently ([942f972](https://github.com/puremetricsai/lumi/commit/942f972611c02c385adc56961d624c03498d0ea3))
+
+
+### Miscellaneous Chores
+
+* release 0.8.1 ([a15748f](https://github.com/puremetricsai/lumi/commit/a15748fdefc21e77d2a1ef51da8229f101e817a4))
+
 ## [0.8.0](https://github.com/puremetricsai/lumi/compare/v0.7.1...v0.8.0) (2026-09-18)
 
 
