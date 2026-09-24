@@ -327,9 +327,9 @@ struct MCPSetupResult: Decodable, Identifiable {
     var detail: String
     var current: String
     /// A paste-able config snippet in the client's own format — JSON for the
-    /// Claude clients, TOML for Codex. It arrives on every result, whatever the
-    /// status. Never build this in Swift: `internal/mcpsetup` owns what each of
-    /// the three foreign config formats looks like, and a second renderer here
+    /// Claude clients, TOML for Codex, TypeScript for Pi. It arrives on every
+    /// result, whatever the status. Never build this in Swift: `internal/mcpsetup` owns what each of
+    /// the foreign config formats look like, and a second renderer here
     /// would drift the moment one of them changed.
     var manual: String
     /// The sentence introducing `manual`, e.g. `add this under "mcpServers"`.
@@ -337,6 +337,9 @@ struct MCPSetupResult: Decodable, Identifiable {
     /// Codex user to paste TOML into a JSON object.
     var manualHint: String
     var changed: Bool
+    /// What the user must do for the client to load a change, e.g. relaunch
+    /// it. Empty unless this run changed a client that needs it; Go decides.
+    var afterChange: String
     /// The failure this client reported, absent when it succeeded.
     ///
     /// The status alone cannot say whether a write landed: a target sets
@@ -355,12 +358,13 @@ struct MCPSetupResult: Decodable, Identifiable {
 
     /// The client's display name. The raw values are `internal/mcpsetup`'s
     /// target names; an unrecognised one is shown as-is rather than dropped, so
-    /// a newer lumi that knows a fourth client still lists it.
+    /// a newer lumi that knows a new client still lists it.
     var displayName: String {
         switch target {
         case "claude-code": return "Claude Code"
         case "claude-desktop": return "Claude Desktop"
         case "codex": return "Codex (CLI and ChatGPT Codex threads)"
+        case "pi": return "Pi"
         default: return target
         }
     }

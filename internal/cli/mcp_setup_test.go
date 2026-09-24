@@ -192,48 +192,21 @@ func TestMCPSetupRefusesAnUnrunnableBinary(t *testing.T) {
 	}
 }
 
-// A reminder printed on a run that changed nothing trains people to ignore it.
-func TestMCPSetupRestartReminderOnlyWhenDesktopChanged(t *testing.T) {
-	const reminder = "Quit and reopen Claude Desktop"
-
-	t.Run("changed", func(t *testing.T) {
-		target := &fakeTarget{name: "claude-desktop", result: mcpsetup.Result{
-			Status: mcpsetup.StatusAdded, Detail: "…", Changed: true}}
-		_, run := newSetupTest(t, target)
-		_, stderr, err := run()
-		if err != nil {
-			t.Fatalf("setup: %v", err)
-		}
-		if !strings.Contains(stderr, reminder) {
-			t.Errorf("stderr lacks the restart reminder:\n%s", stderr)
-		}
-	})
-
-	t.Run("unchanged", func(t *testing.T) {
-		target := &fakeTarget{name: "claude-desktop", result: mcpsetup.Result{
-			Status: mcpsetup.StatusUnchanged, Detail: "already configured"}}
-		_, run := newSetupTest(t, target)
-		_, stderr, err := run()
-		if err != nil {
-			t.Fatalf("setup: %v", err)
-		}
-		if strings.Contains(stderr, reminder) {
-			t.Errorf("no-op run printed the restart reminder:\n%s", stderr)
-		}
-	})
-
-	t.Run("dry run", func(t *testing.T) {
-		target := &fakeTarget{name: "claude-desktop", result: mcpsetup.Result{
-			Status: mcpsetup.StatusAdded, Detail: "…"}}
-		_, run := newSetupTest(t, target)
-		_, stderr, err := run("--dry-run")
-		if err != nil {
-			t.Fatalf("setup: %v", err)
-		}
-		if strings.Contains(stderr, reminder) {
-			t.Errorf("--dry-run printed the restart reminder:\n%s", stderr)
-		}
-	})
+// The CLI prints whatever reminder a target sends and keeps no list of its own;
+// the target decides when one is due.
+func TestMCPSetupPrintsTheTargetsReminder(t *testing.T) {
+	const reminder = "Reload the client to load the change."
+	for name, afterChange := range map[string]string{"sent": reminder, "none": ""} {
+		t.Run(name, func(t *testing.T) {
+			target := &fakeTarget{name: "pi", result: mcpsetup.Result{
+				Status: mcpsetup.StatusAdded, Changed: afterChange != "", AfterChange: afterChange}}
+			_, run := newSetupTest(t, target)
+			_, stderr, err := run()
+			if err != nil || strings.Contains(stderr, reminder) != (afterChange != "") {
+				t.Errorf("setup: %v, stderr = %q", err, stderr)
+			}
+		})
+	}
 }
 
 // One client failing must never stop another from being configured.
@@ -369,12 +342,13 @@ func TestParseClientSelection(t *testing.T) {
 		want    clientSelection
 		wantErr bool
 	}{
-		"all":            {value: "all", want: clientSelection{code: true, desktop: true, codex: true}},
+		"all":            {value: "all", want: clientSelection{code: true, desktop: true, codex: true, pi: true}},
 		"code":           {value: "code", want: clientSelection{code: true, explicit: true}},
 		"desktop":        {value: "desktop", want: clientSelection{desktop: true, explicit: true}},
 		"codex":          {value: "codex", want: clientSelection{codex: true, explicit: true}},
+		"pi":             {value: "pi", want: clientSelection{pi: true, explicit: true}},
 		"case insensive": {value: "Codex", want: clientSelection{codex: true, explicit: true}},
-		"padded":         {value: " all ", want: clientSelection{code: true, desktop: true, codex: true}},
+		"padded":         {value: " all ", want: clientSelection{code: true, desktop: true, codex: true, pi: true}},
 		"unknown":        {value: "cursor", wantErr: true},
 		"target name":    {value: "claude-desktop", want: clientSelection{desktop: true, explicit: true}},
 	} {
@@ -446,7 +420,7 @@ func TestDefaultSetupTargetsCoversEveryClient(t *testing.T) {
 	for _, target := range defaultSetupTargets(sel) {
 		names = append(names, target.Name())
 	}
-	want := []string{"claude-code", "claude-desktop", "codex"}
+	want := []string{"claude-code", "claude-desktop", "codex", "pi"}
 	if !slices.Equal(names, want) {
 		t.Errorf("--client all selected %v, want %v", names, want)
 	}
@@ -456,7 +430,7 @@ func TestDefaultSetupTargetsCoversEveryClient(t *testing.T) {
 // explicitly, it is an error. Both halves have to hold for every target.
 func TestDefaultSetupTargetsMarksExplicitClientsRequired(t *testing.T) {
 	t.Parallel()
-	for _, value := range []string{"code", "desktop", "codex"} {
+	for _, value := range []string{"code", "desktop", "codex", "pi"} {
 		sel, err := parseClientSelection(value)
 		if err != nil {
 			t.Fatalf("parseClientSelection(%q): %v", value, err)

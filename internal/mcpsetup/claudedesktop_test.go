@@ -122,7 +122,7 @@ func TestDesktopIsIdempotent(t *testing.T) {
 	if result.Status != StatusUnchanged {
 		t.Errorf("second run status = %q, want unchanged", result.Status)
 	}
-	if result.Changed {
+	if result.Changed || result.AfterChange != "" {
 		t.Error("second run reported a change")
 	}
 
@@ -222,7 +222,7 @@ func TestDesktopHandlesANullConfigFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
-	if result.Status != StatusAdded || !result.Changed {
+	if result.Status != StatusAdded || !result.Changed || result.AfterChange == "" {
 		t.Fatalf("got %+v, want added and changed", result)
 	}
 	servers, ok := readJSON(t, path)["mcpServers"].(map[string]any)
@@ -458,7 +458,7 @@ func TestDesktopDryRunWritesNothing(t *testing.T) {
 			if result.Status != tc.want {
 				t.Errorf("status = %q, want %q", result.Status, tc.want)
 			}
-			if result.Changed {
+			if result.Changed || result.AfterChange != "" {
 				t.Error("Changed = true under --dry-run")
 			}
 
