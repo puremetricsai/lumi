@@ -119,7 +119,10 @@ rows are shaped is `internal/store`'s; the labelling rules the recorder applies 
   global, bottom-left to top-left — plus a Retina points-versus-pixels check.
 - **Capture retries without discarding completed work.** Screen failures retry on the next interval; an
   audio stream that fails is reopened after one second. Media returned during cancellation gets a short
-  cancellation-free window for insertion. A stream that finishes no chunk for one chunk duration plus 30 s
+  cancellation-free window for processing, and every event insert runs under `insertContext`, detached from
+  cancellation for its whole run: a stop landing while an insert waits on the store's single connection
+  otherwise interrupts it and leaves the media on disk with no row
+  (`TestInsertSurvivesCancellationWhileWaitingOnTheDatabase`). A stream that finishes no chunk for one chunk duration plus 30 s
   counts as failed: a wedged replayd can accept a start and then deliver nothing without ever calling
   `didStopWithError`, which otherwise polls forever and logs nothing. The stall stops the session the way
   cancellation does, so the chunk in flight is still delivered before the error.

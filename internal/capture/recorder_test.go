@@ -2,6 +2,7 @@ package capture
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -2704,4 +2705,71 @@ func TestChunkTracksTranscribeConcurrentlyAndInsertInFrameOrder(t *testing.T) {
 	if len(events) != 2 || events[0].AudioSource != "system" || events[1].AudioSource != "microphone" {
 		t.Fatalf("audio rows not inserted in frame order: %#v", events)
 	}
+}
+
+// A cancellation that lands while an insert is already waiting on the database
+// must not cost the row: the screenshot is on disk, and only the insert makes it
+// findable. A second connection holds the write lock so the insert is provably
+// in flight when recording stops.
+func TestInsertSurvivesCancellationWhileWaitingOnTheDatabase(t *testing.T) {
+	paths, err := config.FromRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := paths.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(context.Background(), paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	holder, err := sql.Open("sqlite", paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close()
+	lock, err := holder.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if _, err := lock.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err != nil {
+		t.Fatal(err)
+	}
+
+	frame := writeScreenFrame(t, paths.Screenshots)
+	recorder := Recorder{Store: s, Paths: paths, Text: fakeVision{},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		recorder.processScreenJob(ctx, screenJob{frame: frame, capturedAt: time.Now().UTC()})
+	}()
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+	time.Sleep(200 * time.Millisecond)
+	if _, err := lock.ExecContext(context.Background(), "ROLLBACK"); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+
+	events, err := s.Search(context.Background(), store.SearchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("screenshot on disk has %d event rows after cancellation mid-insert, want 1", len(events))
+	}
+}
+
+func writeScreenFrame(t *testing.T, directory string) ScreenFrame {
+	t.Helper()
+	path := filepath.Join(directory, "held-display-1.jpg")
+	if err := os.WriteFile(path, []byte("fake-jpeg"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return ScreenFrame{Path: path, DisplayID: 1}
 }

@@ -510,7 +510,7 @@ func (r *Recorder) processScreenJob(ctx context.Context, job screenJob) {
 	event := &store.Event{Kind: store.KindScreen, CapturedAt: job.capturedAt, Text: text,
 		App: screenContext.App, Window: screenContext.Window, MediaPath: frame.Path,
 		TextSource: textSource, DisplayID: frame.DisplayID, Metadata: metadata}
-	storeCtx, cancel := preservationContext(ctx)
+	storeCtx, cancel := insertContext(ctx)
 	insertStart := time.Now()
 	err := r.Store.Insert(storeCtx, event)
 	insertMS := time.Since(insertStart).Milliseconds()
@@ -702,7 +702,7 @@ func (r *Recorder) storeAudioChunk(ctx context.Context, chunk AudioChunk) {
 			StreamOffsetMS:   chunk.StreamOffsetMS,
 			Metadata: audioMetadata(frame.Source, frame.CaptureError, processErr, attribution,
 				verdict, chunk)}
-		storeCtx, cancel := preservationContext(ctx)
+		storeCtx, cancel := insertContext(ctx)
 		insertStart := time.Now()
 		err := r.Store.Insert(storeCtx, event)
 		insertMS := time.Since(insertStart).Milliseconds()
@@ -866,6 +866,15 @@ func preservationContext(ctx context.Context) (context.Context, context.CancelFu
 		return ctx, func() {}
 	}
 	return context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+}
+
+// insertContext detaches an event insert from recording cancellation for its
+// whole run, not only when it starts after it. preservationContext hands back the
+// live context otherwise, so a stop arriving while an insert waits on the store's
+// single connection interrupted it and left the media on disk with no row. The
+// bound is well above busy_timeout, so it only caps a wedged database.
+func insertContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 }
 
 // audioAttributionSample is what a chunk could learn about its own provenance:
