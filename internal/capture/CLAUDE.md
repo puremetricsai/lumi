@@ -70,10 +70,18 @@ rows are shaped is `internal/store`'s; the labelling rules the recorder applies 
   `MaxSilence` (10s) when bytes *changed* but scored similar (video, advancing slides), and `ExactSilence`
   (5min) when bytes are identical, so a frozen screen leaves a bounded presence marker instead of
   re-indexing the same JPEG. `ExactSilence` is clamped up to `MaxSilence`.
+- **Vision and the insert run on a worker pool; everything stateful stays on the tick.** `captureScreen`
+  keeps capture, the focus snapshot, attribution, and `Comparer.Duplicate`, so `Comparer`,
+  `selectionFallback`, and attribution state have one owner; only a non-duplicate frame becomes a
+  `screenJob`. Workers have no `ctx.Done` case: a queued job names a file already on disk, so they drain
+  until `screenLoop` closes the channel, and `Run`'s `wg.Wait` covers them. A nil channel (tests calling
+  `captureScreen` directly) and a full queue both process inline, so nothing is dropped and the backlog
+  stays bounded. Anything added after Vision now runs on a worker, where its state is shared.
+  `TestRecorderIndexesQueuedScreenshotsOnShutdown` pins the drain.
 - **A second, text-similarity dedup at ingest is deferred, and its shape is why.** An agent reading the
   index through `lumi mcp` asked for near-identical OCR text to be collapsed at capture. Such a gate can
-  only sit after Vision (`recorder.go:411`), since `Duplicate` (`compare.go:33-85`) already runs before
-  the extractor: it would save index rows and JPEGs and **zero OCR cost**. Right lever for index noise,
+  only sit after Vision (`processScreenJob`'s `Extract`, `recorder.go:486`), since `Duplicate`
+  (`compare.go:33-85`) already runs before the extractor: it would save index rows and JPEGs and **zero OCR cost**. Right lever for index noise,
   wrong one for CPU. It would also have to carry both deadlines above — a text gate fires strictly more
   often than a pixel one, so without `MaxSilence`/`ExactSilence` a static document leaves the index
   entirely instead of leaving a bounded presence marker.
@@ -89,8 +97,8 @@ rows are shaped is `internal/store`'s; the labelling rules the recorder applies 
     after a successful decode (`compare.go:57-60` against `:81-83`), so neither the histogram nor the
     hash fast path can ever fire for an undecodable frame. Only the two tests feeding a real
     `writeSolidJPEG` exercise dedup at all —
-    `TestRecorderDeletesPerceptualDuplicatesFromDiskAndIndex:499` and
-    `TestRecorderHandlesDisplayHotplugBetweenCaptures:579`, the latter being the one exact per-display
+    `TestRecorderDeletesPerceptualDuplicatesFromDiskAndIndex:617` and
+    `TestRecorderHandlesDisplayHotplugBetweenCaptures:697`, the latter being the one exact per-display
     count assertion and the one that fails if the gate is keyed globally rather than per display.
     Anything landing here needs a text fake that varies per call before it needs the gate.
   - Storing a reference rather than a new row is additionally a schema migration
@@ -123,7 +131,9 @@ rows are shaped is `internal/store`'s; the labelling rules the recorder applies 
   ending "Instead of running." and the next opening "splits the main task into smaller parts". Roughly
   1.7 s of that was the native lifecycle and 0.45 s was transcription blocking the loop, so fixing either
   alone leaves most of the hole. Measured after: consecutive chunk starts exactly one chunk duration apart,
-  each file holding that whole interval to within one sample buffer.
+  each file holding that whole interval to within one sample buffer. A chunk's tracks transcribe
+  concurrently, bounded to its tracks because `audioLoop` hands over one chunk at a time, and their rows
+  still insert in frame order.
 - **A chunk's `captured_at` is the instant its audio began, *measured* at rotation** by reading the host
   clock and ageing it back to the boundary presentation timestamp. Both tracks of a chunk still share one
   timestamp — that is the key their segments are written under, and per-track stamps would break it.
