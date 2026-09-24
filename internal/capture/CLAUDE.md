@@ -307,6 +307,17 @@ chunks over eight minutes, and the ratio scales with how much the user switches 
   system track still attributes. These chunks are the one thing the derived queue cannot drain, which is
   what `store.ChunksFailedTranscription` exists to count — `lumi transcript` and `get_transcript` name them
   apart from real gaps so neither recommends a backfill that would reach the same dead end.
+- **A track reading digital silence is never recognized.** `storeAudioChunk` reads each track's envelope
+  through `ReadAudioEnvelope` first and skips `Transcribe` when `wav.IsDigitalSilence` holds — every
+  `EnvelopeWindowMS` window at `wav.SilenceFloorDBFS`. Measured over seven days: 4,078 of 5,630 tracks
+  (72%) were digitally silent and none of the 924 that produced text were, so the skip loses no words and
+  saves most of SpeechAnalyzer's CPU and energy. The threshold is the floor, not a loudness: absolute
+  dBFS is not portable (speech measured −26 and −68), a quiet room is the recognizer's call, and a muted
+  or idle tap reads exactly zero. A read failure transcribes as usual. The row carries
+  `transcription_skipped: "digital_silence"`, no `text_source` (the recognizer produced nothing), and
+  never `processor_error` — a skip is measured silence, so it must not trip the failed gate above, and
+  the backfill drains it as `silent` without its own copy of the rule, since `--retranscribe` never re-runs
+  an empty track. The envelope is kept for `measureInternalEnergy`, so a file is read once.
 - **`Recorder.Levels` is nil by default, and nil means the measurement is never taken.** Nothing in the
   pipeline needs it — only a supervising app drawing a meter (`levels.go`, `lumi record start
   --emit-levels`). It is measured *live*: sound is summed inside the ScreenCaptureKit callback as it

@@ -170,7 +170,8 @@ const EnvelopeWindowMS = 100
 // each writer because the recorder and the backfill both have to skip exactly the
 // same chunks: measuring where the recorder does not is wasted file I/O on the
 // common case, and failing to measure where it does is a different verdict for
-// the same audio.
+// the same audio. The recorder now reads every track to decide whether to
+// transcribe it, so for it this gates attaching the envelope, not reading it.
 func NeedsInternalEnergy(chunk Chunk) bool {
 	return chunk.System != nil && !hasSpeech(chunk.System) && hasSpeech(chunk.Microphone)
 }

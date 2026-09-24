@@ -72,7 +72,8 @@ type Transcription struct {
 	// The transcriber names itself rather than the recorder hardcoding it, which
 	// is what keeps the two from forking the moment a second recognizer exists.
 	// It is set on success only: a failed recognition must never claim a source
-	// for text that does not exist.
+	// for text that does not exist, and nor does a digitally silent track the
+	// recognizer never ran on — its row says why in transcription_skipped.
 	Source string
 }
 

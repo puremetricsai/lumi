@@ -13,6 +13,7 @@ import (
 
 	"github.com/puremetricsai/lumi/internal/macosnative"
 	"github.com/puremetricsai/lumi/internal/store"
+	"github.com/puremetricsai/lumi/internal/transcript"
 )
 
 func transcriptRoot(t *testing.T) (string, *store.Store) {
@@ -466,6 +467,33 @@ func audioChunkWithMetadata(t *testing.T, s *store.Store, at time.Time, metadata
 		}
 	}
 	return store.FormatCapturedAt(at)
+}
+
+// TestBackfillDrainsASkippedChunkAsSilent is the backfill half of the skip: a
+// track never recognized because it read zero is measured silence, not a
+// failure, so the backfill reaches the recorder's verdict and never re-runs
+// recognition over it.
+func TestBackfillDrainsASkippedChunkAsSilent(t *testing.T) {
+	root, s := transcriptRoot(t)
+	key := audioChunkWithMetadata(t, s, time.Now().UTC().Add(-time.Hour),
+		`{"audio_source":"system","transcription_skipped":"digital_silence"}`)
+	original := retranscribeChunk
+	t.Cleanup(func() { retranscribeChunk = original })
+	retranscribeChunk = func(context.Context, string, string) (macosnative.Transcription, error) {
+		t.Error("the backfill re-ran recognition over a skipped track")
+		return macosnative.Transcription{}, nil
+	}
+
+	if _, err := runCLI(t, "--data-dir", root, "transcript", "backfill", "--retranscribe"); err != nil {
+		t.Fatal(err)
+	}
+	segments, err := s.SegmentsForChunk(context.Background(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segments) != 1 || segments[0].Method != string(transcript.MethodSilent) {
+		t.Errorf("a skipped chunk was not drained as silent: %#v", segments)
+	}
 }
 
 // TestBackfillNeverCallsAFailedTranscriptionSilent is the backfill half of the
