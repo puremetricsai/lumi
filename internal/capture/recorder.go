@@ -340,18 +340,8 @@ func (r *Recorder) sampleEmitters(ctx context.Context, withForeground bool) Emit
 	return observation
 }
 
-// snapshotContext is the only way the recorder reads a focused-window snapshot,
-// so the normalization below cannot be bypassed. All three readers go through
-// it: the screen tick, emitterLoop's own foreground sample (the sole source of
-// focus in --no-screen mode, where no screen tick runs), and audioAttribution's
-// fallback for a chunk that no foreground observation landed inside.
-//
-// A title that only repeats the application name is not a title: it answers
-// nothing App does not already answer, and because events_fts indexes app and
-// window as separate columns, keeping it collects bm25 weight twice for one
-// fact. TitleSource is deliberately left alone — Accessibility did answer, and
-// that its answer was uninformative is a different question from where it came
-// from.
+// Every focus read goes through here, so a title that only repeats the app name
+// is dropped for all readers; kept, it doubles the app's bm25 weight.
 func (r *Recorder) snapshotContext(ctx context.Context) (ScreenContext, error) {
 	screenContext, err := r.Context.Snapshot(ctx)
 	if strings.EqualFold(strings.TrimSpace(screenContext.Window), strings.TrimSpace(screenContext.App)) {
@@ -469,14 +459,8 @@ func (r *Recorder) captureScreen(ctx context.Context) {
 	}
 }
 
-// substantiveAXText reports whether the Accessibility snapshot carries more than
-// the window title or the application name.
-//
-// Both comparisons are load-bearing, and the App one is only there because of
-// snapshotContext: once a title that merely repeated the app name is cleared,
-// AX text reading "Claude" has no matching Window left to be rejected against,
-// and a failed Vision pass would promote it into Event.Text. That trades a
-// useless title for a useless body, which is worse — text is what search reads.
+// The App check matters once snapshotContext clears an app-named title: without
+// it, AX text reading only the app name becomes the body when Vision fails.
 func substantiveAXText(c ScreenContext) bool {
 	text := strings.TrimSpace(c.Text)
 	return text != "" && !strings.EqualFold(text, strings.TrimSpace(c.Window)) && !strings.EqualFold(text, strings.TrimSpace(c.App))

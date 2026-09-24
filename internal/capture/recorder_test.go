@@ -121,11 +121,8 @@ func (titleOnlyContext) Snapshot(context.Context) (ScreenContext, error) {
 	return ScreenContext{App: "Zed", Window: "lumi — .env", Text: "lumi — .env", DisplayID: 1}, nil
 }
 
-// appNamedWindowContext mimics an app whose focused window carries no title of
-// its own, so Accessibility hands back the application name (Claude, ChatGPT,
-// Signal and Lumi all do this). Text is whatever Accessibility could read
-// besides; setting it to the app name too is the shape that makes
-// substantiveAXText's App comparison load-bearing.
+// appNamedWindowContext mimics apps whose focused window has no title, so
+// Accessibility reports the app name as the title.
 type appNamedWindowContext struct{ Text string }
 
 func (c appNamedWindowContext) Snapshot(context.Context) (ScreenContext, error) {
@@ -427,12 +424,8 @@ func TestRecorderUsesFullScreenVisionAndPreservesAccessibility(t *testing.T) {
 	}
 }
 
-// TestRecorderDropsWindowTitleInAudioOnlyCapture covers the reader that has no
-// screen tick behind it. With --no-screen, emitterLoop's foreground sample is
-// the only focus an audio row's attribution gets, so it is driven directly:
-// through Run, a chunk that no sample happened to land inside is attributed by
-// audioAttribution's fallback instead, and the two cannot be told apart from
-// the stored row.
+// Driven directly: through Run, audioAttribution's fallback may supply focus
+// instead, and the stored row cannot tell the two apart.
 func TestRecorderDropsWindowTitleInAudioOnlyCapture(t *testing.T) {
 	recorder := Recorder{
 		Context: appNamedWindowContext{Text: "screen text"}, AudioOutputs: fakeAudioOutputs{},
@@ -454,9 +447,6 @@ func TestRecorderDropsWindowTitleInAudioOnlyCapture(t *testing.T) {
 	}
 }
 
-// TestRecorderDoesNotIndexAnAppNameAsScreenText pins the other half of the
-// rule. Clearing a redundant title must not promote Accessibility text that is
-// itself only the app name into the event body when Vision returns nothing.
 func TestRecorderDoesNotIndexAnAppNameAsScreenText(t *testing.T) {
 	ctx := context.Background()
 	paths, s := recorderPaths(t)
@@ -489,10 +479,6 @@ func TestRecorderDoesNotIndexAnAppNameAsScreenText(t *testing.T) {
 	}
 }
 
-// TestSubstantiveAXTextRejectsTheTitleAndTheAppName pins what counts as screen
-// text beyond the window title. Both comparisons ignore case: Accessibility
-// text that differs from Window or App only in case adds nothing a search for
-// either would not already find.
 func TestSubstantiveAXTextRejectsTheTitleAndTheAppName(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -512,9 +498,6 @@ func TestSubstantiveAXTextRejectsTheTitleAndTheAppName(t *testing.T) {
 	}
 }
 
-// TestRecorderDropsWindowTitleThatOnlyRepeatsTheApp pins the rule across a
-// run that captures both screen and audio: neither kind of row keeps a title
-// that only repeats the application name, whichever reader supplied its focus.
 func TestRecorderDropsWindowTitleThatOnlyRepeatsTheApp(t *testing.T) {
 	ctx := context.Background()
 	paths, s := recorderPaths(t)
