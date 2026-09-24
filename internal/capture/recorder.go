@@ -479,7 +479,7 @@ func (r *Recorder) captureScreen(ctx context.Context) {
 // useless title for a useless body, which is worse — text is what search reads.
 func substantiveAXText(c ScreenContext) bool {
 	text := strings.TrimSpace(c.Text)
-	return text != "" && text != strings.TrimSpace(c.Window) && !strings.EqualFold(text, strings.TrimSpace(c.App))
+	return text != "" && !strings.EqualFold(text, strings.TrimSpace(c.Window)) && !strings.EqualFold(text, strings.TrimSpace(c.App))
 }
 
 func screenMetadata(frame ScreenFrame, textSource, axText string, screenContext ScreenContext,

@@ -123,11 +123,13 @@ func (titleOnlyContext) Snapshot(context.Context) (ScreenContext, error) {
 
 // appNamedWindowContext mimics an app whose focused window carries no title of
 // its own, so Accessibility hands back the application name (Claude, ChatGPT,
-// Signal and Lumi all do this).
-type appNamedWindowContext struct{}
+// Signal and Lumi all do this). Text is whatever Accessibility could read
+// besides; setting it to the app name too is the shape that makes
+// substantiveAXText's App comparison load-bearing.
+type appNamedWindowContext struct{ Text string }
 
-func (appNamedWindowContext) Snapshot(context.Context) (ScreenContext, error) {
-	return ScreenContext{App: "Claude", Window: "Claude", Text: "screen text", DisplayID: 1, AppSource: "accessibility", TitleSource: "accessibility"}, nil
+func (c appNamedWindowContext) Snapshot(context.Context) (ScreenContext, error) {
+	return ScreenContext{App: "Claude", Window: "Claude", Text: c.Text, DisplayID: 1, AppSource: "accessibility", TitleSource: "accessibility"}, nil
 }
 
 // degradedContext mimics the production failure this fallback exists for: the
@@ -425,61 +427,30 @@ func TestRecorderUsesFullScreenVisionAndPreservesAccessibility(t *testing.T) {
 	}
 }
 
-// appNamedEverythingContext is the shape that makes substantiveAXText's App
-// comparison load-bearing: the focused window has no title of its own, so
-// Accessibility reports the application name as the window title *and* as the
-// only text it could read.
-type appNamedEverythingContext struct{}
-
-func (appNamedEverythingContext) Snapshot(context.Context) (ScreenContext, error) {
-	return ScreenContext{App: "Claude", Window: "Claude", Text: "Claude", DisplayID: 1, AppSource: "accessibility", TitleSource: "accessibility"}, nil
-}
-
-// TestRecorderDropsWindowTitleInAudioOnlyCapture covers the path that has no
-// screen tick at all. With --no-screen, emitterLoop takes the only focus
-// samples there are, so a rule applied solely on the screen tick would not
-// reach an audio row's attribution.
+// TestRecorderDropsWindowTitleInAudioOnlyCapture covers the reader that has no
+// screen tick behind it. With --no-screen, emitterLoop's foreground sample is
+// the only focus an audio row's attribution gets, so it is driven directly:
+// through Run, a chunk that no sample happened to land inside is attributed by
+// audioAttribution's fallback instead, and the two cannot be told apart from
+// the stored row.
 func TestRecorderDropsWindowTitleInAudioOnlyCapture(t *testing.T) {
-	ctx := context.Background()
-	paths, err := config.FromRoot(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := paths.Ensure(); err != nil {
-		t.Fatal(err)
-	}
-	s, err := store.Open(ctx, paths.Database)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-
 	recorder := Recorder{
-		Store: s, Paths: paths, CaptureScreen: false, CaptureAudio: true,
-		AudioChunk: 8 * time.Millisecond, EmitterInterval: 4 * time.Millisecond,
-		Audio: dualAudio{}, Transcriber: fakeTranscriber{}, Context: appNamedWindowContext{},
-		AudioOutputs: fakeAudioOutputs{},
+		Context: appNamedWindowContext{Text: "screen text"}, AudioOutputs: fakeAudioOutputs{},
+		timeline: newEmitterTimeline(1, 1),
 	}
-	recordCtx, cancel := context.WithTimeout(ctx, 35*time.Millisecond)
-	defer cancel()
-	if err := recorder.Run(recordCtx); err != nil {
-		t.Fatal(err)
-	}
+	start := time.Now().UTC()
+	recorder.sampleEmitters(context.Background(), true)
 
-	events, err := s.Search(ctx, store.SearchOptions{Kind: store.KindAudio})
-	if err != nil {
-		t.Fatal(err)
+	_, foreground := recorder.timeline.window(start, time.Now().UTC())
+	if len(foreground) != 1 {
+		t.Fatalf("foreground observations = %d, want 1", len(foreground))
 	}
-	if len(events) == 0 {
-		t.Fatal("audio-only capture produced no events")
+	observed := foreground[0].Context
+	if observed.App != "Claude" {
+		t.Fatalf("emitter foreground sample lost the app name: %#v", observed)
 	}
-	for _, event := range events {
-		if event.App != "Claude" {
-			t.Fatalf("audio-only capture lost the app name: %#v", event)
-		}
-		if event.Window != "" {
-			t.Fatalf("audio-only capture kept a window title that only repeats the app: %q", event.Window)
-		}
+	if observed.Window != "" {
+		t.Fatalf("emitter foreground sample kept a window title that only repeats the app: %q", observed.Window)
 	}
 }
 
@@ -488,23 +459,12 @@ func TestRecorderDropsWindowTitleInAudioOnlyCapture(t *testing.T) {
 // itself only the app name into the event body when Vision returns nothing.
 func TestRecorderDoesNotIndexAnAppNameAsScreenText(t *testing.T) {
 	ctx := context.Background()
-	paths, err := config.FromRoot(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := paths.Ensure(); err != nil {
-		t.Fatal(err)
-	}
-	s, err := store.Open(ctx, paths.Database)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
+	paths, s := recorderPaths(t)
 
 	recorder := Recorder{
 		Store: s, Paths: paths, CaptureScreen: true,
 		ScreenInterval: 8 * time.Millisecond,
-		Screen:         &fakeScreen{}, Text: failingText{}, Context: appNamedEverythingContext{},
+		Screen:         &fakeScreen{}, Text: failingText{}, Context: appNamedWindowContext{Text: "Claude"},
 	}
 	recordCtx, cancel := context.WithTimeout(ctx, 35*time.Millisecond)
 	defer cancel()
@@ -529,29 +489,40 @@ func TestRecorderDoesNotIndexAnAppNameAsScreenText(t *testing.T) {
 	}
 }
 
-// TestRecorderDropsWindowTitleThatOnlyRepeatsTheApp pins the rule that a title
-// repeating the application name is not a title. It is dropped once, on the
-// per-tick snapshot, so the screen stamp and the audio stamp — which reads the
-// same ScreenContext back through observeForeground — cannot disagree.
+// TestSubstantiveAXTextRejectsTheTitleAndTheAppName pins what counts as screen
+// text beyond the window title. Both comparisons ignore case: Accessibility
+// text that differs from Window or App only in case adds nothing a search for
+// either would not already find.
+func TestSubstantiveAXTextRejectsTheTitleAndTheAppName(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		context ScreenContext
+		want    bool
+	}{
+		{"distinct text", ScreenContext{App: "Zed", Window: "README.md", Text: "## Install"}, true},
+		{"empty text", ScreenContext{App: "Zed", Window: "README.md", Text: "  "}, false},
+		{"repeats the window up to case", ScreenContext{App: "Zed", Window: "README.md", Text: "readme.md"}, false},
+		{"repeats the app up to case", ScreenContext{App: "Claude", Text: "claude"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := substantiveAXText(tc.context); got != tc.want {
+				t.Fatalf("substantiveAXText(%#v) = %v, want %v", tc.context, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRecorderDropsWindowTitleThatOnlyRepeatsTheApp pins the rule across a
+// run that captures both screen and audio: neither kind of row keeps a title
+// that only repeats the application name, whichever reader supplied its focus.
 func TestRecorderDropsWindowTitleThatOnlyRepeatsTheApp(t *testing.T) {
 	ctx := context.Background()
-	paths, err := config.FromRoot(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := paths.Ensure(); err != nil {
-		t.Fatal(err)
-	}
-	s, err := store.Open(ctx, paths.Database)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
+	paths, s := recorderPaths(t)
 
 	recorder := Recorder{
 		Store: s, Paths: paths, CaptureScreen: true, CaptureAudio: true,
 		ScreenInterval: 8 * time.Millisecond, AudioChunk: 8 * time.Millisecond,
-		Screen: &fakeScreen{}, Text: fakeVision{}, Context: appNamedWindowContext{},
+		Screen: &fakeScreen{}, Text: fakeVision{}, Context: appNamedWindowContext{Text: "screen text"},
 		Audio: fakeAudio{}, Transcriber: fakeTranscriber{},
 	}
 	recordCtx, cancel := context.WithTimeout(ctx, 35*time.Millisecond)
