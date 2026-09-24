@@ -10,6 +10,27 @@ focused-window snapshot per tick is stamped onto **every** display's frame, so o
 `app` filter returns frames from displays where that app was not visible: attribution answers "what was the
 user working in", not "what is shown in this image". Per-display attribution is deliberately not done.
 
+**A window title equal to the application name is dropped, and `snapshotContext` is the only place it can
+be.** Apps whose focused window exposes no title of its own (Claude, ChatGPT, Signal, Lumi) hand
+Accessibility back the application name, which answers nothing `App` does not — and because `events_fts`
+indexes `app` and `window` as separate columns, keeping it collects bm25 weight twice for one fact.
+**Nothing calls `r.Context.Snapshot` directly.** There are three readers and the rule has to hold for all
+of them: the screen tick, `emitterLoop`'s own foreground sample — the *sole* source of focus under
+`--no-screen`, where no screen tick exists to normalize anything — and `audioAttribution`'s fallback for a
+chunk no foreground observation landed inside. A guard on the screen tick alone silently exempts the other
+two, and an audio row's attribution is exactly what it exempts.
+
+`TitleSource` is deliberately left at its reported value: Accessibility *did* answer, and that its answer
+was uninformative is a different question from where it came from. The cleared title lands in
+`ListAttribution` as an empty label, which is already what `internal/store` means by a gap in attribution
+being information.
+
+**`substantiveAXText` compares against `App` as well as `Window`, and the second test is load-bearing
+*because* of the first rule.** Once a redundant title is cleared, Accessibility text reading `"Claude"` no
+longer has a matching `Window` to be rejected against, and a failed Vision pass would promote it into the
+event body — trading a useless title for a useless *body*, which is worse, since `text` is what search
+reads. Removing either comparison re-opens it.
+
 `ScreenContext` degrades rather than failing: `Snapshot` errors only when nothing at all could be read, and
 a failed Accessibility read arrives as a *populated* context carrying `AccessibilityError`. `Degraded()`
 ("something was lost") and `Unattributed()` ("no app name at all") are different questions — conflating

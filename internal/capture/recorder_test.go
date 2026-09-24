@@ -121,6 +121,14 @@ func (titleOnlyContext) Snapshot(context.Context) (ScreenContext, error) {
 	return ScreenContext{App: "Zed", Window: "lumi — .env", Text: "lumi — .env", DisplayID: 1}, nil
 }
 
+// appNamedWindowContext mimics apps whose focused window has no title, so
+// Accessibility reports the app name as the title.
+type appNamedWindowContext struct{ Text string }
+
+func (c appNamedWindowContext) Snapshot(context.Context) (ScreenContext, error) {
+	return ScreenContext{App: "Claude", Window: "Claude", Text: c.Text, DisplayID: 1, AppSource: "accessibility", TitleSource: "accessibility"}, nil
+}
+
 // degradedContext mimics the production failure this fallback exists for: the
 // Accessibility read failed, but NSWorkspace still named the frontmost app and
 // the window list still supplied a title.
@@ -413,6 +421,115 @@ func TestRecorderUsesFullScreenVisionAndPreservesAccessibility(t *testing.T) {
 	}
 	if !strings.Contains(string(events[0].Metadata), "Accessibility primary text") {
 		t.Fatalf("substantive Accessibility text was not preserved in metadata: %s", events[0].Metadata)
+	}
+}
+
+// Driven directly: through Run, audioAttribution's fallback may supply focus
+// instead, and the stored row cannot tell the two apart.
+func TestRecorderDropsWindowTitleInAudioOnlyCapture(t *testing.T) {
+	recorder := Recorder{
+		Context: appNamedWindowContext{Text: "screen text"}, AudioOutputs: fakeAudioOutputs{},
+		timeline: newEmitterTimeline(1, 1),
+	}
+	start := time.Now().UTC()
+	recorder.sampleEmitters(context.Background(), true)
+
+	_, foreground := recorder.timeline.window(start, time.Now().UTC())
+	if len(foreground) != 1 {
+		t.Fatalf("foreground observations = %d, want 1", len(foreground))
+	}
+	observed := foreground[0].Context
+	if observed.App != "Claude" {
+		t.Fatalf("emitter foreground sample lost the app name: %#v", observed)
+	}
+	if observed.Window != "" {
+		t.Fatalf("emitter foreground sample kept a window title that only repeats the app: %q", observed.Window)
+	}
+}
+
+func TestRecorderDoesNotIndexAnAppNameAsScreenText(t *testing.T) {
+	ctx := context.Background()
+	paths, s := recorderPaths(t)
+
+	recorder := Recorder{
+		Store: s, Paths: paths, CaptureScreen: true,
+		ScreenInterval: 8 * time.Millisecond,
+		Screen:         &fakeScreen{}, Text: failingText{}, Context: appNamedWindowContext{Text: "Claude"},
+	}
+	recordCtx, cancel := context.WithTimeout(ctx, 35*time.Millisecond)
+	defer cancel()
+	if err := recorder.Run(recordCtx); err != nil {
+		t.Fatal(err)
+	}
+
+	events, err := s.Search(ctx, store.SearchOptions{Kind: store.KindScreen})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) == 0 {
+		t.Fatal("screen capture produced no events")
+	}
+	for _, event := range events {
+		if strings.TrimSpace(event.Text) != "" {
+			t.Fatalf("indexed the app name as screen text: %q (source %q)", event.Text, event.TextSource)
+		}
+		if _, err := os.Stat(event.MediaPath); err != nil {
+			t.Fatalf("screen media was not preserved: %v", err)
+		}
+	}
+}
+
+func TestSubstantiveAXTextRejectsTheTitleAndTheAppName(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		context ScreenContext
+		want    bool
+	}{
+		{"distinct text", ScreenContext{App: "Zed", Window: "README.md", Text: "## Install"}, true},
+		{"empty text", ScreenContext{App: "Zed", Window: "README.md", Text: "  "}, false},
+		{"repeats the window up to case", ScreenContext{App: "Zed", Window: "README.md", Text: "readme.md"}, false},
+		{"repeats the app up to case", ScreenContext{App: "Claude", Text: "claude"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := substantiveAXText(tc.context); got != tc.want {
+				t.Fatalf("substantiveAXText(%#v) = %v, want %v", tc.context, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRecorderDropsWindowTitleThatOnlyRepeatsTheApp(t *testing.T) {
+	ctx := context.Background()
+	paths, s := recorderPaths(t)
+
+	recorder := Recorder{
+		Store: s, Paths: paths, CaptureScreen: true, CaptureAudio: true,
+		ScreenInterval: 8 * time.Millisecond, AudioChunk: 8 * time.Millisecond,
+		Screen: &fakeScreen{}, Text: fakeVision{}, Context: appNamedWindowContext{Text: "screen text"},
+		Audio: fakeAudio{}, Transcriber: fakeTranscriber{},
+	}
+	recordCtx, cancel := context.WithTimeout(ctx, 35*time.Millisecond)
+	defer cancel()
+	if err := recorder.Run(recordCtx); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, kind := range []store.Kind{store.KindScreen, store.KindAudio} {
+		events, err := s.Search(ctx, store.SearchOptions{Kind: kind})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(events) == 0 {
+			t.Fatalf("%s pipeline produced no events", kind)
+		}
+		for _, event := range events {
+			if event.App != "Claude" {
+				t.Fatalf("%s attribution lost the app name: %#v", kind, event)
+			}
+			if event.Window != "" {
+				t.Fatalf("%s kept a window title that only repeats the app: %q", kind, event.Window)
+			}
+		}
 	}
 }
 

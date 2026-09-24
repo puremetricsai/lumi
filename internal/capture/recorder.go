@@ -335,9 +335,19 @@ func (r *Recorder) sampleEmitters(ctx context.Context, withForeground bool) Emit
 	if !withForeground {
 		return observation
 	}
-	screenContext, err := r.Context.Snapshot(ctx)
+	screenContext, err := r.snapshotContext(ctx)
 	r.timeline.observeForeground(ForegroundObservation{At: now, Context: screenContext, Err: err})
 	return observation
+}
+
+// Every focus read goes through here, so a title that only repeats the app name
+// is dropped for all readers; kept, it doubles the app's bm25 weight.
+func (r *Recorder) snapshotContext(ctx context.Context) (ScreenContext, error) {
+	screenContext, err := r.Context.Snapshot(ctx)
+	if strings.EqualFold(strings.TrimSpace(screenContext.Window), strings.TrimSpace(screenContext.App)) {
+		screenContext.Window = ""
+	}
+	return screenContext, err
 }
 
 func (r *Recorder) captureScreen(ctx context.Context) {
@@ -379,7 +389,7 @@ func (r *Recorder) captureScreen(ctx context.Context) {
 	var contextErr error
 	if r.Context != nil {
 		processingCtx, cancel := preservationContext(ctx)
-		screenContext, contextErr = r.Context.Snapshot(processingCtx)
+		screenContext, contextErr = r.snapshotContext(processingCtx)
 		cancel()
 	}
 	r.noteAttribution(now, screenContext, contextErr)
@@ -449,13 +459,11 @@ func (r *Recorder) captureScreen(ctx context.Context) {
 	}
 }
 
-// substantiveAXText reports whether the Accessibility snapshot carries more than
-// the window title. It mirrors the render-time heuristic in
-// internal/cli/context.go (screenEvidence) so "useful screen text" means the same
-// thing at capture and at query time.
+// The App check matters once snapshotContext clears an app-named title: without
+// it, AX text reading only the app name becomes the body when Vision fails.
 func substantiveAXText(c ScreenContext) bool {
 	text := strings.TrimSpace(c.Text)
-	return text != "" && text != strings.TrimSpace(c.Window)
+	return text != "" && !strings.EqualFold(text, strings.TrimSpace(c.Window)) && !strings.EqualFold(text, strings.TrimSpace(c.App))
 }
 
 func screenMetadata(frame ScreenFrame, textSource, axText string, screenContext ScreenContext,
@@ -842,7 +850,7 @@ func (r *Recorder) audioAttribution(ctx context.Context, capturedAt time.Time, c
 		sample.foregroundSamples = len(foreground)
 		sample.foregroundApps = distinctForegroundApps(foreground)
 	} else if r.Context != nil {
-		sample.screen, sample.screenErr = r.Context.Snapshot(sampleCtx)
+		sample.screen, sample.screenErr = r.snapshotContext(sampleCtx)
 		sample.foregroundSamples = 1
 		sample.foregroundApps = 1
 	}
