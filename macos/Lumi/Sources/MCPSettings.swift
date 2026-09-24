@@ -29,9 +29,9 @@ struct MCPSettings: View {
     /// One past-tense line per client from the last real setup run.
     @State private var setupOutcome: [String] = []
     @State private var setupError: String?
-    /// True when the last run changed Claude Desktop's config. It is the one
-    /// client that reads its configuration only at launch.
-    @State private var needsDesktopRelaunch = false
+    /// What the user must do for each client the last run changed, e.g.
+    /// relaunch Claude Desktop. Go decides which clients need one and says it.
+    @State private var afterChange: [String] = []
     /// The client whose snippet was just copied, so the button can confirm it.
     @State private var copiedTarget: String?
     /// The conflicting client awaiting a replace confirmation, if any.
@@ -112,7 +112,7 @@ struct MCPSettings: View {
             // Said before the wait, not after it. The check shells out to the
             // `claude` and `codex` CLIs and verifies the binary, so several
             // seconds is the normal case rather than a hang.
-            SettingsCaption("Lumi asks the Claude and Codex CLIs, which can take a few seconds.")
+            SettingsCaption("Lumi checks installed clients, which can take a few seconds.")
         case let .failed(message):
             Text(message)
                 .foregroundStyle(Theme.attention)
@@ -143,7 +143,7 @@ struct MCPSettings: View {
 
             if result.status == .conflict, !result.current.isEmpty {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Already registered as:")
+                    Text("Existing entry:")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     code(result.current)
@@ -196,8 +196,8 @@ struct MCPSettings: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
-        if needsDesktopRelaunch {
-            Text("Quit and reopen Claude Desktop to load the new entry.")
+        ForEach(afterChange, id: \.self) { line in
+            Text(line)
                 .font(.caption)
                 .foregroundStyle(Theme.attention)
                 .fixedSize(horizontal: false, vertical: true)
@@ -238,7 +238,7 @@ struct MCPSettings: View {
         isRunningSetup = true
         setupError = nil
         setupOutcome = []
-        needsDesktopRelaunch = false
+        afterChange = []
         defer { isRunningSetup = false }
         do {
             var arguments = ["mcp", "setup", "--json"]
@@ -250,13 +250,9 @@ struct MCPSettings: View {
             // LumiCLI.json already reads the payload before the exit status.
             let report = try await LumiCLI.json(MCPSetupReport.self, arguments)
             setupOutcome = report.results.map(Self.outcome)
-            // `changed` and not `status`: a target reports `added` even when
-            // the write it then attempted failed, and only `changed` is set
-            // after the config actually moved. Telling someone to restart
-            // Claude Desktop for a change that never landed is noise.
-            needsDesktopRelaunch = report.results.contains {
-                $0.target == "claude-desktop" && $0.changed
-            }
+            // Set by the target only after the config actually moved, so a
+            // write that failed or a dry run never asks for a restart.
+            afterChange = report.results.map(\.afterChange).filter { !$0.isEmpty }
             // At least one client failed. The command exits non-zero for this,
             // but LumiCLI.json decodes the payload first — deliberately, so a
             // conflict still reports per client — so the failure is read from
@@ -275,10 +271,9 @@ struct MCPSettings: View {
 
     /// copy puts the client's own snippet on the pasteboard verbatim.
     ///
-    /// The snippet is never built here. `internal/mcpsetup` owns all three
-    /// foreign config formats — JSON for the Claude clients, TOML for Codex —
-    /// and a renderer in Swift would hand a Codex user TOML to paste into a
-    /// JSON object the first time either format moved.
+    /// The snippet is never built here. `internal/mcpsetup` owns the
+    /// foreign config formats — JSON, TOML, and Pi's TypeScript extension —
+    /// and a renderer in Swift would drift when any format changed.
     private func copy(_ result: MCPSetupResult) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(result.manual, forType: .string)

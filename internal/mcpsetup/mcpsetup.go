@@ -1,12 +1,11 @@
-// Package mcpsetup registers a stdio MCP server with the MCP clients installed
-// on this machine.
+// Package mcpsetup configures installed agents to use Lumi's MCP tools.
 //
-// It owns what Lumi knows about three foreign configuration formats and nothing
+// It owns what Lumi knows about foreign configuration formats and nothing
 // else. A Spec carries a name, a binary path, and an argv, so this package has
 // no opinion about --data-dir, os.Executable, or config.Paths; the caller
 // supplies all three. It depends on nothing else of Lumi's.
 //
-// The three targets are deliberately asymmetric, because what each client is
+// The targets are deliberately asymmetric, because what each client is
 // willing to tell us differs.
 //
 // Claude Code's ~/.claude.json is live application state that Claude Code
@@ -38,6 +37,10 @@ import (
 	"sync"
 	"time"
 )
+
+// DefaultName is the server name setup uses unless told otherwise, and the only
+// one Pi's extension supports.
+const DefaultName = "lumi"
 
 // Spec is the MCP server entry a client should end up holding. It is a pure
 // value: two Specs built from the same binary and data directory are equal, and
@@ -112,7 +115,7 @@ type Result struct {
 	// Manual is a paste-able config snippet, set on every result so a caller
 	// can offer it unprompted and a user who cannot or will not let Lumi write
 	// the file still has the answer. Its format follows the client — JSON for
-	// the Claude targets, TOML for Codex — which is why it is built here and
+	// the Claude targets, TOML for Codex, TypeScript for Pi — which is why it is built here and
 	// never by a caller.
 	Manual string `json:"manual"`
 	// ManualHint is the sentence fragment introducing Manual, e.g. `add this
@@ -124,6 +127,11 @@ type Result struct {
 	// It is false under DryRun even when Status is Added or Replaced, which is
 	// what keeps "restart the app" reminders honest.
 	Changed bool `json:"changed"`
+	// AfterChange is what the user must do for the client to load the change,
+	// e.g. relaunch it. Set only alongside Changed, and only by a client that
+	// needs it, so a caller prints whatever arrives and never keeps its own list
+	// of which clients need a reload.
+	AfterChange string `json:"after_change"`
 }
 
 // Target is one MCP client Lumi knows how to configure.
@@ -335,23 +343,52 @@ func notInstalledErr(target, reason string) error {
 // choice below — why interactive, why two call sites — is in this package's
 // CLAUDE.md.
 
-// userPATH is the PATH the user's own interactive login shell would have.
+// shellVars is what the user's own interactive login shell exports that launchd
+// hides from Lumi.app.
+type shellVars struct {
+	path       string
+	piAgentDir string
+}
+
+// userShell probes every variable in one shell run. Each run is a whole rc
+// chain, and most users leave PI_CODING_AGENT_DIR unset, so probing it on its
+// own would cost a second shell to learn nothing.
+var userShell = sync.OnceValue(probeUserShell)
+
+// userPATH is the PATH the user's shell would have, falling back to this
+// process's own on any trouble.
 //
-// A var rather than a func so tests can stub it: a unit test must never spawn a
-// real shell, and the developer's own installs must not answer for the machine
-// under test.
-var userPATH = sync.OnceValue(probeUserPATH)
+// userPATH and userPiAgentDir are vars rather than funcs so tests can stub
+// them: a unit test must never spawn a real shell, and the developer's own
+// installs must not answer for the machine under test.
+var userPATH = func() string {
+	if path := userShell().path; path != "" {
+		return path
+	}
+	return os.Getenv("PATH")
+}
+
+// userPiAgentDir is the PI_CODING_AGENT_DIR the user's shell exports, or "".
+// launchd hides an export in ~/.zshrc exactly as it hides the PATH one, and Pi
+// only ever runs from that shell.
+var userPiAgentDir = func() string { return userShell().piAgentDir }
 
 // pathProbeTimeout bounds one shell probe. An rc chain that hangs must not hang
 // a settings tab; falling back to the inherited PATH is always safe.
 const pathProbeTimeout = 5 * time.Second
 
-// pathMarker prefixes the probe's answer so it can be picked out of whatever
-// else the user's startup files decide to print. Without it the answer has to
-// be guessed at positionally, and a ~/.zlogout — which runs *after* the -c
-// command, with no newline between them — silently appends its message to the
-// last PATH entry.
-const pathMarker = "LUMIPATH:"
+// pathMarker and piAgentDirMarker prefix the probe's answers so they can be
+// picked out of whatever else the user's startup files decide to print. Without
+// them the answer has to be guessed at positionally, and a ~/.zlogout — which
+// runs *after* the -c command, with no newline between them — silently appends
+// its message to the last line.
+const (
+	pathMarker       = "LUMIPATH:"
+	piAgentDirMarker = "LUMIPIDIR:"
+)
+
+// probeCommand is the -c argument: one marked line per variable.
+const probeCommand = `printf '\n` + pathMarker + `%s\n` + piAgentDirMarker + `%s\n' "$PATH" "$` + piAgentDirVar + `"`
 
 // pathProbeFlags are the shell invocations tried in order.
 //
@@ -365,27 +402,28 @@ const pathMarker = "LUMIPATH:"
 // dislikes a flag. Only a failed attempt costs a second one.
 var pathProbeFlags = [][]string{{"-l", "-i", "-c"}, {"-i", "-c"}}
 
-// probeUserPATH asks the user's shell for its PATH, falling back to this
-// process's own on any trouble.
-func probeUserPATH() string {
+// probeUserShell asks the user's shell for its variables, returning zero values
+// on any trouble. An attempt counts as failed only when it yields no PATH; an
+// unset PI_CODING_AGENT_DIR is an answer, not a reason to retry.
+func probeUserShell() shellVars {
 	shell := os.Getenv("SHELL")
 	if shell == "" {
 		shell = "/bin/zsh"
 	}
 	for _, flags := range pathProbeFlags {
-		if probed := runPATHProbe(shell, flags); probed != "" {
-			return probed
+		if vars := runShellProbe(shell, flags); vars.path != "" {
+			return vars
 		}
 	}
-	return os.Getenv("PATH")
+	return shellVars{}
 }
 
-// runPATHProbe runs one invocation and returns the PATH it reported, or "".
-func runPATHProbe(shell string, flags []string) string {
+// runShellProbe runs one invocation and returns what it reported.
+func runShellProbe(shell string, flags []string) shellVars {
 	ctx, cancel := context.WithTimeout(context.Background(), pathProbeTimeout)
 	defer cancel()
 
-	args := append(append([]string{}, flags...), `printf '\n`+pathMarker+`%s\n' "$PATH"`)
+	args := append(append([]string{}, flags...), probeCommand)
 	cmd := exec.CommandContext(ctx, shell, args...)
 	// TERM=dumb keeps an rc file from drawing a prompt or probing a terminal
 	// that is not there. Stdin and Stderr are left nil, which is /dev/null: no
@@ -401,22 +439,26 @@ func runPATHProbe(shell string, flags []string) string {
 	// the command reports failure while stdout already holds a complete answer,
 	// and throwing that away would reintroduce the bug it exists to bound.
 	out, _ := cmd.Output()
-	return parsePATHProbe(string(out))
+	return parseShellProbe(string(out))
 }
 
-// parsePATHProbe pulls the marked PATH out of the probe's stdout, or returns ""
-// if it is not there. Split out so it can be tested without a shell.
+// parseShellProbe pulls the marked values out of the probe's stdout, leaving a
+// field empty if its marker is not there. Split out so it can be tested without
+// a shell.
 //
-// The last marked line wins. A startup banner prints before the marker and a
-// logout message after it, so neither can be mistaken for the answer.
-func parsePATHProbe(out string) string {
-	probed := ""
+// The last marked line wins. A startup banner prints before the markers and a
+// logout message after them, so neither can be mistaken for the answer.
+func parseShellProbe(out string) shellVars {
+	var vars shellVars
 	for _, line := range strings.Split(out, "\n") {
 		if _, value, found := strings.Cut(line, pathMarker); found {
-			probed = strings.TrimSpace(value)
+			vars.path = strings.TrimSpace(value)
+		}
+		if _, value, found := strings.Cut(line, piAgentDirMarker); found {
+			vars.piAgentDir = strings.TrimSpace(value)
 		}
 	}
-	return probed
+	return vars
 }
 
 // lookCLI is the default LookPath both targets use: this process's PATH first,

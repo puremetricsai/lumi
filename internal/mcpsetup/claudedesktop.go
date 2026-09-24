@@ -157,6 +157,8 @@ func (d *ClaudeDesktop) Apply(_ context.Context, spec Spec, opts Options) (Resul
 		return result, fmt.Errorf("%s: write %s: %w", claudeDesktopName, path, err)
 	}
 	result.Changed = true
+	// Claude Desktop reads its configuration only at launch.
+	result.AfterChange = "Quit and reopen Claude Desktop to load the change."
 	return result, nil
 }
 

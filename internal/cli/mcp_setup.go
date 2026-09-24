@@ -20,7 +20,7 @@ import (
 // verifyTimeout bounds the `lumi version` probe run before anything is written.
 const verifyTimeout = 5 * time.Second
 
-// These three vars are the test seams for a command whose whole job is to
+// These vars are the test seams for a command whose whole job is to
 // touch files outside the repository. Without them a test run would rewrite the
 // developer's own Claude configuration.
 var (
@@ -35,13 +35,12 @@ var (
 
 // clientSelection is the set of clients one --client value asks for.
 //
-// A struct rather than positional bools: at two clients the argument list was
-// still readable, at three a caller passing them in the wrong order would
-// compile and silently configure the wrong client.
+// A struct rather than positional bools keeps client selection unambiguous.
 type clientSelection struct {
 	code    bool
 	desktop bool
 	codex   bool
+	pi      bool
 	// explicit reports whether the user named a specific client. A client asked
 	// for by name that turns out to be unconfigurable is an error, while the
 	// same client reached through "all" is a visible skip.
@@ -60,6 +59,9 @@ func defaultSetupTargets(sel clientSelection) []mcpsetup.Target {
 	}
 	if sel.codex {
 		targets = append(targets, &mcpsetup.Codex{Required: sel.explicit})
+	}
+	if sel.pi {
+		targets = append(targets, &mcpsetup.Pi{Required: sel.explicit})
 	}
 	return targets
 }
@@ -107,7 +109,7 @@ type mcpSetupResultJSON struct {
 	Error string `json:"error,omitempty"`
 }
 
-// mcpSetupCommand registers `lumi mcp` with the MCP clients on this machine.
+// mcpSetupCommand configures installed agents to use Lumi's MCP tools.
 //
 // Everything the server needs is baked into the generated argv — an absolute
 // binary path and an absolute --data-dir, always, even at the default root.
@@ -119,11 +121,11 @@ func (a *app) mcpSetupCommand() *cobra.Command {
 	var f mcpSetupFlags
 	cmd := &cobra.Command{
 		Use:   "setup",
-		Short: "Register lumi as an MCP server with Claude Code, Claude Desktop, and Codex",
-		Long: "Write the lumi MCP server entry into the configuration of every MCP client\n" +
-			"installed on this machine — Claude Code, Claude Desktop, and Codex.\n" +
-			"Clients launch `lumi mcp` themselves over stdio, so nothing runs in the\n" +
-			"background and no port is opened.\n\n" +
+		Short: "Configure Lumi for Claude Code, Claude Desktop, Codex, and Pi",
+		Long: "Configure Lumi's tools for every supported agent\n" +
+			"installed on this machine — Claude Code, Claude Desktop, Codex, and Pi.\n" +
+			"Pi loads a small extension that calls the same server over stdio.\n" +
+			"Nothing runs in the background and no port is opened.\n\n" +
 			"Setup is idempotent: a second run reports 'unchanged' and writes nothing. An\n" +
 			"entry that already exists with different settings is never overwritten without\n" +
 			"--force.",
@@ -132,8 +134,8 @@ func (a *app) mcpSetupCommand() *cobra.Command {
 			return a.runMCPSetup(cmd, f)
 		},
 	}
-	cmd.Flags().StringVar(&f.client, "client", "all", "which clients to configure (code, desktop, codex, all)")
-	cmd.Flags().StringVar(&f.name, "name", "lumi", "name to register the server under")
+	cmd.Flags().StringVar(&f.client, "client", "all", "which clients to configure (code, desktop, codex, pi, all)")
+	cmd.Flags().StringVar(&f.name, "name", mcpsetup.DefaultName, "server name for MCP clients (Pi uses the fixed name lumi)")
 	cmd.Flags().BoolVar(&f.dryRun, "dry-run", false, "report what would change without writing anything")
 	cmd.Flags().BoolVar(&f.force, "force", false, "replace an existing entry that differs")
 	cmd.Flags().BoolVar(&f.asJSON, "json", false, "emit JSON")
@@ -213,7 +215,7 @@ func (a *app) runMCPSetup(cmd *cobra.Command, f mcpSetupFlags) error {
 	}
 
 	printSetupResults(cmd.OutOrStdout(), results, f.dryRun)
-	printSetupDiagnostics(cmd.ErrOrStderr(), results, spec, f.dryRun)
+	printSetupDiagnostics(cmd.ErrOrStderr(), results, spec)
 	return errors.Join(errs...)
 }
 
@@ -222,20 +224,22 @@ func (a *app) runMCPSetup(cmd *cobra.Command, f mcpSetupFlags) error {
 // A `Target`'s own name is accepted alongside the short one, because it is the
 // only client name a caller reading the JSON has: Lumi.app hands the `target` it
 // was given straight back rather than keeping a second copy of this vocabulary in
-// Swift. A fourth client needs both of its names here.
+// Swift. Each new client needs both of its names here.
 func parseClientSelection(value string) (clientSelection, error) {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "all":
-		return clientSelection{code: true, desktop: true, codex: true}, nil
+		return clientSelection{code: true, desktop: true, codex: true, pi: true}, nil
 	case "code", "claude-code":
 		return clientSelection{code: true, explicit: true}, nil
 	case "desktop", "claude-desktop":
 		return clientSelection{desktop: true, explicit: true}, nil
 	case "codex":
 		return clientSelection{codex: true, explicit: true}, nil
+	case "pi":
+		return clientSelection{pi: true, explicit: true}, nil
 	default:
 		return clientSelection{}, fmt.Errorf(
-			"unknown --client %q: expected code, desktop, codex, or all", value)
+			"unknown --client %q: expected code, desktop, codex, pi, or all", value)
 	}
 }
 
@@ -350,27 +354,27 @@ func statusVerb(status mcpsetup.Status, dryRun bool) string {
 
 // printSetupDiagnostics writes everything that is not a result: why a client
 // was skipped, what a conflict looks like, and what the user has to do next.
-func printSetupDiagnostics(w io.Writer, results []mcpsetup.Result, spec mcpsetup.Spec, dryRun bool) {
+func printSetupDiagnostics(w io.Writer, results []mcpsetup.Result, spec mcpsetup.Spec) {
 	desired := spec.CommandLine()
-	desktopChanged := false
 	for _, r := range results {
 		switch r.Status {
 		case mcpsetup.StatusSkipped, mcpsetup.StatusFailed:
 			// Both mean "nothing was written and you are on your own", so both
 			// hand back the snippet. The instruction comes from the target, not
-			// from here: the two Claude clients take JSON under "mcpServers" and
-			// Codex takes a TOML table, and one hardcoded sentence would be
-			// wrong for one of them.
+			// from here: JSON, TOML, and Pi's TypeScript extension all
+			// require different instructions.
 			fmt.Fprintf(w, "\n%s: %s — %s.\n"+
 				"  To configure it by hand, %s:\n\n%s\n",
 				r.Target, r.Status, r.Detail, r.ManualHint, r.Manual)
 		case mcpsetup.StatusConflict:
-			fmt.Fprintf(w, "\n%s: %s\n    current:  %s\n    desired:  %s\n"+
-				"  Re-run with --force to replace it, or --name to add a second entry.\n",
-				r.Target, r.Detail, r.Current, desired)
-		}
-		if r.Target == "claude-desktop" && r.Changed {
-			desktopChanged = true
+			if r.Target == "pi" {
+				fmt.Fprintf(w, "\npi: %s\n    existing extension: %s\n"+
+					"  Re-run with --client pi --force to back it up and replace it.\n", r.Detail, r.Current)
+			} else {
+				fmt.Fprintf(w, "\n%s: %s\n    current:  %s\n    desired:  %s\n"+
+					"  Re-run with --force to replace it, or --name to add a second entry.\n",
+					r.Target, r.Detail, r.Current, desired)
+			}
 		}
 	}
 
@@ -384,9 +388,11 @@ func printSetupDiagnostics(w io.Writer, results []mcpsetup.Result, spec mcpsetup
 			"  installing lumi somewhere permanent.\n", spec.Command)
 	}
 
-	// The reminder is emitted only when Claude Desktop's config actually
-	// changed. Printing it on a no-op run trains people to ignore it.
-	if desktopChanged && !dryRun {
-		fmt.Fprintf(w, "\nQuit and reopen Claude Desktop to load the change.\n")
+	// A reminder arrives only with a change a client actually took — never on a
+	// dry run or a no-op, since printing it then trains people to ignore it.
+	for _, r := range results {
+		if r.AfterChange != "" {
+			fmt.Fprintf(w, "\n%s\n", r.AfterChange)
+		}
 	}
 }

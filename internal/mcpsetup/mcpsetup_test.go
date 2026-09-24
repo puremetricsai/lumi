@@ -84,10 +84,11 @@ func TestManualHintMatchesTheFormat(t *testing.T) {
 // must not answer for the machine under test.
 func TestMain(m *testing.M) {
 	userPATH = func() string { return "" }
+	userPiAgentDir = func() string { return "" }
 	os.Exit(m.Run())
 }
 
-func TestParsePATHProbe(t *testing.T) {
+func TestParseShellProbe(t *testing.T) {
 	const marked = "\n" + pathMarker + "/usr/bin:/bin\n"
 	tests := map[string]struct {
 		out  string
@@ -109,10 +110,23 @@ func TestParsePATHProbe(t *testing.T) {
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			if got := parsePATHProbe(tc.out); got != tc.want {
-				t.Errorf("parsePATHProbe(%q) = %q, want %q", tc.out, got, tc.want)
+			if got := parseShellProbe(tc.out).path; got != tc.want {
+				t.Errorf("parseShellProbe(%q).path = %q, want %q", tc.out, got, tc.want)
 			}
 		})
+	}
+}
+
+// An unset PI_CODING_AGENT_DIR still prints its marker, and parses as empty
+// alongside a PATH, so it never counts as a failed probe.
+func TestParseShellProbeReadsThePiAgentDir(t *testing.T) {
+	for out, want := range map[string]string{
+		"\n" + pathMarker + "/usr/bin\n" + piAgentDirMarker + "/Users/me/pi\n": "/Users/me/pi",
+		"\n" + pathMarker + "/usr/bin\n" + piAgentDirMarker + "\n":             "",
+	} {
+		if got := parseShellProbe(out); got.path != "/usr/bin" || got.piAgentDir != want {
+			t.Errorf("parseShellProbe(%q) = %+v, want pi dir %q", out, got, want)
+		}
 	}
 }
 
@@ -181,4 +195,12 @@ func stubUserPATH(t *testing.T, path string) {
 	previous := userPATH
 	t.Cleanup(func() { userPATH = previous })
 	userPATH = func() string { return path }
+}
+
+// stubUserPiAgentDir fixes the shell's PI_CODING_AGENT_DIR for one test.
+func stubUserPiAgentDir(t *testing.T, dir string) {
+	t.Helper()
+	previous := userPiAgentDir
+	t.Cleanup(func() { userPiAgentDir = previous })
+	userPiAgentDir = func() string { return dir }
 }

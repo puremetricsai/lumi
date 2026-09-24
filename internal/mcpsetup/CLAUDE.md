@@ -1,14 +1,29 @@
 # internal/mcpsetup
 
-Registers `lumi mcp` with installed MCP clients, backing `lumi mcp setup`. `Spec` carries a name, binary
-path, and argv; `internal/cli` supplies all three. It has no native or third-party dependencies. The three
-targets are asymmetric because what each client will tell us differs: Claude Code is *read* from
+Registers `lumi mcp` with installed MCP clients and installs a Pi extension, backing `lumi mcp setup`.
+`Spec` carries a name, binary path, and argv; `internal/cli` supplies all three. It has no native or
+third-party dependencies. The targets are asymmetric because what each client will tell us differs: Claude Code is *read* from
 `~/.claude.json` and *written* only via `claude mcp add`/`remove`; Claude Desktop has no CLI and is
 read-modify-written in place; Codex is mediated by `codex mcp get --json`/`add`/`remove` in both directions,
 so `~/.codex/config.toml` is never touched. Every external command goes through the `Runner` seam and every
 path is an injectable field, so tests need no client present.
 
 ## Invariants
+
+- **Pi has no built-in MCP support.** `pi.ts` is embedded into the Go binary, with only the absolute binary
+  path and argv substituted. It asks Lumi's MCP server for its tools at `session_start`, registering their
+  own descriptions, schemas, and instructions as native Pi tools. It starts no process during extension
+  load and uses a short-lived stdio connection per call. Setup writes `~/.pi/agent/extensions/lumi.ts`
+  only if Pi is found or its agent directory already exists. It honors `PI_CODING_AGENT_DIR` from this
+  process, else from the user's shell (the PATH probe reads both) — launchd hides a `~/.zshrc` export, and
+  Lumi would write where Pi never looks. It expands `~/` and refuses relative values, because Lumi.app's
+  working directory is not Pi's. Pi has no named server entries, so a name other than `DefaultName` never
+  writes for Pi rather than silently claiming a second registration: it fails under `--client pi` and is a
+  visible skip under `all`, so a custom name for the other clients still exits zero.
+- **A target says what the user must do after a change; no caller decides it.** `Result.AfterChange`
+  ("quit and reopen Claude Desktop", "reload Pi") is set by the target only alongside `Changed`, so it is
+  empty on a dry run, a no-op, and a failed write. The CLI and Lumi.app print whatever arrives and keep no
+  list of which clients need one.
 
 - **Never hand-write `~/.claude.json`.** It is ~150KB of live Claude Code state rewritten by a running app,
   so a read-modify-write can drop whatever the app wrote in the interim. Lumi may *read* it to detect an
@@ -40,13 +55,16 @@ path is an injectable field, so tests need no client present.
   `claude` and `codex` installed by npm, nvm, or any version manager, and the MCP settings tab reported
   clients the user plainly had as "not installed". Enumerating install locations cannot fix it — a version
   manager's directory contains the version, so there is no fixed path to list. `userPATH` asks the user's
-  own shell instead, once, memoized. The probe has **two** call sites and both are required. `lookCLI` is
+  own shell instead, once, memoized. The PATH has **two** call sites and both are required. `lookCLI` is
   the first, and alone it only moves the failure: an npm-installed `codex` is a `#!/usr/bin/env node`
   script, so a resolved binary still exits 127 under launchd's PATH and the target reports "codex cannot
   read its own configuration" — a lie about what went wrong. `execRunner` is the second, and it is what
   makes the found binary runnable. Both targets reach the probe only through their injectable `LookPath`
   field, so a test that stubs that field cannot be answered by whatever the developer has installed;
-  `TestMain` stubs `userPATH` besides, because a unit test must never spawn a shell.
+  `TestMain` stubs `userPATH` and `userPiAgentDir` besides, because a unit test must never spawn a
+  shell. One probe answers every variable (`userShell`): each run is a whole interactive rc chain, and an
+  unset `PI_CODING_AGENT_DIR` probed on its own cost two more of them, since an empty answer looked like a
+  failed attempt and was retried. Only a missing PATH counts as a failed attempt.
 - **Everything the shell prints around the probe's answer is hostile, and three separate things guard
   against it.** The invocation must be **interactive**, because nvm and its kin initialise from `~/.zshrc`,
   which zsh sources only for an interactive shell — a login-only probe was measured returning a PATH
@@ -54,9 +72,9 @@ path is an injectable field, so tests need no client present.
   a settings tab, and with it: a banner printed *before* the answer, a `~/.zlogout` printed *after* it with
   no newline in between (measured appending `goodbye…` to the last PATH entry), and a shell that rejects
   the flags outright — `csh` and `tcsh` answer `-l` with "Unknown option". So the answer is **marked**
-  (`pathMarker`) and the *last* marked line wins, which is what makes both the banner and the logout
-  message unmistakable; a rejected invocation is retried once without `-l`, which is lazier than a table of
-  shell names and self-heals for the next shell that dislikes a flag.
+  (`pathMarker`, `piAgentDirMarker`) and the *last* marked line wins, which is what makes both the banner
+  and the logout message unmistakable; a rejected invocation is retried once without `-l`, which is lazier
+  than a table of shell names and self-heals for the next shell that dislikes a flag.
 - **`cmd.WaitDelay` is what bounds the probe, not the context.** `CommandContext` kills the shell and not
   its descendants, so an rc file that backgrounds anything inheriting stdout leaves `Output()` waiting on a
   pipe that never closes: measured at **60 seconds against a 5-second timeout**, hanging the settings tab.
@@ -75,7 +93,7 @@ path is an injectable field, so tests need no client present.
   against desired and exits non-zero; only `--force` replaces it, and only after a `.lumi-backup`. Silently
   overwriting destroys a hand-tuned entry; warning but exiting zero leaves the agent pointed at the wrong
   index — the worst failure mode. An entry under Lumi's name that does not *decode* is a conflict too, in
-  all three targets.
+  all targets.
 - **`--dry-run` writes nothing at all, including directories.** `runMCPSetup` skips `Paths.Ensure` under it,
   so previewing a mistyped `--data-dir` doesn't create the root. It may still *read*: `codex mcp get` is the
   only way to know what a dry run would do. That command exits 1 both for an unknown name and an unparseable

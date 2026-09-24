@@ -29,6 +29,7 @@ tasks:
     sources:
       - '**/*.go'
       - '**/*.m'
+      - internal/mcpsetup/pi.ts
       - internal/macosnative/liblumispeech.a
       - go.mod
       - go.sum
