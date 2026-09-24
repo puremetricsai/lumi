@@ -15,7 +15,7 @@ The app is a supervisor and nothing else — root `CLAUDE.md` states that rule; 
   opens the database, reads media, calls a capture framework, or writes a file the binary owns. A rule that
   has a Go home is read from there, never restated here: `record status --json` rather than parsing
   `record.json` (`internal/cli/CLAUDE.md` owns that format), `mcp setup --dry-run --json` rather than
-  inspecting a client's config, `Result.manual_hint` rather than rendering a client's JSON or TOML
+  inspecting a client's config, `Result.manual_hint` rather than rendering a client's config or extension
   (`internal/mcpsetup/CLAUDE.md`), a result's own `target` handed back to `--client` rather than a name
   table. Every invocation passes the app's `--data-dir`, because a child inherits no shell environment.
 - **`LumiCLI.decoder` maps keys with `.convertFromSnakeCase`, so `Models.swift` carries no key tables.**

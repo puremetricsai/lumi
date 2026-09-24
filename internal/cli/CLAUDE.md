@@ -108,7 +108,7 @@ developer's own Claude config.
 - **`--client` accepts a `Target`'s own name as well as the short one.** A caller reading the JSON has only
   the target name, so accepting it is what lets `Lumi.app` replace one conflicting entry by handing back the
   `target` it was given rather than keeping a second copy of this vocabulary in Swift.
-  `TestEveryTargetNameIsAClientValue` derives the check from `defaultSetupTargets`, so a fourth client fails
+  `TestEveryTargetNameIsAClientValue` derives the check from `defaultSetupTargets`, so a new client fails
   it until `parseClientSelection` learns both of its names.
 - **`mcp setup --dry-run --json` is the read-only status query `internal/mcpsetup` does not otherwise
   have.** `Target.Apply` is the only entry point and it writes unless `DryRun` is set, so the macOS app's
@@ -116,7 +116,7 @@ developer's own Claude config.
   `--dry-run` — the app's Set up button wants the same document back from a real run. The payload names the
   resolved binary and the full argv because `lumiBinaryPath` and the absolute `--data-dir` are precisely
   what a reader cannot rebuild, and it carries `manual`/`manual_hint` on *every* result so the app can
-  offer "copy client config" without ever constructing a client's JSON or TOML in Swift.
+  offer "copy client config" without ever constructing a client's config or extension in Swift.
 - **`Recorder.AudioOutputs` and `Recorder.AudioMarkers` are always wired here.** Leaving either nil changes
   what an absent source list *means* in every row written — "no source was found" rather than "no source
   was looked for" — and nothing downstream can tell those apart (`internal/capture/CLAUDE.md`).
