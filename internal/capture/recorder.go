@@ -14,6 +14,7 @@ import (
 	"github.com/puremetricsai/lumi/internal/config"
 	"github.com/puremetricsai/lumi/internal/store"
 	"github.com/puremetricsai/lumi/internal/transcript"
+	"github.com/puremetricsai/lumi/internal/wav"
 )
 
 // SegmentWriter stores one chunk's attributed segments. *store.Store satisfies
@@ -664,6 +665,8 @@ func (r *Recorder) storeAudioChunk(ctx context.Context, chunk AudioChunk) {
 		transcription Transcription
 		err           error
 		ms            int64
+		envelope      []float64
+		skipped       bool
 	}
 	transcriptions := make([]transcribed, len(chunk.Frames))
 	var wg sync.WaitGroup
@@ -673,6 +676,15 @@ func (r *Recorder) storeAudioChunk(ctx context.Context, chunk AudioChunk) {
 			defer wg.Done()
 			if ctx.Err() != nil {
 				transcriptions[i].err = fmt.Errorf("transcription skipped after capture stopped: %w", ctx.Err())
+				return
+			}
+			// A read failure proves nothing about the sound, so it transcribes.
+			envelope, _, err := ReadAudioEnvelope(ctx, frame.Path, transcript.EnvelopeWindowMS)
+			if err == nil {
+				transcriptions[i].envelope = envelope
+				transcriptions[i].skipped = wav.IsDigitalSilence(envelope)
+			}
+			if transcriptions[i].skipped {
 				return
 			}
 			start := time.Now()
@@ -701,8 +713,8 @@ func (r *Recorder) storeAudioChunk(ctx context.Context, chunk AudioChunk) {
 			AudioAttribution: string(verdict.Attribution),
 			SourceApps:       sourceApps,
 			StreamOffsetMS:   chunk.StreamOffsetMS,
-			Metadata: audioMetadata(frame.Source, frame.CaptureError, processErr, attribution,
-				verdict, chunk)}
+			Metadata: audioMetadata(frame.Source, frame.CaptureError, processErr,
+				transcriptions[i].skipped, attribution, verdict, chunk)}
 		storeCtx, cancel := insertContext(ctx)
 		insertStart := time.Now()
 		err := r.Store.Insert(storeCtx, event)
@@ -714,12 +726,13 @@ func (r *Recorder) storeAudioChunk(ctx context.Context, chunk AudioChunk) {
 		}
 		r.Logger.Info("captured audio", "id", event.ID, "source", frame.Source,
 			"characters", len(transcription.Text), "segments", len(transcription.Segments),
-			"transcribe_ms", transcriptions[i].ms, "insert_ms", insertMS)
+			"transcribe_ms", transcriptions[i].ms, "skipped", transcriptions[i].skipped, "insert_ms", insertMS)
 		if processErr != nil {
 			r.Logger.Warn("transcription failed; audio was still indexed", "source", frame.Source, "error", processErr)
 		}
 		results = append(results, audioChunkResult{
-			frame: frame, transcription: transcription, eventID: event.ID, failed: processErr != nil})
+			frame: frame, transcription: transcription, eventID: event.ID, failed: processErr != nil,
+			envelope: transcriptions[i].envelope})
 	}
 	r.attributeChunk(ctx, capturedAt, results)
 }
@@ -735,6 +748,9 @@ type audioChunkResult struct {
 	// reports both as an empty string, and attribution reads that emptiness as
 	// evidence — so which of the two it was has to be carried out of band.
 	failed bool
+	// envelope is the track's energy as read before transcription, nil if the
+	// read failed, so attribution need not read the file a second time.
+	envelope []float64
 }
 
 // attributeChunk decides where a chunk's audio came from and stores the verdict.
@@ -757,6 +773,7 @@ func (r *Recorder) attributeChunk(ctx context.Context, capturedAt time.Time, res
 	}
 	chunk := transcript.Chunk{CapturedAt: capturedAt}
 	eventIDs := make(map[string]int64, len(results))
+	var systemEnvelope []float64
 	systemPath := ""
 	for _, result := range results {
 		eventIDs[result.frame.Source] = result.eventID
@@ -764,11 +781,12 @@ func (r *Recorder) attributeChunk(ctx context.Context, capturedAt time.Time, res
 		case transcript.TrackSystem:
 			chunk.System = buildTrack(result)
 			systemPath = result.frame.Path
+			systemEnvelope = result.envelope
 		case transcript.TrackMicrophone:
 			chunk.Microphone = buildTrack(result)
 		}
 	}
-	r.measureInternalEnergy(ctx, &chunk, systemPath)
+	r.measureInternalEnergy(ctx, &chunk, systemPath, systemEnvelope)
 
 	segments := transcript.Attribute(chunk, transcript.Options{})
 	if len(segments) == 0 {
@@ -841,17 +859,21 @@ func buildTrack(result audioChunkResult) *transcript.Track {
 // whether it was silent or merely untranscribable, which is what
 // transcript.NeedsInternalEnergy decides — the rule lives there so this and the
 // backfill skip exactly the same chunks. Which reader opens the file is
-// ReadAudioEnvelope's, for the same reason.
-func (r *Recorder) measureInternalEnergy(ctx context.Context, chunk *transcript.Chunk, systemPath string) {
+// ReadAudioEnvelope's, for the same reason. envelope is the reading already
+// taken before transcription, when there was one.
+func (r *Recorder) measureInternalEnergy(ctx context.Context, chunk *transcript.Chunk, systemPath string, envelope []float64) {
 	if systemPath == "" || !transcript.NeedsInternalEnergy(*chunk) {
 		return
 	}
-	envelope, _, err := ReadAudioEnvelope(ctx, systemPath, transcript.EnvelopeWindowMS)
-	if err != nil {
-		// Without the measurement the microphone stays confidently external,
-		// which is the pre-existing behaviour rather than a new risk.
-		r.Logger.Debug("could not measure system audio energy", "error", err)
-		return
+	if envelope == nil {
+		var err error
+		envelope, _, err = ReadAudioEnvelope(ctx, systemPath, transcript.EnvelopeWindowMS)
+		if err != nil {
+			// Without the measurement the microphone stays confidently external,
+			// which is the pre-existing behaviour rather than a new risk.
+			r.Logger.Debug("could not measure system audio energy", "error", err)
+			return
+		}
 	}
 	chunk.System.Envelope = envelope
 	chunk.System.EnvelopeWindowMS = transcript.EnvelopeWindowMS
@@ -989,7 +1011,7 @@ func chunkSpan(chunk AudioChunk, configured time.Duration) time.Duration {
 	return configured
 }
 
-func audioMetadata(source, captureError string, processErr error,
+func audioMetadata(source, captureError string, processErr error, skipped bool,
 	attribution audioAttributionSample, verdict AttributionVerdict, chunk AudioChunk) json.RawMessage {
 	metadata := map[string]any{"audio_source": source}
 	if captureError != "" {
@@ -997,6 +1019,11 @@ func audioMetadata(source, captureError string, processErr error,
 	}
 	if processErr != nil {
 		metadata["processor_error"] = processErr.Error()
+	}
+	// A positive reason, never processor_error: a failure blocks the silent
+	// marker, and this track is silence that was measured rather than heard.
+	if skipped {
+		metadata["transcription_skipped"] = "digital_silence"
 	}
 	// app_source and attribution_source keep exactly the meanings they carry on
 	// screen rows: which source named the application, and which supplied the

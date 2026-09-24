@@ -20,6 +20,7 @@ import (
 
 	"github.com/puremetricsai/lumi/internal/config"
 	"github.com/puremetricsai/lumi/internal/store"
+	"github.com/puremetricsai/lumi/internal/transcript"
 )
 
 type fakeScreen struct{ count atomic.Int64 }
@@ -2772,4 +2773,102 @@ func writeScreenFrame(t *testing.T, directory string) ScreenFrame {
 		t.Fatal(err)
 	}
 	return ScreenFrame{Path: path, DisplayID: 1}
+}
+
+// skipProbeTranscriber hears nothing, as the recognizer does in a quiet room,
+// and optionally fails the microphone so a failure can sit beside a skip.
+type skipProbeTranscriber struct {
+	failMic bool
+	calls   atomic.Int64
+}
+
+func (t *skipProbeTranscriber) Transcribe(_ context.Context, path string) (Transcription, error) {
+	t.calls.Add(1)
+	if t.failMic && strings.Contains(path, "microphone") {
+		return Transcription{}, errors.New("transcription failed")
+	}
+	return Transcription{Source: SpeechAnalyzerSource}, nil
+}
+
+// TestDigitallySilentTracksSkipTranscription pins what a skip may and may not
+// be: only a track reading zero skips, it names its own reason rather than a
+// failure or a recognizer, and a real failure beside it still blocks the
+// silent marker.
+func TestDigitallySilentTracksSkipTranscription(t *testing.T) {
+	zeros := make([]int16, 16000)
+	quiet := make([]int16, 16000)
+	for i := range quiet {
+		quiet[i] = int16(1 - 2*(i%2))
+	}
+	for _, c := range []struct {
+		name      string
+		system    []int16 // nil writes an unreadable file
+		mic       []int16
+		failMic   bool
+		wantCalls int64
+		wantSkips int
+		wantMark  bool
+	}{
+		{"silent chunk skips and still drains", zeros, zeros, false, 0, 2, true},
+		{"quiet is not silent", quiet, quiet, false, 2, 0, true},
+		{"unreadable audio transcribes", nil, nil, false, 2, 0, true},
+		{"a failure beside a skip blocks the marker", zeros, nil, true, 1, 1, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			paths, s := recorderPaths(t)
+			transcriber := &skipProbeTranscriber{failMic: c.failMic}
+			recorder := Recorder{
+				Store: s, Segments: s, Paths: paths, AudioChunk: time.Second,
+				Transcriber: transcriber, timeline: newEmitterTimeline(1, 1),
+				Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+			}
+			startedAt := time.Now().UTC()
+			chunk := AudioChunk{StartedAt: startedAt}
+			for _, track := range []struct {
+				source  string
+				samples []int16
+			}{{"system", c.system}, {"microphone", c.mic}} {
+				path := filepath.Join(paths.Audio, fileStamp(startedAt)+"-"+track.source+".wav")
+				if track.samples == nil {
+					if err := os.WriteFile(path, []byte("fake-wave"), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					writeEnvelopeWAV(t, path, track.samples)
+				}
+				chunk.Frames = append(chunk.Frames, AudioFrame{Path: path, Source: track.source, DurationMS: 1000})
+			}
+			recorder.storeAudioChunk(context.Background(), chunk)
+
+			if got := transcriber.calls.Load(); got != c.wantCalls {
+				t.Errorf("transcribed %d tracks, want %d", got, c.wantCalls)
+			}
+			skips := 0
+			for _, event := range audioEventsFrom(t, s) {
+				var metadata map[string]any
+				if err := json.Unmarshal(event.Metadata, &metadata); err != nil {
+					t.Fatal(err)
+				}
+				if metadata["transcription_skipped"] != "digital_silence" {
+					continue
+				}
+				skips++
+				if _, failed := metadata["processor_error"]; failed || event.TextSource != "" {
+					t.Errorf("a skipped track claims a failure or a recognizer: %s, text_source %q",
+						event.Metadata, event.TextSource)
+				}
+			}
+			if skips != c.wantSkips {
+				t.Errorf("%d tracks recorded as skipped, want %d", skips, c.wantSkips)
+			}
+			segments, err := s.SegmentsForChunk(context.Background(), store.FormatCapturedAt(startedAt))
+			if err != nil {
+				t.Fatal(err)
+			}
+			marked := len(segments) == 1 && segments[0].Method == string(transcript.MethodSilent)
+			if marked != c.wantMark {
+				t.Errorf("silent marker written = %v, want %v (segments %#v)", marked, c.wantMark, segments)
+			}
+		})
+	}
 }

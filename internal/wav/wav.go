@@ -329,6 +329,19 @@ func envelopeBytes(data []byte, sampleRate, windowMS int) []float64 {
 	return envelope
 }
 
+// IsDigitalSilence reports whether every window of an envelope sits at
+// SilenceFloorDBFS: at 100 ms that admits one ±1 sample per window and nothing
+// more, so it is the tap reading zero, never a quiet room. An empty envelope
+// measured nothing and is not silence.
+func IsDigitalSilence(envelope []float64) bool {
+	for _, level := range envelope {
+		if level != SilenceFloorDBFS {
+			return false
+		}
+	}
+	return len(envelope) > 0
+}
+
 func dbfs(rms float64) float64 {
 	if rms <= 0 {
 		return SilenceFloorDBFS

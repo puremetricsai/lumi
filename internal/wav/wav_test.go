@@ -346,3 +346,24 @@ func TestDBFSFromMeanSquareClampsUnusableEnergy(t *testing.T) {
 		}
 	}
 }
+
+// The skip before transcription trusts this answer, so a quiet signal must
+// never read as silence: two ±1 samples in one window already clear the floor.
+func TestIsDigitalSilenceIsTheFloorNotAThreshold(t *testing.T) {
+	zeros := make([]int16, 16000)
+	quiet := make([]int16, 16000)
+	quiet[800], quiet[801] = 1, -1
+	for _, c := range []struct {
+		name     string
+		envelope []float64
+		want     bool
+	}{
+		{"all zero", Envelope(zeros, 16000, 100), true},
+		{"two one-bit samples", Envelope(quiet, 16000, 100), false},
+		{"nothing measured", nil, false},
+	} {
+		if got := IsDigitalSilence(c.envelope); got != c.want {
+			t.Errorf("%s: IsDigitalSilence = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
