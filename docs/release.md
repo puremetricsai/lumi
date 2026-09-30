@@ -4,7 +4,7 @@
 commit opens a release PR; merging it cuts a **draft** release, and the rest of the workflow builds,
 signs, uploads, verifies, and only then publishes it.
 
-The release carries one asset that users install, `lumi-macos-arm64.zip`, and `install.sh` at the
+The release carries one asset that users install, `lumi-macos-arm64.dmg`, and `install.sh` at the
 repository root is what installs it: it resolves `releases/latest/download/`, so nothing has to be
 rewritten per release.
 
@@ -27,7 +27,7 @@ Lumi has two front doors.
 
 ## Repository secrets
 
-All three are required, and the release fails without them. An ad-hoc signature has a fresh
+All six are required, and the release fails without them. An ad-hoc signature has a fresh
 designated requirement every build, so shipping one would cost every existing user their TCC
 grants — which is the opposite of what `README.md` promises them. `build-binaries` refuses rather
 than letting that through, which leaves the draft unpublished and everyone on the previous
@@ -38,33 +38,30 @@ release.
 | `MACOS_DEVELOPER_ID_P12_BASE64` | the signing certificate and its private key, as a base64 `.p12` |
 | `MACOS_DEVELOPER_ID_P12_PASSWORD` | the password that `.p12` was exported with |
 | `MACOS_DEVELOPER_IDENTITY` | the identity's common name, passed to `codesign --sign` |
+| `APPLE_API_KEY_P8_BASE64` | the App Store Connect team key's `.p8`, base64 encoded |
+| `APPLE_API_KEY_ID` | the team's API Key ID |
+| `APPLE_API_ISSUER_ID` | the team's Issuer ID |
 
 The names were chosen to survive the move off the interim self-signed certificate: getting a real
 Developer ID is a change of secret *values* and no change to the workflow at all.
 
-**That move has happened.** As of 2026-08-27 the three secrets hold a real
-`Developer ID Application` certificate, not the self-signed one the section below describes. Two
-consequences follow, and the first arrives on its own:
+**The certificate move has happened.** As of 2026-08-27 the signing secrets hold a real
+`Developer ID Application` certificate. The DMG workflow signs both the app and disk image,
+submits the disk image to Apple's notary service, staples its ticket, and keeps the release a
+draft unless all of those steps and the published-asset checks pass. Earlier ZIP releases were
+signed but not notarized.
 
-- **The next release cut ships Developer-ID-signed**, which moves the designated requirement once
-  and costs every existing user their five TCC grants. This happens because the secrets changed —
-  not because notarization landed — so it needs a release note whether or not anything else is
-  ready. `.claude/commands/lumi-developer-id-signing.md` carries the detail.
-- **The release is still not notarized.** The workflow has no `notarytool` step yet; the
-  certificate is the precondition for adding one, not the thing that adds it. Until it exists,
-  `README.md`'s "not notarized yet" section stays accurate and stays put.
+The self-signed procedure below is kept as the record of what shipped before. It cannot be used
+for new releases because Apple's notary service requires Developer ID signing.
 
-The self-signed procedure below is kept as the record of what shipped before, and as the fallback
-if the Developer ID certificate is ever lost.
+Never commit the `.p12`, `.p8`, their passwords, or exported certificates. The workflow prints none.
 
-Never commit the `.p12`, the password, or the exported certificate. The workflow prints neither.
+## Why earlier releases were signed before notarization
 
-## Why the release is signed at all, before notarization is possible
-
-Signing and notarization need a paid Apple Developer account. Until one exists the app cannot be
-notarized. `install.sh` sidesteps the consequence rather than fixing it — `curl` never writes
-`com.apple.quarantine`, so Gatekeeper does not gate the first launch — but that only covers the
-supported install path. A browser download of the same ZIP is quarantined and dies as measured
+Signing and notarization need a paid Apple Developer account. Before one existed the app could not be
+notarized. `install.sh` sidestepped the consequence rather than fixing it — `curl` never wrote
+`com.apple.quarantine`, so Gatekeeper did not gate the first launch — but that only covered the
+supported install path. A browser download of the old ZIP is quarantined and dies as measured
 below.
 
 What one stable certificate still buys, against ad-hoc signing:
@@ -117,9 +114,13 @@ moving to Developer ID will. Keep the `.p12` somewhere you will still have it in
 ## Installing what was released
 
 `install.sh` at the repository root is the only install channel. It gates on `arm64` and macOS 26,
-downloads `releases/latest/download/lumi-macos-arm64.zip`, extracts it with `ditto` (not `unzip`,
-which drops the extended attributes the signature is sealed over), verifies the signature, and moves
+downloads `releases/latest/download/lumi-macos-arm64.dmg`, mounts it read-only, copies the app with
+`ditto`, verifies the signature, and moves
 `Lumi.app` into `/Applications`.
+
+Until the first DMG release is published, the installer falls back to the ZIP on the current
+`latest` release. That prevents an updated `install.sh` on `main` from breaking installs during
+the transition. The ZIP is not published in new DMG releases.
 
 `/Applications` is not a free choice. MCP registration writes the absolute in-bundle path into every
 client's config, and TCC keys its grants on path and signature together, so an install elsewhere
@@ -129,7 +130,7 @@ It carries no version and no digest, so no release step rewrites it. What a rele
 the `latest` pointer the script resolves, which is why `publish-release` runs last. The digest is the
 one deliberate omission: the script is fetched over TLS from the same
 origin that serves the asset, so a pinned hash would add no trust the transport does not already
-carry, and `ditto` fails on a truncated archive anyway.
+carry, and `hdiutil verify` fails on a damaged image anyway.
 
 ### The in-app update check
 
@@ -150,17 +151,15 @@ So a release still moves exactly one thing: the `latest` pointer, which is why `
 last. Nothing about the check is versioned, stamped, or published, and there is still no second front
 door.
 
-### What quarantine still costs
+### Quarantine on earlier ZIP releases
 
-Measured on macOS 26.5.2, and the reason the install command is a `curl` pipe rather than a link to
-the ZIP: a quarantined, never-executed, non-notarized Mach-O is **killed with SIGKILL and no prompt
+Measured on macOS 26.5.2 for the old ZIP release: a quarantined, never-executed, non-notarized Mach-O
+is **killed with SIGKILL and no prompt
 at all** — exit 137, no output, `syspolicyd: Terminating process due to Gatekeeper rejection`.
 Quarantine is written to every file inside the bundle, so it reaches the binary the app spawns as
 well as the app itself.
 
-`curl` writes only `com.apple.provenance`, never `com.apple.quarantine`, so none of that happens on
-the supported path. A browser download of the same asset gets all of it, which is what `README.md`
-documents the recovery for.
+The new DMG is notarized and stapled, so this old ZIP limitation no longer applies to new releases.
 
 ## Recovery
 
@@ -172,10 +171,14 @@ documents the recovery for.
 - **Everything passed but `publish-release` failed.** The assets are good and verified; only the
   draft is unpublished. Re-run that job, or publish by hand:
   `gh release edit "$TAG" --draft=false --latest`.
-- **A published release is missing `lumi-macos-arm64.zip`.** `upload-release-assets` fails rather
+- **A published release is missing `lumi-macos-arm64.dmg`.** `upload-release-assets` fails rather
   than letting one through, so this needs a hand-deleted asset to reach. Re-upload it to the same
   tag; until then every `install.sh` run 404s.
 - **The signing secrets are missing.** `build-binaries` fails at *Import the release signing
   identity* before anything is built. Set all three and re-run the job; nothing shipped, so there is
   nothing to undo. Rotating the certificate to a *different* one later is what costs every user
   their TCC grants once, and that is a decision to make deliberately.
+- **Notarization credentials are missing or Apple rejects the DMG.** The release stays a draft.
+  Configure the three `APPLE_API_*` secrets or fix the issues in the notarization log, then re-run
+  the failed job. A submission must return `Accepted` and its stapled ticket must validate before
+  the workflow uploads the DMG.

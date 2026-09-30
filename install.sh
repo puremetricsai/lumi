@@ -6,12 +6,9 @@
 # Re-run it to upgrade. Uninstall by dragging Lumi.app to the Trash; that leaves
 # ~/Library/Application Support/Lumi -- the database and captured media -- alone.
 #
-# curl does not set com.apple.quarantine, so the un-notarized app launches without
-# the Gatekeeper "Open Anyway" detour a browser download needs.
 set -eu
 
 REPO="puremetricsai/lumi"
-ASSET="lumi-macos-arm64.zip"
 APP="/Applications/Lumi.app"
 
 die() { echo "install.sh: $*" >&2; exit 1; }
@@ -22,17 +19,32 @@ die() { echo "install.sh: $*" >&2; exit 1; }
 [ -w /Applications ] || die "/Applications is not writable; re-run with sudo."
 
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+MOUNTED=0
+trap 'if [ "$MOUNTED" -eq 1 ]; then hdiutil detach "$TMP/mount" >/dev/null 2>&1 || true; fi; rm -rf "$TMP"' EXIT
 
 echo "Downloading the latest Lumi..."
-# /latest/download/ redirects to the newest release, so no tag or GitHub API here.
-curl -fsSL -o "$TMP/$ASSET" "https://github.com/$REPO/releases/latest/download/$ASSET" \
-  || die "download failed."
-
-# ditto, not unzip: the signature is sealed over extended attributes that unzip drops,
-# which would break the bundle's identity and with it every TCC grant.
-/usr/bin/ditto -x -k "$TMP/$ASSET" "$TMP" || die "the download is not a readable archive."
-[ -d "$TMP/Lumi.app" ] || die "the archive does not contain Lumi.app."
+# Prefer the notarized DMG. Until the first DMG release is published, `latest`
+# still points to a ZIP release, so retain that download path for the transition.
+if curl -fsSL -o "$TMP/lumi-macos-arm64.dmg" \
+    "https://github.com/$REPO/releases/latest/download/lumi-macos-arm64.dmg" 2>/dev/null; then
+  hdiutil verify "$TMP/lumi-macos-arm64.dmg" >/dev/null || die "the disk image is damaged."
+  codesign --verify "$TMP/lumi-macos-arm64.dmg" || die "the disk image failed signature verification."
+  mkdir "$TMP/mount"
+  hdiutil attach -readonly -nobrowse -quiet -mountpoint "$TMP/mount" \
+    "$TMP/lumi-macos-arm64.dmg" || die "the disk image could not be mounted."
+  MOUNTED=1
+  [ -d "$TMP/mount/Lumi.app" ] || die "the disk image does not contain Lumi.app."
+  /usr/bin/ditto "$TMP/mount/Lumi.app" "$TMP/Lumi.app" || die "could not copy Lumi.app from the disk image."
+  hdiutil detach "$TMP/mount" >/dev/null || die "could not unmount the disk image."
+  MOUNTED=0
+else
+  curl -fsSL -o "$TMP/lumi-macos-arm64.zip" \
+    "https://github.com/$REPO/releases/latest/download/lumi-macos-arm64.zip" \
+    || die "download failed."
+  # Preserve the bundle metadata sealed by the ZIP release's signature.
+  /usr/bin/ditto -x -k "$TMP/lumi-macos-arm64.zip" "$TMP" || die "the download is not a readable archive."
+  [ -d "$TMP/Lumi.app" ] || die "the archive does not contain Lumi.app."
+fi
 codesign --verify --strict "$TMP/Lumi.app" || die "the downloaded app failed signature verification."
 
 # Overwriting the bundle out from under a running app leaves it executing deleted

@@ -70,20 +70,19 @@ it needs nothing from App Store Connect at all.
 
 | Method | Flags | Needs App Store Connect |
 | :--- | :--- | :--- |
-| API key (**preferred**) | `--key` `--key-id` `--issuer` | yes |
+| Team API key (**preferred**) | `--key` `--key-id` `--issuer` | yes |
 | Apple ID (**interim**) | `--apple-id` `--password` `--team-id` | no |
 | Keychain profile | `--keychain-profile` | wraps either of the above |
 
-Prefer the API key: it is not tied to one person's Apple ID, and
-`.claude/commands/lumi-developer-id-signing.md` names it as the target state. Step 2b is the
-workaround for a blocked account, not the destination.
+The release workflow uses a team API key. Step 2b is available for manual notarization when
+App Store Connect access is blocked.
 
-#### Step 2a: App Store Connect API key
-> **Note**: `--issuer` is **required for Team keys and must be omitted for Individual keys**. Passing
-> it with an Individual key is a 401. Prefer a Team key; the workflow passes `--issuer`.
+#### Step 2a: App Store Connect team API key
+> **Note**: Use a Team key. Apple does not allow Individual keys to authenticate `notarytool`.
+> The workflow passes `--issuer`, which Team keys require.
 
 1. Sign in to [App Store Connect: Users and Access $\rightarrow$ Integrations $\rightarrow$ App Store Connect API](https://appstoreconnect.apple.com/access/integrations/api).
-2. Click **(+)** to generate a new key:
+2. Select **Team Keys** and click **(+)** to generate a new key:
    - Name: `Lumi Notarization Key`
    - Access: `Developer` (or `App Manager`)
 3. Record:
@@ -163,34 +162,36 @@ Lumi uses:
 ## 3. Manual Signing & Notarization Commands
 
 ```sh
-# 1. Build
-task build && task app
+# 1. Build the embedded binary
+task build
 
 # 2. Sign the bundle with runtime + timestamp. build-app.sh signs the embedded
 #    binary before the bundle around it; nothing is signed or shipped separately.
-IDENTITY="Developer ID Application: Puremetrics AI Inc. (ABC123XYZ0)"
+IDENTITY="Developer ID Application: Pure LLC (C34G34593Q)"
 CODESIGN_IDENTITY="$IDENTITY" ./macos/build-app.sh
 
-# 3. Create submission archive
-ditto -c -k --keepParent build/Lumi.app lumi-submission.zip
+# 3. Package and sign the disk image
+mkdir -p build/dmg-root
+ditto build/Lumi.app build/dmg-root/Lumi.app
+ln -s /Applications build/dmg-root/Applications
+hdiutil create -volname Lumi -srcfolder build/dmg-root -format UDZO -ov lumi-macos-arm64.dmg
+codesign --sign "$IDENTITY" --timestamp --identifier com.puremetricsai.lumi.dmg lumi-macos-arm64.dmg
 
 # 4. Submit to Apple Notary Service
-xcrun notarytool submit lumi-submission.zip \
+xcrun notarytool submit lumi-macos-arm64.dmg \
   --key /path/to/AuthKey_KEYID.p8 \
   --key-id KEYID \
   --issuer ISSUER_UUID \
   --wait
 
-# 5. Staple ticket to app bundle
-xcrun stapler staple build/Lumi.app
-xcrun stapler validate build/Lumi.app
+# 5. Staple ticket to the distributable disk image
+xcrun stapler staple lumi-macos-arm64.dmg
+xcrun stapler validate lumi-macos-arm64.dmg
 
-# 6. Verify Gatekeeper acceptance
-spctl --assess --type execute --verbose=2 build/Lumi.app
+# 6. Verify the image and app
+hdiutil verify lumi-macos-arm64.dmg
+codesign --verify --verbose=2 lumi-macos-arm64.dmg
 codesign --verify --deep --strict --verbose=2 build/Lumi.app
-
-# 7. Final distributable zip
-ditto -c -k --keepParent build/Lumi.app lumi-macos-arm64.zip
 ```
 
 ---
@@ -206,23 +207,20 @@ In `.github/workflows/release-please.yml`:
    future runner image drop it, tolerate the duplicate rather than letting it fail the step:
    `security import ... || grep -q "already exists" <<<"$out"`. A local machine missing the
    intermediate is the case section 2 covers.
-2. **Build & Sign App**: Run `CODESIGN_IDENTITY="$IDENTITY" ./macos/build-app.sh`. It signs the embedded binary and then the bundle. `Lumi.app` is the only artifact — there is nothing to sign or notarize beside it.
-3. **Notarize & Staple App**:
-   - `ditto -c -k --keepParent build/Lumi.app lumi-submission.zip`
-   - `xcrun notarytool submit lumi-submission.zip ... --wait --output-format json`
+2. **Build & Sign App**: Run `CODESIGN_IDENTITY="$IDENTITY" ./macos/build-app.sh`. It signs the embedded executables and then the bundle. The DMG contains this app; the embedded binary is never distributed separately.
+3. **Create, Sign, Notarize & Staple DMG**:
+   - Copy `Lumi.app` with `ditto`, create a read-only `UDZO` image with `hdiutil`, and sign it with the Developer ID Application identity.
+   - `xcrun notarytool submit lumi-macos-arm64.dmg ... --wait --output-format json`
    - On error: fetch submission log via `xcrun notarytool log <submission-id> ...`
-   - `xcrun stapler staple build/Lumi.app && xcrun stapler validate build/Lumi.app`
-   - Re-archive final `lumi-macos-arm64.zip`.
-4. **Verify**: Run `codesign --verify --deep --strict`, `spctl --assess --type execute` on both `Lumi.app` and `Contents/MacOS/lumi`.
+   - `xcrun stapler staple lumi-macos-arm64.dmg && xcrun stapler validate lumi-macos-arm64.dmg`.
+4. **Verify**: Run `hdiutil verify`, `codesign --verify`, mount the published DMG, then run `codesign --verify --deep --strict` and `spctl --assess --type execute` on `Lumi.app`.
 5. **Cleanup**: Delete temporary keychain and private key files in `if: always()`.
 
 ---
 
 ## 5. Downstream Updates
 
-1. **`README.md`**:
-   - Remove the "The app is not notarized yet" section: the browser-download recovery it documents
-     stops applying once the bundle is stapled.
+1. **`README.md`**: Describe the notarized DMG and the temporary ZIP fallback during migration.
 2. **TCC Grants**:
    - Nothing further is owed here. The move off the interim self-signed certificate has already
      happened — the published app is signed `Developer ID Application: Pure LLC (C34G34593Q)` — so
