@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.8.2](https://github.com/puremetricsai/lumi/compare/v0.8.1...v0.8.2) (2026-09-30)
+
+
+### Features
+
+* distribute signed and notarized DMG releases ([e987efa](https://github.com/puremetricsai/lumi/commit/e987efad336b05465b3d445f8468758ec56d74c6))
+* distribute signed and notarized DMG releases ([1ce8d22](https://github.com/puremetricsai/lumi/commit/1ce8d224fbe87a19da1123e33e206d60131c2192))
+
 ## [0.8.1](https://github.com/puremetricsai/lumi/compare/v0.8.0...v0.8.1) (2026-09-24)
 
 
