@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.9.0](https://github.com/puremetricsai/lumi/compare/v0.8.1...v0.9.0) (2026-09-30)
+## [0.8.2](https://github.com/puremetricsai/lumi/compare/v0.8.1...v0.8.2) (2026-09-30)
 
 
 ### Features
