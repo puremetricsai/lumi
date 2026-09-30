@@ -99,13 +99,8 @@ ask it to — **Check Now** in the same tab still sends the one request, on the 
 install command still upgrades you either way, and the [releases
 page](https://github.com/puremetricsai/lumi/releases) still lists what changed.
 
-### The app is not notarized yet
-
-The released app is signed with a real Apple Developer ID certificate, but it is not notarized. That is invisible if you install with the command above: `curl` does not mark the download with `com.apple.quarantine`, so Gatekeeper never blocks the first launch.
-
-Download the ZIP in a browser instead and it does get quarantined — Gatekeeper then refuses the first launch with "Apple could not verify Lumi is free of malware". Allow it once from **System Settings → Privacy & Security → Open Anyway**.
-
-Use the install command and none of that applies. All of it goes away with notarization.
+New DMG releases are Developer ID signed and notarized. Earlier ZIP releases were signed but not
+notarized; `install.sh` can still install the latest ZIP while the first DMG release is pending.
 
 ## Using Lumi
 

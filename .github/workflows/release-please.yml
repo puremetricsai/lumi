@@ -154,27 +154,65 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "${APP}"
           lipo "${APP}/Contents/MacOS/LumiApp" -verify_arch arm64
           lipo "${APP}/Contents/MacOS/lumi" -verify_arch arm64
-          # Notarization, stapling, `stapler validate`, and `spctl --assess` are
-          # absent because the release is not notarized: each fails by design on an
-          # un-notarized bundle, so running them here would fail every release rather
-          # than report anything. The certificate itself is no longer the blocker --
-          # the bundle is signed with a real Developer ID, so asserting that authority
-          # would pass today. .claude/commands/lumi-developer-id-signing.md adds the
-          # notarization steps.
           codesign -dvvv "${APP}" 2>&1 | grep -E 'Identifier=|Signature=|Authority=' || true
 
-      # ditto, not zip: it preserves the extended attributes, symlinks, and resource
-      # forks a signed bundle is sealed over, and --keepParent keeps Lumi.app itself
-      # as the archive's top-level entry, which is what install.sh moves into place.
-      - name: Archive Lumi.app
-        run: /usr/bin/ditto -c -k --keepParent build/Lumi.app lumi-macos-arm64.zip
+      - name: Create and sign the disk image
+        env:
+          CODESIGN_IDENTITY: ${{ secrets.MACOS_DEVELOPER_IDENTITY }}
+        run: |
+          set -euo pipefail
+          mkdir -p build/dmg-root
+          # ditto preserves the bundle metadata covered by its signature.
+          /usr/bin/ditto build/Lumi.app build/dmg-root/Lumi.app
+          ln -s /Applications build/dmg-root/Applications
+          hdiutil create -volname Lumi -srcfolder build/dmg-root \
+            -format UDZO -ov lumi-macos-arm64.dmg
+          codesign --sign "${CODESIGN_IDENTITY}" --timestamp \
+            --identifier com.puremetricsai.lumi.dmg lumi-macos-arm64.dmg
+          codesign --verify --verbose=2 lumi-macos-arm64.dmg
+          hdiutil verify lumi-macos-arm64.dmg
+
+      - name: Notarize and staple the disk image
+        env:
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          for name in APPLE_API_KEY_P8_BASE64 APPLE_API_KEY_ID APPLE_API_ISSUER_ID; do
+            [ -n "${!name}" ] || { echo "::error::${name} is required for DMG notarization"; exit 1; }
+          done
+          umask 077
+          KEY_FILE="${RUNNER_TEMP}/lumi-notarization.p8"
+          printf '%s' "${APPLE_API_KEY_P8_BASE64}" | base64 --decode > "${KEY_FILE}"
+          trap 'rm -f "${KEY_FILE}" "${RUNNER_TEMP}/notary-result.json"' EXIT
+          SUBMIT_FAILED=0
+          xcrun notarytool submit lumi-macos-arm64.dmg \
+              --key "${KEY_FILE}" --key-id "${APPLE_API_KEY_ID}" \
+              --issuer "${APPLE_API_ISSUER_ID}" --wait --output-format json \
+              > "${RUNNER_TEMP}/notary-result.json" || SUBMIT_FAILED=1
+          STATUS="$(jq -r '.status // empty' "${RUNNER_TEMP}/notary-result.json" 2>/dev/null || true)"
+          if [ "${SUBMIT_FAILED}" -ne 0 ] || [ "${STATUS}" != Accepted ]; then
+            SUBMISSION_ID="$(jq -r '.id // empty' "${RUNNER_TEMP}/notary-result.json" 2>/dev/null || true)"
+            if [ -n "${SUBMISSION_ID}" ]; then
+              xcrun notarytool log "${SUBMISSION_ID}" \
+                --key "${KEY_FILE}" --key-id "${APPLE_API_KEY_ID}" \
+                --issuer "${APPLE_API_ISSUER_ID}" || true
+            fi
+            echo "::error::notarization returned '${STATUS}' rather than Accepted"
+            exit 1
+          fi
+          xcrun stapler staple lumi-macos-arm64.dmg
+          xcrun stapler validate lumi-macos-arm64.dmg
+          codesign --verify --verbose=2 lumi-macos-arm64.dmg
+
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: lumi-macos-arm64.zip
-          path: lumi-macos-arm64.zip
+          name: lumi-macos-arm64.dmg
+          path: lumi-macos-arm64.dmg
           retention-days: 1
 
-      - name: Delete the temporary keychain
+      - name: Delete temporary signing credentials
         if: always()
         run: |
           # delete-keychain also takes it off the search list, so there is nothing to
@@ -182,6 +220,7 @@ jobs:
           # failure too, and that is the run most likely to have left them behind.
           security delete-keychain "${RUNNER_TEMP}/lumi-signing.keychain-db" 2>/dev/null || true
           rm -f "${RUNNER_TEMP}/lumi-signing.keychain-db" "${RUNNER_TEMP}/certificate.p12"
+          rm -f "${RUNNER_TEMP}/lumi-notarization.p8" "${RUNNER_TEMP}/notary-result.json"
 
   upload-release-assets:
     needs: [release-please, build-binaries]
@@ -211,7 +250,7 @@ jobs:
           # SHA256SUMS.txt lists.
           # The list is one entry because Lumi.app is the whole product: the binary it
           # embeds is not published separately.
-          ARCHIVES=(lumi-macos-arm64.zip)
+          ARCHIVES=(lumi-macos-arm64.dmg)
           for file in "${ARCHIVES[@]}"; do
             [ -f "$file" ] || { echo "::error::build-binaries produced no ${file}"; ls -R; exit 1; }
           done
@@ -240,7 +279,7 @@ jobs:
           set -euo pipefail
           TAG="${{ needs.release-please.outputs.tag_name }}"
           ASSETS=$(gh release view "$TAG" --json assets --jq '.assets[].name' --repo ${{ github.repository }})
-          for asset in lumi-macos-arm64.zip SHA256SUMS.txt; do
+          for asset in lumi-macos-arm64.dmg SHA256SUMS.txt; do
             echo "$ASSETS" | grep -q "^${asset}$" && echo "✓ $asset" || { echo "✗ Missing: $asset"; exit 1; }
           done
 
@@ -275,12 +314,14 @@ jobs:
           mkdir -p appcheck
           cd appcheck
           gh release download "$TAG" --clobber --repo ${{ github.repository }} \
-            --pattern lumi-macos-arm64.zip
-          # ditto both ways. `unzip` drops the extended attributes and resource forks
-          # the signature is sealed over, so it can fail a bundle that is in fact
-          # intact -- and this step's whole job is to tell those two apart.
-          /usr/bin/ditto -x -k lumi-macos-arm64.zip .
-          APP=Lumi.app
+            --pattern lumi-macos-arm64.dmg
+          hdiutil verify lumi-macos-arm64.dmg
+          codesign --verify --verbose=2 lumi-macos-arm64.dmg
+          xcrun stapler validate lumi-macos-arm64.dmg
+          mkdir -p mount
+          hdiutil attach -readonly -nobrowse -mountpoint "$PWD/mount" lumi-macos-arm64.dmg
+          trap 'hdiutil detach "$PWD/mount"' EXIT
+          APP="$PWD/mount/Lumi.app"
           ACTUAL="$("${APP}/Contents/MacOS/lumi" version)"
           [ "${ACTUAL}" = "${TAG}" ] || { echo "::error::the published app's lumi reports '${ACTUAL}', expected '${TAG}'"; exit 1; }
           SHORT="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "${APP}/Contents/Info.plist")"
@@ -288,11 +329,7 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "${APP}"
           lipo "${APP}/Contents/MacOS/LumiApp" -verify_arch arm64
           lipo "${APP}/Contents/MacOS/lumi" -verify_arch arm64
-          # `xcrun stapler validate` and `spctl --assess --type execute` belong here and
-          # are absent for one reason: there is no notarization ticket to staple yet, so
-          # both fail by design rather than reporting anything. The Developer ID
-          # certificate exists and is what signed this bundle; only notarization is
-          # missing. .claude/commands/lumi-developer-id-signing.md adds it.
+          spctl --assess --type execute --verbose=2 "${APP}"
           codesign -dvvv "${APP}" 2>&1 | grep -E 'Identifier=|Signature=|Authority=' || true
 
   # release-please cuts the release as a *draft* (release-please-config.json), and this
