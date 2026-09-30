@@ -62,8 +62,10 @@ jobs:
           swiftc -emit-library -static -O \
             -o internal/macosnative/liblumispeech.a \
             internal/macosnative/speech.swift
+          # -trimpath drops the build machine's paths from the binary; -s -w drop the symbol
+          # and DWARF tables. Keep in step with build:release in Taskfile.yml.
           LDFLAGS="-s -w -X github.com/puremetricsai/lumi/internal/cli.version=${VERSION}"
-          go build -ldflags="${LDFLAGS}" -o lumi ./cmd/lumi
+          go build -trimpath -ldflags="${LDFLAGS}" -o lumi ./cmd/lumi
       - name: Verify the injected version
         run: |
           TAG="${{ needs.release-please.outputs.tag_name }}"

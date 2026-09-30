@@ -38,6 +38,14 @@ tasks:
     cmds:
       - go build -o {{.BINARY}} {{.PKG}}
 
+  build:release:
+    desc: Build the stripped, path-free release binary (same flags as the release workflow)
+    deps: [speech]
+    vars:
+      VERSION: '{{.VERSION | default "0.1.0-dev"}}'
+    cmds:
+      - go build -trimpath -ldflags="-s -w -X github.com/puremetricsai/lumi/internal/cli.version={{.VERSION}}" -o {{.BINARY}} {{.PKG}}
+
   install:
     desc: Install the lumi binary system-wide into the Go bin directory
     deps: [speech]
