@@ -14,7 +14,6 @@
   <a href="https://github.com/puremetricsai/lumi/releases"><img src="https://img.shields.io/github/v/release/puremetricsai/lumi?color=111111&label=release" alt="Latest release"></a>
   <img src="https://img.shields.io/badge/macOS-26%2B%20%C2%B7%20Apple%20Silicon-111111" alt="macOS 26 or newer, Apple Silicon">
   <img src="https://img.shields.io/badge/data-100%25%20on--device-111111" alt="All data stays on device">
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/puremetricsai/lumi?color=111111" alt="MIT licensed"></a>
 </p>
 
 <p align="center">
@@ -177,12 +176,8 @@ Captured media stays on disk until it is pruned — nothing is scheduled automat
 
 Compression re-encodes media already on disk into smaller files without deleting any event — screenshots to HEIC, audio to lossless FLAC, then a database rebuild. Roughly 3x on a real index, run from **Settings → Danger**. The screenshot pass is a second lossy generation and is the one decision worth reading before you run it: [docs/compress.md](docs/compress.md).
 
-## Architecture
+## License
 
-How capture, processing, storage, and query fit together, what each package owns, and how frame deduplication and permissions work: [docs/architecture.md](docs/architecture.md).
-
-## Development
-
-Lumi is a Swift menu-bar app wrapped around a Go binary that does all the work. Building it, the `task` targets, the app rebuild loop, and driving the pipeline from the binary directly: [docs/development.md](docs/development.md).
-
-Lumi is licensed under the MIT License.
+Lumi is no longer developed in the open. The source code this repository published up to this
+commit stays available under the [MIT License](LICENSE), as it was released. Releases published
+here from now on are binaries only, under their own terms. Third-party components are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
