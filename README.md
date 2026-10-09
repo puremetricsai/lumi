@@ -178,6 +178,6 @@ Compression re-encodes media already on disk into smaller files without deleting
 
 ## License
 
-Lumi is no longer developed in the open. The source code this repository published up to this
-commit stays available under the [MIT License](LICENSE), as it was released. Releases published
-here from now on are binaries only, under their own terms. Third-party components are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Lumi is proprietary software of Pure LLC, under the [Lumi Proprietary License](LICENSE) and the
+[terms](https://lumimac.app/terms). Releases published here are binaries only. Source code this
+repository published in earlier commits keeps the license it was released under. Third-party components are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
