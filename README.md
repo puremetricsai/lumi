@@ -29,7 +29,8 @@ Tools that fix this usually want your day on their servers, behind a subscriptio
 do not control.
 
 Lumi keeps the whole loop on your Mac. Capture, OCR, transcription, and the index all run locally with
-Apple's own frameworks — nothing is uploaded, there is no account, and it is free. Lumi performs no
+Apple's own frameworks — nothing is uploaded, and there is no account. Lumi is a subscription, $14 a
+month or $120 a year, after a free trial ([lumimac.app](https://lumimac.app)). Lumi performs no
 inference at all; it hands your own searchable history to whichever AI agent you already trust.
 
 ## Quickstart
@@ -92,11 +93,15 @@ github.com for the newest release tag; the request carries nothing but itself �
 machine identifier, no usage. When there is an update, the menu bar offers it, and taking it runs the
 same `install.sh` above: one install channel, not two. Lumi stops recording, installs, and reopens.
 
-That daily check is the only time Lumi contacts the network on its own, and **Settings → About →
-Check for updates automatically** turns it off. With it off Lumi never reaches the network unless you
-ask it to — **Check Now** in the same tab still sends the one request, on the spot. Re-running the
-install command still upgrades you either way, and the [releases
-page](https://github.com/puremetricsai/lumi/releases) still lists what changed.
+**Settings → About → Check for updates automatically** turns that check off; **Check Now** in the same
+tab still sends the one request, on the spot. Re-running the install command still upgrades you either
+way, and the [releases page](https://github.com/puremetricsai/lumi/releases) still lists what changed.
+
+The only other request Lumi makes on its own is a daily license check with Lumi's license service at
+lumimac.app, while you're licensed. It sends your license key, the activation ID the service issued and
+the IDs of the signing keys your version knows; activating also sends a name for the Mac ("Mac" unless you
+type another, never its hostname). The trial sends nothing, and nothing you captured ever leaves your
+Mac. The [privacy page](https://lumimac.app/privacy) lists every request.
 
 New DMG releases are Developer ID signed and notarized. Earlier ZIP releases were signed but not
 notarized; `install.sh` can still install the latest ZIP while the first DMG release is pending.
@@ -178,6 +183,6 @@ Compression re-encodes media already on disk into smaller files without deleting
 
 ## License
 
-Lumi is no longer developed in the open. The source code this repository published up to this
-commit stays available under the [MIT License](LICENSE), as it was released. Releases published
-here from now on are binaries only, under their own terms. Third-party components are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Lumi is proprietary software of Pure LLC, under the [Lumi Proprietary License](LICENSE) and the
+[terms](https://lumimac.app/terms). Releases published here are binaries only. Source code this
+repository published in earlier commits keeps the license it was released under. Third-party components are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
